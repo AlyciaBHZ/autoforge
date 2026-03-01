@@ -1,0 +1,10 @@
+Build a personal blog website with these features:
+- Markdown-based blog posts with frontmatter metadata
+- Tag system for categorizing posts
+- Full-text search across all posts
+- RSS feed generation
+- Syntax highlighting for code blocks
+- Responsive design with dark mode toggle
+- Static site generation for performance
+
+Tech preferences: Next.js with TypeScript, static generation (SSG), Tailwind CSS
