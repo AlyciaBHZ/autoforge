@@ -1,24 +1,33 @@
-"""Lock Manager — atomic task claiming via filesystem symlinks."""
+"""Lock Manager — atomic task claiming via filesystem.
+
+Uses os.symlink() on POSIX (atomic) and file-write on Windows (with
+FileExistsError-based race detection using os.open with O_CREAT|O_EXCL).
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+_IS_WINDOWS = sys.platform == "win32"
+
 
 class LockManager:
-    """Atomic task claiming using filesystem symlinks.
+    """Atomic task claiming using filesystem locks.
 
-    Uses os.symlink() which is atomic on POSIX systems.
-    A task is claimed by creating a symlink:
-        locks/<task-id>.lock -> <agent-instance-id>
+    POSIX: symlink-based (atomic by OS guarantee).
+    Windows: exclusive-create file (O_CREAT|O_EXCL is atomic on NTFS).
 
-    If the symlink already exists, the claim fails (FileExistsError),
-    guaranteeing no two agents can claim the same task.
+    A task is claimed by creating a lock file:
+        locks/<task-id>.lock
+
+    If the file already exists, the claim fails, guaranteeing no two
+    agents can claim the same task.
     """
 
     def __init__(self, lock_dir: Path) -> None:
@@ -29,7 +38,13 @@ class LockManager:
         """Atomically claim a task. Returns True if successful."""
         lock_path = self.lock_dir / f"{task_id}.lock"
         try:
-            os.symlink(agent_id, lock_path)
+            if _IS_WINDOWS:
+                # O_CREAT | O_EXCL is atomic on NTFS — fails if file exists
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, agent_id.encode())
+                os.close(fd)
+            else:
+                os.symlink(agent_id, lock_path)
             logger.info(f"Task {task_id} claimed by {agent_id}")
             return True
         except FileExistsError:
@@ -41,7 +56,8 @@ class LockManager:
         """Release a task lock. Only the owner can release."""
         lock_path = self.lock_dir / f"{task_id}.lock"
         try:
-            if lock_path.is_symlink() and os.readlink(lock_path) == agent_id:
+            owner = self._read_owner(lock_path)
+            if owner == agent_id:
                 lock_path.unlink()
                 logger.info(f"Task {task_id} released by {agent_id}")
                 return True
@@ -53,10 +69,18 @@ class LockManager:
         """Query who owns a task lock."""
         lock_path = self.lock_dir / f"{task_id}.lock"
         try:
+            return self._read_owner(lock_path)
+        except (FileNotFoundError, OSError):
+            return None
+
+    def _read_owner(self, lock_path: Path) -> Optional[str]:
+        """Read the owner from a lock file (symlink or regular file)."""
+        if _IS_WINDOWS:
+            if lock_path.exists():
+                return lock_path.read_text(encoding="utf-8").strip()
+        else:
             if lock_path.is_symlink():
                 return os.readlink(lock_path)
-        except (FileNotFoundError, OSError):
-            pass
         return None
 
     def agent_task_count(self, agent_id: str) -> int:
@@ -64,7 +88,8 @@ class LockManager:
         count = 0
         for lock_file in self.lock_dir.glob("*.lock"):
             try:
-                if lock_file.is_symlink() and os.readlink(lock_file) == agent_id:
+                owner = self._read_owner(lock_file)
+                if owner == agent_id:
                     count += 1
             except OSError:
                 continue

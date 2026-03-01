@@ -273,12 +273,18 @@ class Orchestrator:
         lock_manager: LockManager,
         existing_files: list[str],
     ) -> None:
-        """Build a single task with review."""
+        """Build a single task with git worktree isolation and review."""
+        branch_name = f"task-{task.id.lower()}"
+        worktree_path: Path | None = None
         try:
+            # Create an isolated worktree for this builder
+            worktree_path = await git.create_worktree(branch_name)
+            working_dir = worktree_path
+
             builder = BuilderAgent(
                 self.config,
                 self.llm,
-                working_dir=self.project_dir,
+                working_dir=working_dir,
                 sandbox=sandbox,
                 agent_id=agent_id,
             )
@@ -291,8 +297,11 @@ class Orchestrator:
             })
 
             if result.success:
-                # Quick review
-                reviewer = ReviewerAgent(self.config, self.llm, self.project_dir)
+                # Commit work in the worktree
+                await git.commit_worktree(branch_name, task.description, task.id)
+
+                # Quick review (reviewer reads from worktree)
+                reviewer = ReviewerAgent(self.config, self.llm, working_dir)
                 review_result = await reviewer.run({
                     "task": task.to_dict(),
                     "spec": self.spec,
@@ -300,6 +309,8 @@ class Orchestrator:
                 review = reviewer.parse_review(review_result.output)
 
                 if review.approved:
+                    # Merge worktree branch into main
+                    await git.merge_branch(branch_name)
                     self.dag.mark_done(task.id, f"score={review.score}")
                     console.print(f"  [green][{agent_id}] Done:[/green] {task.id} (score: {review.score})")
                 else:
@@ -314,6 +325,8 @@ class Orchestrator:
                         "existing_files": self._list_project_files(),
                     })
                     if revision_result.success:
+                        await git.commit_worktree(branch_name, f"Revise: {task.description}", task.id)
+                        await git.merge_branch(branch_name)
                         self.dag.mark_done(task.id, "revised and approved")
                         console.print(f"  [green][{agent_id}] Done (revised):[/green] {task.id}")
                     else:
@@ -328,6 +341,12 @@ class Orchestrator:
             console.print(f"  [red][{agent_id}] Error:[/red] {task.id} — {e}")
         finally:
             lock_manager.release(task.id, agent_id)
+            # Always clean up the worktree
+            if worktree_path is not None:
+                try:
+                    await git.cleanup_worktree(branch_name)
+                except Exception:
+                    logger.warning(f"Could not clean up worktree {branch_name}")
 
     # ──────────────────────────────────────────────
     # Phase 3: VERIFY

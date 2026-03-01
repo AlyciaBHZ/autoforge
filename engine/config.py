@@ -75,6 +75,7 @@ class ForgeConfig:
             budget_limit_usd=float(os.getenv("FORGE_BUDGET_LIMIT", "10.0")),
             max_agents=int(os.getenv("FORGE_MAX_AGENTS", "3")),
             log_level=os.getenv("FORGE_LOG_LEVEL", "INFO"),
+            docker_enabled=os.getenv("FORGE_DOCKER_ENABLED", "").lower() in ("true", "1", "yes"),
         )
         for key, value in overrides.items():
             if hasattr(config, key) and value is not None:

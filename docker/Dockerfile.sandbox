@@ -9,11 +9,24 @@ RUN apt-get update && apt-get install -y \
 # Node.js package managers and tools
 RUN npm install -g pnpm yarn typescript ts-node eslint prettier
 
+# Go (latest stable)
+RUN curl -fsSL https://go.dev/dl/go1.22.5.linux-amd64.tar.gz | tar -C /usr/local -xzf -
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+# Java (OpenJDK 21 headless — for Spring Boot, Android scaffold, etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-17-jdk-headless \
+    && rm -rf /var/lib/apt/lists/*
+
 # Working directory
 WORKDIR /workspace
 
 # Non-root user for safety
 RUN useradd -m -s /bin/bash forge
 USER forge
+
+# Set Go workspace for non-root user
+ENV GOPATH="/home/forge/go"
+ENV PATH="${GOPATH}/bin:${PATH}"
 
 CMD ["bash"]
