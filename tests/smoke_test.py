@@ -251,9 +251,14 @@ def test_llm_router_instantiation():
 
 def test_git_manager_instantiation():
     from engine.git_manager import GitManager
-    gm = GitManager(Path("/tmp/test-project"))
-    assert gm.main_worktree == Path("/tmp/test-project")
-    assert gm.worktrees_dir == Path("/tmp/worktrees")
+    d = Path(tempfile.mkdtemp())
+    try:
+        project_dir = d / "test-project"
+        gm = GitManager(project_dir)
+        assert gm.main_worktree == project_dir
+        assert gm.worktrees_dir == d / "worktrees"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_all_agents_instantiate():
@@ -269,23 +274,26 @@ def test_all_agents_instantiate():
 
     config = ForgeConfig(anthropic_api_key="fake")
     llm = LLMRouter(config)
-    wd = Path("/tmp/test")
+    wd = Path(tempfile.mkdtemp())
 
-    d = DirectorAgent(config, llm)
-    assert d.ROLE == "director" and len(d._tools) == 0
-    df = DirectorFixAgent(config, llm)
-    assert df.ROLE == "director"
-    a = ArchitectAgent(config, llm)
-    assert a.ROLE == "architect" and len(a._tools) == 1
-    sb = SubprocessSandbox(wd)
-    b = BuilderAgent(config, llm, working_dir=wd, sandbox=sb)
-    assert b.ROLE == "builder" and len(b._tools) == 4
-    r = ReviewerAgent(config, llm, working_dir=wd)
-    assert r.ROLE == "reviewer" and len(r._tools) == 2
-    t = TesterAgent(config, llm, working_dir=wd, sandbox=sb)
-    assert t.ROLE == "tester" and len(t._tools) == 2
-    g = GardenerAgent(config, llm, working_dir=wd)
-    assert g.ROLE == "gardener" and len(g._tools) == 3
+    try:
+        d = DirectorAgent(config, llm)
+        assert d.ROLE == "director" and len(d._tools) == 0
+        df = DirectorFixAgent(config, llm)
+        assert df.ROLE == "director"
+        a = ArchitectAgent(config, llm)
+        assert a.ROLE == "architect" and len(a._tools) == 1
+        sb = SubprocessSandbox(wd)
+        b = BuilderAgent(config, llm, working_dir=wd, sandbox=sb)
+        assert b.ROLE == "builder" and len(b._tools) == 4
+        r = ReviewerAgent(config, llm, working_dir=wd)
+        assert r.ROLE == "reviewer" and len(r._tools) == 2
+        t = TesterAgent(config, llm, working_dir=wd, sandbox=sb)
+        assert t.ROLE == "tester" and len(t._tools) == 2
+        g = GardenerAgent(config, llm, working_dir=wd)
+        assert g.ROLE == "gardener" and len(g._tools) == 3
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
 
 
 def test_agent_build_prompts():
@@ -301,16 +309,19 @@ def test_agent_build_prompts():
 
     config = ForgeConfig(anthropic_api_key="fake")
     llm = LLMRouter(config)
-    wd = Path("/tmp/test")
+    wd = Path(tempfile.mkdtemp())
     sb = SubprocessSandbox(wd)
     spec = {"project_name": "test", "modules": []}
 
-    assert len(DirectorAgent(config, llm).build_prompt({"project_description": "x"})) > 0
-    assert len(ArchitectAgent(config, llm).build_prompt({"spec": spec})) > 0
-    assert len(BuilderAgent(config, llm, wd, sb).build_prompt({"task": {"id": "T"}, "spec": spec})) > 0
-    assert len(ReviewerAgent(config, llm, wd).build_prompt({"task": {"id": "T"}, "spec": spec})) > 0
-    assert len(TesterAgent(config, llm, wd, sb).build_prompt({"spec": spec})) > 0
-    assert len(GardenerAgent(config, llm, wd).build_prompt({"review": {}, "spec": spec})) > 0
+    try:
+        assert len(DirectorAgent(config, llm).build_prompt({"project_description": "x"})) > 0
+        assert len(ArchitectAgent(config, llm).build_prompt({"spec": spec})) > 0
+        assert len(BuilderAgent(config, llm, wd, sb).build_prompt({"task": {"id": "T"}, "spec": spec})) > 0
+        assert len(ReviewerAgent(config, llm, wd).build_prompt({"task": {"id": "T"}, "spec": spec})) > 0
+        assert len(TesterAgent(config, llm, wd, sb).build_prompt({"spec": spec})) > 0
+        assert len(GardenerAgent(config, llm, wd).build_prompt({"review": {}, "spec": spec})) > 0
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
 
 
 def test_agent_parse_methods():
@@ -331,11 +342,12 @@ def test_agent_parse_methods():
     fix = df.parse_fix_task('{"id": "FIX-1", "description": "fix"}')
     assert fix["id"] == "FIX-1"
 
-    r = ReviewerAgent(config, llm, Path("/tmp"))
+    _td = Path(tempfile.mkdtemp())
+    r = ReviewerAgent(config, llm, _td)
     review = r.parse_review('{"approved": true, "score": 8, "issues": [], "summary": "ok"}')
     assert review.approved is True and review.score == 8
 
-    t = TesterAgent(config, llm, Path("/tmp"))
+    t = TesterAgent(config, llm, _td)
     results = t.parse_results('{"all_passed": true, "results": [], "summary": "ok"}')
     assert results.all_passed is True
 
