@@ -1,0 +1,204 @@
+"""Task DAG — directed acyclic graph for task scheduling."""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+class TaskStatus(Enum):
+    TODO = "todo"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+
+
+class TaskPhase(Enum):
+    SPEC = "spec"
+    BUILD = "build"
+    VERIFY = "verify"
+    REFACTOR = "refactor"
+    DELIVER = "deliver"
+
+
+@dataclass
+class Task:
+    """A single task in the DAG."""
+
+    id: str
+    description: str
+    owner: str = "builder"
+    phase: TaskPhase = TaskPhase.BUILD
+    status: TaskStatus = TaskStatus.TODO
+    depends_on: list[str] = field(default_factory=list)
+    files: list[str] = field(default_factory=list)
+    claimed_by: Optional[str] = None
+    result: Optional[str] = None
+    acceptance_criteria: str = ""
+    retry_count: int = 0
+
+    def is_ready(self, completed_ids: set[str]) -> bool:
+        """A task is ready if all its dependencies are completed."""
+        return all(dep in completed_ids for dep in self.depends_on)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "description": self.description,
+            "owner": self.owner,
+            "phase": self.phase.value,
+            "status": self.status.value,
+            "depends_on": self.depends_on,
+            "files": self.files,
+            "claimed_by": self.claimed_by,
+            "result": self.result,
+            "acceptance_criteria": self.acceptance_criteria,
+            "retry_count": self.retry_count,
+        }
+
+
+class TaskDAG:
+    """Manages the directed acyclic graph of tasks."""
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, Task] = {}
+
+    def add_task(self, task: Task) -> None:
+        self._tasks[task.id] = task
+
+    def get_task(self, task_id: str) -> Optional[Task]:
+        return self._tasks.get(task_id)
+
+    def get_all_tasks(self) -> list[Task]:
+        return list(self._tasks.values())
+
+    def total_tasks(self) -> int:
+        return len(self._tasks)
+
+    def get_ready_tasks(self) -> list[Task]:
+        """Return tasks whose dependencies are all completed and status is TODO."""
+        completed = {
+            tid for tid, t in self._tasks.items() if t.status == TaskStatus.DONE
+        }
+        return [
+            t
+            for t in self._tasks.values()
+            if t.status == TaskStatus.TODO and t.is_ready(completed)
+        ]
+
+    def get_tasks_by_phase(self, phase: TaskPhase) -> list[Task]:
+        return [t for t in self._tasks.values() if t.phase == phase]
+
+    def has_pending_tasks(self, phase: Optional[TaskPhase] = None) -> bool:
+        """Check if there are tasks not yet done."""
+        tasks = self.get_tasks_by_phase(phase) if phase else self.get_all_tasks()
+        return any(
+            t.status in (TaskStatus.TODO, TaskStatus.IN_PROGRESS) for t in tasks
+        )
+
+    def is_complete(self) -> bool:
+        """All tasks are done or blocked."""
+        return all(
+            t.status in (TaskStatus.DONE, TaskStatus.BLOCKED)
+            for t in self._tasks.values()
+        )
+
+    def has_failures(self) -> bool:
+        return any(t.status == TaskStatus.FAILED for t in self._tasks.values())
+
+    def mark_in_progress(self, task_id: str, agent_id: str) -> None:
+        task = self._tasks[task_id]
+        task.status = TaskStatus.IN_PROGRESS
+        task.claimed_by = agent_id
+
+    def mark_done(self, task_id: str, result: str = "") -> None:
+        task = self._tasks[task_id]
+        task.status = TaskStatus.DONE
+        task.result = result
+        task.claimed_by = None
+
+    def mark_failed(self, task_id: str, error: str = "") -> None:
+        task = self._tasks[task_id]
+        task.retry_count += 1
+        if task.retry_count >= 3:
+            task.status = TaskStatus.BLOCKED
+            task.result = f"Blocked after 3 failures: {error}"
+        else:
+            task.status = TaskStatus.FAILED
+            task.result = error
+
+    def reset_failed(self, task_id: str) -> None:
+        """Reset a failed task to TODO for retry."""
+        task = self._tasks[task_id]
+        if task.status == TaskStatus.FAILED:
+            task.status = TaskStatus.TODO
+            task.claimed_by = None
+
+    @classmethod
+    def from_dict(cls, tasks_data: list[dict]) -> TaskDAG:
+        """Build DAG from a list of task dictionaries (e.g. from Architect output)."""
+        dag = cls()
+        for item in tasks_data:
+            task = Task(
+                id=item["id"],
+                description=item["description"],
+                owner=item.get("owner", "builder"),
+                phase=TaskPhase(item.get("phase", "build")),
+                status=TaskStatus(item.get("status", "todo")),
+                depends_on=item.get("depends_on", []),
+                files=item.get("files", []),
+                claimed_by=item.get("claimed_by"),
+                result=item.get("result"),
+                acceptance_criteria=item.get("acceptance_criteria", ""),
+                retry_count=item.get("retry_count", 0),
+            )
+            dag.add_task(task)
+        return dag
+
+    def save(self, path: Path) -> None:
+        """Persist DAG state to JSON for resume capability."""
+        data = [t.to_dict() for t in self._tasks.values()]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        logger.debug(f"DAG saved to {path}")
+
+    @classmethod
+    def load(cls, path: Path) -> TaskDAG:
+        """Load DAG state from JSON for resume."""
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return cls.from_dict(data)
+
+    def to_markdown(self) -> str:
+        """Render the DAG as a markdown task list (DEV_PLAN format)."""
+        lines = ["# DEV_PLAN\n"]
+
+        for phase in TaskPhase:
+            tasks = self.get_tasks_by_phase(phase)
+            if not tasks:
+                continue
+
+            lines.append(f"## Phase: {phase.value.upper()}\n")
+            for t in tasks:
+                status_icon = {
+                    TaskStatus.TODO: "[ ]",
+                    TaskStatus.IN_PROGRESS: "[~]",
+                    TaskStatus.DONE: "[x]",
+                    TaskStatus.FAILED: "[!]",
+                    TaskStatus.BLOCKED: "[B]",
+                }[t.status]
+
+                owner_str = f"owner: {t.claimed_by or t.owner}"
+                line = f"- {status_icon} {t.id}: {t.description} | {owner_str}"
+                if t.depends_on:
+                    line += f" | depends: {', '.join(t.depends_on)}"
+                lines.append(line)
+            lines.append("")
+
+        return "\n".join(lines)
