@@ -1,0 +1,19 @@
+FROM node:20-slim
+
+# System tools
+RUN apt-get update && apt-get install -y \
+    python3 python3-pip python3-venv \
+    git curl build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js package managers and tools
+RUN npm install -g pnpm yarn typescript ts-node eslint prettier
+
+# Working directory
+WORKDIR /workspace
+
+# Non-root user for safety
+RUN useradd -m -s /bin/bash forge
+USER forge
+
+CMD ["bash"]

@@ -1,0 +1,9 @@
+Build a Todo application with the following features:
+- User registration and login (email/password)
+- Create, read, update, delete tasks
+- Task due dates and priority levels (high/medium/low)
+- Mark tasks as complete/incomplete
+- Filter tasks by status and priority
+- Clean, responsive UI
+
+Tech preferences: Next.js with TypeScript, SQLite database, Tailwind CSS

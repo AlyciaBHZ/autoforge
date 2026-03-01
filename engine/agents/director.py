@@ -1,0 +1,108 @@
+"""Director Agent — requirement analysis and task planning."""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any
+
+from engine.agent_base import AgentBase
+from engine.llm_router import TaskComplexity
+
+logger = logging.getLogger(__name__)
+
+
+class DirectorAgent(AgentBase):
+    """Analyzes user requirements and produces structured project specifications.
+
+    The Director is the first agent to run. It takes natural language input
+    and outputs a JSON spec that other agents consume.
+    """
+
+    ROLE = "director"
+    COMPLEXITY = TaskComplexity.HIGH  # Uses Opus for deep understanding
+
+    def _register_tools(self) -> None:
+        """Director has no tools — it produces output through text only."""
+        self._tools = []
+
+    def build_prompt(self, context: dict[str, Any]) -> str:
+        description = context.get("project_description", "")
+        return (
+            f"Analyze the following project requirements and produce a detailed "
+            f"specification.\n\n"
+            f"## Project Description\n\n{description}\n\n"
+            f"## Instructions\n\n"
+            f"1. Understand what the user wants to build\n"
+            f"2. Choose an appropriate technology stack\n"
+            f"3. Break the project into independent modules\n"
+            f"4. Define what files each module needs\n"
+            f"5. Identify module dependencies\n"
+            f"6. Explicitly state what is OUT of scope for MVP\n\n"
+            f"Output a single JSON code block with the specification. "
+            f"Follow the format defined in your system prompt exactly."
+        )
+
+    def parse_spec(self, output: str) -> dict[str, Any]:
+        """Extract JSON spec from the Director's output text."""
+        # Try to find a JSON code block
+        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
+        if match:
+            return json.loads(match.group(1).strip())
+
+        # Fallback: try parsing the entire output as JSON
+        # Find the first { and last }
+        start = output.find("{")
+        end = output.rfind("}")
+        if start != -1 and end != -1:
+            return json.loads(output[start : end + 1])
+
+        raise ValueError("Could not extract JSON spec from Director output")
+
+
+class DirectorFixAgent(AgentBase):
+    """Creates fix tasks when tests fail.
+
+    A specialized Director mode that analyzes test failures and produces
+    targeted fix tasks for the Builder.
+    """
+
+    ROLE = "director"
+    COMPLEXITY = TaskComplexity.HIGH
+
+    def _register_tools(self) -> None:
+        self._tools = []
+
+    def build_prompt(self, context: dict[str, Any]) -> str:
+        failure = context.get("failure", {})
+        spec = context.get("spec", {})
+        return (
+            f"A test has failed in the project '{spec.get('project_name', '')}'.\n\n"
+            f"## Failure Details\n\n"
+            f"Step: {failure.get('step', 'unknown')}\n"
+            f"Command: {failure.get('command', 'unknown')}\n"
+            f"Error:\n```\n{failure.get('stderr', failure.get('error', 'unknown'))}\n```\n\n"
+            f"## Instructions\n\n"
+            f"Analyze this failure and produce a fix task as a JSON code block:\n\n"
+            f"```json\n"
+            f'{{\n'
+            f'  "id": "FIX-XXX",\n'
+            f'  "description": "What needs to be fixed",\n'
+            f'  "owner": "builder",\n'
+            f'  "files": ["path/to/file/to/fix"],\n'
+            f'  "fix_strategy": "Explanation of how to fix it"\n'
+            f'}}\n'
+            f"```"
+        )
+
+    def parse_fix_task(self, output: str) -> dict[str, Any]:
+        """Extract fix task from output."""
+        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
+        if match:
+            return json.loads(match.group(1).strip())
+        start = output.find("{")
+        end = output.rfind("}")
+        if start != -1 and end != -1:
+            return json.loads(output[start : end + 1])
+        raise ValueError("Could not extract fix task from Director output")

@@ -1,0 +1,4 @@
+anthropic>=0.84.0
+python-dotenv>=1.0.0
+rich>=13.0
+pyyaml>=6.0
