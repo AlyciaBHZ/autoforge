@@ -49,18 +49,31 @@ async def start_webhook_server(
 
     @app.post("/api/build", dependencies=[Depends(verify_auth)])
     async def build_project(request: Request) -> dict[str, Any]:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+
         description = body.get("description", "").strip()
         if not description:
             raise HTTPException(status_code=400, detail="description is required")
+        if len(description) > 10000:
+            raise HTTPException(status_code=400, detail="description too long (max 10,000 chars)")
 
         budget = body.get("budget", config.budget_limit_usd)
+        try:
+            budget = float(budget)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="budget must be a number")
+        if budget <= 0:
+            raise HTTPException(status_code=400, detail="budget must be positive")
+
         requester = f"webhook:{request.client.host}" if request.client else "webhook:unknown"
 
         project = await registry.enqueue(
             description=description,
             requested_by=requester,
-            budget_usd=float(budget),
+            budget_usd=budget,
         )
         queue_size = await registry.queue_size()
 

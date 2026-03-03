@@ -61,6 +61,7 @@ class ForgeDaemon:
                 channel_tasks.append(task)
                 console.print("  Telegram bot: [green]active[/green]")
             except ImportError:
+                console.print("  Telegram bot: [yellow]skipped[/yellow] (pip install python-telegram-bot)")
                 logger.warning("python-telegram-bot not installed, skipping Telegram")
 
         if self.config.webhook_enabled:
@@ -72,6 +73,7 @@ class ForgeDaemon:
                 channel_tasks.append(task)
                 console.print(f"  Webhook API: [green]http://{self.config.webhook_host}:{self.config.webhook_port}[/green]")
             except ImportError:
+                console.print("  Webhook API: [yellow]skipped[/yellow] (pip install fastapi uvicorn)")
                 logger.warning("fastapi/uvicorn not installed, skipping webhook")
 
         console.print()
@@ -151,8 +153,9 @@ class ForgeDaemon:
 
             except Exception as e:
                 error_msg = str(e)[:500]
+                cost = project_config.estimated_cost_usd if "project_config" in dir() else 0.0
                 logger.error(f"Build failed for {project.id}: {error_msg}", exc_info=True)
-                await self.registry.mark_failed(project.id, error_msg)
+                await self.registry.mark_failed(project.id, error_msg, cost_usd=cost)
 
                 console.print(f"[bold red]Failed:[/bold red] {project.id} — {error_msg[:80]}")
 

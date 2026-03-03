@@ -72,52 +72,57 @@ def detect_framework(project_dir: Path) -> dict[str, Any]:
 
 def generate_deploy_guide(project_dir: Path, project_name: str = "") -> str:
     """Generate a Vercel deployment guide for the project."""
+    if not project_dir.is_dir():
+        return f"# Deploy Guide\n\nError: project directory not found: {project_dir}\n"
+
     info = detect_framework(project_dir)
     framework = info["framework"]
     name = project_name or project_dir.name
+    # Quote the path for safe use in shell commands
+    safe_dir = str(project_dir).replace(" ", "\\ ")
 
     lines = [
-        f"# {name} — Vercel 部署指南",
+        f"# {name} — Vercel Deployment Guide / 部署指南",
         "",
-        f"检测到框架: **{framework.upper()}**",
+        f"Detected framework / 检测到框架: **{framework.upper()}**",
         "",
         "---",
         "",
-        "## 第 1 步：推送代码到 GitHub",
+        "## Step 1: Push to GitHub / 第 1 步：推送代码到 GitHub",
         "",
         "```bash",
-        f"cd {project_dir}",
+        f"cd {safe_dir}",
         "git init",
         "git add .",
         'git commit -m "Initial commit from AutoForge"',
-        "# 在 GitHub 创建仓库后：",
+        "# Create a repo on GitHub, then:",
         f"git remote add origin https://github.com/YOUR_USERNAME/{name}.git",
         "git push -u origin main",
         "```",
         "",
-        "## 第 2 步：在 Vercel 部署",
+        "## Step 2: Deploy on Vercel / 第 2 步：在 Vercel 部署",
         "",
-        "1. 打开 [vercel.com](https://vercel.com)，用 GitHub 账号登录",
-        "2. 点击 **Add New Project**",
-        f"3. 选择你的 `{name}` 仓库",
-        "4. Vercel 会自动检测框架配置：",
+        "1. Go to [vercel.com](https://vercel.com), sign in with GitHub / 打开 vercel.com 登录",
+        "2. Click **Add New Project** / 点击 Add New Project",
+        f"3. Select your `{name}` repo / 选择你的仓库",
+        "4. Vercel auto-detects framework settings / 自动检测框架配置：",
         f"   - Framework Preset: **{framework}**",
         f"   - Build Command: `{info['build_command']}`",
         f"   - Output Directory: `{info['output_directory']}`",
         f"   - Install Command: `{info['install_command']}`",
-        "5. 点击 **Deploy**",
+        "5. Click **Deploy** / 点击 Deploy",
         "",
     ]
 
     # Environment variables section
     if info["env_vars"]:
         lines.extend([
-            "## 第 3 步：配置环境变量",
+            "## Step 3: Environment Variables / 第 3 步：配置环境变量",
             "",
-            "在 Vercel Dashboard → Settings → Environment Variables 中添加：",
+            "Vercel Dashboard → Settings → Environment Variables:",
             "",
-            "| 变量名 | 说明 | 如何获取 |",
-            "|--------|------|---------|",
+            "| Variable | Description | How to Get |",
+            "|----------|-------------|------------|",
         ])
         for var in info["env_vars"]:
             hint = _get_env_var_hint(var)
@@ -126,49 +131,47 @@ def generate_deploy_guide(project_dir: Path, project_name: str = "") -> str:
 
     # Domain section
     lines.extend([
-        "## 域名配置（可选）",
+        "## Custom Domain / 域名配置（可选）",
         "",
-        "Vercel 免费提供 `*.vercel.app` 子域名。如果你想用自定义域名：",
+        "Vercel provides free `*.vercel.app` subdomains. For custom domains:",
         "",
-        "### 免费方案",
-        "- 直接使用 Vercel 默认分配的 `your-project.vercel.app`",
-        "- 完全免费，自带 HTTPS",
+        "### Free Option / 免费方案",
+        "- Use the default `your-project.vercel.app` — free with HTTPS",
         "",
-        "### 自定义域名（推荐性价比方案）",
+        "### Custom Domain Registrars / 自定义域名",
         "",
-        "| 平台 | 价格 | 特点 |",
-        "|------|------|------|",
-        "| **Cloudflare Registrar** | ~$9/年 (.com) | 成本价，无加价，免费 DNS |",
-        "| **Namecheap** | ~$9-13/年 (.com) | 首年优惠多，免费隐私保护 |",
-        "| **Google Domains** | ~$12/年 (.com) | 简洁，自带隐私保护 |",
-        "| **Porkbun** | ~$9/年 (.com) | 便宜，免费 SSL + 隐私 |",
+        "| Registrar | Price | Notes |",
+        "|-----------|-------|-------|",
+        "| **Cloudflare** | ~$9/yr (.com) | At-cost pricing, free DNS |",
+        "| **Namecheap** | ~$9-13/yr (.com) | First-year deals, free privacy |",
+        "| **Porkbun** | ~$9/yr (.com) | Cheap, free SSL + privacy |",
         "",
-        "**配置步骤：**",
-        "1. 在域名注册商购买域名",
+        "**Setup:**",
+        "1. Buy domain at registrar",
         "2. Vercel Dashboard → Settings → Domains → Add Domain",
-        "3. 按提示在域名注册商添加 DNS 记录（CNAME 指向 `cname.vercel-dns.com`）",
-        "4. 等待 DNS 生效（通常几分钟到几小时）",
-        "5. Vercel 自动配置 HTTPS",
+        "3. Add CNAME record pointing to `cname.vercel-dns.com`",
+        "4. Wait for DNS propagation (minutes to hours)",
+        "5. Vercel auto-configures HTTPS",
         "",
         "---",
         "",
-        "## Vercel 免费额度",
+        "## Vercel Free Tier / 免费额度",
         "",
-        "Vercel Hobby 计划（免费）包含：",
-        "- 100 GB 带宽/月",
-        "- Serverless Functions（每月 100 GB-Hours）",
-        "- 自动 HTTPS",
-        "- Preview Deployments（每个 PR 自动部署预览）",
-        "- 边缘网络（全球 CDN）",
+        "Vercel Hobby plan (free) includes:",
+        "- 100 GB bandwidth/month",
+        "- Serverless Functions (100 GB-Hours/month)",
+        "- Automatic HTTPS",
+        "- Preview Deployments (auto-deploy per PR)",
+        "- Edge Network (global CDN)",
         "",
-        "对于大多数个人项目和 MVP 来说，免费额度绰绰有余。",
+        "More than enough for personal projects and MVPs.",
         "",
         "---",
         "",
-        "## 持续部署",
+        "## Continuous Deployment / 持续部署",
         "",
-        "连接 GitHub 后，每次 `git push` Vercel 都会自动重新部署。",
-        "每个 Pull Request 也会自动生成预览链接。",
+        "Once connected to GitHub, every `git push` auto-deploys.",
+        "Each Pull Request also gets a preview link.",
     ])
 
     return "\n".join(lines)
@@ -179,48 +182,48 @@ def _get_env_var_hint(var: str) -> dict[str, str]:
     var_upper = var.upper()
     hints = {
         "DATABASE_URL": {
-            "desc": "数据库连接地址",
-            "how": "Vercel Postgres / Supabase / PlanetScale 免费套餐",
+            "desc": "Database URL",
+            "how": "Vercel Postgres / Supabase / PlanetScale (free tier)",
         },
         "NEXTAUTH_SECRET": {
-            "desc": "NextAuth 加密密钥",
-            "how": "运行 `openssl rand -base64 32` 生成",
+            "desc": "NextAuth encryption key",
+            "how": "Run `openssl rand -base64 32`",
         },
         "NEXTAUTH_URL": {
-            "desc": "应用 URL",
-            "how": "设为 `https://your-project.vercel.app`",
+            "desc": "App URL",
+            "how": "Set to `https://your-project.vercel.app`",
         },
         "NEXT_PUBLIC_API_URL": {
-            "desc": "公开 API 地址",
-            "how": "设为你的 Vercel 部署 URL",
+            "desc": "Public API URL",
+            "how": "Set to your Vercel deployment URL",
         },
         "JWT_SECRET": {
-            "desc": "JWT 签名密钥",
-            "how": "运行 `openssl rand -base64 32` 生成",
+            "desc": "JWT signing key",
+            "how": "Run `openssl rand -base64 32`",
         },
         "OPENAI_API_KEY": {
-            "desc": "OpenAI API 密钥",
-            "how": "[platform.openai.com](https://platform.openai.com) 获取",
+            "desc": "OpenAI API key",
+            "how": "[platform.openai.com](https://platform.openai.com)",
         },
         "ANTHROPIC_API_KEY": {
-            "desc": "Anthropic API 密钥",
-            "how": "[console.anthropic.com](https://console.anthropic.com) 获取",
+            "desc": "Anthropic API key",
+            "how": "[console.anthropic.com](https://console.anthropic.com)",
         },
         "STRIPE_SECRET_KEY": {
-            "desc": "Stripe 支付密钥",
-            "how": "[dashboard.stripe.com](https://dashboard.stripe.com) 获取",
+            "desc": "Stripe secret key",
+            "how": "[dashboard.stripe.com](https://dashboard.stripe.com)",
         },
         "STRIPE_PUBLISHABLE_KEY": {
-            "desc": "Stripe 公钥",
-            "how": "[dashboard.stripe.com](https://dashboard.stripe.com) 获取",
+            "desc": "Stripe publishable key",
+            "how": "[dashboard.stripe.com](https://dashboard.stripe.com)",
         },
         "REDIS_URL": {
-            "desc": "Redis 连接地址",
-            "how": "Vercel KV / Upstash 免费套餐",
+            "desc": "Redis connection URL",
+            "how": "Vercel KV / Upstash (free tier)",
         },
         "S3_BUCKET": {
-            "desc": "S3 存储桶",
-            "how": "AWS S3 或 Cloudflare R2（免费 10 GB）",
+            "desc": "S3 bucket name",
+            "how": "AWS S3 or Cloudflare R2 (free 10 GB)",
         },
     }
 
@@ -229,10 +232,10 @@ def _get_env_var_hint(var: str) -> dict[str, str]:
 
     # Generic hints based on patterns
     if "SECRET" in var_upper or "KEY" in var_upper:
-        return {"desc": "密钥/凭证", "how": "按对应服务文档生成或获取"}
+        return {"desc": "Secret / credential", "how": "See service docs to generate or obtain"}
     if "URL" in var_upper:
-        return {"desc": "服务 URL", "how": "按你的部署地址填写"}
+        return {"desc": "Service URL", "how": "Set to your deployment address"}
     if "TOKEN" in var_upper:
-        return {"desc": "访问令牌", "how": "从对应平台获取"}
+        return {"desc": "Access token", "how": "Obtain from the service platform"}
 
-    return {"desc": "环境变量", "how": "按项目文档填写"}
+    return {"desc": "Environment variable", "how": "See project docs"}

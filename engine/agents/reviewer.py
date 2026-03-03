@@ -113,22 +113,35 @@ class ReviewerAgent(AgentBase):
 
     def parse_review(self, output: str) -> ReviewResult:
         """Extract structured review from output."""
+        _fail = ReviewResult(
+            approved=False, score=0, issues=[],
+            summary="Could not parse review output — manual review required",
+        )
+
+        # Try JSON code block first, then raw JSON
+        raw: str | None = None
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
         if match:
-            data = json.loads(match.group(1).strip())
+            raw = match.group(1).strip()
         else:
             start = output.find("{")
             end = output.rfind("}")
             if start != -1 and end != -1:
-                data = json.loads(output[start : end + 1])
-            else:
-                # Default to approved if we can't parse
-                logger.warning("Could not parse review output, defaulting to approved")
-                return ReviewResult(approved=True, score=7, issues=[], summary="Auto-approved")
+                raw = output[start : end + 1]
+
+        if raw is None:
+            logger.warning("Could not find JSON in review output, rejecting")
+            return _fail
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON in review output: {e}")
+            return _fail
 
         return ReviewResult(
-            approved=data.get("approved", True),
-            score=data.get("score", 7),
+            approved=data.get("approved", False),
+            score=data.get("score", 0),
             issues=data.get("issues", []),
             summary=data.get("summary", ""),
         )

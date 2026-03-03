@@ -170,7 +170,18 @@ class AgentBase(ABC):
                     messages.append({"role": "assistant", "content": response.content})
                     messages.append({"role": "user", "content": tool_results})
             else:
+                # MAX_TURNS exceeded — this is a failure
                 self._log_action("max_turns_reached", f"turns={turns}")
+                elapsed = time.monotonic() - start_time
+                return AgentResult(
+                    agent_name=self.ROLE,
+                    success=False,
+                    output="\n".join(self._output_parts),
+                    artifacts=self._artifacts,
+                    error=f"Agent exceeded maximum turns ({self.MAX_TURNS})",
+                    total_turns=turns,
+                    duration_seconds=elapsed,
+                )
 
             elapsed = time.monotonic() - start_time
             return AgentResult(

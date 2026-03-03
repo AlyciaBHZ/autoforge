@@ -33,6 +33,11 @@ class LLMRouter:
 
     def __init__(self, config: ForgeConfig) -> None:
         self.config = config
+        if not config.anthropic_api_key:
+            raise ValueError(
+                "ANTHROPIC_API_KEY is not set. "
+                "Add it to your .env file or run setup.sh"
+            )
         self.client = AsyncAnthropic(api_key=config.anthropic_api_key)
         self._call_count = 0
 

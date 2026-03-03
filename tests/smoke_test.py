@@ -188,6 +188,52 @@ def test_task_dag_failure_handling():
     assert dag.get_task("F-1").status == TaskStatus.BLOCKED
 
 
+def test_task_dag_cycle_detection():
+    from engine.task_dag import TaskDAG, Task
+    dag = TaskDAG()
+    dag.add_task(Task(id="A", description="a", depends_on=["B"]))
+    dag.add_task(Task(id="B", description="b", depends_on=["A"]))
+    try:
+        dag.validate_acyclic()
+        raise AssertionError("Should have raised ValueError for cycle")
+    except ValueError as e:
+        assert "Cycle" in str(e)
+
+
+def test_project_registry_validation():
+    """Test that enqueue rejects empty/invalid descriptions."""
+    from engine.project_registry import ProjectRegistry
+
+    async def _test():
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        try:
+            async with ProjectRegistry(db_path) as reg:
+                # Empty description
+                try:
+                    await reg.enqueue("", "cli")
+                    raise AssertionError("Should reject empty description")
+                except ValueError:
+                    pass
+
+                # Whitespace-only description
+                try:
+                    await reg.enqueue("   ", "cli")
+                    raise AssertionError("Should reject whitespace description")
+                except ValueError:
+                    pass
+
+                # Negative budget
+                try:
+                    await reg.enqueue("valid", "cli", budget_usd=-1.0)
+                    raise AssertionError("Should reject negative budget")
+                except ValueError:
+                    pass
+        finally:
+            db_path.unlink(missing_ok=True)
+
+    asyncio.run(_test())
+
+
 def test_lock_manager():
     from engine.lock_manager import LockManager
     d = Path(tempfile.mkdtemp()) / "locks"
@@ -356,6 +402,33 @@ def test_agent_parse_methods():
     assert results.all_passed is True
 
 
+def test_agent_parse_failsafe():
+    """Test that agents fail-safe on unparseable output (never auto-approve/pass)."""
+    from engine.config import ForgeConfig
+    from engine.llm_router import LLMRouter
+    from engine.agents.reviewer import ReviewerAgent
+    from engine.agents.tester import TesterAgent
+
+    config = ForgeConfig(anthropic_api_key="fake")
+    llm = LLMRouter(config)
+    _td = Path(tempfile.mkdtemp())
+
+    r = ReviewerAgent(config, llm, _td)
+    # Unparseable output should NOT auto-approve
+    review = r.parse_review("This is not JSON at all")
+    assert review.approved is False
+    assert review.score == 0
+
+    # Invalid JSON should NOT auto-approve
+    review2 = r.parse_review('```json\n{bad json}\n```')
+    assert review2.approved is False
+
+    t = TesterAgent(config, llm, _td)
+    # Unparseable output should NOT auto-pass
+    results = t.parse_results("Random text output")
+    assert results.all_passed is False
+
+
 # ────────────────────────────────────────────
 # Phase 4: Integration
 # ────────────────────────────────────────────
@@ -373,9 +446,21 @@ def test_orchestrator_instantiation():
 def test_orchestrator_show_status():
     from engine.config import ForgeConfig
     from engine.orchestrator import Orchestrator
-    config = ForgeConfig()
+    config = ForgeConfig(anthropic_api_key="fake-key")
     orch = Orchestrator(config)
     orch.show_status()  # Should not raise
+
+
+def test_llm_router_requires_api_key():
+    """LLMRouter must reject empty API key."""
+    from engine.config import ForgeConfig
+    from engine.llm_router import LLMRouter
+    config = ForgeConfig(anthropic_api_key="")
+    try:
+        LLMRouter(config)
+        raise AssertionError("Should have raised ValueError")
+    except ValueError as e:
+        assert "ANTHROPIC_API_KEY" in str(e)
 
 
 # ────────────────────────────────────────────
@@ -604,6 +689,7 @@ def main():
             ("Basic operations + dependency resolution", test_task_dag_basic),
             ("Save and load (JSON persistence)", test_task_dag_save_load),
             ("Failure handling + BLOCKED status", test_task_dag_failure_handling),
+            ("Cycle detection", test_task_dag_cycle_detection),
         ]),
         ("Unit: LockManager", [
             ("Claim, release, enforce, clear", test_lock_manager),
@@ -614,6 +700,7 @@ def main():
         ]),
         ("Unit: LLMRouter", [
             ("Instantiation + model selection", test_llm_router_instantiation),
+            ("Rejects empty API key", test_llm_router_requires_api_key),
         ]),
         ("Unit: GitManager", [
             ("Instantiation", test_git_manager_instantiation),
@@ -622,6 +709,7 @@ def main():
             ("All 7 agents instantiate", test_all_agents_instantiate),
             ("All build_prompt methods", test_agent_build_prompts),
             ("All parse methods", test_agent_parse_methods),
+            ("Fail-safe on unparseable output", test_agent_parse_failsafe),
         ]),
         ("Integration", [
             ("Orchestrator instantiation", test_orchestrator_instantiation),
@@ -630,6 +718,7 @@ def main():
         ("Unit: ProjectRegistry", [
             ("CRUD operations", test_project_registry_crud),
             ("Project.to_dict()", test_project_registry_to_dict),
+            ("Input validation", test_project_registry_validation),
         ]),
         ("Unit: DeployGuide", [
             ("Next.js detection + guide generation", test_deploy_guide_generation),

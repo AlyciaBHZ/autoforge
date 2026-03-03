@@ -149,7 +149,20 @@ class GardenerAgent(AgentBase):
 
     def parse_changes(self, output: str) -> dict[str, Any]:
         """Extract change summary from output."""
+        raw: str | None = None
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
         if match:
-            return json.loads(match.group(1).strip())
+            raw = match.group(1).strip()
+        else:
+            start = output.find("{")
+            end = output.rfind("}")
+            if start != -1 and end != -1:
+                raw = output[start : end + 1]
+
+        if raw is not None:
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Invalid JSON in gardener output: {e}")
+
         return {"changes_made": [], "summary": output[:500]}

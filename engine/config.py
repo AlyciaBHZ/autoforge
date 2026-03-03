@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -86,27 +87,69 @@ class ForgeConfig:
         """Create config from environment variables and optional overrides."""
         load_dotenv()
 
+        def _safe_float(key: str, default: float) -> float:
+            raw = os.getenv(key, "")
+            if not raw:
+                return default
+            try:
+                return float(raw)
+            except ValueError:
+                logging.getLogger(__name__).warning(
+                    f"Invalid value for {key}={raw!r}, using default {default}"
+                )
+                return default
+
+        def _safe_int(key: str, default: int) -> int:
+            raw = os.getenv(key, "")
+            if not raw:
+                return default
+            try:
+                return int(raw)
+            except ValueError:
+                logging.getLogger(__name__).warning(
+                    f"Invalid value for {key}={raw!r}, using default {default}"
+                )
+                return default
+
         # Parse allowed Telegram users (comma-separated)
         allowed_raw = os.getenv("FORGE_TELEGRAM_ALLOWED_USERS", "")
         allowed_users = [u.strip() for u in allowed_raw.split(",") if u.strip()]
+
+        # Validate log level
+        log_level = os.getenv("FORGE_LOG_LEVEL", "INFO").upper()
+        if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            logging.getLogger(__name__).warning(
+                f"Invalid FORGE_LOG_LEVEL={log_level!r}, using INFO"
+            )
+            log_level = "INFO"
+
+        budget = _safe_float("FORGE_BUDGET_LIMIT", 10.0)
+        if budget <= 0:
+            budget = 10.0
+
+        max_agents = _safe_int("FORGE_MAX_AGENTS", 3)
+        if max_agents < 1:
+            max_agents = 1
+        elif max_agents > 50:
+            max_agents = 50
 
         config = cls(
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
             model_strong=os.getenv("FORGE_MODEL_STRONG", "claude-opus-4-6"),
             model_fast=os.getenv("FORGE_MODEL_FAST", "claude-sonnet-4-5-20250929"),
-            budget_limit_usd=float(os.getenv("FORGE_BUDGET_LIMIT", "10.0")),
-            max_agents=int(os.getenv("FORGE_MAX_AGENTS", "3")),
-            log_level=os.getenv("FORGE_LOG_LEVEL", "INFO"),
+            budget_limit_usd=budget,
+            max_agents=max_agents,
+            log_level=log_level,
             docker_enabled=os.getenv("FORGE_DOCKER_ENABLED", "").lower() in ("true", "1", "yes"),
             # Daemon
-            daemon_poll_interval=int(os.getenv("FORGE_DAEMON_POLL_INTERVAL", "10")),
+            daemon_poll_interval=_safe_int("FORGE_DAEMON_POLL_INTERVAL", 10),
             # Telegram
             telegram_token=os.getenv("FORGE_TELEGRAM_TOKEN", ""),
             telegram_allowed_users=allowed_users,
             # Webhook
             webhook_enabled=os.getenv("FORGE_WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes"),
             webhook_host=os.getenv("FORGE_WEBHOOK_HOST", "127.0.0.1"),
-            webhook_port=int(os.getenv("FORGE_WEBHOOK_PORT", "8420")),
+            webhook_port=_safe_int("FORGE_WEBHOOK_PORT", 8420),
             webhook_secret=os.getenv("FORGE_WEBHOOK_SECRET", ""),
         )
         for key, value in overrides.items():

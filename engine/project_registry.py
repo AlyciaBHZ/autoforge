@@ -6,7 +6,7 @@ Each project has its own budget, workspace, and status.
 
 from __future__ import annotations
 
-import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectStatus(str, Enum):
@@ -87,7 +89,14 @@ class ProjectRegistry:
         self.db_path = db_path
         self._db: aiosqlite.Connection | None = None
 
+    def _ensure_db(self) -> aiosqlite.Connection:
+        """Return db connection or raise RuntimeError."""
+        if self._db is None:
+            raise RuntimeError("ProjectRegistry not opened. Call open() or use 'async with'.")
+        return self._db
+
     async def open(self) -> None:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(self.db_path))
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
@@ -130,22 +139,31 @@ class ProjectRegistry:
         budget_usd: float = 10.0,
     ) -> Project:
         """Add a new project to the build queue."""
+        # Validate inputs
+        description = description.strip()
+        if not description:
+            raise ValueError("Project description cannot be empty")
+        if len(description) > 10000:
+            raise ValueError("Project description too long (max 10,000 characters)")
+        if budget_usd <= 0:
+            raise ValueError("Budget must be positive")
+
         project_id = uuid.uuid4().hex[:12]
         now = datetime.now(timezone.utc).isoformat()
-        assert self._db is not None
+        db = self._ensure_db()
 
-        await self._db.execute(
+        await db.execute(
             """INSERT INTO projects (id, description, status, requested_by, budget_usd, created_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (project_id, description, ProjectStatus.QUEUED.value, requested_by, budget_usd, now),
         )
-        await self._db.commit()
+        await db.commit()
         return await self.get(project_id)
 
     async def get(self, project_id: str) -> Project:
         """Get a project by ID."""
-        assert self._db is not None
-        cursor = await self._db.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
+        db = self._ensure_db()
+        cursor = await db.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
         row = await cursor.fetchone()
         if row is None:
             raise KeyError(f"Project not found: {project_id}")
@@ -153,8 +171,8 @@ class ProjectRegistry:
 
     async def list_all(self, limit: int = 50) -> list[Project]:
         """List all projects, newest first."""
-        assert self._db is not None
-        cursor = await self._db.execute(
+        db = self._ensure_db()
+        cursor = await db.execute(
             "SELECT * FROM projects ORDER BY created_at DESC LIMIT ?", (limit,)
         )
         rows = await cursor.fetchall()
@@ -162,8 +180,8 @@ class ProjectRegistry:
 
     async def list_by_status(self, status: ProjectStatus) -> list[Project]:
         """List projects with a given status."""
-        assert self._db is not None
-        cursor = await self._db.execute(
+        db = self._ensure_db()
+        cursor = await db.execute(
             "SELECT * FROM projects WHERE status = ? ORDER BY created_at ASC",
             (status.value,),
         )
@@ -172,8 +190,8 @@ class ProjectRegistry:
 
     async def dequeue(self) -> Project | None:
         """Get the oldest queued project and mark it as building."""
-        assert self._db is not None
-        cursor = await self._db.execute(
+        db = self._ensure_db()
+        cursor = await db.execute(
             "SELECT * FROM projects WHERE status = ? ORDER BY created_at ASC LIMIT 1",
             (ProjectStatus.QUEUED.value,),
         )
@@ -183,66 +201,66 @@ class ProjectRegistry:
 
         project = self._row_to_project(row)
         now = datetime.now(timezone.utc).isoformat()
-        await self._db.execute(
+        await db.execute(
             "UPDATE projects SET status = ?, started_at = ? WHERE id = ?",
             (ProjectStatus.BUILDING.value, now, project.id),
         )
-        await self._db.commit()
+        await db.commit()
         project.status = ProjectStatus.BUILDING
         project.started_at = now
         return project
 
     async def update_phase(self, project_id: str, phase: str) -> None:
         """Update the current build phase."""
-        assert self._db is not None
-        await self._db.execute(
+        db = self._ensure_db()
+        await db.execute(
             "UPDATE projects SET phase = ? WHERE id = ?", (phase, project_id)
         )
-        await self._db.commit()
+        await db.commit()
 
     async def update_name(self, project_id: str, name: str, workspace_path: str) -> None:
         """Update project name and workspace path once SPEC completes."""
-        assert self._db is not None
-        await self._db.execute(
+        db = self._ensure_db()
+        await db.execute(
             "UPDATE projects SET name = ?, workspace_path = ? WHERE id = ?",
             (name, workspace_path, project_id),
         )
-        await self._db.commit()
+        await db.commit()
 
     async def mark_completed(self, project_id: str, cost_usd: float) -> None:
         """Mark a project as completed."""
-        assert self._db is not None
+        db = self._ensure_db()
         now = datetime.now(timezone.utc).isoformat()
-        await self._db.execute(
+        await db.execute(
             "UPDATE projects SET status = ?, cost_usd = ?, completed_at = ?, phase = 'complete' WHERE id = ?",
             (ProjectStatus.COMPLETED.value, cost_usd, now, project_id),
         )
-        await self._db.commit()
+        await db.commit()
 
     async def mark_failed(self, project_id: str, error: str, cost_usd: float = 0.0) -> None:
         """Mark a project as failed."""
-        assert self._db is not None
+        db = self._ensure_db()
         now = datetime.now(timezone.utc).isoformat()
-        await self._db.execute(
+        await db.execute(
             "UPDATE projects SET status = ?, error = ?, cost_usd = ?, completed_at = ? WHERE id = ?",
             (ProjectStatus.FAILED.value, error, cost_usd, now, project_id),
         )
-        await self._db.commit()
+        await db.commit()
 
     async def cancel(self, project_id: str) -> bool:
         """Cancel a queued project. Returns False if not queued."""
-        assert self._db is not None
-        cursor = await self._db.execute(
+        db = self._ensure_db()
+        cursor = await db.execute(
             "UPDATE projects SET status = ? WHERE id = ? AND status = ?",
             (ProjectStatus.CANCELLED.value, project_id, ProjectStatus.QUEUED.value),
         )
-        await self._db.commit()
+        await db.commit()
         return cursor.rowcount > 0
 
     async def queue_size(self) -> int:
         """Number of projects waiting in queue."""
-        assert self._db is not None
-        cursor = await self._db.execute(
+        db = self._ensure_db()
+        cursor = await db.execute(
             "SELECT COUNT(*) FROM projects WHERE status = ?",
             (ProjectStatus.QUEUED.value,),
         )
@@ -251,7 +269,7 @@ class ProjectRegistry:
 
     async def total_cost(self) -> float:
         """Total cost across all projects."""
-        assert self._db is not None
-        cursor = await self._db.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM projects")
+        db = self._ensure_db()
+        cursor = await db.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM projects")
         row = await cursor.fetchone()
         return row[0]

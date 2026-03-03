@@ -180,7 +180,7 @@ async def async_main() -> int:
             return 1
 
     # Handle new project
-    if not args.description:
+    if not args.description or not args.description.strip():
         console.print("[red]Error:[/red] Please provide a project description or use --resume/--status")
         console.print("Usage: python forge.py \"your project description\"")
         console.print()
@@ -188,6 +188,14 @@ async def async_main() -> int:
         console.print("  python forge.py daemon start       # Start 24/7 daemon")
         console.print('  python forge.py queue "project"     # Add to build queue')
         console.print("  python forge.py projects            # List all projects")
+        return 1
+
+    # Validate CLI overrides
+    if hasattr(args, "budget") and args.budget is not None and args.budget <= 0:
+        console.print("[red]Error:[/red] Budget must be a positive number")
+        return 1
+    if hasattr(args, "agents") and args.agents is not None and args.agents < 1:
+        console.print("[red]Error:[/red] Agent count must be at least 1")
         return 1
 
     if not config.anthropic_api_key:

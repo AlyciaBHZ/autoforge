@@ -12,6 +12,7 @@ Commands:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Callable, Coroutine
 
@@ -81,10 +82,18 @@ async def start_telegram_bot(
         if text.startswith("$"):
             parts = text.split(" ", 1)
             try:
-                budget = float(parts[0][1:])
+                parsed_budget = float(parts[0][1:])
+                if parsed_budget <= 0:
+                    await update.message.reply_text("Budget must be a positive number.")
+                    return
+                if parsed_budget > 1000:
+                    await update.message.reply_text("Budget too high (max $1000).")
+                    return
+                budget = parsed_budget
                 text = parts[1] if len(parts) > 1 else ""
             except ValueError:
-                pass
+                await update.message.reply_text("Invalid budget format. Use: /build $5 description")
+                return
 
         if not text:
             await update.message.reply_text("Please provide a project description.")
@@ -253,6 +262,3 @@ async def start_telegram_bot(
         await app.stop()
         await app.shutdown()
 
-
-# Need asyncio for the sleep in start_telegram_bot
-import asyncio
