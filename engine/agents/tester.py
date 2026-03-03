@@ -110,8 +110,11 @@ class TesterAgent(AgentBase):
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         spec = context.get("spec", {})
-        return (
-            f"Verify the generated project '{spec.get('project_name', '')}'.\n\n"
+        mobile = spec.get("mobile", {})
+        mobile_target = mobile.get("target", "none") if mobile else "none"
+
+        base_prompt = (
+            f"Verify the project '{spec.get('project_name', '')}'.\n\n"
             f"## Tech Stack\n"
             f"```json\n{json.dumps(spec.get('tech_stack', {}), indent=2)}\n```\n\n"
             f"## Instructions\n"
@@ -120,9 +123,43 @@ class TesterAgent(AgentBase):
             f"3. Run the build command\n"
             f"4. Run tests if they exist\n"
             f"5. Check for common issues\n\n"
+        )
+
+        # Add mobile-specific instructions if applicable
+        if mobile_target != "none":
+            mobile_framework = mobile.get("framework", "react-native")
+            base_prompt += (
+                f"## Mobile App Testing\n"
+                f"This project includes a mobile app ({mobile_framework}, target: {mobile_target}).\n\n"
+            )
+            if mobile_framework == "react-native":
+                base_prompt += (
+                    f"For React Native:\n"
+                    f"- Run `npm install` or `yarn install`\n"
+                    f"- Run `npx tsc --noEmit` for type checking\n"
+                    f"- Run `npm test` or `jest` if tests exist\n"
+                    f"- Check that metro bundler config is valid\n"
+                )
+                if mobile_target in ("android", "both"):
+                    base_prompt += (
+                        f"- If Android SDK is available: `cd android && ./gradlew assembleDebug`\n"
+                    )
+            elif mobile_framework == "flutter":
+                base_prompt += (
+                    f"For Flutter:\n"
+                    f"- Run `flutter pub get`\n"
+                    f"- Run `flutter analyze`\n"
+                    f"- Run `flutter test` if tests exist\n"
+                )
+                if mobile_target in ("android", "both"):
+                    base_prompt += f"- If Android SDK available: `flutter build apk --debug`\n"
+            base_prompt += "\n"
+
+        base_prompt += (
             f"Output a JSON code block with your test results following the format "
             f"in your system prompt.\n"
         )
+        return base_prompt
 
     def parse_results(self, output: str) -> TestResults:
         """Extract structured test results from output."""

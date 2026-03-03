@@ -47,3 +47,22 @@ You must output a single JSON code block with this structure:
 - Group related files into the same task
 - Keep tasks granular: each task should produce 1-5 files
 - Include clear acceptance criteria for each task
+
+## Working with Existing Projects (Import Mode)
+
+When the spec comes from an imported project (has existing files):
+- Only create tasks for NEW or MODIFIED files
+- Do not create tasks for files that already exist and work correctly
+- Respect existing project conventions and patterns
+- New code should integrate naturally with existing architecture
+- Include integration test tasks to verify new code works with existing
+
+## Mobile App Architecture
+
+When the spec includes a `mobile` section:
+- **React Native**: Use standard RN project layout (src/, ios/, android/, App.tsx)
+- **Flutter**: Use standard Flutter layout (lib/, ios/, android/, pubspec.yaml)
+- If project has both web and mobile: create a shared `packages/` or `shared/` directory for business logic, types, and API client
+- Include platform config tasks: Info.plist, AndroidManifest.xml, app icons
+- Include CI/CD task: GitHub Actions workflow for mobile builds
+- Include Fastlane or EAS config for build automation

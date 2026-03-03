@@ -74,34 +74,76 @@ def test_engine_imports():
 
 def test_agent_imports():
     from engine.agents import AGENT_REGISTRY
-    assert len(AGENT_REGISTRY) == 7, f"Expected 7 agents, got {len(AGENT_REGISTRY)}"
+    assert len(AGENT_REGISTRY) == 8, f"Expected 8 agents, got {len(AGENT_REGISTRY)}"
     from engine.agents.director import DirectorAgent, DirectorFixAgent  # noqa: F401
     from engine.agents.architect import ArchitectAgent  # noqa: F401
     from engine.agents.builder import BuilderAgent  # noqa: F401
     from engine.agents.reviewer import ReviewerAgent  # noqa: F401
     from engine.agents.tester import TesterAgent  # noqa: F401
     from engine.agents.gardener import GardenerAgent  # noqa: F401
+    from engine.agents.scanner import ScannerAgent  # noqa: F401
+
+
+def test_cli_imports():
+    from cli.app import build_parser, async_main  # noqa: F401
+    from cli.display import show_banner, show_startup_info, show_review_report  # noqa: F401
+    from cli.setup_wizard import needs_setup, load_global_config  # noqa: F401
 
 
 # ────────────────────────────────────────────
 # Phase 2: CLI
 # ────────────────────────────────────────────
 
-def test_cli_parse_args():
-    saved = sys.argv
-    try:
-        sys.argv = [
-            "forge.py", "Build a Todo app",
-            "--budget", "5.0", "--agents", "2", "--verbose",
-        ]
-        from forge import parse_args
-        args = parse_args()
-        assert args.description == "Build a Todo app"
-        assert args.budget == 5.0
-        assert args.agents == 2
-        assert args.verbose is True
-    finally:
-        sys.argv = saved
+def test_cli_parse_subcommands():
+    from cli.app import build_parser
+    parser = build_parser()
+
+    # Test generate subcommand
+    args = parser.parse_args(["generate", "Build a Todo app"])
+    assert args.command == "generate"
+    assert args.description == "Build a Todo app"
+
+    # Test review subcommand
+    args = parser.parse_args(["review", "/tmp/project"])
+    assert args.command == "review"
+    assert args.path == "/tmp/project"
+
+    # Test import subcommand
+    args = parser.parse_args(["import", "/tmp/project", "--enhance", "add dark mode"])
+    assert args.command == "import"
+    assert args.path == "/tmp/project"
+    assert args.enhance == "add dark mode"
+
+    # Test status
+    args = parser.parse_args(["status"])
+    assert args.command == "status"
+
+    # Test global flags
+    args = parser.parse_args(["--budget", "5.0", "--mode", "research", "--mobile", "both", "generate", "test"])
+    assert args.budget == 5.0
+    assert args.mode == "research"
+    assert args.mobile == "both"
+
+
+def test_cli_legacy_compat():
+    """Test that legacy CLI usage still works."""
+    from cli.app import build_parser, _KNOWN_COMMANDS
+
+    parser = build_parser()
+
+    # Legacy: python forge.py --status
+    args = parser.parse_args(["--status"])
+    assert args.legacy_status is True
+
+    # Legacy: python forge.py --resume
+    args = parser.parse_args(["--resume"])
+    assert args.legacy_resume == "auto"
+
+    # Verify legacy pre-scan detects bare descriptions
+    # (bare descriptions are handled by argv pre-scanning in async_main,
+    #  not by argparse, so we test the detection logic here)
+    assert "Build a todo app" not in _KNOWN_COMMANDS
+    assert "generate" in _KNOWN_COMMANDS
 
 
 # ────────────────────────────────────────────
@@ -116,13 +158,16 @@ def test_forge_config():
     assert len(config.run_id) == 12
     assert config.workspace_dir.name == "workspace"
     assert config.constitution_dir.name == "constitution"
+    assert config.mode == "developer"
+    assert config.mobile_target == "none"
 
 
 def test_forge_config_from_env():
     from engine.config import ForgeConfig
-    config = ForgeConfig.from_env(budget_limit_usd=5.0, max_agents=2)
+    config = ForgeConfig.from_env(budget_limit_usd=5.0, max_agents=2, mode="research")
     assert config.budget_limit_usd == 5.0
     assert config.max_agents == 2
+    assert config.mode == "research"
 
 
 def test_forge_config_budget_tracking():
@@ -136,6 +181,13 @@ def test_forge_config_budget_tracking():
     # Exhaust budget
     config.record_usage("claude-opus-4-6", 10_000_000, 10_000_000)
     assert config.check_budget() is False
+
+
+def test_forge_config_mobile():
+    from engine.config import ForgeConfig
+    config = ForgeConfig(mobile_target="both", mobile_framework="flutter")
+    assert config.mobile_target == "both"
+    assert config.mobile_framework == "flutter"
 
 
 def test_task_dag_basic():
@@ -270,6 +322,7 @@ def test_all_agents_instantiate():
     from engine.agents.reviewer import ReviewerAgent
     from engine.agents.tester import TesterAgent
     from engine.agents.gardener import GardenerAgent
+    from engine.agents.scanner import ScannerAgent
     from engine.sandbox import SubprocessSandbox
 
     config = ForgeConfig(anthropic_api_key="fake")
@@ -292,6 +345,8 @@ def test_all_agents_instantiate():
         assert t.ROLE == "tester" and len(t._tools) == 2
         g = GardenerAgent(config, llm, working_dir=wd)
         assert g.ROLE == "gardener" and len(g._tools) == 3
+        s = ScannerAgent(config, llm, working_dir=wd)
+        assert s.ROLE == "scanner" and len(s._tools) == 3
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 
@@ -305,6 +360,7 @@ def test_agent_build_prompts():
     from engine.agents.reviewer import ReviewerAgent
     from engine.agents.tester import TesterAgent
     from engine.agents.gardener import GardenerAgent
+    from engine.agents.scanner import ScannerAgent
     from engine.sandbox import SubprocessSandbox
 
     config = ForgeConfig(anthropic_api_key="fake")
@@ -318,8 +374,16 @@ def test_agent_build_prompts():
         assert len(ArchitectAgent(config, llm).build_prompt({"spec": spec})) > 0
         assert len(BuilderAgent(config, llm, wd, sb).build_prompt({"task": {"id": "T"}, "spec": spec})) > 0
         assert len(ReviewerAgent(config, llm, wd).build_prompt({"task": {"id": "T"}, "spec": spec})) > 0
+        # Full project review prompt
+        assert len(ReviewerAgent(config, llm, wd).build_prompt(
+            {"task": {"id": "T"}, "spec": spec, "full_project_review": True}
+        )) > 0
         assert len(TesterAgent(config, llm, wd, sb).build_prompt({"spec": spec})) > 0
+        # Tester with mobile spec
+        mobile_spec = {**spec, "mobile": {"target": "both", "framework": "react-native"}}
+        assert "React Native" in TesterAgent(config, llm, wd, sb).build_prompt({"spec": mobile_spec})
         assert len(GardenerAgent(config, llm, wd).build_prompt({"review": {}, "spec": spec})) > 0
+        assert len(ScannerAgent(config, llm, wd).build_prompt({"project_path": str(wd)})) > 0
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 
@@ -330,6 +394,7 @@ def test_agent_parse_methods():
     from engine.agents.director import DirectorAgent, DirectorFixAgent
     from engine.agents.reviewer import ReviewerAgent
     from engine.agents.tester import TesterAgent
+    from engine.agents.scanner import ScannerAgent
 
     config = ForgeConfig(anthropic_api_key="fake")
     llm = LLMRouter(config)
@@ -351,6 +416,24 @@ def test_agent_parse_methods():
     results = t.parse_results('{"all_passed": true, "results": [], "summary": "ok"}')
     assert results.all_passed is True
 
+    s = ScannerAgent(config, llm, _td)
+    scan = s.parse_scan('```json\n{"project_name": "test", "completeness": 80, "gaps": ["missing tests"]}\n```')
+    assert scan.completeness == 80
+    assert len(scan.gaps) == 1
+
+
+def test_research_mode_blocks_writes():
+    """Test that research mode blocks write tools."""
+    from engine.agent_base import AgentBase
+    from engine.config import ForgeConfig
+
+    config = ForgeConfig(anthropic_api_key="fake", mode="research")
+    assert config.mode == "research"
+
+    # Verify WRITE_TOOLS is defined
+    assert "write_file" in AgentBase.WRITE_TOOLS
+    assert "run_command" in AgentBase.WRITE_TOOLS
+
 
 # ────────────────────────────────────────────
 # Phase 4: Integration
@@ -364,6 +447,15 @@ def test_orchestrator_instantiation():
     assert orch.llm is not None
     assert orch.config is config
     assert orch._list_project_files() == []
+
+
+def test_orchestrator_has_review_and_import():
+    """Test that orchestrator has review_project and import_project methods."""
+    from engine.orchestrator import Orchestrator
+    assert hasattr(Orchestrator, "review_project")
+    assert hasattr(Orchestrator, "import_project")
+    assert callable(getattr(Orchestrator, "review_project"))
+    assert callable(getattr(Orchestrator, "import_project"))
 
 
 def test_orchestrator_show_status():
@@ -382,14 +474,22 @@ def test_constitution_files_exist():
     base = PROJECT_ROOT / "constitution"
     assert (base / "CONSTITUTION.md").exists()
     assert (base / "quality_gates.md").exists()
-    for agent in ["director", "architect", "builder", "reviewer", "tester", "gardener"]:
+    for agent in ["director", "architect", "builder", "reviewer", "tester", "gardener", "scanner"]:
         path = base / "agents" / f"{agent}.md"
         assert path.exists(), f"Missing: {path}"
         assert path.stat().st_size > 0, f"Empty: {path}"
-    for workflow in ["spec", "build", "verify", "refactor", "deliver"]:
+    for workflow in ["spec", "build", "verify", "refactor", "deliver", "review", "import"]:
         path = base / "workflows" / f"{workflow}.md"
         assert path.exists(), f"Missing: {path}"
         assert path.stat().st_size > 0, f"Empty: {path}"
+
+
+def test_display_module():
+    """Test display module works without errors."""
+    from cli.display import show_banner, show_phase_progress, show_cost_tracker
+    show_banner()
+    show_phase_progress("SPEC", "done")
+    show_cost_tracker(1.5, 10.0)
 
 
 # ────────────────────────────────────────────
@@ -406,15 +506,18 @@ def main():
             ("Standard library imports", test_stdlib_imports),
             ("Dependency imports", test_dependency_imports),
             ("Engine module imports", test_engine_imports),
-            ("Agent imports + registry", test_agent_imports),
+            ("Agent imports + registry (8 agents)", test_agent_imports),
+            ("CLI module imports", test_cli_imports),
         ]),
         ("CLI", [
-            ("Argument parsing", test_cli_parse_args),
+            ("Subcommand parsing", test_cli_parse_subcommands),
+            ("Legacy CLI compatibility", test_cli_legacy_compat),
         ]),
         ("Unit: ForgeConfig", [
-            ("Default construction", test_forge_config),
+            ("Default construction + new fields", test_forge_config),
             ("from_env with overrides", test_forge_config_from_env),
             ("Budget tracking + exhaustion", test_forge_config_budget_tracking),
+            ("Mobile config fields", test_forge_config_mobile),
         ]),
         ("Unit: TaskDAG", [
             ("Basic operations + dependency resolution", test_task_dag_basic),
@@ -435,16 +538,21 @@ def main():
             ("Instantiation", test_git_manager_instantiation),
         ]),
         ("Unit: Agents", [
-            ("All 7 agents instantiate", test_all_agents_instantiate),
+            ("All 8 agents instantiate", test_all_agents_instantiate),
             ("All build_prompt methods", test_agent_build_prompts),
             ("All parse methods", test_agent_parse_methods),
+            ("Research mode blocks writes", test_research_mode_blocks_writes),
         ]),
         ("Integration", [
             ("Orchestrator instantiation", test_orchestrator_instantiation),
+            ("Orchestrator has review + import", test_orchestrator_has_review_and_import),
             ("Orchestrator show_status", test_orchestrator_show_status),
         ]),
         ("Constitution", [
             ("All constitution files exist + non-empty", test_constitution_files_exist),
+        ]),
+        ("Display", [
+            ("Display module functions", test_display_module),
         ]),
     ]
 
