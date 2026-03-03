@@ -18,6 +18,12 @@ python forge.py --resume
 
 # Test
 python tests/smoke_test.py
+
+# Daemon mode
+python forge.py daemon start                # 24/7 background service
+python forge.py queue "project description" # Add to build queue
+python forge.py projects                    # List all projects
+python forge.py deploy <project_id>         # Show deploy guide
 ```
 
 ## Architecture
@@ -47,13 +53,18 @@ engine/
   lock_manager.py           Cross-platform atomic task locking
   git_manager.py            Git worktree management for parallel builders
   sandbox.py                Subprocess + Docker command execution
+  project_registry.py       SQLite multi-project management (daemon mode)
+  daemon.py                 24/7 daemon controller
+  deploy_guide.py           Vercel deployment guide generator
+  channels/                 Input channels (Telegram bot, webhook API)
   agents/                   6 agent implementations
 constitution/
   CONSTITUTION.md           Core principles and hard rules
   agents/*.md               Per-agent system prompts
   workflows/*.md            Phase workflow definitions
   quality_gates.md          Phase transition criteria
-tests/smoke_test.py         22-check smoke test (no API key needed)
+services/                   systemd + launchd service configs
+tests/smoke_test.py         31-check smoke test (no API key needed)
 ```
 
 ## Coding Standards

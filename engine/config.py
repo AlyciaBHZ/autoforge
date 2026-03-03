@@ -56,11 +56,28 @@ class ForgeConfig:
     sandbox_image: str = "autoforge-sandbox:latest"
     docker_enabled: bool = False  # Default off; setup.sh enables if available
 
+    # Daemon mode
+    daemon_enabled: bool = False
+    daemon_poll_interval: int = 10  # seconds between queue checks
+    db_path: Path | None = None  # SQLite database for project registry
+
+    # Telegram bot
+    telegram_token: str = ""
+    telegram_allowed_users: list[str] = field(default_factory=list)
+
+    # Webhook API
+    webhook_enabled: bool = False
+    webhook_host: str = "127.0.0.1"
+    webhook_port: int = 8420
+    webhook_secret: str = ""  # Bearer token for webhook auth
+
     def __post_init__(self) -> None:
         if self.workspace_dir is None:
             self.workspace_dir = self.project_root / "workspace"
         if self.constitution_dir is None:
             self.constitution_dir = self.project_root / "constitution"
+        if self.db_path is None:
+            self.db_path = self.project_root / "autoforge.db"
         if not self.run_id:
             self.run_id = uuid.uuid4().hex[:12]
 
@@ -68,6 +85,11 @@ class ForgeConfig:
     def from_env(cls, **overrides) -> ForgeConfig:
         """Create config from environment variables and optional overrides."""
         load_dotenv()
+
+        # Parse allowed Telegram users (comma-separated)
+        allowed_raw = os.getenv("FORGE_TELEGRAM_ALLOWED_USERS", "")
+        allowed_users = [u.strip() for u in allowed_raw.split(",") if u.strip()]
+
         config = cls(
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
             model_strong=os.getenv("FORGE_MODEL_STRONG", "claude-opus-4-6"),
@@ -76,6 +98,16 @@ class ForgeConfig:
             max_agents=int(os.getenv("FORGE_MAX_AGENTS", "3")),
             log_level=os.getenv("FORGE_LOG_LEVEL", "INFO"),
             docker_enabled=os.getenv("FORGE_DOCKER_ENABLED", "").lower() in ("true", "1", "yes"),
+            # Daemon
+            daemon_poll_interval=int(os.getenv("FORGE_DAEMON_POLL_INTERVAL", "10")),
+            # Telegram
+            telegram_token=os.getenv("FORGE_TELEGRAM_TOKEN", ""),
+            telegram_allowed_users=allowed_users,
+            # Webhook
+            webhook_enabled=os.getenv("FORGE_WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes"),
+            webhook_host=os.getenv("FORGE_WEBHOOK_HOST", "127.0.0.1"),
+            webhook_port=int(os.getenv("FORGE_WEBHOOK_PORT", "8420")),
+            webhook_secret=os.getenv("FORGE_WEBHOOK_SECRET", ""),
         )
         for key, value in overrides.items():
             if hasattr(config, key) and value is not None:

@@ -18,7 +18,11 @@ python forge.py "project description"   # Generate project
 python forge.py --budget 5.00 "desc"    # With budget limit
 python forge.py --status                # Show projects
 python forge.py --resume                # Resume interrupted run
-python tests/smoke_test.py              # Run 22-check smoke test
+python tests/smoke_test.py              # Run 31-check smoke test
+python forge.py daemon start            # Start 24/7 daemon
+python forge.py queue "description"     # Add to build queue
+python forge.py projects                # List all projects
+python forge.py deploy <project_id>     # Show deploy guide
 ```
 
 ## Architecture
@@ -38,10 +42,15 @@ python tests/smoke_test.py              # Run 22-check smoke test
 - `engine/lock_manager.py` — Cross-platform atomic task locking
 - `engine/git_manager.py` — Git worktree isolation for parallel builders
 - `engine/sandbox.py` — Subprocess + Docker sandbox
+- `engine/project_registry.py` — SQLite multi-project management (daemon mode)
+- `engine/daemon.py` — 24/7 daemon controller
+- `engine/deploy_guide.py` — Vercel deployment guide generator
+- `engine/channels/` — Input channels (Telegram bot, webhook API)
 - `engine/agents/` — 6 agent implementations
 - `constitution/` — Agent behavior rules (editable markdown)
 - `constitution/agents/*.md` — Per-agent system prompts
 - `constitution/workflows/*.md` — Phase definitions
+- `services/` — systemd + launchd service configs
 
 ## Coding Standards
 

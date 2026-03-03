@@ -11,7 +11,10 @@ source .venv/bin/activate               # Activate venv
 python forge.py "project description"   # Generate project
 python forge.py --status                # Show projects
 python forge.py --resume                # Resume run
-python tests/smoke_test.py              # 22-check smoke test
+python tests/smoke_test.py              # 31-check smoke test
+python forge.py daemon start            # 24/7 daemon
+python forge.py queue "description"     # Queue project
+python forge.py projects                # List projects
 ```
 
 ## Architecture
@@ -30,6 +33,8 @@ Agents: Director (Opus), Architect (Opus), Builder (Sonnet), Reviewer (Sonnet), 
 - engine/lock_manager.py: Cross-platform locking
 - engine/git_manager.py: Worktree isolation
 - engine/sandbox.py: Subprocess/Docker sandbox
+- engine/daemon.py: 24/7 daemon + project_registry.py + deploy_guide.py
+- engine/channels/: Telegram bot + webhook API
 - engine/agents/: 6 agent implementations
 - constitution/: Agent behavior rules (editable)
 

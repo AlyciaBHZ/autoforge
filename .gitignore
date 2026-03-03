@@ -36,3 +36,6 @@ docker/sandbox-data/
 
 # Logs
 *.log
+
+# Database (daemon mode)
+*.db

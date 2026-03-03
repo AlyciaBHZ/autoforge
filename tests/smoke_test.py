@@ -70,6 +70,10 @@ def test_engine_imports():
         SandboxResult, create_sandbox,
     )
     from engine.orchestrator import Orchestrator  # noqa: F401
+    from engine.project_registry import ProjectRegistry, ProjectStatus, Project  # noqa: F401
+    from engine.daemon import ForgeDaemon  # noqa: F401
+    from engine.deploy_guide import detect_framework, generate_deploy_guide  # noqa: F401
+    import engine.channels  # noqa: F401
 
 
 def test_agent_imports():
@@ -375,7 +379,187 @@ def test_orchestrator_show_status():
 
 
 # ────────────────────────────────────────────
-# Phase 5: Constitution files
+# Phase 5: Daemon components
+# ────────────────────────────────────────────
+
+def test_project_registry_crud():
+    """Test ProjectRegistry CRUD operations."""
+    from engine.project_registry import ProjectRegistry, ProjectStatus
+
+    async def _test():
+        import os
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        try:
+            async with ProjectRegistry(db_path) as reg:
+                # Enqueue
+                p = await reg.enqueue("Test project", "cli", 5.0)
+                assert p.status == ProjectStatus.QUEUED
+                assert p.budget_usd == 5.0
+
+                # Get
+                p2 = await reg.get(p.id)
+                assert p2.description == "Test project"
+
+                # List
+                all_projects = await reg.list_all()
+                assert len(all_projects) == 1
+
+                # Queue size
+                assert await reg.queue_size() == 1
+
+                # Dequeue
+                dequeued = await reg.dequeue()
+                assert dequeued is not None
+                assert dequeued.status == ProjectStatus.BUILDING
+                assert await reg.queue_size() == 0
+
+                # Update phase
+                await reg.update_phase(p.id, "build")
+                updated = await reg.get(p.id)
+                assert updated.phase == "build"
+
+                # Mark completed
+                await reg.mark_completed(p.id, 2.50)
+                completed = await reg.get(p.id)
+                assert completed.status == ProjectStatus.COMPLETED
+                assert completed.cost_usd == 2.50
+
+                # Total cost
+                assert await reg.total_cost() == 2.50
+
+                # Enqueue + Cancel
+                p3 = await reg.enqueue("Cancel me", "cli")
+                assert await reg.cancel(p3.id) is True
+                cancelled = await reg.get(p3.id)
+                assert cancelled.status == ProjectStatus.CANCELLED
+
+                # Cannot cancel non-queued
+                assert await reg.cancel(p.id) is False
+        finally:
+            db_path.unlink(missing_ok=True)
+
+    asyncio.run(_test())
+
+
+def test_project_registry_to_dict():
+    """Test Project.to_dict() serialization."""
+    from engine.project_registry import Project, ProjectStatus
+    p = Project(
+        id="abc123", name="test", description="desc",
+        status=ProjectStatus.QUEUED, phase="", workspace_path="",
+        requested_by="cli", budget_usd=10.0, cost_usd=0.0,
+        created_at="2025-01-01T00:00:00", started_at=None,
+        completed_at=None, error=None,
+    )
+    d = p.to_dict()
+    assert d["id"] == "abc123"
+    assert d["status"] == "queued"
+
+
+def test_deploy_guide_generation():
+    """Test deploy guide generation."""
+    from engine.deploy_guide import detect_framework, generate_deploy_guide
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        # Create a Next.js project
+        (d / "package.json").write_text(json.dumps({
+            "name": "test-app",
+            "dependencies": {"next": "14.0.0", "react": "18.0.0"},
+            "scripts": {"build": "next build", "dev": "next dev"},
+        }), encoding="utf-8")
+        (d / ".env.example").write_text(
+            "DATABASE_URL=\nNEXTAUTH_SECRET=\n", encoding="utf-8"
+        )
+
+        # Detect
+        info = detect_framework(d)
+        assert info["framework"] == "nextjs"
+        assert "DATABASE_URL" in info["env_vars"]
+
+        # Generate
+        guide = generate_deploy_guide(d, "test-app")
+        assert "Vercel" in guide
+        assert "DATABASE_URL" in guide
+        assert "test-app" in guide
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_deploy_guide_vite():
+    """Test framework detection for Vite project."""
+    from engine.deploy_guide import detect_framework
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "package.json").write_text(json.dumps({
+            "dependencies": {"react": "18.0.0"},
+            "devDependencies": {"vite": "5.0.0"},
+        }), encoding="utf-8")
+        info = detect_framework(d)
+        assert info["framework"] == "vite"
+        assert info["output_directory"] == "dist"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_daemon_instantiation():
+    """Test ForgeDaemon can be instantiated."""
+    from engine.config import ForgeConfig
+    from engine.daemon import ForgeDaemon
+    config = ForgeConfig(anthropic_api_key="fake-key")
+    daemon = ForgeDaemon(config)
+    assert daemon.config is config
+    assert daemon._running is False
+
+
+def test_forge_config_daemon_fields():
+    """Test daemon-related config fields."""
+    from engine.config import ForgeConfig
+    config = ForgeConfig()
+    assert config.daemon_enabled is False
+    assert config.daemon_poll_interval == 10
+    assert config.telegram_token == ""
+    assert config.webhook_enabled is False
+    assert config.webhook_port == 8420
+    assert config.db_path is not None
+
+
+def test_cli_daemon_subcommand():
+    """Test CLI parses daemon subcommand."""
+    saved = sys.argv
+    try:
+        sys.argv = ["forge.py", "daemon", "status"]
+        from forge import parse_args
+        args = parse_args()
+        assert args.command == "daemon"
+        assert args.action == "status"
+    finally:
+        sys.argv = saved
+
+
+def test_cli_queue_subcommand():
+    """Test CLI parses queue subcommand."""
+    saved = sys.argv
+    try:
+        sys.argv = ["forge.py", "queue", "Build a todo app", "--budget", "5.0"]
+        from forge import parse_args
+        args = parse_args()
+        assert args.command == "queue"
+        assert args.queue_description == "Build a todo app"
+        assert args.budget == 5.0
+    finally:
+        sys.argv = saved
+
+
+def test_service_files_exist():
+    """Test service config files exist."""
+    assert (PROJECT_ROOT / "services" / "autoforge.service").exists()
+    assert (PROJECT_ROOT / "services" / "com.autoforge.daemon.plist").exists()
+
+
+# ────────────────────────────────────────────
+# Phase 6: Constitution files
 # ────────────────────────────────────────────
 
 def test_constitution_files_exist():
@@ -442,6 +626,25 @@ def main():
         ("Integration", [
             ("Orchestrator instantiation", test_orchestrator_instantiation),
             ("Orchestrator show_status", test_orchestrator_show_status),
+        ]),
+        ("Unit: ProjectRegistry", [
+            ("CRUD operations", test_project_registry_crud),
+            ("Project.to_dict()", test_project_registry_to_dict),
+        ]),
+        ("Unit: DeployGuide", [
+            ("Next.js detection + guide generation", test_deploy_guide_generation),
+            ("Vite detection", test_deploy_guide_vite),
+        ]),
+        ("Unit: Daemon", [
+            ("ForgeDaemon instantiation", test_daemon_instantiation),
+            ("Config daemon fields", test_forge_config_daemon_fields),
+        ]),
+        ("CLI: Subcommands", [
+            ("daemon subcommand parsing", test_cli_daemon_subcommand),
+            ("queue subcommand parsing", test_cli_queue_subcommand),
+        ]),
+        ("Service Files", [
+            ("systemd + launchd configs exist", test_service_files_exist),
         ]),
         ("Constitution", [
             ("All constitution files exist + non-empty", test_constitution_files_exist),

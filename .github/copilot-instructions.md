@@ -6,9 +6,13 @@ AutoForge uses 6 AI agents to build complete projects from natural language. Run
 
 - Setup: `./setup.sh` (macOS/Linux) or `setup.bat` (Windows)
 - Run: `python forge.py "project description"`
-- Test: `python tests/smoke_test.py` (22 checks, no API key needed)
+- Test: `python tests/smoke_test.py` (31 checks, no API key needed)
 - Status: `python forge.py --status`
 - Resume: `python forge.py --resume`
+- Daemon: `python forge.py daemon start` (24/7 background service)
+- Queue: `python forge.py queue "description"` (add project to build queue)
+- Projects: `python forge.py projects` (list all projects)
+- Deploy: `python forge.py deploy <id>` (show Vercel deployment guide)
 
 ## Architecture
 
@@ -22,6 +26,10 @@ Reviewer (Sonnet, review), Tester (Sonnet, test), Gardener (Sonnet, refactor).
 - `engine/orchestrator.py` — Pipeline controller
 - `engine/config.py` — Configuration + budget tracking
 - `engine/agent_base.py` — Agentic tool-use loop
+- `engine/daemon.py` — 24/7 daemon controller
+- `engine/project_registry.py` — SQLite multi-project management
+- `engine/deploy_guide.py` — Vercel deployment guide generator
+- `engine/channels/` — Telegram bot + webhook API
 - `engine/agents/` — Agent implementations
 - `constitution/` — Agent behavior rules (editable markdown)
 

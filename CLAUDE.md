@@ -19,7 +19,14 @@ python forge.py --status                    # Show all projects
 python forge.py --resume                    # Resume interrupted run
 
 # Test
-python tests/smoke_test.py                  # 22-check smoke test suite
+python tests/smoke_test.py                  # 31-check smoke test suite
+
+# Daemon mode (24/7 background service)
+python forge.py daemon start                # Start daemon
+python forge.py daemon status               # Check status
+python forge.py queue "project description" # Add to build queue
+python forge.py projects                    # List all projects
+python forge.py deploy <project_id>         # Show deploy guide
 ```
 
 ## Architecture
@@ -40,11 +47,16 @@ engine/task_dag.py           TaskDAG — dependency graph, scheduling, persisten
 engine/lock_manager.py      Cross-platform atomic task locking (symlink on POSIX, O_CREAT|O_EXCL on Windows)
 engine/git_manager.py       Git worktree isolation for parallel builders
 engine/sandbox.py           Subprocess + Docker sandbox for safe code execution
+engine/project_registry.py  SQLite-backed multi-project management (daemon mode)
+engine/daemon.py            24/7 daemon controller — queue → build → notify → repeat
+engine/deploy_guide.py      Vercel deployment guide generator
+engine/channels/            Input channels (Telegram bot, webhook API)
 engine/agents/              6 agent implementations (director, architect, builder, reviewer, tester, gardener)
 constitution/               Agent behavior rules, workflow definitions, quality gates
 constitution/agents/*.md    Per-agent system prompts (loaded by agent_base.py)
 constitution/workflows/*.md Phase definitions (spec, build, verify, refactor, deliver)
-tests/smoke_test.py         22-check validation suite (no API key needed)
+services/                   systemd + launchd service configs for daemon mode
+tests/smoke_test.py         31-check validation suite (no API key needed)
 ```
 
 ## Coding Conventions

@@ -283,6 +283,12 @@ autoforge/
 │   ├── lock_manager.py      ← 跨平台原子锁
 │   ├── git_manager.py       ← Git worktree 管理
 │   ├── sandbox.py           ← 沙盒：安全执行生成的代码
+│   ├── project_registry.py  ← SQLite 多项目管理
+│   ├── daemon.py            ← 24/7 守护进程控制器
+│   ├── deploy_guide.py      ← Vercel 部署指南生成
+│   ├── channels/            ← 输入渠道
+│   │   ├── telegram_bot.py  ← Telegram 机器人
+│   │   └── webhook.py       ← REST API 接口
 │   └── agents/              ← 6 个 Agent 实现
 │       ├── director.py
 │       ├── architect.py
@@ -292,9 +298,10 @@ autoforge/
 │       └── gardener.py
 │
 ├── constitution/            ← 宪法层：Agent 行为规则
+├── services/                ← 系统服务配置（systemd / launchd）
 ├── docker/                  ← Docker 沙盒配置（Node.js + Python + Go + Java）
 ├── templates/               ← 项目模板（供 Agent 参考）
-├── tests/                   ← Smoke test（22 项自动验证）
+├── tests/                   ← Smoke test（31 项自动验证）
 ├── workspace/               ← 生成的项目（gitignore）
 └── examples/                ← 示例需求
 ```
@@ -302,6 +309,8 @@ autoforge/
 ---
 
 ## CLI 完整参数
+
+### 直接模式（一次性构建）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -313,6 +322,19 @@ autoforge/
 | `--status` | — | 查看当前所有项目状态 |
 | `--verbose` | — | 显示详细日志 |
 | `--log-level` | INFO | 日志级别（DEBUG/INFO/WARNING/ERROR） |
+
+### 守护进程模式
+
+| 命令 | 说明 |
+|------|------|
+| `python forge.py daemon start` | 启动 24/7 守护进程 |
+| `python forge.py daemon stop` | 停止守护进程 |
+| `python forge.py daemon status` | 查看守护进程状态 |
+| `python forge.py daemon install` | 安装为系统服务 |
+| `python forge.py queue "描述"` | 添加项目到构建队列 |
+| `python forge.py queue "描述" --budget 5.0` | 指定预算添加项目 |
+| `python forge.py projects` | 查看所有项目列表 |
+| `python forge.py deploy <project_id>` | 查看项目部署指南 |
 
 ---
 
@@ -345,6 +367,135 @@ FORGE_BUDGET_LIMIT=10.0          # 预算上限（美元）
 FORGE_MAX_AGENTS=3               # 最大并行 Agent 数
 FORGE_DOCKER_ENABLED=true        # 启用 Docker 沙盒（setup 脚本会自动设置）
 FORGE_LOG_LEVEL=INFO             # 日志级别
+
+# 守护进程模式（可选）
+FORGE_TELEGRAM_TOKEN=            # Telegram Bot Token（从 @BotFather 获取）
+FORGE_TELEGRAM_ALLOWED_USERS=    # 允许的用户（逗号分隔，空=全部允许）
+FORGE_WEBHOOK_ENABLED=false      # 启用 REST API
+FORGE_WEBHOOK_PORT=8420          # API 端口
+FORGE_WEBHOOK_SECRET=            # API 认证密钥
+```
+
+---
+
+## 24/7 守护进程模式
+
+AutoForge 可以作为后台服务持续运行，通过 Telegram 或 API 接收开发请求，自动排队、构建、通知。
+
+### 架构
+
+```
+用户 ──→ Telegram Bot ──→ ┌──────────┐     ┌─────────────┐
+                          │  项目队列  │ ──→ │ AutoForge   │ ──→ workspace/
+用户 ──→ Webhook API ──→  │ (SQLite)  │     │  Pipeline   │
+                          └──────────┘     └─────────────┘
+用户 ──→ CLI queue   ──→       ↑                   │
+                              │                   ▼
+                         完成/失败通知       DEPLOY_GUIDE.md
+```
+
+### 快速开始
+
+```bash
+# 1. 配置 .env（添加 Telegram Token 或启用 Webhook）
+
+# 2. 通过 CLI 添加项目到队列
+python forge.py queue "做一个博客网站"
+python forge.py queue "Build a REST API" --budget 5.0
+
+# 3. 启动守护进程
+python forge.py daemon start
+
+# 4. 查看项目状态
+python forge.py projects
+python forge.py daemon status
+
+# 5. 查看部署指南
+python forge.py deploy <project_id>
+```
+
+### Telegram 机器人
+
+1. 在 Telegram 中找到 [@BotFather](https://t.me/botfather)，发送 `/newbot` 创建机器人
+2. 把获得的 Token 填入 `.env` 的 `FORGE_TELEGRAM_TOKEN`
+3. 启动守护进程：`python forge.py daemon start`
+4. 在 Telegram 中和你的机器人对话：
+
+| 命令 | 说明 |
+|------|------|
+| `/build 做一个博客` | 提交开发任务 |
+| `/build $5 做一个博客` | 指定预算提交任务 |
+| `/status` | 查看所有项目 |
+| `/queue` | 查看当前队列 |
+| `/budget` | 查看总花费 |
+| `/cancel <id>` | 取消排队中的项目 |
+| `/deploy <id>` | 获取部署指南 |
+
+### Webhook REST API
+
+启用后（`FORGE_WEBHOOK_ENABLED=true`），可以通过 HTTP API 管理项目：
+
+```bash
+# 提交新项目
+curl -X POST http://localhost:8420/api/build \
+  -H "Authorization: Bearer YOUR_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"description": "做一个博客网站", "budget": 5.0}'
+
+# 查看所有项目
+curl http://localhost:8420/api/projects \
+  -H "Authorization: Bearer YOUR_SECRET"
+
+# 查看项目详情
+curl http://localhost:8420/api/projects/<id> \
+  -H "Authorization: Bearer YOUR_SECRET"
+
+# 获取部署指南
+curl http://localhost:8420/api/projects/<id>/deploy \
+  -H "Authorization: Bearer YOUR_SECRET"
+
+# 取消排队中的项目
+curl -X DELETE http://localhost:8420/api/projects/<id> \
+  -H "Authorization: Bearer YOUR_SECRET"
+
+# 健康检查
+curl http://localhost:8420/api/health
+```
+
+### 安装为系统服务（开机自启）
+
+**Linux (systemd)：**
+```bash
+python forge.py daemon install
+# 按提示执行 systemctl 命令
+```
+
+**macOS (launchd)：**
+```bash
+python forge.py daemon install
+# 按提示执行 launchctl 命令
+```
+
+**Windows：**
+使用 Task Scheduler 或 NSSM 配置为服务。
+
+---
+
+## 部署到 Vercel
+
+AutoForge 生成的 npm/serverless 前端项目会自动附带 `DEPLOY_GUIDE.md`，包含：
+
+1. **推送到 GitHub** — 完整的 git 命令
+2. **Vercel 部署** — 自动检测框架（Next.js/Vite/SvelteKit 等），一键部署
+3. **环境变量配置** — 每个变量的获取方式和说明
+4. **域名设置** — 性价比方案推荐：
+   - 免费：`*.vercel.app` 子域名
+   - 低成本：Cloudflare (~$9/年)、Porkbun (~$9/年)、Namecheap (~$9-13/年)
+5. **Vercel 免费额度** — 100 GB 带宽/月，Serverless Functions，Preview Deployments
+
+```bash
+# 查看某个项目的部署指南
+python forge.py deploy <project_id>
 ```
 
 ---
@@ -383,6 +534,15 @@ A: 可以。用 `setup.bat` 安装，然后一样用 `python forge.py` 运行。
 
 **Q: 生成的代码质量怎么样？**
 A: 有 Reviewer Agent 做代码审查，有 Tester Agent 做自动测试，有 Gardener Agent 做重构优化。质量有保障。
+
+**Q: 守护进程模式是什么？**
+A: 守护进程模式让 AutoForge 在后台 24/7 运行。你可以通过 Telegram、API 或命令行随时提交开发任务，AutoForge 会自动排队处理。适合同时管理多个项目。
+
+**Q: 生成的项目怎么部署上线？**
+A: AutoForge 会自动生成 `DEPLOY_GUIDE.md` 部署指南，包含 Vercel 部署的完整步骤、环境变量配置和域名设置建议。运行 `python forge.py deploy <id>` 查看。
+
+**Q: 可以同时做多个项目吗？**
+A: 可以。用守护进程模式，通过 `python forge.py queue` 或 Telegram `/build` 提交多个任务，它们会按顺序自动构建。
 
 ---
 
