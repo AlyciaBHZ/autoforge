@@ -34,9 +34,20 @@ You must output a single JSON code block with this exact structure:
       "dependencies": ["other-module-name"]
     }
   ],
+  "mobile": {
+    "target": "none | ios | android | both",
+    "framework": "react-native | flutter",
+    "features": ["push-notifications", "offline-storage"],
+    "platforms": {
+      "ios": { "min_version": "15.0" },
+      "android": { "min_sdk": 26 }
+    }
+  },
   "excluded": ["Feature X - out of scope for MVP", "Feature Y - too complex"]
 }
 ```
+
+Note: The `mobile` field is only required when generating a mobile app. Omit it for non-mobile projects.
 
 ## Supported Project Types
 
@@ -57,6 +68,15 @@ Choose the appropriate project type and tech stack based on the user's descripti
 - For **mobile-scaffold**: Generate complete source code, project config, and build scripts. The user will need to install platform SDKs (Android Studio / Xcode) themselves to compile.
 - For **desktop-scaffold**: Generate Electron/Tauri source code. The user will need to install native toolchains to build the final binary.
 - Always include a README in the generated project explaining how to set up the build environment.
+
+### Mobile App Generation
+
+When the user requests a mobile app (or `mobile_target` is set to ios/android/both):
+- Default to **React Native + TypeScript** unless user specifies Flutter
+- Include platform-specific configuration (Info.plist template, AndroidManifest.xml)
+- Include CI/CD workflow templates (GitHub Actions for builds)
+- Include a `mobile` section in the spec with target platforms and features
+- Structure modules to share business logic between web and mobile when both exist
 
 ## Decision Principles
 

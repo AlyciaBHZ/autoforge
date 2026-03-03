@@ -1,6 +1,10 @@
 """Orchestrator — the brain of AutoForge.
 
-Drives the 5-phase pipeline: SPEC → BUILD → VERIFY → REFACTOR → DELIVER.
+Supports three pipelines:
+  - Generate:  SPEC → BUILD → VERIFY → REFACTOR → DELIVER
+  - Review:    SCAN → REVIEW → [REFACTOR] → REPORT
+  - Import:    SCAN → REVIEW → [ENHANCE] → VERIFY → [REFACTOR] → DELIVER
+
 Each phase has a quality gate. The orchestrator manages agent lifecycle,
 task scheduling, and state persistence.
 """
@@ -22,6 +26,7 @@ from engine.agents.builder import BuilderAgent
 from engine.agents.director import DirectorAgent, DirectorFixAgent
 from engine.agents.gardener import GardenerAgent
 from engine.agents.reviewer import ReviewerAgent
+from engine.agents.scanner import ScannerAgent
 from engine.agents.tester import TesterAgent
 from engine.config import ForgeConfig
 from engine.git_manager import GitManager
@@ -473,6 +478,253 @@ class Orchestrator:
                 p.rename(forge_dir / internal_file)
 
         console.print("  [green]Project packaged[/green]")
+
+    # ──────────────────────────────────────────────
+    # Review Pipeline: SCAN → REVIEW → [REFACTOR] → REPORT
+    # ──────────────────────────────────────────────
+
+    async def review_project(self, project_path: str) -> dict[str, Any]:
+        """Standalone review of an existing project.
+
+        Pipeline: SCAN → REVIEW → [REFACTOR in developer mode] → REPORT
+        """
+        self._start_time = time.monotonic()
+        self.project_dir = Path(project_path).resolve()
+        logger.info(f"AutoForge review {self.config.run_id} starting: {self.project_dir}")
+
+        try:
+            # Phase 1: SCAN — Understand the project
+            console.print("\n[bold blue]Phase 1: SCAN[/bold blue] — Analyzing project...")
+            scan_result = await self._phase_scan(self.project_dir)
+            self.spec = scan_result.spec
+            console.print(
+                f"  [green]Scan complete:[/green] {self.spec.get('project_name', 'project')} "
+                f"— {scan_result.completeness}% complete, {len(scan_result.gaps)} gaps found"
+            )
+
+            # Phase 2: REVIEW — Deep code review
+            console.print("\n[bold blue]Phase 2: REVIEW[/bold blue] — Reviewing code...")
+            review = await self._phase_full_review()
+            console.print(f"  Quality score: {review.score}/10")
+            console.print(f"  Issues found: {len(review.issues)}")
+
+            # Phase 3: REFACTOR (developer mode only)
+            if (
+                self.config.mode == "developer"
+                and review.score < int(self.config.quality_threshold * 10)
+                and review.issues
+            ):
+                console.print("\n[bold blue]Phase 3: REFACTOR[/bold blue] — Applying fixes...")
+                await self._phase_refactor()
+
+            # Phase 4: REPORT
+            console.print("\n[bold blue]Phase 4: REPORT[/bold blue] — Generating report...")
+            report = self._generate_review_report(scan_result, review)
+
+            self._print_review_summary(review, scan_result)
+            return report
+
+        except BudgetExceededError as e:
+            console.print(f"\n[bold red]Budget exceeded:[/bold red] {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Review failed: {e}", exc_info=True)
+            raise
+
+    async def _phase_scan(self, project_dir: Path):
+        """Run Scanner Agent on existing project."""
+        scanner = ScannerAgent(self.config, self.llm, project_dir)
+        result = await scanner.run({"project_path": str(project_dir)})
+
+        if not result.success:
+            raise RuntimeError(f"Scanner failed: {result.error}")
+
+        return scanner.parse_scan(result.output)
+
+    async def _phase_full_review(self):
+        """Run full-project review with Reviewer Agent."""
+        reviewer = ReviewerAgent(self.config, self.llm, self.project_dir)
+        review_result = await reviewer.run({
+            "task": {"id": "FULL-REVIEW", "description": "Full project review", "files": self._list_project_files()},
+            "spec": self.spec,
+            "full_project_review": True,
+        })
+        review = reviewer.parse_review(review_result.output)
+
+        # Save review report
+        forge_dir = self.project_dir / ".autoforge"
+        forge_dir.mkdir(exist_ok=True)
+        (forge_dir / "review_report.json").write_text(
+            json.dumps({
+                "score": review.score,
+                "approved": review.approved,
+                "issues": review.issues,
+                "summary": review.summary,
+            }, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        return review
+
+    def _generate_review_report(self, scan_result, review) -> dict[str, Any]:
+        """Generate structured review report."""
+        report = {
+            "project_name": self.spec.get("project_name", "unknown"),
+            "tech_stack": self.spec.get("tech_stack", {}),
+            "completeness": scan_result.completeness,
+            "gaps": scan_result.gaps,
+            "score": review.score,
+            "issues": review.issues,
+            "summary": review.summary,
+            "cost_usd": self.config.estimated_cost_usd,
+        }
+
+        # Save report
+        forge_dir = self.project_dir / ".autoforge"
+        forge_dir.mkdir(exist_ok=True)
+        (forge_dir / "review_report.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        return report
+
+    def _print_review_summary(self, review, scan_result) -> None:
+        """Print review summary."""
+        from cli.display import show_review_report
+
+        elapsed = time.monotonic() - self._start_time if self._start_time else 0
+
+        show_review_report({
+            "score": review.score,
+            "issues": review.issues,
+            "summary": review.summary,
+        })
+
+        console.print(f"  Completeness: {scan_result.completeness}%")
+        console.print(f"  Gaps: {len(scan_result.gaps)}")
+        for gap in scan_result.gaps[:5]:
+            console.print(f"    - {gap}")
+        if len(scan_result.gaps) > 5:
+            console.print(f"    ... and {len(scan_result.gaps) - 5} more")
+
+        console.print()
+        console.print(f"  Cost:     ${self.config.estimated_cost_usd:.4f}")
+        console.print(f"  Duration: {elapsed:.1f}s")
+        console.print(f"  Report:   {self.project_dir / '.autoforge' / 'review_report.json'}")
+
+    # ──────────────────────────────────────────────
+    # Import Pipeline: SCAN → REVIEW → [ENHANCE] → VERIFY → [REFACTOR] → DELIVER
+    # ──────────────────────────────────────────────
+
+    async def import_project(self, project_path: str, enhancement: str = "") -> Path:
+        """Import and optionally enhance an existing project.
+
+        Pipeline: SCAN → REVIEW → [ENHANCE] → VERIFY → [REFACTOR] → DELIVER
+        """
+        self._start_time = time.monotonic()
+        source_dir = Path(project_path).resolve()
+        logger.info(f"AutoForge import {self.config.run_id}: {source_dir}")
+
+        if not source_dir.is_dir():
+            raise ValueError(f"Not a directory: {project_path}")
+
+        try:
+            # Copy to workspace (preserve original)
+            import shutil
+
+            project_name = source_dir.name
+            self.project_dir = self.config.workspace_dir / f"{project_name}-forge"
+            if self.project_dir.exists():
+                shutil.rmtree(self.project_dir)
+            shutil.copytree(source_dir, self.project_dir, ignore=shutil.ignore_patterns(
+                ".git", "node_modules", "__pycache__", ".venv", "venv", ".env"
+            ))
+            self._state_file = self.project_dir / ".forge_state.json"
+
+            # Phase 1: SCAN
+            console.print("\n[bold blue]Phase 1: SCAN[/bold blue] — Analyzing project...")
+            scan_result = await self._phase_scan(self.project_dir)
+            self.spec = scan_result.spec
+            console.print(
+                f"  [green]Scan complete:[/green] {self.spec.get('project_name', project_name)} "
+                f"— {scan_result.completeness}% complete"
+            )
+            self._save_state("scan_complete")
+
+            # Phase 2: REVIEW
+            console.print("\n[bold blue]Phase 2: REVIEW[/bold blue] — Reviewing code...")
+            review = await self._phase_full_review()
+            console.print(f"  Quality score: {review.score}/10, {len(review.issues)} issues")
+            self._save_state("review_complete")
+
+            # Phase 3: ENHANCE (optional, if enhancement description provided)
+            if enhancement:
+                console.print("\n[bold blue]Phase 3: ENHANCE[/bold blue] — Adding features...")
+                await self._phase_enhance(enhancement)
+                self._save_state("enhance_complete")
+
+            # Phase 4: VERIFY
+            console.print("\n[bold blue]Phase 4: VERIFY[/bold blue] — Verifying project...")
+            await self._phase_verify()
+            self._save_state("verify_complete")
+
+            # Phase 5: REFACTOR (developer mode only)
+            if self.config.mode == "developer":
+                console.print("\n[bold blue]Phase 5: REFACTOR[/bold blue] — Improving quality...")
+                await self._phase_refactor()
+                self._save_state("refactor_complete")
+
+            # Phase 6: DELIVER
+            console.print("\n[bold blue]Phase 6: DELIVER[/bold blue] — Packaging...")
+            await self._phase_deliver()
+            self._save_state("complete")
+
+            self._print_summary()
+            return self.project_dir
+
+        except BudgetExceededError as e:
+            console.print(f"\n[bold red]Budget exceeded:[/bold red] {e}")
+            if self.project_dir:
+                self._save_state("budget_exceeded")
+            raise
+        except Exception as e:
+            logger.error(f"Import failed: {e}", exc_info=True)
+            if self.project_dir:
+                self._save_state(f"failed: {e}")
+            raise
+
+    async def _phase_enhance(self, enhancement: str) -> None:
+        """Add new features to an imported project.
+
+        Uses Director to merge enhancement requests with existing spec,
+        then Architect + Builders to implement new code.
+        """
+        # Director merges existing spec with enhancement request
+        director = DirectorAgent(self.config, self.llm)
+        result = await director.run({
+            "project_description": (
+                f"This is an existing project with the following spec:\n"
+                f"```json\n{json.dumps(self.spec, indent=2, ensure_ascii=False)}\n```\n\n"
+                f"The user wants to add the following enhancements:\n{enhancement}\n\n"
+                f"Output a MERGED spec that includes the existing modules AND new modules "
+                f"for the requested enhancements. Keep existing module names and files unchanged."
+            ),
+        })
+
+        if not result.success:
+            console.print(f"  [yellow]Enhancement planning failed: {result.error}[/yellow]")
+            return
+
+        merged_spec = director.parse_spec(result.output)
+        self.spec = merged_spec
+
+        # Save updated spec
+        (self.project_dir / "spec.json").write_text(
+            json.dumps(self.spec, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        # Build new modules
+        await self._phase_build()
 
     # ──────────────────────────────────────────────
     # State management

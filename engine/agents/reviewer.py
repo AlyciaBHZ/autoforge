@@ -99,6 +99,35 @@ class ReviewerAgent(AgentBase):
     def build_prompt(self, context: dict[str, Any]) -> str:
         task = context.get("task", {})
         spec = context.get("spec", {})
+
+        # Full project review mode (no specific task)
+        if context.get("full_project_review"):
+            project_name = spec.get("project_name", "project")
+            modules = spec.get("modules", [])
+            tech_stack = json.dumps(spec.get("tech_stack", {}), indent=2, ensure_ascii=False)
+            return (
+                f"Perform a comprehensive code review of the project "
+                f"'{project_name}'.\n\n"
+                f"## Tech Stack\n```json\n{tech_stack}\n```\n\n"
+                f"## Modules\n"
+                + "\n".join(
+                    f"- **{m.get('name', '?')}**: {m.get('description', '')} "
+                    f"({', '.join(m.get('files', []))})"
+                    for m in modules
+                )
+                + "\n\n"
+                f"## Instructions\n"
+                f"1. List all files in the project\n"
+                f"2. Read each source file systematically\n"
+                f"3. Check correctness, security, error handling, and code quality\n"
+                f"4. Pay special attention to: SQL injection, XSS, hardcoded secrets, "
+                f"error handling, input validation\n"
+                f"5. Output a JSON code block with your review following the format "
+                f"in your system prompt\n\n"
+                f"Give a thorough review with specific file:line references where possible.\n"
+            )
+
+        # Standard task-level review
         return (
             f"Review the code for task '{task.get('id', '')}' in project "
             f"'{spec.get('project_name', '')}'.\n\n"

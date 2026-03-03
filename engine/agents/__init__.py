@@ -5,6 +5,7 @@ from engine.agents.builder import BuilderAgent
 from engine.agents.director import DirectorAgent, DirectorFixAgent
 from engine.agents.gardener import GardenerAgent
 from engine.agents.reviewer import ReviewerAgent
+from engine.agents.scanner import ScannerAgent
 from engine.agents.tester import TesterAgent
 
 AGENT_REGISTRY = {
@@ -15,6 +16,7 @@ AGENT_REGISTRY = {
     "reviewer": ReviewerAgent,
     "tester": TesterAgent,
     "gardener": GardenerAgent,
+    "scanner": ScannerAgent,
 }
 
 __all__ = [
@@ -25,5 +27,6 @@ __all__ = [
     "ReviewerAgent",
     "TesterAgent",
     "GardenerAgent",
+    "ScannerAgent",
     "AGENT_REGISTRY",
 ]

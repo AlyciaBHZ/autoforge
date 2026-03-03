@@ -47,6 +47,10 @@ class AgentBase(ABC):
         2. If stop_reason == "end_turn", done
         3. If stop_reason == "tool_use", execute tools, append results
         4. Repeat until done or MAX_TURNS exceeded
+
+    Supports two modes via config.mode:
+        - "developer": Full read-write access (default)
+        - "research": Read-only; write tools return errors
     """
 
     # Subclasses must set these
@@ -54,9 +58,13 @@ class AgentBase(ABC):
     COMPLEXITY: TaskComplexity = TaskComplexity.STANDARD
     MAX_TURNS: int = 25
 
+    # Tools that modify state — blocked in research mode
+    WRITE_TOOLS: set[str] = {"write_file", "run_command", "delete_file"}
+
     def __init__(self, config: ForgeConfig, llm: LLMRouter) -> None:
         self.config = config
         self.llm = llm
+        self.mode: str = getattr(config, "mode", "developer")
         self._system_prompt: str = ""
         self._tools: list[ToolDefinition] = []
         self._output_parts: list[str] = []
@@ -94,7 +102,18 @@ class AgentBase(ABC):
         ]
 
     async def _execute_tool(self, name: str, input_data: dict[str, Any]) -> str:
-        """Execute a tool by name and return the result string."""
+        """Execute a tool by name and return the result string.
+
+        In research mode, write tools are blocked and return an error message.
+        """
+        # Block write operations in research mode
+        if self.mode == "research" and name in self.WRITE_TOOLS:
+            logger.info(f"[{self.ROLE}] Blocked '{name}' in research mode")
+            return json.dumps({
+                "error": f"Tool '{name}' is disabled in research mode. "
+                "Research mode is read-only. Switch to developer mode to make changes."
+            })
+
         for tool in self._tools:
             if tool.name == name and tool.handler is not None:
                 try:

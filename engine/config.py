@@ -1,4 +1,11 @@
-"""AutoForge configuration."""
+"""AutoForge configuration.
+
+Config priority chain (highest → lowest):
+    1. CLI arguments
+    2. Project .env file (in repo root)
+    3. Global ~/.autoforge/config.toml (user-level defaults)
+    4. Built-in defaults
+"""
 
 from __future__ import annotations
 
@@ -14,6 +21,7 @@ from dotenv import load_dotenv
 MODEL_PRICING = {
     "claude-opus-4-6": {"input": 15.0, "output": 75.0},
     "claude-sonnet-4-5-20250929": {"input": 3.0, "output": 15.0},
+    "claude-haiku-4-5-20251001": {"input": 1.0, "output": 5.0},
 }
 
 # Default fallback pricing
@@ -49,6 +57,13 @@ class ForgeConfig:
     verbose: bool = False
     log_level: str = "INFO"
 
+    # Operating mode
+    mode: str = "developer"  # "developer" or "research"
+
+    # Mobile target
+    mobile_target: str = "none"  # "none", "ios", "android", "both"
+    mobile_framework: str = "react-native"  # "react-native" or "flutter"
+
     # Run identity
     run_id: str = ""
 
@@ -66,17 +81,55 @@ class ForgeConfig:
 
     @classmethod
     def from_env(cls, **overrides) -> ForgeConfig:
-        """Create config from environment variables and optional overrides."""
+        """Create config from environment variables and optional overrides.
+
+        Priority chain:
+            1. overrides (CLI args)
+            2. .env file (project-level)
+            3. ~/.autoforge/config.toml (global user config)
+            4. Built-in defaults
+        """
+        # Layer 3: Load global config (lowest priority)
+        global_config = _load_global_config()
+
+        # Layer 2: Load .env (overrides global)
         load_dotenv()
+
+        # Start with global config values, then override with .env, then CLI
         config = cls(
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
-            model_strong=os.getenv("FORGE_MODEL_STRONG", "claude-opus-4-6"),
-            model_fast=os.getenv("FORGE_MODEL_FAST", "claude-sonnet-4-5-20250929"),
-            budget_limit_usd=float(os.getenv("FORGE_BUDGET_LIMIT", "10.0")),
-            max_agents=int(os.getenv("FORGE_MAX_AGENTS", "3")),
-            log_level=os.getenv("FORGE_LOG_LEVEL", "INFO"),
-            docker_enabled=os.getenv("FORGE_DOCKER_ENABLED", "").lower() in ("true", "1", "yes"),
+            anthropic_api_key=(
+                os.getenv("ANTHROPIC_API_KEY")
+                or global_config.get("anthropic_api_key", "")
+            ),
+            model_strong=(
+                os.getenv("FORGE_MODEL_STRONG")
+                or global_config.get("model_strong", "claude-opus-4-6")
+            ),
+            model_fast=(
+                os.getenv("FORGE_MODEL_FAST")
+                or global_config.get("model_fast", "claude-sonnet-4-5-20250929")
+            ),
+            budget_limit_usd=float(
+                os.getenv("FORGE_BUDGET_LIMIT")
+                or global_config.get("budget_limit_usd", 10.0)
+            ),
+            max_agents=int(
+                os.getenv("FORGE_MAX_AGENTS")
+                or global_config.get("max_agents", 3)
+            ),
+            log_level=(
+                os.getenv("FORGE_LOG_LEVEL")
+                or global_config.get("log_level", "INFO")
+            ),
+            docker_enabled=(
+                os.getenv("FORGE_DOCKER_ENABLED", "").lower() in ("true", "1", "yes")
+                or global_config.get("docker_enabled", False)
+            ),
+            mode=global_config.get("mode", "developer"),
+            mobile_target=global_config.get("mobile_target", "none"),
         )
+
+        # Layer 1: CLI overrides (highest priority)
         for key, value in overrides.items():
             if hasattr(config, key) and value is not None:
                 setattr(config, key, value)
@@ -114,3 +167,12 @@ class ForgeConfig:
     def check_budget(self) -> bool:
         """Return True if there is budget remaining."""
         return self.estimated_cost_usd < self.budget_limit_usd
+
+
+def _load_global_config() -> dict:
+    """Load global config from ~/.autoforge/config.toml."""
+    try:
+        from cli.setup_wizard import load_global_config
+        return load_global_config()
+    except ImportError:
+        return {}
