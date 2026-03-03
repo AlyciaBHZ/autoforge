@@ -7,8 +7,8 @@ import logging
 import re
 from typing import Any
 
-from engine.agent_base import AgentBase
-from engine.llm_router import TaskComplexity
+from autoforge.engine.agent_base import AgentBase
+from autoforge.engine.llm_router import TaskComplexity
 
 logger = logging.getLogger(__name__)
 

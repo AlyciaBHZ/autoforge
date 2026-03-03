@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """AutoForge — AI-powered multi-agent development platform.
 
-Usage:
-    python forge.py                                    # Interactive mode
-    python forge.py generate "Build a Todo app"        # Generate new project
-    python forge.py review ./my-project                # Review existing project
-    python forge.py import ./my-project                # Import & improve
-    python forge.py setup                              # Configure settings
-    python forge.py status                             # Show projects
-    python forge.py resume                             # Resume interrupted run
+Preferred usage (install first: pip install autoforge):
+    autoforge                                    # Interactive mode
+    autoforge generate "Build a Todo app"        # Generate new project
+    autoforge review ./my-project                # Review existing project
+    autoforge import ./my-project                # Import & improve
+    autoforge setup                              # Configure settings
 
 Legacy usage (still supported):
-    python forge.py "Build a Todo app with user login"
+    python forge.py "Build a Todo app"
     python forge.py --resume
     python forge.py --status
 """
 
-from cli.app import main
+from autoforge.cli.app import main
 
 if __name__ == "__main__":
     main()

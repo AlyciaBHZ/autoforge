@@ -21,19 +21,19 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
-from engine.agents.architect import ArchitectAgent
-from engine.agents.builder import BuilderAgent
-from engine.agents.director import DirectorAgent, DirectorFixAgent
-from engine.agents.gardener import GardenerAgent
-from engine.agents.reviewer import ReviewerAgent
-from engine.agents.scanner import ScannerAgent
-from engine.agents.tester import TesterAgent
-from engine.config import ForgeConfig
-from engine.git_manager import GitManager
-from engine.llm_router import BudgetExceededError, LLMRouter
-from engine.lock_manager import LockManager
-from engine.sandbox import SandboxBase, create_sandbox
-from engine.task_dag import Task, TaskDAG, TaskPhase, TaskStatus
+from autoforge.engine.agents.architect import ArchitectAgent
+from autoforge.engine.agents.builder import BuilderAgent
+from autoforge.engine.agents.director import DirectorAgent, DirectorFixAgent
+from autoforge.engine.agents.gardener import GardenerAgent
+from autoforge.engine.agents.reviewer import ReviewerAgent
+from autoforge.engine.agents.scanner import ScannerAgent
+from autoforge.engine.agents.tester import TesterAgent
+from autoforge.engine.config import ForgeConfig
+from autoforge.engine.git_manager import GitManager
+from autoforge.engine.llm_router import BudgetExceededError, LLMRouter
+from autoforge.engine.lock_manager import LockManager
+from autoforge.engine.sandbox import SandboxBase, create_sandbox
+from autoforge.engine.task_dag import Task, TaskDAG, TaskPhase, TaskStatus
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -590,7 +590,7 @@ class Orchestrator:
 
     def _print_review_summary(self, review, scan_result) -> None:
         """Print review summary."""
-        from cli.display import show_review_report
+        from autoforge.cli.display import show_review_report
 
         elapsed = time.monotonic() - self._start_time if self._start_time else 0
 

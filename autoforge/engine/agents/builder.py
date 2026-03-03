@@ -7,9 +7,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from engine.agent_base import AgentBase, ToolDefinition
-from engine.llm_router import TaskComplexity
-from engine.sandbox import SandboxBase
+from autoforge.engine.agent_base import AgentBase, ToolDefinition
+from autoforge.engine.llm_router import TaskComplexity
+from autoforge.engine.sandbox import SandboxBase
 
 logger = logging.getLogger(__name__)
 
