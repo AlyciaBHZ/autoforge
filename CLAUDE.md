@@ -27,6 +27,14 @@ python forge.py daemon status               # Check status
 python forge.py queue "project description" # Add to build queue
 python forge.py projects                    # List all projects
 python forge.py deploy <project_id>         # Show deploy guide
+
+# Version control (git sync)
+python scripts/git_sync.py status           # Show branch sync status vs main
+python scripts/git_sync.py changelog        # Show changes since last sync
+python scripts/git_sync.py merge-main       # Merge main into current branch
+python scripts/git_sync.py sync             # Full sync: fetch + merge + push
+python scripts/git_sync.py cherry-pick <sha> # Cherry-pick specific commits
+python scripts/git_sync.py pick-range 0,2-4 # Cherry-pick by index from main
 ```
 
 ## Architecture
@@ -57,6 +65,7 @@ constitution/agents/*.md    Per-agent system prompts (loaded by agent_base.py)
 constitution/workflows/*.md Phase definitions (spec, build, verify, refactor, deliver)
 services/                   systemd + launchd service configs for daemon mode
 tests/smoke_test.py         31-check validation suite (no API key needed)
+scripts/git_sync.py         Automated git merge/cherry-pick workflow tool
 ```
 
 ## Coding Conventions
