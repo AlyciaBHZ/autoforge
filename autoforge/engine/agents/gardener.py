@@ -8,8 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from engine.agent_base import AgentBase, ToolDefinition
-from engine.llm_router import TaskComplexity
+from autoforge.engine.agent_base import AgentBase, ToolDefinition
+from autoforge.engine.llm_router import TaskComplexity
 
 logger = logging.getLogger(__name__)
 

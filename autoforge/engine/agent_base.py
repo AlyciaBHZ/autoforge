@@ -10,8 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
-from engine.config import ForgeConfig
-from engine.llm_router import LLMRouter, TaskComplexity
+from autoforge.engine.config import ForgeConfig
+from autoforge.engine.llm_router import LLMRouter, TaskComplexity
 
 logger = logging.getLogger(__name__)
 

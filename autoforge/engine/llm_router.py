@@ -8,7 +8,7 @@ from typing import Any
 
 from anthropic import AsyncAnthropic
 
-from engine.config import ForgeConfig
+from autoforge.engine.config import ForgeConfig
 
 logger = logging.getLogger(__name__)
 

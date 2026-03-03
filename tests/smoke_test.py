@@ -59,35 +59,35 @@ def test_dependency_imports():
 
 
 def test_engine_imports():
-    from engine.config import ForgeConfig  # noqa: F401
-    from engine.llm_router import LLMRouter, TaskComplexity, BudgetExceededError  # noqa: F401
-    from engine.agent_base import AgentBase, AgentResult, ToolDefinition  # noqa: F401
-    from engine.task_dag import TaskDAG, Task, TaskPhase, TaskStatus  # noqa: F401
-    from engine.lock_manager import LockManager  # noqa: F401
-    from engine.git_manager import GitManager, GitError  # noqa: F401
-    from engine.sandbox import (  # noqa: F401
+    from autoforge.engine.config import ForgeConfig  # noqa: F401
+    from autoforge.engine.llm_router import LLMRouter, TaskComplexity, BudgetExceededError  # noqa: F401
+    from autoforge.engine.agent_base import AgentBase, AgentResult, ToolDefinition  # noqa: F401
+    from autoforge.engine.task_dag import TaskDAG, Task, TaskPhase, TaskStatus  # noqa: F401
+    from autoforge.engine.lock_manager import LockManager  # noqa: F401
+    from autoforge.engine.git_manager import GitManager, GitError  # noqa: F401
+    from autoforge.engine.sandbox import (  # noqa: F401
         SandboxBase, SubprocessSandbox, DockerSandbox,
         SandboxResult, create_sandbox,
     )
-    from engine.orchestrator import Orchestrator  # noqa: F401
+    from autoforge.engine.orchestrator import Orchestrator  # noqa: F401
 
 
 def test_agent_imports():
-    from engine.agents import AGENT_REGISTRY
+    from autoforge.engine.agents import AGENT_REGISTRY
     assert len(AGENT_REGISTRY) == 8, f"Expected 8 agents, got {len(AGENT_REGISTRY)}"
-    from engine.agents.director import DirectorAgent, DirectorFixAgent  # noqa: F401
-    from engine.agents.architect import ArchitectAgent  # noqa: F401
-    from engine.agents.builder import BuilderAgent  # noqa: F401
-    from engine.agents.reviewer import ReviewerAgent  # noqa: F401
-    from engine.agents.tester import TesterAgent  # noqa: F401
-    from engine.agents.gardener import GardenerAgent  # noqa: F401
-    from engine.agents.scanner import ScannerAgent  # noqa: F401
+    from autoforge.engine.agents.director import DirectorAgent, DirectorFixAgent  # noqa: F401
+    from autoforge.engine.agents.architect import ArchitectAgent  # noqa: F401
+    from autoforge.engine.agents.builder import BuilderAgent  # noqa: F401
+    from autoforge.engine.agents.reviewer import ReviewerAgent  # noqa: F401
+    from autoforge.engine.agents.tester import TesterAgent  # noqa: F401
+    from autoforge.engine.agents.gardener import GardenerAgent  # noqa: F401
+    from autoforge.engine.agents.scanner import ScannerAgent  # noqa: F401
 
 
 def test_cli_imports():
-    from cli.app import build_parser, async_main  # noqa: F401
-    from cli.display import show_banner, show_startup_info, show_review_report  # noqa: F401
-    from cli.setup_wizard import needs_setup, load_global_config  # noqa: F401
+    from autoforge.cli.app import build_parser, async_main  # noqa: F401
+    from autoforge.cli.display import show_banner, show_startup_info, show_review_report  # noqa: F401
+    from autoforge.cli.setup_wizard import needs_setup, load_global_config  # noqa: F401
 
 
 # ────────────────────────────────────────────
@@ -95,7 +95,7 @@ def test_cli_imports():
 # ────────────────────────────────────────────
 
 def test_cli_parse_subcommands():
-    from cli.app import build_parser
+    from autoforge.cli.app import build_parser
     parser = build_parser()
 
     # Test generate subcommand
@@ -127,7 +127,7 @@ def test_cli_parse_subcommands():
 
 def test_cli_legacy_compat():
     """Test that legacy CLI usage still works."""
-    from cli.app import build_parser, _KNOWN_COMMANDS
+    from autoforge.cli.app import build_parser, _KNOWN_COMMANDS
 
     parser = build_parser()
 
@@ -151,7 +151,7 @@ def test_cli_legacy_compat():
 # ────────────────────────────────────────────
 
 def test_forge_config():
-    from engine.config import ForgeConfig
+    from autoforge.engine.config import ForgeConfig
     config = ForgeConfig()
     assert config.budget_limit_usd == 10.0
     assert config.max_agents == 3
@@ -163,7 +163,7 @@ def test_forge_config():
 
 
 def test_forge_config_from_env():
-    from engine.config import ForgeConfig
+    from autoforge.engine.config import ForgeConfig
     config = ForgeConfig.from_env(budget_limit_usd=5.0, max_agents=2, mode="research")
     assert config.budget_limit_usd == 5.0
     assert config.max_agents == 2
@@ -171,7 +171,7 @@ def test_forge_config_from_env():
 
 
 def test_forge_config_budget_tracking():
-    from engine.config import ForgeConfig
+    from autoforge.engine.config import ForgeConfig
     config = ForgeConfig(budget_limit_usd=1.0)
     config.record_usage("claude-sonnet-4-5-20250929", 1000, 500)
     assert config.total_input_tokens == 1000
@@ -184,14 +184,14 @@ def test_forge_config_budget_tracking():
 
 
 def test_forge_config_mobile():
-    from engine.config import ForgeConfig
+    from autoforge.engine.config import ForgeConfig
     config = ForgeConfig(mobile_target="both", mobile_framework="flutter")
     assert config.mobile_target == "both"
     assert config.mobile_framework == "flutter"
 
 
 def test_task_dag_basic():
-    from engine.task_dag import TaskDAG, Task, TaskPhase, TaskStatus
+    from autoforge.engine.task_dag import TaskDAG, Task, TaskPhase, TaskStatus
     dag = TaskDAG()
     t1 = Task(id="T-001", description="Setup", phase=TaskPhase.BUILD)
     t2 = Task(id="T-002", description="Auth", phase=TaskPhase.BUILD, depends_on=["T-001"])
@@ -208,7 +208,7 @@ def test_task_dag_basic():
 
 
 def test_task_dag_save_load():
-    from engine.task_dag import TaskDAG, Task
+    from autoforge.engine.task_dag import TaskDAG, Task
     dag = TaskDAG()
     dag.add_task(Task(id="X-1", description="test"))
     tmp = Path(tempfile.mktemp(suffix=".json"))
@@ -222,7 +222,7 @@ def test_task_dag_save_load():
 
 
 def test_task_dag_failure_handling():
-    from engine.task_dag import TaskDAG, Task, TaskStatus
+    from autoforge.engine.task_dag import TaskDAG, Task, TaskStatus
     dag = TaskDAG()
     dag.add_task(Task(id="F-1", description="fail test"))
     dag.mark_failed("F-1", "error")
@@ -237,7 +237,7 @@ def test_task_dag_failure_handling():
 
 
 def test_lock_manager():
-    from engine.lock_manager import LockManager
+    from autoforge.engine.lock_manager import LockManager
     d = Path(tempfile.mkdtemp()) / "locks"
     try:
         lm = LockManager(d)
@@ -259,7 +259,7 @@ def test_lock_manager():
 
 
 def test_sandbox_subprocess():
-    from engine.sandbox import SubprocessSandbox
+    from autoforge.engine.sandbox import SubprocessSandbox
 
     async def _test():
         d = Path(tempfile.mkdtemp())
@@ -277,8 +277,8 @@ def test_sandbox_subprocess():
 
 
 def test_sandbox_factory():
-    from engine.sandbox import create_sandbox, SubprocessSandbox
-    from engine.config import ForgeConfig
+    from autoforge.engine.sandbox import create_sandbox, SubprocessSandbox
+    from autoforge.engine.config import ForgeConfig
     config = ForgeConfig(docker_enabled=False)
     d = Path(tempfile.mkdtemp())
     try:
@@ -289,8 +289,8 @@ def test_sandbox_factory():
 
 
 def test_llm_router_instantiation():
-    from engine.llm_router import LLMRouter, TaskComplexity
-    from engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter, TaskComplexity
+    from autoforge.engine.config import ForgeConfig
     config = ForgeConfig(anthropic_api_key="fake-key")
     router = LLMRouter(config)
     m, t = router._select_model(TaskComplexity.HIGH)
@@ -302,7 +302,7 @@ def test_llm_router_instantiation():
 
 
 def test_git_manager_instantiation():
-    from engine.git_manager import GitManager
+    from autoforge.engine.git_manager import GitManager
     d = Path(tempfile.mkdtemp())
     try:
         project_dir = d / "test-project"
@@ -314,16 +314,16 @@ def test_git_manager_instantiation():
 
 
 def test_all_agents_instantiate():
-    from engine.config import ForgeConfig
-    from engine.llm_router import LLMRouter
-    from engine.agents.director import DirectorAgent, DirectorFixAgent
-    from engine.agents.architect import ArchitectAgent
-    from engine.agents.builder import BuilderAgent
-    from engine.agents.reviewer import ReviewerAgent
-    from engine.agents.tester import TesterAgent
-    from engine.agents.gardener import GardenerAgent
-    from engine.agents.scanner import ScannerAgent
-    from engine.sandbox import SubprocessSandbox
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+    from autoforge.engine.agents.director import DirectorAgent, DirectorFixAgent
+    from autoforge.engine.agents.architect import ArchitectAgent
+    from autoforge.engine.agents.builder import BuilderAgent
+    from autoforge.engine.agents.reviewer import ReviewerAgent
+    from autoforge.engine.agents.tester import TesterAgent
+    from autoforge.engine.agents.gardener import GardenerAgent
+    from autoforge.engine.agents.scanner import ScannerAgent
+    from autoforge.engine.sandbox import SubprocessSandbox
 
     config = ForgeConfig(anthropic_api_key="fake")
     llm = LLMRouter(config)
@@ -352,16 +352,16 @@ def test_all_agents_instantiate():
 
 
 def test_agent_build_prompts():
-    from engine.config import ForgeConfig
-    from engine.llm_router import LLMRouter
-    from engine.agents.director import DirectorAgent
-    from engine.agents.architect import ArchitectAgent
-    from engine.agents.builder import BuilderAgent
-    from engine.agents.reviewer import ReviewerAgent
-    from engine.agents.tester import TesterAgent
-    from engine.agents.gardener import GardenerAgent
-    from engine.agents.scanner import ScannerAgent
-    from engine.sandbox import SubprocessSandbox
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+    from autoforge.engine.agents.director import DirectorAgent
+    from autoforge.engine.agents.architect import ArchitectAgent
+    from autoforge.engine.agents.builder import BuilderAgent
+    from autoforge.engine.agents.reviewer import ReviewerAgent
+    from autoforge.engine.agents.tester import TesterAgent
+    from autoforge.engine.agents.gardener import GardenerAgent
+    from autoforge.engine.agents.scanner import ScannerAgent
+    from autoforge.engine.sandbox import SubprocessSandbox
 
     config = ForgeConfig(anthropic_api_key="fake")
     llm = LLMRouter(config)
@@ -389,12 +389,12 @@ def test_agent_build_prompts():
 
 
 def test_agent_parse_methods():
-    from engine.config import ForgeConfig
-    from engine.llm_router import LLMRouter
-    from engine.agents.director import DirectorAgent, DirectorFixAgent
-    from engine.agents.reviewer import ReviewerAgent
-    from engine.agents.tester import TesterAgent
-    from engine.agents.scanner import ScannerAgent
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+    from autoforge.engine.agents.director import DirectorAgent, DirectorFixAgent
+    from autoforge.engine.agents.reviewer import ReviewerAgent
+    from autoforge.engine.agents.tester import TesterAgent
+    from autoforge.engine.agents.scanner import ScannerAgent
 
     config = ForgeConfig(anthropic_api_key="fake")
     llm = LLMRouter(config)
@@ -424,8 +424,8 @@ def test_agent_parse_methods():
 
 def test_research_mode_blocks_writes():
     """Test that research mode blocks write tools."""
-    from engine.agent_base import AgentBase
-    from engine.config import ForgeConfig
+    from autoforge.engine.agent_base import AgentBase
+    from autoforge.engine.config import ForgeConfig
 
     config = ForgeConfig(anthropic_api_key="fake", mode="research")
     assert config.mode == "research"
@@ -440,8 +440,8 @@ def test_research_mode_blocks_writes():
 # ────────────────────────────────────────────
 
 def test_orchestrator_instantiation():
-    from engine.config import ForgeConfig
-    from engine.orchestrator import Orchestrator
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
     config = ForgeConfig(anthropic_api_key="fake-key")
     orch = Orchestrator(config)
     assert orch.llm is not None
@@ -451,7 +451,7 @@ def test_orchestrator_instantiation():
 
 def test_orchestrator_has_review_and_import():
     """Test that orchestrator has review_project and import_project methods."""
-    from engine.orchestrator import Orchestrator
+    from autoforge.engine.orchestrator import Orchestrator
     assert hasattr(Orchestrator, "review_project")
     assert hasattr(Orchestrator, "import_project")
     assert callable(getattr(Orchestrator, "review_project"))
@@ -459,8 +459,8 @@ def test_orchestrator_has_review_and_import():
 
 
 def test_orchestrator_show_status():
-    from engine.config import ForgeConfig
-    from engine.orchestrator import Orchestrator
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
     config = ForgeConfig()
     orch = Orchestrator(config)
     orch.show_status()  # Should not raise
@@ -471,7 +471,7 @@ def test_orchestrator_show_status():
 # ────────────────────────────────────────────
 
 def test_constitution_files_exist():
-    base = PROJECT_ROOT / "constitution"
+    base = PROJECT_ROOT / "autoforge" / "data" / "constitution"
     assert (base / "CONSTITUTION.md").exists()
     assert (base / "quality_gates.md").exists()
     for agent in ["director", "architect", "builder", "reviewer", "tester", "gardener", "scanner"]:
@@ -486,7 +486,7 @@ def test_constitution_files_exist():
 
 def test_display_module():
     """Test display module works without errors."""
-    from cli.display import show_banner, show_phase_progress, show_cost_tracker
+    from autoforge.cli.display import show_banner, show_phase_progress, show_cost_tracker
     show_banner()
     show_phase_progress("SPEC", "done")
     show_cost_tracker(1.5, 10.0)

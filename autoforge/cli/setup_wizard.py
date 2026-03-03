@@ -89,7 +89,7 @@ def run_setup_wizard() -> None:
 
     console.print()
     console.print(f"[green]Configuration saved to {CONFIG_FILE}[/green]")
-    console.print("You can re-run setup anytime with: [bold]python forge.py setup[/bold]")
+    console.print("You can re-run setup anytime with: [bold]autoforge setup[/bold]")
     console.print()
 
 

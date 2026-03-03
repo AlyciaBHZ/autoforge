@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
-from engine.config import ForgeConfig
+from autoforge.engine.config import ForgeConfig
 
 logger = logging.getLogger(__name__)
 

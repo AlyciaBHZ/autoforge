@@ -42,12 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python forge.py                                   # Interactive mode\n"
-            '  python forge.py generate "Build a Todo app"       # Generate new project\n'
-            "  python forge.py review ./my-project               # Review existing project\n"
-            "  python forge.py import ./my-project               # Import & improve\n"
-            "  python forge.py setup                             # Configure settings\n"
-            "  python forge.py status                            # Show projects\n"
+            "  autoforge                                   # Interactive mode\n"
+            '  autoforge generate "Build a Todo app"       # Generate new project\n'
+            "  autoforge review ./my-project               # Review existing project\n"
+            "  autoforge import ./my-project               # Import & improve\n"
+            "  autoforge setup                             # Configure settings\n"
+            "  autoforge status                            # Show projects\n"
         ),
     )
 
@@ -140,11 +140,11 @@ def _build_config_overrides(args: argparse.Namespace) -> dict:
 
 async def _run_generate(config, description: str) -> int:
     """Run the generate pipeline."""
-    from cli.display import show_startup_info
-    from engine.orchestrator import Orchestrator
+    from autoforge.cli.display import show_startup_info
+    from autoforge.engine.orchestrator import Orchestrator
 
     if not config.anthropic_api_key:
-        console.print("[red]Error:[/red] No API key configured. Run: python forge.py setup")
+        console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
         return 1
 
     show_startup_info(
@@ -170,11 +170,11 @@ async def _run_generate(config, description: str) -> int:
 
 async def _run_review(config, project_path: str) -> int:
     """Run the review pipeline."""
-    from cli.display import show_startup_info
-    from engine.orchestrator import Orchestrator
+    from autoforge.cli.display import show_startup_info
+    from autoforge.engine.orchestrator import Orchestrator
 
     if not config.anthropic_api_key:
-        console.print("[red]Error:[/red] No API key configured. Run: python forge.py setup")
+        console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
         return 1
 
     path = Path(project_path).resolve()
@@ -204,11 +204,11 @@ async def _run_review(config, project_path: str) -> int:
 
 async def _run_import(config, project_path: str, enhance: str = "") -> int:
     """Run the import pipeline."""
-    from cli.display import show_startup_info
-    from engine.orchestrator import Orchestrator
+    from autoforge.cli.display import show_startup_info
+    from autoforge.engine.orchestrator import Orchestrator
 
     if not config.anthropic_api_key:
-        console.print("[red]Error:[/red] No API key configured. Run: python forge.py setup")
+        console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
         return 1
 
     path = Path(project_path).resolve()
@@ -273,7 +273,7 @@ async def async_main() -> int:
             return await _run_interactive(args)
 
     # Build config
-    from engine.config import ForgeConfig
+    from autoforge.engine.config import ForgeConfig
 
     overrides = _build_config_overrides(args)
     config = ForgeConfig.from_env(**overrides)
@@ -281,7 +281,7 @@ async def async_main() -> int:
 
     # Dispatch subcommand
     if args.command == "setup":
-        from cli.setup_wizard import run_setup_wizard
+        from autoforge.cli.setup_wizard import run_setup_wizard
         run_setup_wizard()
         return 0
 
@@ -296,16 +296,16 @@ async def async_main() -> int:
         return await _run_import(config, args.path, enhance)
 
     elif args.command == "status":
-        from engine.orchestrator import Orchestrator
+        from autoforge.engine.orchestrator import Orchestrator
         orchestrator = Orchestrator(config)
         orchestrator.show_status()
         return 0
 
     elif args.command == "resume":
-        from engine.orchestrator import Orchestrator
+        from autoforge.engine.orchestrator import Orchestrator
 
         if not config.anthropic_api_key:
-            console.print("[red]Error:[/red] No API key configured. Run: python forge.py setup")
+            console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
             return 1
 
         orchestrator = Orchestrator(config)
@@ -325,35 +325,35 @@ async def async_main() -> int:
 
 async def _run_interactive(args: argparse.Namespace) -> int:
     """Run interactive mode with InquirerPy menus."""
-    from cli.display import show_banner
-    from cli.setup_wizard import needs_setup
+    from autoforge.cli.display import show_banner
+    from autoforge.cli.setup_wizard import needs_setup
 
     show_banner()
 
     # Check if setup is needed
     if needs_setup():
         console.print("[yellow]First time? Let's set up AutoForge.[/yellow]\n")
-        from cli.setup_wizard import run_setup_wizard
+        from autoforge.cli.setup_wizard import run_setup_wizard
         run_setup_wizard()
         console.print()
 
     try:
-        from cli.interactive import run_interactive
+        from autoforge.cli.interactive import run_interactive
     except ImportError:
         console.print("[red]Error:[/red] InquirerPy not installed. Run: pip install InquirerPy")
-        console.print("Or use subcommands directly: python forge.py generate \"your description\"")
+        console.print("Or use subcommands directly: autoforge generate \"your description\"")
         return 1
 
     choices = run_interactive()
     action = choices.get("action")
 
     if action == "setup":
-        from cli.setup_wizard import run_setup_wizard
+        from autoforge.cli.setup_wizard import run_setup_wizard
         run_setup_wizard()
         return 0
 
     # Build config from global config + interactive choices
-    from engine.config import ForgeConfig
+    from autoforge.engine.config import ForgeConfig
 
     overrides = _build_config_overrides(args)
     # Apply interactive choices as overrides

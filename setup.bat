@@ -32,20 +32,11 @@ if not exist ".venv" (
 )
 echo Virtual environment: .venv
 
-:: ── Activate and install dependencies ──
+:: ── Activate and install ──
 call .venv\Scripts\activate.bat
-echo Installing dependencies...
+echo Installing AutoForge...
 pip install -q --upgrade pip
-pip install -q -r requirements.txt
-
-:: ── Create .env ──
-if not exist ".env" (
-    copy .env.example .env >nul
-    echo.
-    echo Created .env from template.
-    echo ^>^>^> Please edit .env and add your ANTHROPIC_API_KEY ^<^<^<
-    echo.
-)
+pip install -q -e .
 
 :: ── Create workspace ──
 if not exist "workspace" mkdir workspace
@@ -81,18 +72,29 @@ if %errorlevel% equ 0 (
 :: ── Verify installation ──
 echo.
 echo Verifying installation...
-.venv\Scripts\python -c "from engine.orchestrator import Orchestrator; print('  Engine: OK')" 2>&1 || echo   Engine: FAILED
+.venv\Scripts\autoforge --help >nul 2>&1 && echo   AutoForge CLI: OK || echo   AutoForge CLI: FAILED
+.venv\Scripts\python -c "from autoforge.engine.orchestrator import Orchestrator; print('  Engine: OK')" 2>&1 || echo   Engine: FAILED
+
+:: ── Auto-launch setup wizard if needed ──
+echo.
+.venv\Scripts\python -c "from autoforge.cli.setup_wizard import needs_setup; exit(0 if needs_setup() else 1)" 2>nul
+if !errorlevel! equ 0 (
+    echo First-time setup — launching configuration wizard...
+    echo.
+    .venv\Scripts\autoforge setup
+)
 
 echo.
 echo === Setup complete! ===
 echo.
-echo Next steps:
-echo   1. Edit .env and add your ANTHROPIC_API_KEY
-echo   2. Run: .venv\Scripts\activate.bat
-echo   3. Run: python forge.py "your project description"
+echo Usage:
+echo   .venv\Scripts\autoforge                          :: Run from this directory
+echo   .venv\Scripts\autoforge generate "your prompt"   :: Generate a project
+echo   .venv\Scripts\autoforge review .\my-project      :: Review existing code
+echo   .venv\Scripts\autoforge setup                    :: Reconfigure settings
 echo.
-echo Examples:
-echo   python forge.py "Build a Todo app with user login"
-echo   python forge.py "做一个心理咨询预约平台" --budget 5.00
+echo Or install globally:
+echo   pip install -e .    :: Then "autoforge" works from anywhere
+echo.
 
 endlocal

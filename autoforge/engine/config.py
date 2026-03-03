@@ -16,6 +16,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+import autoforge
+
 
 # Approximate pricing per million tokens (USD)
 MODEL_PRICING = {
@@ -33,7 +35,7 @@ class ForgeConfig:
     """Central configuration for an AutoForge run."""
 
     # Paths
-    project_root: Path = field(default_factory=lambda: Path(__file__).parent.parent)
+    project_root: Path = field(default_factory=lambda: Path.cwd())
     workspace_dir: Path | None = None
     constitution_dir: Path | None = None
 
@@ -75,7 +77,7 @@ class ForgeConfig:
         if self.workspace_dir is None:
             self.workspace_dir = self.project_root / "workspace"
         if self.constitution_dir is None:
-            self.constitution_dir = self.project_root / "constitution"
+            self.constitution_dir = autoforge.DATA_DIR / "constitution"
         if not self.run_id:
             self.run_id = uuid.uuid4().hex[:12]
 
@@ -172,7 +174,7 @@ class ForgeConfig:
 def _load_global_config() -> dict:
     """Load global config from ~/.autoforge/config.toml."""
     try:
-        from cli.setup_wizard import load_global_config
+        from autoforge.cli.setup_wizard import load_global_config
         return load_global_config()
     except ImportError:
         return {}

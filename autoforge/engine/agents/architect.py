@@ -8,8 +8,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-from engine.agent_base import AgentBase, ToolDefinition
-from engine.llm_router import TaskComplexity
+import autoforge
+from autoforge.engine.agent_base import AgentBase, ToolDefinition
+from autoforge.engine.llm_router import TaskComplexity
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ class ArchitectAgent(AgentBase):
     COMPLEXITY = TaskComplexity.HIGH  # Uses Opus for architectural decisions
 
     def __init__(self, config, llm, templates_dir: Path | None = None) -> None:
-        self.templates_dir = templates_dir or config.project_root / "templates"
+        self.templates_dir = templates_dir or autoforge.DATA_DIR / "templates"
         super().__init__(config, llm)
 
     def _register_tools(self) -> None:
