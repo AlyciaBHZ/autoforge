@@ -33,19 +33,10 @@ fi
 source .venv/bin/activate
 echo "Virtual environment: .venv"
 
-# ── Install dependencies ──
-echo "Installing dependencies..."
+# ── Install AutoForge ──
+echo "Installing AutoForge..."
 pip install -q --upgrade pip
-pip install -q -r requirements.txt
-
-# ── Create .env ──
-if [ ! -f ".env" ]; then
-    cp .env.example .env
-    echo ""
-    echo "Created .env from template."
-    echo ">>> Please edit .env and add your ANTHROPIC_API_KEY <<<"
-    echo ""
-fi
+pip install -q -e .
 
 # ── Create workspace ──
 mkdir -p workspace
@@ -60,7 +51,6 @@ if command -v docker &>/dev/null; then
             echo "Building sandbox image..."
             if docker build -t autoforge-sandbox:latest -f docker/Dockerfile.sandbox docker/ >/dev/null 2>&1; then
                 echo "Sandbox image built successfully"
-                # Enable Docker in .env if not already set
                 if ! grep -q "FORGE_DOCKER_ENABLED" .env 2>/dev/null; then
                     echo "FORGE_DOCKER_ENABLED=true" >> .env
                 fi
@@ -78,16 +68,26 @@ fi
 # ── Verify installation ──
 echo ""
 echo "Verifying installation..."
-.venv/bin/python -c "from engine.orchestrator import Orchestrator; print('  Engine: OK')" 2>&1 || echo "  Engine: FAILED (check error above)"
+.venv/bin/autoforge --help >/dev/null 2>&1 && echo "  AutoForge CLI: OK" || echo "  AutoForge CLI: FAILED"
+.venv/bin/python -c "from autoforge.engine.orchestrator import Orchestrator; print('  Engine: OK')" 2>&1 || echo "  Engine: FAILED"
+
+# ── Auto-launch setup wizard if needed ──
+echo ""
+if .venv/bin/python -c "from autoforge.cli.setup_wizard import needs_setup; exit(0 if needs_setup() else 1)" 2>/dev/null; then
+    echo "First-time setup — launching configuration wizard..."
+    echo ""
+    .venv/bin/autoforge setup
+fi
 
 echo ""
 echo "=== Setup complete! ==="
 echo ""
-echo "Next steps:"
-echo "  1. Edit .env and add your ANTHROPIC_API_KEY"
-echo "  2. Run: source .venv/bin/activate"
-echo '  3. Run: python forge.py "your project description"'
+echo "Usage:"
+echo '  .venv/bin/autoforge                          # Run from this directory'
+echo '  .venv/bin/autoforge generate "your prompt"   # Generate a project'
+echo '  .venv/bin/autoforge review ./my-project      # Review existing code'
+echo '  .venv/bin/autoforge setup                    # Reconfigure settings'
 echo ""
-echo "Examples:"
-echo '  python forge.py "Build a Todo app with user login"'
-echo '  python forge.py "做一个心理咨询预约平台" --budget 5.00'
+echo "Or install globally:"
+echo '  pip install -e .    # Then "autoforge" works from anywhere'
+echo ""
