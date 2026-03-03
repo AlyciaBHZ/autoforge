@@ -386,6 +386,24 @@ A: 有 Reviewer Agent 做代码审查，有 Tester Agent 做自动测试，有 G
 
 ---
 
+## AI 编码工具兼容
+
+Clone 本仓库后，以下 AI 编码工具会**自动读取项目配置**，无需额外设置即可理解项目并开始工作：
+
+| AI 工具 | 配置文件 | 状态 |
+|---------|---------|:----:|
+| **Claude Code** | `CLAUDE.md` | 自动加载 |
+| **OpenAI Codex CLI** | `AGENTS.md` | 自动加载 |
+| **OpenCode** | `AGENTS.md` | 自动加载 |
+| **Cursor** | `.cursor/rules/autoforge.mdc` | 自动加载 |
+| **GitHub Copilot** | `.github/copilot-instructions.md` | 自动加载 |
+| **Windsurf (Codeium)** | `.windsurfrules` | 自动加载 |
+| **Aider** | `.aider.conf.yml` → `AGENTS.md` | 自动加载 |
+
+**使用方式**：Clone 仓库 → 用你喜欢的 AI 编码工具打开 → AI 自动理解项目 → 开始工作。
+
+---
+
 ## 宪法系统
 
 AutoForge 通过 `constitution/` 目录中的规则文件控制 Agent 行为：
