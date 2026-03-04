@@ -36,7 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -722,8 +722,6 @@ class EvolutionEngine:
         This is used when the engine has enough history to identify which
         specific parameters contributed to success.
         """
-        import random
-
         child = WorkflowGenome(
             # Take architecture from the higher-scoring parent
             arch_strategy=genome_a.arch_strategy or genome_b.arch_strategy,

@@ -103,28 +103,47 @@ class TaskDAG:
             t.status in (TaskStatus.TODO, TaskStatus.IN_PROGRESS) for t in tasks
         )
 
-    def is_complete(self) -> bool:
-        """All tasks are done or blocked."""
+    def is_finished(self) -> bool:
+        """All tasks are done, blocked, or failed (no work remaining)."""
         return all(
-            t.status in (TaskStatus.DONE, TaskStatus.BLOCKED)
+            t.status in (TaskStatus.DONE, TaskStatus.BLOCKED, TaskStatus.FAILED)
             for t in self._tasks.values()
         )
 
+    def is_all_done(self) -> bool:
+        """All tasks completed successfully (none blocked or failed)."""
+        return all(
+            t.status == TaskStatus.DONE for t in self._tasks.values()
+        )
+
+    def is_complete(self) -> bool:
+        """Backward-compatible alias: finished with no failures."""
+        return self.is_finished() and not self.has_failures()
+
     def has_failures(self) -> bool:
-        return any(t.status == TaskStatus.FAILED for t in self._tasks.values())
+        return any(
+            t.status in (TaskStatus.FAILED, TaskStatus.BLOCKED)
+            for t in self._tasks.values()
+        )
 
     def mark_in_progress(self, task_id: str, agent_id: str) -> None:
+        if task_id not in self._tasks:
+            raise ValueError(f"Unknown task: {task_id}")
         task = self._tasks[task_id]
         task.status = TaskStatus.IN_PROGRESS
         task.claimed_by = agent_id
 
     def mark_done(self, task_id: str, result: str = "") -> None:
+        if task_id not in self._tasks:
+            raise ValueError(f"Unknown task: {task_id}")
         task = self._tasks[task_id]
         task.status = TaskStatus.DONE
         task.result = result
         task.claimed_by = None
 
     def mark_failed(self, task_id: str, error: str = "") -> None:
+        if task_id not in self._tasks:
+            raise ValueError(f"Unknown task: {task_id}")
         task = self._tasks[task_id]
         task.retry_count += 1
         if task.retry_count >= 3:
@@ -162,13 +181,41 @@ class TaskDAG:
         for tid in self._tasks:
             _dfs(tid)
 
+    def validate(self) -> list[str]:
+        """Full DAG validation: cycles + dangling dependencies.
+
+        Returns a list of warning messages (empty if clean).
+        Raises ValueError on cycle detection.
+        """
+        # Check cycles first (raises on failure)
+        self.validate_acyclic()
+
+        # Check for dangling dependency references
+        warnings: list[str] = []
+        known_ids = set(self._tasks.keys())
+        for task in self._tasks.values():
+            for dep_id in task.depends_on:
+                if dep_id not in known_ids:
+                    msg = (
+                        f"Task '{task.id}' depends on '{dep_id}' "
+                        f"which does not exist in the DAG"
+                    )
+                    warnings.append(msg)
+                    logger.warning(msg)
+        return warnings
+
     @classmethod
     def from_dict(cls, tasks_data: list[dict]) -> TaskDAG:
         """Build DAG from a list of task dictionaries (e.g. from Architect output)."""
         dag = cls()
+        skipped = 0
         for item in tasks_data:
             if "id" not in item or "description" not in item:
-                logger.warning(f"Skipping malformed task entry (missing id/description): {item}")
+                logger.error(
+                    f"Skipping malformed task entry (missing required "
+                    f"'id' or 'description' field): {item}"
+                )
+                skipped += 1
                 continue
             try:
                 task = Task(
@@ -186,10 +233,14 @@ class TaskDAG:
                 )
                 dag.add_task(task)
             except (ValueError, KeyError) as e:
-                logger.warning(f"Skipping invalid task {item.get('id', '?')}: {e}")
+                logger.error(f"Skipping invalid task {item.get('id', '?')}: {e}")
+                skipped += 1
 
-        # Validate no cycles
-        dag.validate_acyclic()
+        if skipped:
+            logger.error(f"Total tasks skipped due to errors: {skipped}/{len(tasks_data)}")
+
+        # Full validation: cycles + dangling dependencies
+        dag.validate()
         return dag
 
     def save(self, path: Path) -> None:

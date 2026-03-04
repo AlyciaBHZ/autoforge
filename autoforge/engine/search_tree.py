@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -384,7 +386,6 @@ async def generate_candidates(
                 text += block.text
 
         # Parse JSON from response
-        import re
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
         if match:
             candidates = json.loads(match.group(1).strip())
@@ -451,7 +452,6 @@ async def evaluate_candidate(
                 text += block.text
 
         # Parse evaluation
-        import re
         match = re.search(r"\{.*?\}", text, re.DOTALL)
         if match:
             data = json.loads(match.group())
@@ -482,8 +482,6 @@ async def evaluate_candidate(
 # The basic SearchTree is still useful for architecture exploration
 # (where execution feedback isn't available).
 
-
-import math
 
 
 @dataclass
@@ -633,6 +631,8 @@ class MCTSSearchTree:
         Traverses from root to leaf, at each level choosing the child
         with the highest UCB1 score.
         """
+        if self.root_id is None or self.root_id not in self.nodes:
+            raise ValueError("Search tree not initialized. Call create_root() first.")
         node_id = self.root_id
         node = self.nodes[node_id]
 
@@ -847,8 +847,7 @@ class MCTSSearchTree:
                 if block.type == "text":
                     text += block.text
 
-            import re
-            match = re.search(r"\{.*\}", text, re.DOTALL)
+            match = re.search(r"\{.*?\}", text, re.DOTALL)
             if not match:
                 return None
 

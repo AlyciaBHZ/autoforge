@@ -66,6 +66,31 @@ class AgentBase(ABC):
     COMPLEXITY: TaskComplexity = TaskComplexity.STANDARD
     MAX_TURNS: int = 25
 
+    @staticmethod
+    def validate_path(path_str: str, base_dir: Path) -> Path:
+        """Validate and resolve a path, preventing path traversal.
+
+        Uses Path.is_relative_to() which correctly handles:
+        - Case-insensitive comparisons on Windows
+        - Prefix collisions (e.g. /proj vs /project)
+        - Symlink resolution
+
+        Args:
+            path_str: The relative path string to validate.
+            base_dir: The base directory the path must stay within.
+
+        Returns:
+            The resolved absolute Path.
+
+        Raises:
+            ValueError: If the resolved path escapes base_dir.
+        """
+        resolved = (base_dir / path_str).resolve()
+        base_resolved = base_dir.resolve()
+        if not resolved.is_relative_to(base_resolved):
+            raise ValueError(f"Path traversal detected: {path_str}")
+        return resolved
+
     # Tools that modify state — blocked in research mode
     WRITE_TOOLS: set[str] = {"write_file", "run_command", "delete_file"}
 
@@ -181,7 +206,7 @@ class AgentBase(ABC):
         files_written_list: list[str] = []
         # --- Anti-spin tracking (Section B) ---
         last_write_turn = 0  # last turn that called write_file
-        is_write_agent = bool(self.WRITE_TOOLS)  # spin detection only for write-capable agents
+        is_write_agent = bool(self.WRITE_TOOLS & {t.name for t in self._tools})  # spin detection only for write-capable agents
 
         # --- Checkpoint setup (Section E) ---
         checkpoint_enabled = is_write_agent and self.MAX_TURNS >= 15
@@ -301,13 +326,21 @@ class AgentBase(ABC):
                                 f"Feedback: {verdict.feedback}\n"
                                 f"Action: Adjust your approach based on this feedback."
                             )
-                            tool_results[-1]["content"] += correction
+                            if tool_results:
+                                tool_results[-1]["content"] += correction
                             self._log_action("checkpoint_adjust", verdict.feedback[:100])
                         elif verdict.should_reset:
                             # Rollback to last good checkpoint
                             good_cp = self._checkpoint_mgr.get_last_good_checkpoint()
                             if good_cp:
                                 messages = good_cp.messages_snapshot
+                                # Reset stale tracking state to avoid
+                                # spin-detection false positives and
+                                # accumulated metric drift after rollback.
+                                files_written = 0
+                                last_write_turn = 0
+                                tool_counts = {}
+                                idle_turns = 0
                                 reset_msg = (
                                     f"\n\n[CHECKPOINT RESET — Turn {turns}]\n"
                                     f"Your previous approach scored {verdict.score:.1f}/1.0.\n"

@@ -452,9 +452,11 @@ class ProcessRewardModel:
                 except Exception as e:
                     step.execution_output += f"Test execution error: {e}"
 
-        # If all syntax checks passed and no test failures, mark as success
+        # If all syntax checks passed but no execution was actually performed
+        # (no test output), mark as unknown rather than success to avoid
+        # conflating "syntax valid" with "execution succeeded".
         if step.syntax_valid and not step.execution_output:
-            step.execution_success = True
+            step.execution_success = None
 
     # ──────── Internal: LLM Evaluation ────────
 

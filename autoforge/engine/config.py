@@ -62,9 +62,25 @@ def _safe_int(key: str, default: int) -> int:
         return default
     try:
         return int(raw)
-    except ValueError:
+    except (ValueError, TypeError):
         logging.getLogger(__name__).warning(
             f"Invalid value for {key}={raw!r}, using default {default}"
+        )
+        return default
+
+
+def _to_int(value: Any, default: int) -> int:
+    """Safely convert a value to int with a fallback default.
+
+    Handles strings from TOML config, None, and other non-int types.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        logging.getLogger(__name__).warning(
+            f"Cannot convert {value!r} to int, using default {default}"
         )
         return default
 
@@ -227,6 +243,14 @@ class ForgeConfig:
     tlaplus_enabled: bool = False              # TLA+ model checker (distributed systems)
     z3_smt_enabled: bool = False               # Z3 SMT solver (program verification)
     dafny_enabled: bool = False                # Dafny (verified programming)
+    # Known model name patterns for validation (prefix-based)
+    _KNOWN_MODEL_PATTERNS: tuple[str, ...] = (
+        "claude-",
+        "gpt-",
+        "o3",
+        "o4",
+        "gemini-",
+    )
 
     def __post_init__(self) -> None:
         if self.workspace_dir is None:
@@ -237,6 +261,21 @@ class ForgeConfig:
             self.db_path = self.project_root / "autoforge.db"
         if not self.run_id:
             self.run_id = uuid.uuid4().hex[:12]
+
+        # Warn (but don't block) if model names don't match known patterns
+        logger = logging.getLogger(__name__)
+        for label, model_name in (
+            ("model_strong", self.model_strong),
+            ("model_fast", self.model_fast),
+        ):
+            if not any(model_name.startswith(p) for p in self._KNOWN_MODEL_PATTERNS):
+                logger.warning(
+                    "%s=%r does not match any known model pattern (%s). "
+                    "Proceeding anyway — verify this is correct.",
+                    label,
+                    model_name,
+                    ", ".join(self._KNOWN_MODEL_PATTERNS),
+                )
 
     @property
     def has_api_key(self) -> bool:
@@ -307,6 +346,24 @@ class ForgeConfig:
             if "auth_method" not in auth_config["google"]:
                 auth_config["google"]["auth_method"] = "adc"
 
+        # AWS Bedrock env overrides
+        if os.getenv("CLAUDE_CODE_USE_BEDROCK", "").lower() in ("1", "true", "yes"):
+            auth_config.setdefault("anthropic", {})
+            if "auth_method" not in auth_config["anthropic"]:
+                auth_config["anthropic"]["auth_method"] = "bedrock"
+            if os.getenv("AWS_REGION"):
+                auth_config["anthropic"]["aws_region"] = os.getenv("AWS_REGION", "")
+
+        # Google Vertex AI env overrides
+        if os.getenv("CLAUDE_CODE_USE_VERTEX", "").lower() in ("1", "true", "yes"):
+            auth_config.setdefault("anthropic", {})
+            if "auth_method" not in auth_config["anthropic"]:
+                auth_config["anthropic"]["auth_method"] = "vertex_ai"
+            if os.getenv("ANTHROPIC_VERTEX_PROJECT_ID"):
+                auth_config["anthropic"]["project_id"] = os.getenv("ANTHROPIC_VERTEX_PROJECT_ID", "")
+            if os.getenv("CLOUD_ML_REGION"):
+                auth_config["anthropic"]["region"] = os.getenv("CLOUD_ML_REGION", "")
+
         # Parse allowed Telegram users (comma-separated)
         allowed_raw = os.getenv("FORGE_TELEGRAM_ALLOWED_USERS", "")
         allowed_users = [u.strip() for u in allowed_raw.split(",") if u.strip()]
@@ -331,7 +388,7 @@ class ForgeConfig:
 
         max_agents = _safe_int(
             "FORGE_MAX_AGENTS",
-            int(global_config.get("max_agents", 3)),
+            _to_int(global_config.get("max_agents", 3), 3),
         )
         if max_agents < 1:
             max_agents = 1
@@ -373,15 +430,15 @@ class ForgeConfig:
             search_backend=os.getenv("FORGE_SEARCH_BACKEND", global_config.get("search_backend", "duckduckgo")),
             search_api_key=os.getenv("FORGE_SEARCH_API_KEY", global_config.get("search_api_key", "")),
             # Build TDD
-            build_test_loops=_safe_int("FORGE_BUILD_TEST_LOOPS", int(global_config.get("build_test_loops", 0))),
+            build_test_loops=_safe_int("FORGE_BUILD_TEST_LOOPS", _to_int(global_config.get("build_test_loops", 0), 0)),
             # GitHub
             github_token=os.getenv("GITHUB_TOKEN", global_config.get("github_token", "")),
             # Search tree
             search_tree_enabled=os.getenv("FORGE_SEARCH_TREE", "true").lower() not in ("false", "0", "no"),
-            search_tree_max_candidates=_safe_int("FORGE_SEARCH_CANDIDATES", int(global_config.get("search_tree_max_candidates", 3))),
+            search_tree_max_candidates=_safe_int("FORGE_SEARCH_CANDIDATES", _to_int(global_config.get("search_tree_max_candidates", 3), 3)),
             # Checkpoints
             checkpoints_enabled=os.getenv("FORGE_CHECKPOINTS", "true").lower() not in ("false", "0", "no"),
-            checkpoint_interval=_safe_int("FORGE_CHECKPOINT_INTERVAL", int(global_config.get("checkpoint_interval", 8))),
+            checkpoint_interval=_safe_int("FORGE_CHECKPOINT_INTERVAL", _to_int(global_config.get("checkpoint_interval", 8), 8)),
         )
 
         # Layer 1: CLI overrides (highest priority)

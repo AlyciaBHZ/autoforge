@@ -108,7 +108,7 @@ class VerificationReport:
 # ──────────────────────────────────────────────
 
 
-async def _tool_available(cmd: str) -> bool:
+def _tool_available(cmd: str) -> bool:
     """Check if a command-line tool is available (cross-platform)."""
     # shutil.which is cross-platform (works on Windows, macOS, Linux)
     return shutil.which(cmd) is not None
@@ -432,15 +432,12 @@ class FormalVerifier:
 
     async def detect_tools(self) -> dict[str, bool]:
         """Detect which verification tools are available."""
-        checks = {
+        results = {
             "flake8": _tool_available("flake8"),
             "mypy": _tool_available("mypy"),
             "bandit": _tool_available("bandit"),
             "eslint": _tool_available("npx"),
         }
-        results = {}
-        for name, coro in checks.items():
-            results[name] = await coro
 
         self._available_tools = results
         logger.info(f"[FormalVerify] Available tools: {results}")
@@ -509,16 +506,19 @@ class FormalVerifier:
                 project_dir, critical_files, llm,
             )))
 
-        # Execute all tasks
-        for tool_name, coro in tasks:
-            try:
-                issues = await coro
-                if issues:
+        # Execute all tasks in parallel
+        if tasks:
+            tool_names = [name for name, _ in tasks]
+            coroutines = [coro for _, coro in tasks]
+            results = await asyncio.gather(*coroutines, return_exceptions=True)
+
+            for tool_name, result in zip(tool_names, results):
+                if isinstance(result, Exception):
+                    logger.warning(f"[FormalVerify] {tool_name} failed: {result}")
+                elif result:
                     report.tools_used.append(tool_name)
-                    for issue in issues:
+                    for issue in result:
                         report.add_issue(issue)
-            except Exception as e:
-                logger.warning(f"[FormalVerify] {tool_name} failed: {e}")
 
         logger.info(f"[FormalVerify] {report.summary()}")
         return report
