@@ -23,6 +23,7 @@ References:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -326,8 +327,12 @@ async def _llm_security_scan(
                 text += block.text
 
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-        if match:
-            items = json.loads(match.group(1).strip())
+        raw_json = match.group(1).strip() if match else text.strip()
+        # Fallback: try extracting JSON array directly
+        if not match and "[" in text:
+            raw_json = text[text.index("["):text.rindex("]") + 1]
+        if raw_json:
+            items = json.loads(raw_json)
             findings = []
             for item in items:
                 if isinstance(item, dict):
@@ -356,7 +361,6 @@ async def _llm_security_scan(
 
 async def _check_python_deps(project_dir: Path) -> list[SecurityFinding]:
     """Check Python dependencies for known vulnerabilities using pip-audit."""
-    import asyncio
     findings = []
 
     req_files = list(project_dir.glob("requirements*.txt"))
@@ -393,7 +397,6 @@ async def _check_python_deps(project_dir: Path) -> list[SecurityFinding]:
 
 async def _check_npm_deps(project_dir: Path) -> list[SecurityFinding]:
     """Check npm dependencies for known vulnerabilities."""
-    import asyncio
     findings = []
 
     if not (project_dir / "package.json").exists():

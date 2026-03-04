@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -108,17 +109,9 @@ class VerificationReport:
 
 
 async def _tool_available(cmd: str) -> bool:
-    """Check if a command-line tool is available."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "which", cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-        return proc.returncode == 0
-    except Exception:
-        return False
+    """Check if a command-line tool is available (cross-platform)."""
+    # shutil.which is cross-platform (works on Windows, macOS, Linux)
+    return shutil.which(cmd) is not None
 
 
 # ──────────────────────────────────────────────

@@ -49,6 +49,8 @@ from autoforge.engine.adaptive_compute import AdaptiveComputeRouter
 from autoforge.engine.ldb_debugger import LDBDebugger
 from autoforge.engine.speculative_pipeline import SpeculativePipeline
 from autoforge.engine.hierarchical_decomp import HierarchicalDecomposer
+from autoforge.engine.lean_prover import LeanProver
+from autoforge.engine.capability_dag import CapabilityDAG, DAGBridge, Domain
 from autoforge.engine.task_dag import Task, TaskDAG, TaskPhase, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -88,11 +90,20 @@ class Orchestrator:
         self._ldb = LDBDebugger()
         self._speculative = SpeculativePipeline()
         self._decomposer = HierarchicalDecomposer()
+        self._lean_prover: LeanProver | None = None
+        self._capability_dag = CapabilityDAG()
+        self._dag_bridge = DAGBridge(self._capability_dag)
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
         self._start_time = time.monotonic()
         logger.info(f"AutoForge run {self.config.run_id} starting")
+
+        # Load capability DAG from global storage
+        global_dag_dir = self.config.project_root / ".autoforge" / "capability_dag"
+        self._capability_dag.load(global_dag_dir)
+        if self._capability_dag.size > 0:
+            console.print(f"  [cyan]CapabilityDAG:[/cyan] loaded {self._capability_dag.size} capabilities")
 
         try:
             # Phase 1: SPEC
@@ -193,6 +204,10 @@ class Orchestrator:
             if self.config.security_scan_enabled:
                 await self._run_security_scan()
 
+            # Lean formal proving: prove Lean files if present
+            if self.config.lean_prover_enabled:
+                await self._run_lean_proving()
+
             self._save_state("verify_complete")
 
             # Checkpoint: review test results
@@ -235,9 +250,21 @@ class Orchestrator:
             if self.config.reflexion_enabled and self.project_dir:
                 self._reflexion.save_state(self.project_dir / ".autoforge")
 
+            # Lean prover: save proof state (foundation, conjectures)
+            if self.config.lean_prover_enabled and self._lean_prover and self.project_dir:
+                self._lean_prover.save_state(self.project_dir / ".autoforge" / "lean")
+                console.print(f"  [cyan]Lean:[/cyan] proof state saved")
+
             # Adaptive compute: save calibration data
             if self.config.adaptive_compute_enabled and self.project_dir:
                 self._adaptive_compute.save_state(self.project_dir / ".autoforge")
+
+            # CapabilityDAG: ingest knowledge from this run + save
+            await self._ingest_run_to_dag(project_name)
+            self._capability_dag.save(global_dag_dir)
+            console.print(
+                f"  [cyan]CapabilityDAG:[/cyan] {self._capability_dag.size} total capabilities"
+            )
 
             self._print_summary()
             return self.project_dir
@@ -560,6 +587,13 @@ class Orchestrator:
                     builder.set_dynamic_constitution(
                         (getattr(builder, "_dynamic_supplement", "") or "") + rag_context
                     )
+
+            # CapabilityDAG: inject relevant capabilities from universal knowledge graph
+            dag_context = self._dag_bridge.build_context(task.description, max_tokens=2000)
+            if dag_context:
+                builder.set_dynamic_constitution(
+                    (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + dag_context
+                )
 
             # Hierarchical decomposition: for complex tasks, provide structured plan
             if self.config.hierarchical_decomp_enabled:
@@ -1604,7 +1638,7 @@ class Orchestrator:
                         {"role": "architect_A", "position": json.dumps(scored[0][1], ensure_ascii=False)[:500]},
                         {"role": "architect_B", "position": json.dumps(scored[1][1], ensure_ascii=False)[:500]},
                     ]
-                    should = await self._debate.should_debate(debate_topic, positions, self.llm)
+                    should, uncertainty = await self._debate.should_debate(debate_topic, positions, self.llm)
                     if should:
                         outcome = await self._debate.run_debate(
                             debate_topic,
@@ -1851,6 +1885,129 @@ class Orchestrator:
             logger.warning(f"Security scan failed: {e}")
 
     # ──────────────────────────────────────────────
+    # CapabilityDAG — Knowledge Ingestion
+    # ──────────────────────────────────────────────
+
+    async def _ingest_run_to_dag(self, project_name: str) -> None:
+        """Ingest knowledge from this run into the CapabilityDAG.
+
+        Captures:
+          - Architecture decisions + outcomes
+          - Debugging patterns (errors encountered + fixes applied)
+          - Code patterns (from generated files)
+          - Workflow strategy (from evolution genome)
+        """
+        if not self.project_dir:
+            return
+
+        try:
+            # 1. Architecture decision
+            if self.architecture:
+                self._dag_bridge.ingest_architecture_decision(
+                    decision=json.dumps(self.architecture, ensure_ascii=False)[:2000],
+                    context=self.spec.get("description", ""),
+                    outcome_success=True,
+                    source_project=project_name,
+                )
+
+            # 2. Workflow genome (if evolution produced one)
+            if self._genome:
+                self._dag_bridge.ingest_workflow(
+                    strategy_description=json.dumps(
+                        self._genome.to_dict(), ensure_ascii=False
+                    )[:2000],
+                    tech_fingerprint=getattr(self._genome, "tech_fingerprint", ""),
+                    source_project=project_name,
+                )
+
+            # 3. Debugging knowledge from reflexion memories
+            if self.config.reflexion_enabled:
+                for ref in self._reflexion._memory[:10]:
+                    self._dag_bridge.ingest_debug_pattern(
+                        error_pattern=ref.failure_description,
+                        fix_strategy=ref.reflection,
+                        success=ref.led_to_success,
+                        source_project=project_name,
+                    )
+
+            logger.info(f"[CapDAG] Ingested knowledge from project {project_name}")
+
+        except Exception as e:
+            logger.debug(f"[CapDAG] Ingestion failed: {e}")
+
+    # ──────────────────────────────────────────────
+    # Lean 4 Formal Theorem Proving
+    # ──────────────────────────────────────────────
+
+    async def _run_lean_proving(self) -> None:
+        """Run Lean 4 formal proving on any .lean files in the project.
+
+        Integrates the full LeanProver pipeline:
+          - Detects .lean files in the generated project
+          - For each file containing 'sorry', attempts proof completion
+          - Reports verification results
+        """
+        if not self.project_dir:
+            return
+
+        try:
+            # Lazy init
+            if self._lean_prover is None:
+                self._lean_prover = LeanProver(workspace=self.project_dir)
+                # Load prior state if available
+                lean_state = self.project_dir / ".autoforge" / "lean"
+                if lean_state.exists():
+                    self._lean_prover.load_state(lean_state)
+
+            lean_files = list(self.project_dir.rglob("*.lean"))
+            if not lean_files:
+                return
+
+            lean_available = await self._lean_prover.check_lean_available()
+            console.print(
+                f"  [cyan]Lean prover:[/cyan] found {len(lean_files)} .lean file(s)"
+                f"{' (Lean 4 installed)' if lean_available else ' (LLM-simulated)'}"
+            )
+
+            proved = 0
+            sorry_total = 0
+
+            for lean_file in lean_files:
+                content = lean_file.read_text(encoding="utf-8")
+                sorry_count = content.count("sorry")
+
+                if sorry_count > 0:
+                    console.print(
+                        f"    {lean_file.name}: {sorry_count} sorry — "
+                        f"attempting proof completion..."
+                    )
+                    # Attempt to prove sorry theorems
+                    sorry_total += sorry_count
+                    # Extract theorem statements with sorry
+                    import re
+                    sorry_blocks = re.findall(
+                        r'((?:theorem|lemma)\s+\w+[^:]*:.*?(?:sorry))',
+                        content, re.DOTALL,
+                    )
+                    for block in sorry_blocks[:5]:  # Limit attempts per file
+                        stmt = block.replace("sorry", "").strip()
+                        attempt = await self._lean_prover.prove_theorem(
+                            stmt, self.llm,
+                        )
+                        if attempt.status.value == "proved":
+                            proved += 1
+
+            if sorry_total > 0:
+                console.print(
+                    f"  [cyan]Lean prover:[/cyan] proved {proved}/{sorry_total} sorry blocks"
+                )
+            else:
+                console.print(f"  [green]Lean:[/green] all files clean (no sorry)")
+
+        except Exception as e:
+            logger.warning(f"Lean proving failed: {e}")
+
+    # ──────────────────────────────────────────────
     # EvoMAC Text Backpropagation
     # ──────────────────────────────────────────────
 
@@ -1895,7 +2052,7 @@ class Orchestrator:
                             if updated != current:
                                 from autoforge.engine.dynamic_constitution import ConstitutionPatch
                                 self._dynamic_constitution.add_patch(ConstitutionPatch(
-                                    id=f"evomac-{role}-{self._evomac._iteration}",
+                                    id=f"evomac-{role}-{self._evomac.iteration}",
                                     target_role=role,
                                     content=updated,
                                     source="evomac",

@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -240,13 +239,13 @@ class AdaptiveComputeRouter:
                 score += 0.15
                 signals.append(f"tech_stack_size:{len(tech)}(+0.15)")
 
-        # 3. File count
-        if file_count > 20:
-            score += 0.15
-            signals.append(f"files:{file_count}(+0.15)")
-        elif file_count > 50:
+        # 3. File count (check larger threshold first)
+        if file_count > 50:
             score += 0.3
             signals.append(f"files:{file_count}(+0.3)")
+        elif file_count > 20:
+            score += 0.15
+            signals.append(f"files:{file_count}(+0.15)")
 
         # 4. Description length (longer descriptions often mean more complex tasks)
         desc_len = len(task_description)

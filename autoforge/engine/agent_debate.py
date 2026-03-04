@@ -30,11 +30,33 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_json(text: str) -> dict[str, Any] | None:
+    """Robustly extract JSON object from LLM response text.
+
+    Handles markdown fences, nested braces, and surrounding text.
+    """
+    if "{" not in text:
+        return None
+    try:
+        json_str = text[text.index("{"):text.rindex("}") + 1]
+        return json.loads(json_str)
+    except (json.JSONDecodeError, ValueError):
+        # Fallback: try non-greedy regex for simple objects
+        match = re.search(r"\{[^{}]*\}", text)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+    return None
 
 
 # ──────────────────────────────────────────────
@@ -179,10 +201,8 @@ class ConditionalDebateEngine:
                 if block.type == "text":
                     text += block.text
 
-            import re
-            match = re.search(r"\{.*?\}", text, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
+            data = _extract_json(text)
+            if data:
                 uncertainty = float(data.get("uncertainty", 0.5))
                 should_trigger = (
                     uncertainty >= self.UNCERTAINTY_THRESHOLD
@@ -358,10 +378,8 @@ class ConditionalDebateEngine:
                     if block.type == "text":
                         text += block.text
 
-                import re
-                match = re.search(r"\{.*?\}", text, re.DOTALL)
-                if match:
-                    data = json.loads(match.group())
+                data = _extract_json(text)
+                if data:
                     new_arg = DebateArgument(
                         agent_role=arg.agent_role,
                         position=data.get("position", arg.position),
@@ -408,10 +426,8 @@ class ConditionalDebateEngine:
                 if block.type == "text":
                     text += block.text
 
-            import re
-            match = re.search(r"\{.*?\}", text, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
+            data = _extract_json(text)
+            if data:
                 return float(data.get("score", 0.5))
 
         except Exception:
@@ -486,10 +502,8 @@ class ConditionalDebateEngine:
                 if block.type == "text":
                     text += block.text
 
-            import re
-            match = re.search(r"\{.*?\}", text, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
+            data = _extract_json(text)
+            if data:
                 return DebateOutcome(
                     topic=topic,
                     winner_position=data.get("winner_position", top_args[0].position if top_args else ""),

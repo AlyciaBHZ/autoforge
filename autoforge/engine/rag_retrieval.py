@@ -365,10 +365,10 @@ class CodeExtractor:
         """Extract Python functions and classes using regex (no AST for resilience)."""
         snippets = []
 
-        # Extract functions
+        # Extract functions — match def line + all following indented/blank lines
         func_pattern = re.compile(
-            r'^((?:async\s+)?def\s+(\w+)\s*\([^)]*\).*?(?:\n(?=\S)|\Z))',
-            re.MULTILINE | re.DOTALL,
+            r'^((?:async\s+)?def\s+(\w+)\s*\([^)]*\)[^\n]*\n(?:(?:[ \t]+[^\n]*|[ \t]*)\n)*)',
+            re.MULTILINE,
         )
         for match in func_pattern.finditer(content):
             func_body = match.group(1).strip()
@@ -401,10 +401,10 @@ class CodeExtractor:
                 token_count=len(func_body.split()),
             ))
 
-        # Extract classes
+        # Extract classes — match class line + all following indented/blank lines
         class_pattern = re.compile(
-            r'^(class\s+(\w+)\s*(?:\([^)]*\))?:.*?(?:\n(?=\S)|\Z))',
-            re.MULTILINE | re.DOTALL,
+            r'^(class\s+(\w+)\s*(?:\([^)]*\))?:[^\n]*\n(?:(?:[ \t]+[^\n]*|[ \t]*)\n)*)',
+            re.MULTILINE,
         )
         for match in class_pattern.finditer(content):
             class_body = match.group(1).strip()
