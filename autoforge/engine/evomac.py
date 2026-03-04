@@ -95,7 +95,7 @@ class TeamPerformance:
     test_pass_rate: float = 0.0
     review_score: float = 0.0
     build_success_rate: float = 0.0
-    gradients_generated: int = 0
+    gradients_pending: int = 0
     gradients_applied: int = 0
     timestamp: float = field(default_factory=time.time)
 
@@ -435,7 +435,7 @@ class EvoMACEngine:
             test_pass_rate=test_pass_rate,
             review_score=review_score,
             build_success_rate=build_success_rate,
-            gradients_generated=sum(len(g) for g in self._pending_gradients.values()),
+            gradients_pending=sum(len(g) for g in self._pending_gradients.values()),
         )
         self._performance_history.append(perf)
         return perf

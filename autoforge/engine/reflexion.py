@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from autoforge.engine.llm_router import TaskComplexity
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
@@ -221,10 +223,10 @@ class ReflexionEngine:
         )
 
         try:
-            response = await llm.query(
+            response = await llm.call(
                 system="You are a reflective coding agent. Be concise and specific.",
                 messages=[{"role": "user", "content": prompt}],
-                complexity="standard",
+                complexity=TaskComplexity.STANDARD,
             )
 
             reflection_text = ""
@@ -298,6 +300,10 @@ class ReflexionEngine:
         for r in chain:
             if r.outcome == "pending":
                 r.outcome = "persistent"
+
+    def get_recent_memories(self, n: int) -> list[Reflection]:
+        """Return the *n* most recent reflections from episodic memory."""
+        return self._memory.reflections[-n:] if n > 0 else []
 
     # ── Persistence ──────────────────────────────
 

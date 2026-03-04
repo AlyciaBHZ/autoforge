@@ -65,7 +65,7 @@ async def handle_grep_search(
 
     # Resolve and validate search path
     search_dir = (working_dir / rel_path).resolve()
-    if not str(search_dir).startswith(str(working_dir.resolve())):
+    if not search_dir.is_relative_to(working_dir.resolve()):
         return json.dumps({"error": "Path traversal not allowed"})
     if not search_dir.is_dir():
         return json.dumps({"error": f"Not a directory: {rel_path}"})

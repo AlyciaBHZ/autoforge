@@ -113,14 +113,24 @@ class DirectorAgent(AgentBase):
         # Try to find a JSON code block
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
         if match:
-            return json.loads(match.group(1).strip())
+            try:
+                return json.loads(match.group(1).strip())
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Found JSON code block in Director output but it contains invalid JSON: {e}"
+                ) from e
 
         # Fallback: try parsing the entire output as JSON
         # Find the first { and last }
         start = output.find("{")
         end = output.rfind("}")
         if start != -1 and end != -1:
-            return json.loads(output[start : end + 1])
+            try:
+                return json.loads(output[start : end + 1])
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Found JSON-like content in Director output but it is invalid: {e}"
+                ) from e
 
         raise ValueError("Could not extract JSON spec from Director output")
 
@@ -164,9 +174,19 @@ class DirectorFixAgent(AgentBase):
         """Extract fix task from output."""
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
         if match:
-            return json.loads(match.group(1).strip())
+            try:
+                return json.loads(match.group(1).strip())
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Found JSON code block in fix task output but it contains invalid JSON: {e}"
+                ) from e
         start = output.find("{")
         end = output.rfind("}")
         if start != -1 and end != -1:
-            return json.loads(output[start : end + 1])
+            try:
+                return json.loads(output[start : end + 1])
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Found JSON-like content in fix task output but it is invalid: {e}"
+                ) from e
         raise ValueError("Could not extract fix task from Director output")

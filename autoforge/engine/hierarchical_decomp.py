@@ -24,11 +24,14 @@ by the AdaptiveComputeRouter.
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+from autoforge.engine.llm_router import TaskComplexity
 
 logger = logging.getLogger(__name__)
 
@@ -149,10 +152,10 @@ Reply with JSON:
 }}"""
 
         try:
-            response = await llm.query(
+            response = await llm.call(
                 system="You are a precise software architect. Decompose tasks into testable functions.",
                 messages=[{"role": "user", "content": prompt}],
-                complexity="complex",
+                complexity=TaskComplexity.HIGH,
             )
 
             text = ""
@@ -261,10 +264,10 @@ Reply with ONLY the function implementation (def statement + body).
 No explanations, no markdown, no tests — just the function code."""
 
             try:
-                response = await llm.query(
+                response = await llm.call(
                     system="You are an expert Python developer. Write clean, correct code.",
                     messages=[{"role": "user", "content": prompt}],
-                    complexity="standard",
+                    complexity=TaskComplexity.STANDARD,
                 )
 
                 code = ""
@@ -352,20 +355,21 @@ No explanations, no markdown, no tests — just the function code."""
                     in_degree[f.name] += 1
                     dependents[dep].append(f.name)
 
-        # Start with leaf nodes (no dependencies)
-        queue = [name for name, deg in in_degree.items() if deg == 0]
+        # Start with leaf nodes (no dependencies), using a min-heap for
+        # efficient sorted extraction (O(n log n) instead of O(n^2))
+        heap = [name for name, deg in in_degree.items() if deg == 0]
+        heapq.heapify(heap)
         order: list[str] = []
 
-        while queue:
-            # Sort alphabetically for determinism
-            queue.sort()
-            current = queue.pop(0)
+        while heap:
+            # Pop alphabetically smallest for determinism
+            current = heapq.heappop(heap)
             order.append(current)
 
             for dependent in dependents.get(current, []):
                 in_degree[dependent] -= 1
                 if in_degree[dependent] == 0:
-                    queue.append(dependent)
+                    heapq.heappush(heap, dependent)
 
         # Handle cycles: add remaining nodes
         remaining = [f.name for f in functions if f.name not in order]

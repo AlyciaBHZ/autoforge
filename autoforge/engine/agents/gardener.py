@@ -115,15 +115,20 @@ class GardenerAgent(AgentBase):
                 handler=handle_fetch_url,
             ))
 
+    # 2 MB per file limit to prevent runaway writes (matches builder)
+    MAX_FILE_SIZE = 2 * 1024 * 1024
+
     def _validate_path(self, rel_path: str) -> Path:
-        full_path = (self.working_dir / rel_path).resolve()
-        if not str(full_path).startswith(str(self.working_dir.resolve())):
-            raise ValueError(f"Path traversal detected: {rel_path}")
-        return full_path
+        """Validate and resolve a relative path, preventing path traversal."""
+        return self.validate_path(rel_path, self.working_dir)
 
     async def _handle_write_file(self, input_data: dict[str, Any]) -> str:
         rel_path = input_data["path"]
         content = input_data["content"]
+        if len(content) > self.MAX_FILE_SIZE:
+            return json.dumps({
+                "error": f"File too large ({len(content)} bytes). Max is {self.MAX_FILE_SIZE} bytes.",
+            })
         full_path = self._validate_path(rel_path)
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(content, encoding="utf-8")
@@ -142,9 +147,13 @@ class GardenerAgent(AgentBase):
         full_path = self._validate_path(rel_path)
         if not full_path.is_dir():
             return json.dumps({"error": f"Not a directory: {rel_path}"})
+        base_resolved = self.working_dir.resolve()
         files = []
         for p in sorted(full_path.rglob("*")):
             if p.is_file() and ".git" not in p.parts:
+                # Prevent symlinks from escaping the workspace
+                if not p.resolve().is_relative_to(base_resolved):
+                    continue
                 try:
                     files.append(str(p.relative_to(self.working_dir)))
                 except ValueError:
