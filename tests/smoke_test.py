@@ -366,6 +366,46 @@ def test_git_manager_instantiation():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_git_available_detection():
+    from autoforge.engine.git_manager import is_git_available, _git_available
+    import autoforge.engine.git_manager as gm_mod
+    # Reset cache so we test fresh
+    old = gm_mod._git_available
+    gm_mod._git_available = None
+    try:
+        result = is_git_available()
+        assert isinstance(result, bool)
+        # On most CI/dev systems git is installed; just verify it returns bool
+        # Also verify caching works
+        assert gm_mod._git_available is result
+        assert is_git_available() is result  # cached
+    finally:
+        gm_mod._git_available = old
+
+
+def test_git_version_async():
+    from autoforge.engine.git_manager import get_git_version, is_git_available
+    version = asyncio.run(get_git_version())
+    if is_git_available():
+        assert version is not None
+        assert "git version" in version.lower()
+    else:
+        assert version is None
+
+
+def test_config_has_api_key():
+    from autoforge.engine.config import ForgeConfig
+    # No keys → has_api_key is False
+    config = ForgeConfig(api_keys={})
+    assert config.has_api_key is False
+    # With a key → has_api_key is True
+    config2 = ForgeConfig(api_keys={"openai": "sk-test123"})
+    assert config2.has_api_key is True
+    # Empty string key → has_api_key is False
+    config3 = ForgeConfig(api_keys={"anthropic": ""})
+    assert config3.has_api_key is False
+
+
 def test_all_agents_instantiate():
     from autoforge.engine.config import ForgeConfig
     from autoforge.engine.llm_router import LLMRouter

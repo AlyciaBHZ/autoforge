@@ -137,6 +137,11 @@ class ForgeConfig:
             self.run_id = uuid.uuid4().hex[:12]
 
     @property
+    def has_api_key(self) -> bool:
+        """Check if at least one LLM API key is configured."""
+        return any(v for v in self.api_keys.values())
+
+    @property
     def anthropic_api_key(self) -> str:
         """Backward-compatible access to Anthropic API key."""
         return self.api_keys.get("anthropic", "")

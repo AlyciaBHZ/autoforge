@@ -58,12 +58,17 @@ def show_startup_info(
     mobile_target: str = "none",
 ) -> None:
     """Display startup configuration panel."""
+    from autoforge.engine.git_manager import is_git_available
+
+    git_status = "[green]detected[/green]" if is_git_available() else "[yellow]not found[/yellow] (install: git-scm.com)"
+
     lines = [
         f"[bold]Mode:[/bold]    {mode}",
         f"[bold]Action:[/bold]  {action}",
         f"[bold]Budget:[/bold]  ${budget:.2f}",
         f"[bold]Agents:[/bold]  {agents}",
         f"[bold]Models:[/bold]  {model_strong} / {model_fast}",
+        f"[bold]Git:[/bold]     {git_status}",
     ]
     if mobile_target != "none":
         lines.append(f"[bold]Mobile:[/bold]  {mobile_target}")

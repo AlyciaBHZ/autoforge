@@ -5,9 +5,48 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Module-level cache for git availability
+_git_available: bool | None = None
+
+
+def is_git_available() -> bool:
+    """Check if git is installed and accessible on the system.
+
+    Result is cached after first check for performance.
+    """
+    global _git_available
+    if _git_available is not None:
+        return _git_available
+
+    _git_available = shutil.which("git") is not None
+    if _git_available:
+        logger.debug("Git detected on system PATH")
+    else:
+        logger.info("Git not found on system PATH")
+    return _git_available
+
+
+async def get_git_version() -> str | None:
+    """Get the installed git version string, or None if git is not available."""
+    if not is_git_available():
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            return stdout.decode(errors="replace").strip()
+    except (OSError, FileNotFoundError):
+        pass
+    return None
 
 
 class GitError(Exception):

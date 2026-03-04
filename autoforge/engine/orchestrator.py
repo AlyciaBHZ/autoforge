@@ -29,7 +29,7 @@ from autoforge.engine.agents.reviewer import ReviewerAgent
 from autoforge.engine.agents.scanner import ScannerAgent
 from autoforge.engine.agents.tester import TesterAgent
 from autoforge.engine.config import ForgeConfig
-from autoforge.engine.git_manager import GitManager
+from autoforge.engine.git_manager import GitManager, is_git_available
 from autoforge.engine.llm_router import BudgetExceededError, LLMRouter
 from autoforge.engine.lock_manager import LockManager
 from autoforge.engine.sandbox import SandboxBase, create_sandbox
@@ -163,9 +163,16 @@ class Orchestrator:
             self.dag.to_markdown(), encoding="utf-8"
         )
 
-        # Step 2: Initialize git repo for the project
-        git = GitManager(self.project_dir)
-        await git.init_repo()
+        # Step 2: Initialize git repo (if git is available)
+        git: GitManager | None = None
+        if is_git_available():
+            git = GitManager(self.project_dir)
+            await git.init_repo()
+        else:
+            console.print(
+                "  [yellow]Git not found[/yellow] — building without branch isolation.\n"
+                "  Install Git for parallel worktree support: [link=https://git-scm.com]https://git-scm.com[/link]"
+            )
 
         # Step 3: Build tasks
         sandbox = create_sandbox(self.config, self.project_dir)
@@ -199,7 +206,7 @@ class Orchestrator:
 
     async def _execute_build_tasks(
         self,
-        git: GitManager,
+        git: GitManager | None,
         sandbox: SandboxBase,
         lock_manager: LockManager,
     ) -> None:
@@ -274,17 +281,26 @@ class Orchestrator:
         task: Task,
         agent_id: str,
         sandbox: SandboxBase,
-        git: GitManager,
+        git: GitManager | None,
         lock_manager: LockManager,
         existing_files: list[str],
     ) -> None:
-        """Build a single task with git worktree isolation and review."""
+        """Build a single task with optional git worktree isolation and review.
+
+        If git is available, each builder works in an isolated worktree.
+        If git is not available, builders work directly in the project dir.
+        """
         branch_name = f"task-{task.id.lower()}"
         worktree_path: Path | None = None
+        use_git = git is not None
         try:
-            # Create an isolated worktree for this builder
-            worktree_path = await git.create_worktree(branch_name)
-            working_dir = worktree_path
+            if use_git:
+                # Create an isolated worktree for this builder
+                worktree_path = await git.create_worktree(branch_name)
+                working_dir = worktree_path
+            else:
+                # No git — work directly in project dir
+                working_dir = self.project_dir
 
             builder = BuilderAgent(
                 self.config,
@@ -302,10 +318,11 @@ class Orchestrator:
             })
 
             if result.success:
-                # Commit work in the worktree
-                await git.commit_worktree(branch_name, task.description, task.id)
+                if use_git:
+                    # Commit work in the worktree
+                    await git.commit_worktree(branch_name, task.description, task.id)
 
-                # Quick review (reviewer reads from worktree)
+                # Quick review
                 reviewer = ReviewerAgent(self.config, self.llm, working_dir)
                 review_result = await reviewer.run({
                     "task": task.to_dict(),
@@ -314,8 +331,9 @@ class Orchestrator:
                 review = reviewer.parse_review(review_result.output)
 
                 if review.approved:
-                    # Merge worktree branch into main
-                    await git.merge_branch(branch_name)
+                    if use_git:
+                        # Merge worktree branch into main
+                        await git.merge_branch(branch_name)
                     self.dag.mark_done(task.id, f"score={review.score}")
                     console.print(f"  [green][{agent_id}] Done:[/green] {task.id} (score: {review.score})")
                 else:
@@ -330,8 +348,9 @@ class Orchestrator:
                         "existing_files": self._list_project_files(),
                     })
                     if revision_result.success:
-                        await git.commit_worktree(branch_name, f"Revise: {task.description}", task.id)
-                        await git.merge_branch(branch_name)
+                        if use_git:
+                            await git.commit_worktree(branch_name, f"Revise: {task.description}", task.id)
+                            await git.merge_branch(branch_name)
                         self.dag.mark_done(task.id, "revised and approved")
                         console.print(f"  [green][{agent_id}] Done (revised):[/green] {task.id}")
                     else:
@@ -346,8 +365,8 @@ class Orchestrator:
             console.print(f"  [red][{agent_id}] Error:[/red] {task.id} — {e}")
         finally:
             lock_manager.release(task.id, agent_id)
-            # Always clean up the worktree
-            if worktree_path is not None:
+            # Always clean up the worktree (if we created one)
+            if use_git and worktree_path is not None:
                 try:
                     await git.cleanup_worktree(branch_name)
                 except Exception:

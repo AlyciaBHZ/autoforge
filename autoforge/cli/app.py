@@ -143,7 +143,7 @@ async def _run_generate(config, description: str) -> int:
     from autoforge.cli.display import show_startup_info
     from autoforge.engine.orchestrator import Orchestrator
 
-    if not config.anthropic_api_key:
+    if not config.has_api_key:
         console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
         return 1
 
@@ -173,7 +173,7 @@ async def _run_review(config, project_path: str) -> int:
     from autoforge.cli.display import show_startup_info
     from autoforge.engine.orchestrator import Orchestrator
 
-    if not config.anthropic_api_key:
+    if not config.has_api_key:
         console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
         return 1
 
@@ -207,7 +207,7 @@ async def _run_import(config, project_path: str, enhance: str = "") -> int:
     from autoforge.cli.display import show_startup_info
     from autoforge.engine.orchestrator import Orchestrator
 
-    if not config.anthropic_api_key:
+    if not config.has_api_key:
         console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
         return 1
 
@@ -351,7 +351,7 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
     elif args.command == "resume":
         from autoforge.engine.orchestrator import Orchestrator
 
-        if not config.anthropic_api_key:
+        if not config.has_api_key:
             console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
             return 1
 
