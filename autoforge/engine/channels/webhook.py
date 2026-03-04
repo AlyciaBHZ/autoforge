@@ -11,7 +11,9 @@ FastAPI server exposing a REST API for project management:
 
 from __future__ import annotations
 
+import hmac
 import logging
+from pathlib import Path
 from typing import Any
 
 from autoforge.engine.config import ForgeConfig
@@ -31,12 +33,13 @@ async def start_webhook_server(
 
     app = FastAPI(title="AutoForge API", version="0.1.0")
 
-    # Auth dependency
+    # Auth dependency (constant-time comparison to prevent timing attacks)
     async def verify_auth(request: Request) -> None:
         if not config.webhook_secret:
             return  # No auth configured
-        auth = request.headers.get("Authorization", "")
-        if auth != f"Bearer {config.webhook_secret}":
+        auth = request.headers.get("Authorization", "").encode()
+        expected = f"Bearer {config.webhook_secret}".encode()
+        if not hmac.compare_digest(auth, expected):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     @app.get("/api/health")
@@ -67,6 +70,8 @@ async def start_webhook_server(
             raise HTTPException(status_code=400, detail="budget must be a number")
         if budget <= 0:
             raise HTTPException(status_code=400, detail="budget must be positive")
+        if budget > 1000:
+            raise HTTPException(status_code=400, detail="budget too high (max $1000)")
 
         requester = f"webhook:{request.client.host}" if request.client else "webhook:unknown"
 
@@ -86,6 +91,7 @@ async def start_webhook_server(
 
     @app.get("/api/projects", dependencies=[Depends(verify_auth)])
     async def list_projects(limit: int = 50) -> list[dict[str, Any]]:
+        limit = min(max(limit, 1), 500)
         projects = await registry.list_all(limit=limit)
         return [p.to_dict() for p in projects]
 
@@ -110,12 +116,17 @@ async def start_webhook_server(
                 detail=f"Project not completed (status: {project.status.value})",
             )
 
-        from pathlib import Path
-        guide_path = Path(project.workspace_path) / "DEPLOY_GUIDE.md"
+        workspace = Path(project.workspace_path).resolve()
+        guide_path = (workspace / "DEPLOY_GUIDE.md").resolve()
+        if not str(guide_path).startswith(str(workspace)):
+            raise HTTPException(status_code=403, detail="Access denied")
         if not guide_path.exists():
             raise HTTPException(status_code=404, detail="Deploy guide not found")
 
-        return {"guide": guide_path.read_text(encoding="utf-8")}
+        try:
+            return {"guide": guide_path.read_text(encoding="utf-8")}
+        except (OSError, UnicodeDecodeError) as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read deploy guide: {e}")
 
     @app.delete("/api/projects/{project_id}", dependencies=[Depends(verify_auth)])
     async def cancel_project(project_id: str) -> dict[str, Any]:

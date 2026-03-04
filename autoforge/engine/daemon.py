@@ -63,6 +63,9 @@ class ForgeDaemon:
             except ImportError:
                 console.print("  Telegram bot: [yellow]skipped[/yellow] (pip install python-telegram-bot)")
                 logger.warning("python-telegram-bot not installed, skipping Telegram")
+            except Exception as e:
+                console.print(f"  Telegram bot: [red]failed[/red] ({e})")
+                logger.error(f"Failed to start Telegram bot: {e}", exc_info=True)
 
         if self.config.webhook_enabled:
             try:
@@ -75,6 +78,9 @@ class ForgeDaemon:
             except ImportError:
                 console.print("  Webhook API: [yellow]skipped[/yellow] (pip install fastapi uvicorn)")
                 logger.warning("fastapi/uvicorn not installed, skipping webhook")
+            except Exception as e:
+                console.print(f"  Webhook API: [red]failed[/red] ({e})")
+                logger.error(f"Failed to start webhook: {e}", exc_info=True)
 
         console.print()
 
@@ -91,7 +97,12 @@ class ForgeDaemon:
             self._running = False
             for t in channel_tasks:
                 t.cancel()
-            await self.registry.close()
+            if channel_tasks:
+                await asyncio.gather(*channel_tasks, return_exceptions=True)
+            try:
+                await self.registry.close()
+            except Exception as e:
+                logger.error(f"Failed to close registry: {e}")
             console.print("[bold]AutoForge Daemon stopped[/bold]")
 
     async def _build_loop(self) -> None:
@@ -107,6 +118,7 @@ class ForgeDaemon:
             self._current_project_id = project.id
             console.print(f"[bold blue]Building:[/bold blue] {project.id} — {project.description[:80]}")
 
+            project_config = None
             try:
                 # Create a per-project config with its own budget
                 project_config = ForgeConfig.from_env(
@@ -118,9 +130,9 @@ class ForgeDaemon:
                 # Hook into orchestrator to track phase changes
                 original_save = orchestrator._save_state
 
-                async def _track_phase(phase: str, _orig=original_save, _pid=project.id) -> None:
+                def _track_phase(phase: str, _orig=original_save, _pid=project.id) -> None:
                     _orig(phase)
-                    await self.registry.update_phase(_pid, phase)
+                    asyncio.ensure_future(self.registry.update_phase(_pid, phase))
 
                 orchestrator._save_state = _track_phase  # type: ignore[assignment]
 
@@ -153,7 +165,7 @@ class ForgeDaemon:
 
             except Exception as e:
                 error_msg = str(e)[:500]
-                cost = project_config.estimated_cost_usd if "project_config" in dir() else 0.0
+                cost = project_config.estimated_cost_usd if project_config is not None else 0.0
                 logger.error(f"Build failed for {project.id}: {error_msg}", exc_info=True)
                 await self.registry.mark_failed(project.id, error_msg, cost_usd=cost)
 
@@ -180,9 +192,8 @@ class ForgeDaemon:
                 logger.warning(f"Notification failed: {e}")
 
     async def _on_notify(self, requested_by: str, message: str) -> None:
-        """Notification handler (passed to channels)."""
-        if self._notify_callback:
-            await self._notify_callback(requested_by, message)
+        """Notification handler (passed to channels) — delegates to _notify."""
+        await self._notify(requested_by, message)
 
     def _handle_signal(self) -> None:
         """Handle shutdown signal."""
