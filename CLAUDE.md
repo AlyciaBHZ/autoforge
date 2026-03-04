@@ -68,6 +68,8 @@ engine/adaptive_compute.py      Adaptive test-time compute — difficulty-aware 
 engine/ldb_debugger.py          LDB — block-level fault localization via runtime simulation
 engine/speculative_pipeline.py  Speculative pipeline — overlapping phase pre-execution for speed
 engine/hierarchical_decomp.py   Hierarchical decomposition — Parsel-style function-level task planning
+engine/lean_prover.py           Lean 4 theorem proving — Hilbert+COPRA+MCTS+STP multi-strategy formal prover
+engine/capability_dag.py        CapabilityDAG — self-growing universal knowledge graph, community-mergeable
 engine/task_dag.py           TaskDAG — dependency graph, scheduling, persistence
 engine/lock_manager.py      Cross-platform atomic task locking (symlink on POSIX, O_CREAT|O_EXCL on Windows)
 engine/git_manager.py       Git worktree isolation for parallel builders
