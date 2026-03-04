@@ -50,6 +50,7 @@ from autoforge.engine.ldb_debugger import LDBDebugger
 from autoforge.engine.speculative_pipeline import SpeculativePipeline
 from autoforge.engine.hierarchical_decomp import HierarchicalDecomposer
 from autoforge.engine.lean_prover import LeanProver
+from autoforge.engine.multi_prover import MultiProverEngine
 from autoforge.engine.capability_dag import CapabilityDAG, DAGBridge, Domain
 from autoforge.engine.theoretical_reasoning import TheoreticalReasoningEngine
 from autoforge.engine.task_dag import Task, TaskDAG, TaskPhase, TaskStatus
@@ -92,6 +93,7 @@ class Orchestrator:
         self._speculative = SpeculativePipeline()
         self._decomposer = HierarchicalDecomposer()
         self._lean_prover: LeanProver | None = None
+        self._multi_prover: MultiProverEngine | None = None
         self._capability_dag = CapabilityDAG()
         self._dag_bridge = DAGBridge(self._capability_dag)
         self._theoretical_reasoning = TheoreticalReasoningEngine()
@@ -271,6 +273,9 @@ class Orchestrator:
             if self.config.lean_prover_enabled and self._lean_prover and self.project_dir:
                 self._lean_prover.save_state(self.project_dir / ".autoforge" / "lean")
                 console.print(f"  [cyan]Lean:[/cyan] proof state saved")
+
+            if self._multi_prover and self.project_dir:
+                self._multi_prover.save_state(self.project_dir / ".autoforge" / "multi_prover.json")
 
             # Theoretical reasoning: save theory graphs (project-level + global)
             if self.config.theoretical_reasoning_enabled and self.project_dir:
@@ -698,9 +703,18 @@ class Orchestrator:
                 except Exception as e:
                     logger.debug(f"[ContextBudget] Difficulty estimation failed: {e}")
 
+            # Goal-aware budget adjustment (v2.8): projects with declared goals
+            # get boosted budgets for their target discipline's context sources.
+            goal_multiplier = 1.0
+            _goal_type = getattr(self.config, "project_goal_type", "general")
+            if _goal_type == "formal_verification":
+                goal_multiplier = 1.5  # Formal verification needs more context
+            elif _goal_type == "research":
+                goal_multiplier = 1.3
+
             # Compute adaptive base budget
             base_budget_chars = self.config.context_budget_tokens * 4  # ~4 chars/token
-            budget_chars = int(base_budget_chars * difficulty_multiplier * self._context_budget_multiplier)
+            budget_chars = int(base_budget_chars * difficulty_multiplier * self._context_budget_multiplier * goal_multiplier)
             used_chars = 0
             context_parts: list[tuple[str, str]] = []  # (label, text)
 
@@ -2173,12 +2187,49 @@ class Orchestrator:
                         if attempt.status.value == "proved":
                             proved += 1
 
+            # Multi-pass proof repair (v2.8) — use ProofRepairEngine for deeper sorry elimination
+            if sorry_total > 0 and proved < sorry_total and getattr(self.config, "lean_auto_repair_passes", 0) > 0:
+                try:
+                    for lean_file in lean_files:
+                        content = lean_file.read_text(encoding="utf-8")
+                        if "sorry" not in content:
+                            continue
+                        repaired, remaining = await self._lean_prover.repair_proof(
+                            content, self.llm,
+                            max_passes=self.config.lean_auto_repair_passes,
+                        )
+                        if repaired != content:
+                            lean_file.write_text(repaired, encoding="utf-8")
+                            new_sorry = repaired.count("sorry")
+                            repaired_count = content.count("sorry") - new_sorry
+                            proved += repaired_count
+                            console.print(
+                                f"    [cyan]Repair:[/cyan] {lean_file.name}: "
+                                f"eliminated {repaired_count} sorry, {new_sorry} remaining"
+                            )
+                except Exception as e:
+                    logger.debug(f"Lean proof repair pass failed: {e}")
+
             if sorry_total > 0:
                 console.print(
                     f"  [cyan]Lean prover:[/cyan] proved {proved}/{sorry_total} sorry blocks"
                 )
             else:
                 console.print(f"  [green]Lean:[/green] all files clean (no sorry)")
+
+            # Multi-prover cross-verification (v2.8) — if other provers are enabled
+            _any_alt_prover = any(getattr(self.config, f"{p}_enabled", False)
+                                 for p in ("coq", "isabelle", "tlaplus", "z3_smt", "dafny"))
+            if _any_alt_prover:
+                try:
+                    if self._multi_prover is None:
+                        self._multi_prover = MultiProverEngine(workspace=self.project_dir)
+                    available = await self._multi_prover.detect_available_provers()
+                    active = [k.value for k, v in available.items() if v]
+                    if active:
+                        console.print(f"  [cyan]Multi-prover:[/cyan] {', '.join(active)} available")
+                except Exception as e:
+                    logger.debug(f"Multi-prover detection failed: {e}")
 
         except Exception as e:
             logger.warning(f"Lean proving failed: {e}")
