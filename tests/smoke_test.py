@@ -92,7 +92,7 @@ def test_agent_imports():
 
 
 def test_cli_imports():
-    from autoforge.cli.app import build_parser, async_main  # noqa: F401
+    from autoforge.cli.app import build_parser, main  # noqa: F401
     from autoforge.cli.display import show_banner, show_startup_info, show_review_report  # noqa: F401
     from autoforge.cli.setup_wizard import needs_setup, load_global_config  # noqa: F401
 
@@ -147,7 +147,7 @@ def test_cli_legacy_compat():
     assert args.legacy_resume == "auto"
 
     # Verify legacy pre-scan detects bare descriptions
-    # (bare descriptions are handled by argv pre-scanning in async_main,
+    # (bare descriptions are handled by argv pre-scanning in _resolve_command,
     #  not by argparse, so we test the detection logic here)
     assert "Build a todo app" not in _KNOWN_COMMANDS
     assert "generate" in _KNOWN_COMMANDS

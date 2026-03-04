@@ -237,55 +237,102 @@ async def _run_import(config, project_path: str, enhance: str = "") -> int:
         return 1
 
 
-async def async_main() -> int:
-    """Main async entry point."""
+def _resolve_command(argv: list[str]) -> tuple[argparse.Namespace, str | None]:
+    """Parse CLI args, handling legacy bare-description mode.
+
+    Returns (parsed_args, legacy_description_or_None).
+    """
     parser = build_parser()
 
     # Pre-scan for legacy bare description: python forge.py "Build a todo app"
     # If the first non-flag arg isn't a known subcommand, treat as generate.
-    argv = sys.argv[1:]
     legacy_description = None
+    clean_argv = list(argv)
     for i, arg in enumerate(argv):
         if arg.startswith("-"):
             continue
         if arg not in _KNOWN_COMMANDS:
             legacy_description = arg
-            argv = argv[:i] + argv[i + 1:]
+            clean_argv = argv[:i] + argv[i + 1:]
         break
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(clean_argv)
+    return args, legacy_description
 
-    # Handle: no command at all → interactive mode or legacy mode
-    if args.command is None:
-        # Legacy: python forge.py --status
-        if args.legacy_status:
-            args.command = "status"
-        # Legacy: python forge.py --resume
-        elif args.legacy_resume is not None:
-            args.command = "resume"
-            args.path = None if args.legacy_resume == "auto" else args.legacy_resume
-        # Legacy: python forge.py "description"
-        elif legacy_description:
-            args.command = "generate"
-            args.description = legacy_description
-        # No args at all → interactive mode
-        else:
-            return await _run_interactive(args)
 
-    # Build config
-    from autoforge.engine.config import ForgeConfig
+def _run_interactive_sync(args: argparse.Namespace) -> int:
+    """Run interactive mode — all InquirerPy prompts happen here (sync).
 
-    overrides = _build_config_overrides(args)
-    config = ForgeConfig.from_env(**overrides)
-    setup_logging(config.log_level, config.verbose)
+    Returns exit code. May call asyncio.run() for the actual pipeline.
+    """
+    from autoforge.cli.display import show_banner
+    from autoforge.cli.setup_wizard import needs_setup
 
-    # Dispatch subcommand
-    if args.command == "setup":
+    show_banner()
+
+    # Check if setup is needed — runs InquirerPy (sync, no event loop)
+    if needs_setup():
+        console.print("[yellow]First time? Let's set up AutoForge.[/yellow]\n")
+        from autoforge.cli.setup_wizard import run_setup_wizard
+        run_setup_wizard()
+        console.print()
+
+    try:
+        from autoforge.cli.interactive import run_interactive
+    except ImportError:
+        console.print("[red]Error:[/red] InquirerPy not installed. Run: pip install InquirerPy")
+        console.print("Or use subcommands directly: autoforge generate \"your description\"")
+        return 1
+
+    # Run InquirerPy menus (sync, no event loop)
+    choices = run_interactive()
+    action = choices.get("action")
+
+    if action == "setup":
         from autoforge.cli.setup_wizard import run_setup_wizard
         run_setup_wizard()
         return 0
 
-    elif args.command == "generate":
+    # Build config from global config + interactive choices
+    from autoforge.engine.config import ForgeConfig
+
+    overrides = _build_config_overrides(args)
+    # Apply interactive choices as overrides
+    if "budget" in choices:
+        overrides["budget_limit_usd"] = choices["budget"]
+    if "max_agents" in choices:
+        overrides["max_agents"] = choices["max_agents"]
+    if "mode" in choices:
+        overrides["mode"] = choices["mode"]
+    if "mobile_target" in choices:
+        overrides["mobile_target"] = choices["mobile_target"]
+
+    config = ForgeConfig.from_env(**overrides)
+    setup_logging(config.log_level, config.verbose)
+
+    # Now enter the async event loop only for the pipeline execution
+    if action == "generate":
+        return asyncio.run(_run_generate(config, choices["description"]))
+    elif action == "review":
+        return asyncio.run(_run_review(config, choices["project_path"]))
+    elif action == "import":
+        return asyncio.run(_run_import(
+            config,
+            choices["project_path"],
+            choices.get("enhance_description", ""),
+        ))
+
+    return 0
+
+
+async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
+    """Dispatch a resolved subcommand to its async handler."""
+    from autoforge.engine.config import ForgeConfig
+
+    config = ForgeConfig.from_env(**overrides)
+    setup_logging(config.log_level, config.verbose)
+
+    if args.command == "generate":
         return await _run_generate(config, args.description)
 
     elif args.command == "review":
@@ -318,74 +365,44 @@ async def async_main() -> int:
             console.print(f"[red]Resume failed:[/red] {e}")
             return 1
 
-    else:
-        parser.print_help()
-        return 1
-
-
-async def _run_interactive(args: argparse.Namespace) -> int:
-    """Run interactive mode with InquirerPy menus."""
-    from autoforge.cli.display import show_banner
-    from autoforge.cli.setup_wizard import needs_setup
-
-    show_banner()
-
-    # Check if setup is needed
-    if needs_setup():
-        console.print("[yellow]First time? Let's set up AutoForge.[/yellow]\n")
-        from autoforge.cli.setup_wizard import run_setup_wizard
-        run_setup_wizard()
-        console.print()
-
-    try:
-        from autoforge.cli.interactive import run_interactive
-    except ImportError:
-        console.print("[red]Error:[/red] InquirerPy not installed. Run: pip install InquirerPy")
-        console.print("Or use subcommands directly: autoforge generate \"your description\"")
-        return 1
-
-    choices = run_interactive()
-    action = choices.get("action")
-
-    if action == "setup":
-        from autoforge.cli.setup_wizard import run_setup_wizard
-        run_setup_wizard()
-        return 0
-
-    # Build config from global config + interactive choices
-    from autoforge.engine.config import ForgeConfig
-
-    overrides = _build_config_overrides(args)
-    # Apply interactive choices as overrides
-    if "budget" in choices:
-        overrides["budget_limit_usd"] = choices["budget"]
-    if "max_agents" in choices:
-        overrides["max_agents"] = choices["max_agents"]
-    if "mode" in choices:
-        overrides["mode"] = choices["mode"]
-    if "mobile_target" in choices:
-        overrides["mobile_target"] = choices["mobile_target"]
-
-    config = ForgeConfig.from_env(**overrides)
-    setup_logging(config.log_level, config.verbose)
-
-    if action == "generate":
-        return await _run_generate(config, choices["description"])
-    elif action == "review":
-        return await _run_review(config, choices["project_path"])
-    elif action == "import":
-        return await _run_import(
-            config,
-            choices["project_path"],
-            choices.get("enhance_description", ""),
-        )
-
-    return 0
+    return 1
 
 
 def main() -> None:
-    """Synchronous entry point."""
-    sys.exit(asyncio.run(async_main()))
+    """Synchronous entry point.
+
+    All InquirerPy interactions (setup wizard, interactive menus) run here
+    in the sync context. Only orchestrator pipelines use asyncio.run().
+    """
+    args, legacy_description = _resolve_command(sys.argv[1:])
+
+    # Handle: no command at all -> interactive mode or legacy mode
+    if args.command is None:
+        # Legacy: python forge.py --status
+        if args.legacy_status:
+            args.command = "status"
+        # Legacy: python forge.py --resume
+        elif args.legacy_resume is not None:
+            args.command = "resume"
+            args.path = None if args.legacy_resume == "auto" else args.legacy_resume
+        # Legacy: python forge.py "description"
+        elif legacy_description:
+            args.command = "generate"
+            args.description = legacy_description
+        # No args at all -> interactive mode (sync, InquirerPy runs here)
+        else:
+            sys.exit(_run_interactive_sync(args))
+            return
+
+    # Subcommand: "setup" runs InquirerPy directly (sync, no event loop)
+    if args.command == "setup":
+        from autoforge.cli.setup_wizard import run_setup_wizard
+        run_setup_wizard()
+        sys.exit(0)
+
+    # All other subcommands dispatch through asyncio
+    overrides = _build_config_overrides(args)
+    sys.exit(asyncio.run(_async_dispatch(args, overrides)))
 
 
 if __name__ == "__main__":
