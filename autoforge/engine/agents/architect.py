@@ -31,7 +31,7 @@ class ArchitectAgent(AgentBase):
         super().__init__(config, llm)
 
     def _register_tools(self) -> None:
-        """Architect can read template files for reference."""
+        """Architect can read template files and search the web for reference."""
         self._tools = [
             ToolDefinition(
                 name="read_template",
@@ -52,6 +52,40 @@ class ArchitectAgent(AgentBase):
                 handler=self._handle_read_template,
             ),
         ]
+
+        # Add web tools if enabled
+        if getattr(self.config, "web_tools_enabled", True):
+            from functools import partial
+
+            from autoforge.engine.tools.web import (
+                FETCH_URL_TOOL_SCHEMA,
+                SEARCH_WEB_TOOL_SCHEMA,
+                handle_fetch_url,
+                handle_search_web,
+            )
+
+            self._tools.append(ToolDefinition(
+                name="search_web",
+                description=(
+                    "Search the web for library documentation, API specs, "
+                    "and architectural patterns. Use to validate design decisions."
+                ),
+                input_schema=SEARCH_WEB_TOOL_SCHEMA,
+                handler=partial(
+                    handle_search_web,
+                    backend=self.config.search_backend,
+                    api_key=self.config.search_api_key,
+                ),
+            ))
+            self._tools.append(ToolDefinition(
+                name="fetch_url",
+                description=(
+                    "Fetch a web page and return its text content. "
+                    "Use to read library docs, API references, or example code."
+                ),
+                input_schema=FETCH_URL_TOOL_SCHEMA,
+                handler=handle_fetch_url,
+            ))
 
     async def _handle_read_template(self, input_data: dict[str, Any]) -> str:
         rel_path = input_data["path"]

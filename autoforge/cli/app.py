@@ -74,6 +74,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level",
     )
+    parser.add_argument(
+        "--confirm",
+        default=None,
+        help="Phases to pause for confirmation: spec,build,verify,refactor,all",
+    )
+    parser.add_argument(
+        "--tdd",
+        type=int,
+        default=None,
+        help="TDD iterations per build task (0=disabled, 1-3 recommended)",
+    )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -135,6 +146,10 @@ def _build_config_overrides(args: argparse.Namespace) -> dict:
         overrides["verbose"] = True
     if args.log_level:
         overrides["log_level"] = args.log_level
+    if getattr(args, "confirm", None) is not None:
+        overrides["confirm_phases"] = [p.strip() for p in args.confirm.split(",")]
+    if getattr(args, "tdd", None) is not None:
+        overrides["build_test_loops"] = max(0, min(args.tdd, 5))
     return overrides
 
 

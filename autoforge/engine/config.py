@@ -126,6 +126,17 @@ class ForgeConfig:
     webhook_port: int = 8420
     webhook_secret: str = ""  # Bearer token for webhook auth
 
+    # Web tools (search + fetch)
+    web_tools_enabled: bool = True  # Kill switch for all web tools
+    search_backend: str = "duckduckgo"  # "duckduckgo" | "google" | "bing"
+    search_api_key: str = ""  # API key for Google/Bing search backends
+
+    # Human-in-the-loop checkpoints
+    confirm_phases: list[str] = field(default_factory=list)  # e.g. ["spec", "build"] or ["all"]
+
+    # Build-phase TDD loops
+    build_test_loops: int = 0  # 0=disabled, 1-3=test-fix iterations per task
+
     def __post_init__(self) -> None:
         if self.workspace_dir is None:
             self.workspace_dir = self.project_root / "workspace"
@@ -247,6 +258,12 @@ class ForgeConfig:
             webhook_host=os.getenv("FORGE_WEBHOOK_HOST", "127.0.0.1"),
             webhook_port=_safe_int("FORGE_WEBHOOK_PORT", 8420),
             webhook_secret=os.getenv("FORGE_WEBHOOK_SECRET", ""),
+            # Web tools
+            web_tools_enabled=os.getenv("FORGE_WEB_TOOLS", "true").lower() not in ("false", "0", "no"),
+            search_backend=os.getenv("FORGE_SEARCH_BACKEND", global_config.get("search_backend", "duckduckgo")),
+            search_api_key=os.getenv("FORGE_SEARCH_API_KEY", global_config.get("search_api_key", "")),
+            # Build TDD
+            build_test_loops=_safe_int("FORGE_BUILD_TEST_LOOPS", int(global_config.get("build_test_loops", 0))),
         )
 
         # Layer 1: CLI overrides (highest priority)
