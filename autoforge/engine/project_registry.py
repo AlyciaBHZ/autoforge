@@ -44,6 +44,7 @@ class Project:
     started_at: str | None
     completed_at: str | None
     error: str | None
+    idempotency_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -60,6 +61,7 @@ class Project:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "error": self.error,
+            "idempotency_key": self.idempotency_key,
         }
 
 
@@ -77,7 +79,8 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at TEXT NOT NULL,
     started_at TEXT,
     completed_at TEXT,
-    error TEXT
+    error TEXT,
+    idempotency_key TEXT
 );
 """
 
@@ -102,6 +105,8 @@ class ProjectRegistry:
             self._db.row_factory = aiosqlite.Row
             await self._db.execute("PRAGMA journal_mode=WAL")
             await self._db.executescript(_SCHEMA)
+            await self._migrate_schema()
+            await self._ensure_indexes()
             await self._db.commit()
         except Exception:
             await self._db.close()
@@ -135,6 +140,29 @@ class ProjectRegistry:
             started_at=row["started_at"],
             completed_at=row["completed_at"],
             error=row["error"],
+            idempotency_key=row["idempotency_key"] if "idempotency_key" in row.keys() else None,
+        )
+
+    async def _migrate_schema(self) -> None:
+        """Apply additive migrations for older SQLite files."""
+        db = self._ensure_db()
+        cursor = await db.execute("PRAGMA table_info(projects)")
+        rows = await cursor.fetchall()
+        columns = {row["name"] for row in rows}
+        if "idempotency_key" not in columns:
+            await db.execute("ALTER TABLE projects ADD COLUMN idempotency_key TEXT")
+
+    async def _ensure_indexes(self) -> None:
+        db = self._ensure_db()
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_projects_status_created ON projects(status, created_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_projects_requester_created ON projects(requested_by, created_at DESC)"
+        )
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_requester_idempotency "
+            "ON projects(requested_by, idempotency_key)"
         )
 
     async def enqueue(
@@ -142,6 +170,7 @@ class ProjectRegistry:
         description: str,
         requested_by: str = "cli",
         budget_usd: float = 10.0,
+        idempotency_key: str | None = None,
     ) -> Project:
         """Add a new project to the build queue."""
         # Validate inputs
@@ -158,9 +187,17 @@ class ProjectRegistry:
         db = self._ensure_db()
 
         await db.execute(
-            """INSERT INTO projects (id, description, status, requested_by, budget_usd, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (project_id, description, ProjectStatus.QUEUED.value, requested_by, budget_usd, now),
+            """INSERT INTO projects (id, description, status, requested_by, budget_usd, created_at, idempotency_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                project_id,
+                description,
+                ProjectStatus.QUEUED.value,
+                requested_by,
+                budget_usd,
+                now,
+                idempotency_key,
+            ),
         )
         await db.commit()
         return await self.get(project_id)
@@ -174,11 +211,47 @@ class ProjectRegistry:
             raise KeyError(f"Project not found: {project_id}")
         return self._row_to_project(row)
 
+    async def get_for_requester(self, project_id: str, requested_by: str) -> Project:
+        """Get a project by id scoped to the requesting owner."""
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "SELECT * FROM projects WHERE id = ? AND requested_by = ?",
+            (project_id, requested_by),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise KeyError(f"Project not found: {project_id}")
+        return self._row_to_project(row)
+
+    async def get_by_idempotency(
+        self,
+        requested_by: str,
+        idempotency_key: str,
+    ) -> Project | None:
+        """Lookup an existing request by requester + idempotency key."""
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "SELECT * FROM projects WHERE requested_by = ? AND idempotency_key = ?",
+            (requested_by, idempotency_key),
+        )
+        row = await cursor.fetchone()
+        return self._row_to_project(row) if row is not None else None
+
     async def list_all(self, limit: int = 50) -> list[Project]:
         """List all projects, newest first."""
         db = self._ensure_db()
         cursor = await db.execute(
             "SELECT * FROM projects ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_project(r) for r in rows]
+
+    async def list_for_requester(self, requested_by: str, limit: int = 50) -> list[Project]:
+        """List projects belonging to one requester, newest first."""
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "SELECT * FROM projects WHERE requested_by = ? ORDER BY created_at DESC LIMIT ?",
+            (requested_by, limit),
         )
         rows = await cursor.fetchall()
         return [self._row_to_project(r) for r in rows]
@@ -189,6 +262,20 @@ class ProjectRegistry:
         cursor = await db.execute(
             "SELECT * FROM projects WHERE status = ? ORDER BY created_at ASC",
             (status.value,),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_project(r) for r in rows]
+
+    async def list_by_status_for_requester(
+        self,
+        status: ProjectStatus,
+        requested_by: str,
+    ) -> list[Project]:
+        """List projects for a requester with a given status."""
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "SELECT * FROM projects WHERE status = ? AND requested_by = ? ORDER BY created_at ASC",
+            (status.value, requested_by),
         )
         rows = await cursor.fetchall()
         return [self._row_to_project(r) for r in rows]
@@ -262,6 +349,21 @@ class ProjectRegistry:
         await db.commit()
         return cursor.rowcount > 0
 
+    async def cancel_for_requester(self, project_id: str, requested_by: str) -> bool:
+        """Cancel a queued project owned by requester. Returns False if unavailable."""
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "UPDATE projects SET status = ? WHERE id = ? AND requested_by = ? AND status = ?",
+            (
+                ProjectStatus.CANCELLED.value,
+                project_id,
+                requested_by,
+                ProjectStatus.QUEUED.value,
+            ),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
     async def queue_size(self) -> int:
         """Number of projects waiting in queue."""
         db = self._ensure_db()
@@ -272,9 +374,58 @@ class ProjectRegistry:
         row = await cursor.fetchone()
         return row[0]
 
+    async def queue_size_for_requester(self, requested_by: str) -> int:
+        """Number of queued projects for one requester."""
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM projects WHERE status = ? AND requested_by = ?",
+            (ProjectStatus.QUEUED.value, requested_by),
+        )
+        row = await cursor.fetchone()
+        return row[0]
+
     async def total_cost(self) -> float:
         """Total cost across all projects."""
         db = self._ensure_db()
         cursor = await db.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM projects")
+        row = await cursor.fetchone()
+        return row[0]
+
+    async def total_cost_for_requester(self, requested_by: str) -> float:
+        """Total cost for a specific requester."""
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM projects WHERE requested_by = ?",
+            (requested_by,),
+        )
+        row = await cursor.fetchone()
+        return row[0]
+
+    async def count_created_since(self, requested_by: str, since_iso: str) -> int:
+        """Count requests created by requester since timestamp."""
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM projects WHERE requested_by = ? AND created_at >= ?",
+            (requested_by, since_iso),
+        )
+        row = await cursor.fetchone()
+        return row[0]
+
+    async def count_by_status_for_requester(
+        self,
+        requested_by: str,
+        *,
+        statuses: list[ProjectStatus],
+    ) -> int:
+        """Count projects for requester in a list of statuses."""
+        if not statuses:
+            return 0
+        placeholders = ",".join("?" for _ in statuses)
+        args = [requested_by, *[s.value for s in statuses]]
+        db = self._ensure_db()
+        cursor = await db.execute(
+            f"SELECT COUNT(*) FROM projects WHERE requested_by = ? AND status IN ({placeholders})",
+            args,
+        )
         row = await cursor.fetchone()
         return row[0]

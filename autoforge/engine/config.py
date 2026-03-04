@@ -97,13 +97,35 @@ class DaemonConfig:
 
     daemon_enabled: bool = False
     daemon_poll_interval: int = 10
+    daemon_max_concurrent_projects: int = 1
+    daemon_pid_file: Path | None = None
     db_path: Path | None = None
+
+    # Intake policy (CLI queue, Telegram, Webhook)
+    queue_max_size: int = 200
+    requester_queue_limit: int = 3
+    requester_daily_limit: int = 20
+    requester_rate_limit: int = 5
+    requester_rate_window_seconds: int = 60
+    request_max_budget_usd: float = 1000.0
+    request_max_description_chars: int = 10000
+
+    # Telegram channel
     telegram_token: str = ""
     telegram_allowed_users: list[str] = field(default_factory=list)
+    telegram_allow_public: bool = False
+
+    # Webhook channel
     webhook_enabled: bool = False
     webhook_host: str = "127.0.0.1"
     webhook_port: int = 8420
     webhook_secret: str = ""
+    webhook_require_auth: bool = True
+    webhook_allow_unauthenticated_local: bool = False
+    webhook_admin_secret: str = ""
+    webhook_requester_header: str = "X-Autoforge-Requester"
+    webhook_trust_requester_header: bool = False
+    webhook_idempotency_header: str = "Idempotency-Key"
 
 
 @dataclass
@@ -325,6 +347,134 @@ class ForgeConfig:
     @webhook_secret.setter
     def webhook_secret(self, v: str) -> None:
         self.daemon.webhook_secret = v
+
+    @property
+    def daemon_max_concurrent_projects(self) -> int:
+        return self.daemon.daemon_max_concurrent_projects
+
+    @daemon_max_concurrent_projects.setter
+    def daemon_max_concurrent_projects(self, v: int) -> None:
+        self.daemon.daemon_max_concurrent_projects = v
+
+    @property
+    def daemon_pid_file(self) -> Path | None:
+        return self.daemon.daemon_pid_file
+
+    @daemon_pid_file.setter
+    def daemon_pid_file(self, v: Path | None) -> None:
+        self.daemon.daemon_pid_file = v
+
+    @property
+    def queue_max_size(self) -> int:
+        return self.daemon.queue_max_size
+
+    @queue_max_size.setter
+    def queue_max_size(self, v: int) -> None:
+        self.daemon.queue_max_size = v
+
+    @property
+    def requester_queue_limit(self) -> int:
+        return self.daemon.requester_queue_limit
+
+    @requester_queue_limit.setter
+    def requester_queue_limit(self, v: int) -> None:
+        self.daemon.requester_queue_limit = v
+
+    @property
+    def requester_daily_limit(self) -> int:
+        return self.daemon.requester_daily_limit
+
+    @requester_daily_limit.setter
+    def requester_daily_limit(self, v: int) -> None:
+        self.daemon.requester_daily_limit = v
+
+    @property
+    def requester_rate_limit(self) -> int:
+        return self.daemon.requester_rate_limit
+
+    @requester_rate_limit.setter
+    def requester_rate_limit(self, v: int) -> None:
+        self.daemon.requester_rate_limit = v
+
+    @property
+    def requester_rate_window_seconds(self) -> int:
+        return self.daemon.requester_rate_window_seconds
+
+    @requester_rate_window_seconds.setter
+    def requester_rate_window_seconds(self, v: int) -> None:
+        self.daemon.requester_rate_window_seconds = v
+
+    @property
+    def request_max_budget_usd(self) -> float:
+        return self.daemon.request_max_budget_usd
+
+    @request_max_budget_usd.setter
+    def request_max_budget_usd(self, v: float) -> None:
+        self.daemon.request_max_budget_usd = v
+
+    @property
+    def request_max_description_chars(self) -> int:
+        return self.daemon.request_max_description_chars
+
+    @request_max_description_chars.setter
+    def request_max_description_chars(self, v: int) -> None:
+        self.daemon.request_max_description_chars = v
+
+    @property
+    def telegram_allow_public(self) -> bool:
+        return self.daemon.telegram_allow_public
+
+    @telegram_allow_public.setter
+    def telegram_allow_public(self, v: bool) -> None:
+        self.daemon.telegram_allow_public = v
+
+    @property
+    def webhook_require_auth(self) -> bool:
+        return self.daemon.webhook_require_auth
+
+    @webhook_require_auth.setter
+    def webhook_require_auth(self, v: bool) -> None:
+        self.daemon.webhook_require_auth = v
+
+    @property
+    def webhook_allow_unauthenticated_local(self) -> bool:
+        return self.daemon.webhook_allow_unauthenticated_local
+
+    @webhook_allow_unauthenticated_local.setter
+    def webhook_allow_unauthenticated_local(self, v: bool) -> None:
+        self.daemon.webhook_allow_unauthenticated_local = v
+
+    @property
+    def webhook_admin_secret(self) -> str:
+        return self.daemon.webhook_admin_secret
+
+    @webhook_admin_secret.setter
+    def webhook_admin_secret(self, v: str) -> None:
+        self.daemon.webhook_admin_secret = v
+
+    @property
+    def webhook_requester_header(self) -> str:
+        return self.daemon.webhook_requester_header
+
+    @webhook_requester_header.setter
+    def webhook_requester_header(self, v: str) -> None:
+        self.daemon.webhook_requester_header = v
+
+    @property
+    def webhook_trust_requester_header(self) -> bool:
+        return self.daemon.webhook_trust_requester_header
+
+    @webhook_trust_requester_header.setter
+    def webhook_trust_requester_header(self, v: bool) -> None:
+        self.daemon.webhook_trust_requester_header = v
+
+    @property
+    def webhook_idempotency_header(self) -> str:
+        return self.daemon.webhook_idempotency_header
+
+    @webhook_idempotency_header.setter
+    def webhook_idempotency_header(self, v: str) -> None:
+        self.daemon.webhook_idempotency_header = v
 
     @property
     def web_tools_enabled(self) -> bool:
@@ -691,6 +841,8 @@ class ForgeConfig:
             self.workspace_dir = self.project_root / "workspace"
         if self.constitution_dir is None:
             self.constitution_dir = autoforge.DATA_DIR / "constitution"
+        if self.daemon.daemon_pid_file is None:
+            self.daemon.daemon_pid_file = self.project_root / ".autoforge" / "daemon.pid"
         if self.daemon.db_path is None:
             self.daemon.db_path = self.project_root / "autoforge.db"
         if not self.run_id:
@@ -802,6 +954,68 @@ class ForgeConfig:
         allowed_raw = os.getenv("FORGE_TELEGRAM_ALLOWED_USERS", "")
         allowed_users = [u.strip() for u in allowed_raw.split(",") if u.strip()]
 
+        daemon_pid_raw = (
+            os.getenv("FORGE_DAEMON_PID_FILE")
+            or str(global_config.get("daemon_pid_file", "")).strip()
+        )
+        daemon_pid_file = Path(daemon_pid_raw).expanduser() if daemon_pid_raw else None
+
+        daemon_max_concurrent_projects = _safe_int(
+            "FORGE_DAEMON_MAX_CONCURRENT_PROJECTS",
+            _to_int(global_config.get("daemon_max_concurrent_projects", 1), 1),
+        )
+        if daemon_max_concurrent_projects < 1:
+            daemon_max_concurrent_projects = 1
+
+        queue_max_size = _safe_int(
+            "FORGE_QUEUE_MAX_SIZE",
+            _to_int(global_config.get("queue_max_size", 200), 200),
+        )
+        if queue_max_size < 1:
+            queue_max_size = 1
+
+        requester_queue_limit = _safe_int(
+            "FORGE_REQUESTER_QUEUE_LIMIT",
+            _to_int(global_config.get("requester_queue_limit", 3), 3),
+        )
+        if requester_queue_limit < 1:
+            requester_queue_limit = 1
+
+        requester_daily_limit = _safe_int(
+            "FORGE_REQUESTER_DAILY_LIMIT",
+            _to_int(global_config.get("requester_daily_limit", 20), 20),
+        )
+        if requester_daily_limit < 1:
+            requester_daily_limit = 1
+
+        requester_rate_limit = _safe_int(
+            "FORGE_REQUESTER_RATE_LIMIT",
+            _to_int(global_config.get("requester_rate_limit", 5), 5),
+        )
+        if requester_rate_limit < 1:
+            requester_rate_limit = 1
+
+        requester_rate_window_seconds = _safe_int(
+            "FORGE_REQUESTER_RATE_WINDOW_SECONDS",
+            _to_int(global_config.get("requester_rate_window_seconds", 60), 60),
+        )
+        if requester_rate_window_seconds < 1:
+            requester_rate_window_seconds = 1
+
+        request_max_description_chars = _safe_int(
+            "FORGE_REQUEST_MAX_DESCRIPTION_CHARS",
+            _to_int(global_config.get("request_max_description_chars", 10000), 10000),
+        )
+        if request_max_description_chars < 100:
+            request_max_description_chars = 100
+
+        request_max_budget_usd = _safe_float(
+            "FORGE_REQUEST_MAX_BUDGET_USD",
+            float(global_config.get("request_max_budget_usd", 1000.0)),
+        )
+        if request_max_budget_usd <= 0:
+            request_max_budget_usd = 1000.0
+
         # Validate log level
         log_level = (
             os.getenv("FORGE_LOG_LEVEL")
@@ -852,12 +1066,28 @@ class ForgeConfig:
             # Sub-configs
             daemon=DaemonConfig(
                 daemon_poll_interval=_safe_int("FORGE_DAEMON_POLL_INTERVAL", 10),
+                daemon_max_concurrent_projects=daemon_max_concurrent_projects,
+                daemon_pid_file=daemon_pid_file,
+                queue_max_size=queue_max_size,
+                requester_queue_limit=requester_queue_limit,
+                requester_daily_limit=requester_daily_limit,
+                requester_rate_limit=requester_rate_limit,
+                requester_rate_window_seconds=requester_rate_window_seconds,
+                request_max_budget_usd=request_max_budget_usd,
+                request_max_description_chars=request_max_description_chars,
                 telegram_token=os.getenv("FORGE_TELEGRAM_TOKEN", ""),
                 telegram_allowed_users=allowed_users,
+                telegram_allow_public=os.getenv("FORGE_TELEGRAM_ALLOW_PUBLIC", "").lower() in ("true", "1", "yes"),
                 webhook_enabled=os.getenv("FORGE_WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes"),
                 webhook_host=os.getenv("FORGE_WEBHOOK_HOST", "127.0.0.1"),
                 webhook_port=_safe_int("FORGE_WEBHOOK_PORT", 8420),
                 webhook_secret=os.getenv("FORGE_WEBHOOK_SECRET", ""),
+                webhook_require_auth=os.getenv("FORGE_WEBHOOK_REQUIRE_AUTH", "true").lower() not in ("false", "0", "no"),
+                webhook_allow_unauthenticated_local=os.getenv("FORGE_WEBHOOK_ALLOW_UNAUTH_LOCAL", "").lower() in ("true", "1", "yes"),
+                webhook_admin_secret=os.getenv("FORGE_WEBHOOK_ADMIN_SECRET", ""),
+                webhook_requester_header=os.getenv("FORGE_WEBHOOK_REQUESTER_HEADER", "X-Autoforge-Requester"),
+                webhook_trust_requester_header=os.getenv("FORGE_WEBHOOK_TRUST_REQUESTER_HEADER", "").lower() in ("true", "1", "yes"),
+                webhook_idempotency_header=os.getenv("FORGE_WEBHOOK_IDEMPOTENCY_HEADER", "Idempotency-Key"),
             ),
             tools=ToolsConfig(
                 web_tools_enabled=os.getenv("FORGE_WEB_TOOLS", "true").lower() not in ("false", "0", "no"),
