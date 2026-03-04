@@ -192,7 +192,23 @@ def build_parser() -> argparse.ArgumentParser:
     paper_infer.add_argument("goal", help="High-level research goal (no paper title)")
     paper_infer.add_argument("--year", type=int, default=default_year, help="ICLR year (default: previous year)")
     paper_infer.add_argument("--top-k", type=int, default=5, help="Show top-k paper candidates")
-    paper_infer.add_argument("--corpus-size", type=int, default=1200, help="Number of papers to fetch from OpenReview")
+    paper_infer.add_argument(
+        "--corpus-size",
+        type=int,
+        default=600,
+        help="Number of papers to fetch from OpenReview (smaller is faster)",
+    )
+    paper_infer.add_argument(
+        "--cache-hours",
+        type=int,
+        default=48,
+        help="Reuse local corpus cache up to N hours (default: 48)",
+    )
+    paper_infer.add_argument(
+        "--refresh-corpus",
+        action="store_true",
+        help="Bypass local cache and fetch fresh metadata from OpenReview",
+    )
 
     paper_bench = paper_subparsers.add_parser(
         "benchmark",
@@ -201,7 +217,23 @@ def build_parser() -> argparse.ArgumentParser:
     paper_bench.add_argument("--year", type=int, default=default_year, help="ICLR year")
     paper_bench.add_argument("--sample-size", type=int, default=5, help="How many benchmark cases to evaluate")
     paper_bench.add_argument("--top-k", type=int, default=5, help="Hit@k threshold")
-    paper_bench.add_argument("--corpus-size", type=int, default=1200, help="Number of papers to fetch")
+    paper_bench.add_argument(
+        "--corpus-size",
+        type=int,
+        default=600,
+        help="Number of papers to fetch (smaller is faster)",
+    )
+    paper_bench.add_argument(
+        "--cache-hours",
+        type=int,
+        default=48,
+        help="Reuse local corpus cache up to N hours (default: 48)",
+    )
+    paper_bench.add_argument(
+        "--refresh-corpus",
+        action="store_true",
+        help="Bypass local cache and fetch fresh metadata from OpenReview",
+    )
     paper_bench.add_argument("--seed", type=int, default=42, help="Random seed for case sampling")
     paper_bench.add_argument(
         "--output",
@@ -217,7 +249,28 @@ def build_parser() -> argparse.ArgumentParser:
     paper_repro.add_argument("--year", type=int, default=default_year, help="ICLR year")
     paper_repro.add_argument("--top-k", type=int, default=5, help="Candidate pool size")
     paper_repro.add_argument("--pick", type=int, default=1, help="1-based candidate index to reproduce")
-    paper_repro.add_argument("--corpus-size", type=int, default=1200, help="Number of papers to fetch")
+    paper_repro.add_argument(
+        "--corpus-size",
+        type=int,
+        default=600,
+        help="Number of papers to fetch (smaller is faster)",
+    )
+    paper_repro.add_argument(
+        "--cache-hours",
+        type=int,
+        default=48,
+        help="Reuse local corpus cache up to N hours (default: 48)",
+    )
+    paper_repro.add_argument(
+        "--refresh-corpus",
+        action="store_true",
+        help="Bypass local cache and fetch fresh metadata from OpenReview",
+    )
+    paper_repro.add_argument(
+        "--with-pdf",
+        action="store_true",
+        help="Parse PDF text for richer signal extraction (extra network/CPU cost)",
+    )
     paper_repro.add_argument(
         "--output-dir",
         default=None,
@@ -656,10 +709,18 @@ async def _run_paper_infer(config, args: argparse.Namespace) -> int:
 
     year = int(getattr(args, "year", 0) or 0)
     top_k = max(1, min(int(getattr(args, "top_k", 5)), 20))
-    corpus_size = max(50, min(int(getattr(args, "corpus_size", 1200)), 5000))
+    corpus_size = max(50, min(int(getattr(args, "corpus_size", 600)), 2000))
+    cache_hours = max(1, min(int(getattr(args, "cache_hours", 48)), 24 * 14))
+    refresh = bool(getattr(args, "refresh_corpus", False))
 
     try:
-        papers = await asyncio.to_thread(fetch_iclr_papers, year=year, limit=corpus_size)
+        papers = await asyncio.to_thread(
+            fetch_iclr_papers,
+            year=year,
+            limit=corpus_size,
+            use_cache=not refresh,
+            cache_max_age_hours=cache_hours,
+        )
     except Exception as exc:
         console.print(f"[red]Failed to fetch ICLR papers:[/red] {exc}")
         return 1
@@ -690,8 +751,11 @@ async def _run_paper_benchmark(config, args: argparse.Namespace) -> int:
     year = int(getattr(args, "year", 0) or 0)
     sample_size = max(3, min(int(getattr(args, "sample_size", 5)), 20))
     top_k = max(1, min(int(getattr(args, "top_k", 5)), 20))
-    corpus_size = max(200, min(int(getattr(args, "corpus_size", 1200)), 5000))
+    min_corpus = max(100, sample_size * 20)
+    corpus_size = max(min_corpus, min(int(getattr(args, "corpus_size", 600)), 2000))
     seed = int(getattr(args, "seed", 42))
+    cache_hours = max(1, min(int(getattr(args, "cache_hours", 48)), 24 * 14))
+    refresh = bool(getattr(args, "refresh_corpus", False))
 
     try:
         report = await asyncio.to_thread(
@@ -701,6 +765,8 @@ async def _run_paper_benchmark(config, args: argparse.Namespace) -> int:
             corpus_size=corpus_size,
             top_k=top_k,
             seed=seed,
+            use_cache=not refresh,
+            cache_max_age_hours=cache_hours,
         )
     except Exception as exc:
         console.print(f"[red]Benchmark failed:[/red] {exc}")
@@ -735,10 +801,14 @@ async def _run_paper_benchmark(config, args: argparse.Namespace) -> int:
 async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
     """Infer one paper and generate reproduction artifacts/prompt."""
     from autoforge.engine.paper_repro import (
+        build_environment_spec,
         build_generation_prompt,
         build_reproduction_brief,
+        build_verification_plan,
+        extract_paper_signals,
         fetch_iclr_papers,
         infer_papers_from_goal,
+        simulate_pipeline_feedback,
     )
 
     goal = (args.goal or "").strip()
@@ -749,10 +819,18 @@ async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
     year = int(getattr(args, "year", 0) or 0)
     top_k = max(1, min(int(getattr(args, "top_k", 5)), 20))
     pick = max(1, int(getattr(args, "pick", 1)))
-    corpus_size = max(200, min(int(getattr(args, "corpus_size", 1200)), 5000))
+    corpus_size = max(100, min(int(getattr(args, "corpus_size", 600)), 2000))
+    cache_hours = max(1, min(int(getattr(args, "cache_hours", 48)), 24 * 14))
+    refresh = bool(getattr(args, "refresh_corpus", False))
 
     try:
-        papers = await asyncio.to_thread(fetch_iclr_papers, year=year, limit=corpus_size)
+        papers = await asyncio.to_thread(
+            fetch_iclr_papers,
+            year=year,
+            limit=corpus_size,
+            use_cache=not refresh,
+            cache_max_age_hours=cache_hours,
+        )
     except Exception as exc:
         console.print(f"[red]Failed to fetch ICLR papers:[/red] {exc}")
         return 1
@@ -768,8 +846,16 @@ async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
     chosen = ranked[pick - 1]
     paper = chosen.paper
 
-    brief = build_reproduction_brief(goal, paper)
-    prompt = build_generation_prompt(goal, paper)
+    include_pdf = bool(getattr(args, "with_pdf", False))
+    try:
+        signals = await asyncio.to_thread(extract_paper_signals, paper, include_pdf=include_pdf)
+    except Exception:
+        signals = await asyncio.to_thread(extract_paper_signals, paper, include_pdf=False)
+
+    brief = build_reproduction_brief(goal, paper, signals=signals)
+    prompt = build_generation_prompt(goal, paper, signals=signals)
+    verification_plan = build_verification_plan(signals)
+    env_spec = build_environment_spec(paper, signals, theory_first=True)
 
     out_arg = getattr(args, "output_dir", None)
     if out_arg:
@@ -802,6 +888,18 @@ async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
         )
         (out_dir / "reproduction_brief.md").write_text(brief, encoding="utf-8")
         (out_dir / "generation_prompt.txt").write_text(prompt, encoding="utf-8")
+        (out_dir / "paper_signals.json").write_text(
+            json.dumps(signals.to_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (out_dir / "verification_plan.json").write_text(
+            json.dumps(verification_plan, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (out_dir / "environment_spec.json").write_text(
+            json.dumps(env_spec, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     except OSError as exc:
         console.print(f"[red]Failed to write reproduction artifacts:[/red] {exc}")
         return 1
@@ -809,14 +907,33 @@ async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
     console.print(f"[bold]Selected paper:[/bold] {paper.title}")
     console.print(f"score={chosen.score:.2f}  matched={', '.join(chosen.matched_terms[:10]) or '-'}")
     console.print(f"openreview: {paper.openreview_url}")
+    console.print(f"signal_source: {signals.text_source}")
     console.print(f"artifacts: {out_dir}")
 
     if not getattr(args, "run_generate", False):
         return 0
 
     if not config.has_api_key:
-        console.print("[red]--run-generate requires API key/auth config (run `autoforge setup`).[/red]")
-        return 1
+        feedback = simulate_pipeline_feedback(
+            goal=goal,
+            paper=paper,
+            signals=signals,
+            inference_score=chosen.score,
+        )
+        try:
+            (out_dir / "simulated_pipeline_feedback.json").write_text(
+                json.dumps(feedback, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            console.print(f"[red]Failed to write simulated feedback:[/red] {exc}")
+            return 1
+        console.print(
+            "[yellow]No API key detected.[/yellow] "
+            "Generated simulated pipeline feedback at "
+            f"{out_dir / 'simulated_pipeline_feedback.json'}"
+        )
+        return 0
 
     from autoforge.engine.orchestrator import Orchestrator
 

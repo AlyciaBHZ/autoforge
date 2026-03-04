@@ -1096,6 +1096,50 @@ def test_cli_paper_subcommand():
     from autoforge.engine.paper_repro import fetch_iclr_papers  # noqa: F401
 
 
+def test_paper_repro_signals_and_simulation():
+    """Test local paper signal extraction + no-key simulation feedback."""
+    from autoforge.engine.paper_repro import (
+        PaperRecord,
+        build_environment_spec,
+        build_verification_plan,
+        extract_paper_signals,
+        simulate_pipeline_feedback,
+    )
+
+    paper = PaperRecord(
+        note_id="test123",
+        title="Fast Sparse Attention for Long-Context LLM Decoding",
+        abstract=(
+            "We propose a sparse attention method that reduces latency by 2.0x "
+            "while maintaining accuracy on MMLU."
+        ),
+        keywords=["sparse attention", "long context", "llm inference"],
+        year=2025,
+        openreview_url="https://openreview.net/forum?id=test123",
+        pdf_url="https://openreview.net/pdf?id=test123",
+    )
+    signals = extract_paper_signals(paper, include_pdf=False)
+    assert "latency" in signals.metrics
+
+    plan = build_verification_plan(signals)
+    assert "checklist" in plan and len(plan["checklist"]) >= 1
+
+    env = build_environment_spec(paper, signals)
+    assert env["python"] == "3.11"
+    dep_names = {d["name"] for d in env["dependencies"]}
+    assert "torch" not in dep_names
+    assert env["profile"] == "theory-first"
+
+    fb = simulate_pipeline_feedback(
+        goal="speed up long-context sparse attention decoding",
+        paper=paper,
+        signals=signals,
+        inference_score=15.0,
+    )
+    assert fb["mode"] == "simulated_no_api_key"
+    assert "p0_p4_status" in fb
+
+
 def test_service_files_exist():
     """Test service config files exist."""
     assert (PROJECT_ROOT / "services" / "autoforge.service").exists()
@@ -2126,6 +2170,9 @@ def main():
             ("daemon subcommand parsing", test_cli_daemon_subcommand),
             ("queue subcommand parsing", test_cli_queue_subcommand),
             ("paper subcommand parsing", test_cli_paper_subcommand),
+        ]),
+        ("Paper Repro", [
+            ("Signal extraction + no-key simulation", test_paper_repro_signals_and_simulation),
         ]),
         ("Service Files", [
             ("systemd + launchd configs exist", test_service_files_exist),

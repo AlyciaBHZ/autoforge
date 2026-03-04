@@ -105,6 +105,228 @@ class DiscoveryConfig:
 
 
 # ══════════════════════════════════════════════════════════════
+# Domain Context (D2: generalise domain-hardcoded prompts)
+# ══════════════════════════════════════════════════════════════
+
+
+@dataclass
+class DomainContext:
+    """Template variables that specialise strategy prompts to a mathematical domain.
+
+    ConjectureGenerator replaces ``{domain.*}`` placeholders in its prompt
+    templates with the values from whichever DomainContext is active.  Three
+    pre-built contexts ship with AutoForge; users can construct their own.
+    """
+
+    name: str
+    key_structures: str              # One-paragraph description of core objects
+    typical_theorems: str            # Flavour text: what a good theorem looks like
+    canonical_examples: str          # Concrete small examples one can compute with
+    known_open_problems: str         # 3-5 open problems to bias exploration toward
+    boundary_questions: str          # What limits / degeneracies are interesting?
+    computable_quantities: str       # Named quantities + known exact values
+    target_transfer_domains: str     # Where cross-domain analogies should point
+    known_dualities: str             # Dual pairs already established in the theory
+    higher_dim_challenges: str       # What breaks / changes in d ≥ 2
+
+
+# ── Pre-built domain contexts ──────────────────────────────
+
+SUPERSPACE_MODEL_SETS = DomainContext(
+    name="Superspace Model Sets & Information-Theoretic Time",
+    key_structures=(
+        "Cut-and-project schemes (CPS) with physical space E = ℝ^d and internal "
+        "space H = ℝ^n, lattice Γ ⊂ E × H, model sets Λ(W), golden-mean language "
+        "X_m, Zeckendorf representation, Fold stabilization map, gauge anomaly G_m, "
+        "scan error ε_m, boundary cylinder dimension, Parry measure μ, refinement "
+        "functional τ(t) = −log μ(C(a_{0:t−1}))."
+    ),
+    typical_theorems=(
+        "Results that are publishable in Inventiones or Annals: asymptotic formulae "
+        "with sharp error terms, universal distributional limits, duality identities "
+        "between entropy-like quantities, and connections to ergodic / operator theory."
+    ),
+    canonical_examples=(
+        "1D golden-mean SFT on two symbols {0,1} with forbidden word 11. "
+        "|X_m| = F_{m+2}. Gauge anomaly E[G_m]/m → 4/9, σ² = 118/243. "
+        "Parry measure with entropy rate h = log φ. Zeckendorf carry propagation."
+    ),
+    known_open_problems=(
+        "• Exact distribution of G_m beyond mean/variance (higher moments or CLT?)\n"
+        "• Non-expansion optimal scan protocol for general windows W\n"
+        "• Higher-dimensional (d ≥ 2) Zeckendorf stabilization dynamics\n"
+        "• Operator-algebraic formulation of the KL-ledger identity\n"
+        "• Connections to Rauzy fractal geometry in d = 2"
+    ),
+    boundary_questions=(
+        "m → ∞ (infinite resolution), m → 1 (minimal resolution), "
+        "φ → other algebraic numbers, boundary ∂W of the acceptance window, "
+        "lattice Γ degeneration."
+    ),
+    computable_quantities=(
+        "Gauge anomaly density δ_m = E[G_m]/m → 4/9, variance σ² = 118/243, "
+        "fiber sizes |F_m(x)|, scan error ε_m(P;μ) decay rates, "
+        "boundary cylinder counts N_m(∂P), entropy rate h_μ = log φ, "
+        "refinement functional τ(t)."
+    ),
+    target_transfer_domains=(
+        "Operator algebras / quantum information, ergodic theory / dynamical systems, "
+        "coding theory / information theory, algebraic topology / homological algebra, "
+        "number theory / arithmetic geometry, statistical mechanics / phase transitions."
+    ),
+    known_dualities=(
+        "Resolution ↔ time depth (Remark 4.2: lost DOF recovered as temporal context), "
+        "visible entropy H(π) ↔ fiber degeneracy E_π[log d_m(X)] (KL-ledger), "
+        "synchronization budget ↔ collision budget (capacity law), "
+        "physical space E ↔ internal space H (CPS duality)."
+    ),
+    higher_dim_challenges=(
+        "Golden-mean language becomes a higher-dimensional SFT, "
+        "Zeckendorf stabilization generalizes to multi-dimensional carry rules, "
+        "boundary cylinder dimension depends on window geometry in ℝ^n, "
+        "Sturmian coding becomes multidimensional symbolic dynamics."
+    ),
+)
+
+
+ALGEBRAIC_GEOMETRY = DomainContext(
+    name="Algebraic Geometry & Arithmetic",
+    key_structures=(
+        "Schemes, sheaves, cohomology, moduli spaces, étale fundamental groups, "
+        "motivic cohomology, derived categories, intersection theory, "
+        "Hodge structures, abelian varieties, elliptic curves."
+    ),
+    typical_theorems=(
+        "Structure theorems for moduli spaces, finiteness results, "
+        "comparison theorems between cohomology theories, "
+        "effective bounds on rational points."
+    ),
+    canonical_examples=(
+        "P^n (projective space), elliptic curves over Q, "
+        "Grassmannians, toric varieties, K3 surfaces."
+    ),
+    known_open_problems=(
+        "• Hodge conjecture\n"
+        "• Standard conjectures on algebraic cycles\n"
+        "• Effective Mordell / uniform Manin-Mumford\n"
+        "• Mirror symmetry beyond Calabi-Yau\n"
+        "• Motivic t-structures"
+    ),
+    boundary_questions=(
+        "Degeneration of families (stable reduction), base-change to char p, "
+        "semi-stable limits, tropical/non-archimedean limits."
+    ),
+    computable_quantities=(
+        "Euler characteristics, Betti numbers, Picard numbers, "
+        "heights of rational points, conductor exponents, "
+        "Tamagawa numbers, L-function special values."
+    ),
+    target_transfer_domains=(
+        "Number theory, representation theory, mathematical physics (string compactifications), "
+        "symplectic topology, combinatorics (matroid theory), logic (model theory of fields)."
+    ),
+    known_dualities=(
+        "Serre duality, Poincaré duality, Langlands duality, "
+        "mirror symmetry (Hodge diamonds), Fourier-Mukai transforms."
+    ),
+    higher_dim_challenges=(
+        "Minimal model program in higher dimensions, "
+        "abundance conjecture, classification of Fano manifolds, "
+        "birational geometry of moduli spaces."
+    ),
+)
+
+
+DYNAMICAL_SYSTEMS = DomainContext(
+    name="Dynamical Systems & Ergodic Theory",
+    key_structures=(
+        "Measure-preserving transformations, symbolic dynamics (SFTs, sofic shifts), "
+        "entropy (topological, measure-theoretic, Kolmogorov-Sinai), "
+        "mixing properties, Lyapunov exponents, transfer operators, "
+        "thermodynamic formalism, Ruelle-Perron-Frobenius theory."
+    ),
+    typical_theorems=(
+        "Distributional limit theorems for ergodic averages, "
+        "entropy formulae, dimension formulae for invariant measures, "
+        "orbit-counting asymptotics, equilibrium state uniqueness."
+    ),
+    canonical_examples=(
+        "Full shifts on k symbols, golden-mean SFT, Bernoulli shifts, "
+        "Arnold cat map, Smale horseshoe, Lorenz attractor, "
+        "continued-fraction (Gauss) map."
+    ),
+    known_open_problems=(
+        "• Furstenberg ×2 ×3 conjecture\n"
+        "• Smooth realization of entropy\n"
+        "• Effective equidistribution on higher-rank homogeneous spaces\n"
+        "• Uniform hyperbolicity vs dominated splitting\n"
+        "• Mixing rates for billiards in higher dimensions"
+    ),
+    boundary_questions=(
+        "Zero-temperature limits (ground states), infinite-alphabet limits, "
+        "bifurcation boundaries, critical points of pressure functions."
+    ),
+    computable_quantities=(
+        "Topological entropy, measure-theoretic entropy, "
+        "Lyapunov exponents, mixing rates (decay of correlations), "
+        "pressure function P(φ), zeta functions, period-counting sequences."
+    ),
+    target_transfer_domains=(
+        "Number theory (homogeneous dynamics), statistical mechanics, "
+        "information theory, probability (random matrices), "
+        "operator algebras (Cuntz algebras), combinatorics (symbolic substitutions)."
+    ),
+    known_dualities=(
+        "Time-reversal duality, natural extension, "
+        "spectral ↔ dynamical (Halmos-von Neumann), "
+        "entropy ↔ dimension (Ledrappier-Young), "
+        "transfer operator ↔ zeta function (Ruelle)."
+    ),
+    higher_dim_challenges=(
+        "Higher-dimensional SFTs have undecidable entropy, "
+        "smooth ergodic theory in dim ≥ 3 (partial hyperbolicity), "
+        "multidimensional symbolic dynamics, "
+        "higher-rank abelian actions (Katok-Spatzier rigidity)."
+    ),
+)
+
+
+# Map for auto-detection from TheoryGraph domains
+_DOMAIN_CONTEXT_REGISTRY: dict[str, DomainContext] = {
+    "superspace_model_sets": SUPERSPACE_MODEL_SETS,
+    "algebraic_geometry": ALGEBRAIC_GEOMETRY,
+    "dynamical_systems": DYNAMICAL_SYSTEMS,
+}
+
+
+def detect_domain_context(graph: TheoryGraph) -> DomainContext:
+    """Auto-detect the best DomainContext from a TheoryGraph's content.
+
+    Heuristic: count domain tags and pick the matching pre-built context.
+    Falls back to SUPERSPACE_MODEL_SETS (the reference use case).
+    """
+    stats = graph.get_stats()
+    by_domain = stats.get("by_domain", {})
+
+    # Simple keyword matching on graph title + dominant domain
+    title_lower = graph.title.lower()
+    if "model set" in title_lower or "superspace" in title_lower:
+        return SUPERSPACE_MODEL_SETS
+    if "algebraic" in title_lower or "scheme" in title_lower:
+        return ALGEBRAIC_GEOMETRY
+    if "dynami" in title_lower or "ergodic" in title_lower:
+        return DYNAMICAL_SYSTEMS
+
+    # Look at dominant scientific domain
+    if by_domain.get("information_theory", 0) + by_domain.get("pure_mathematics", 0) > 3:
+        return SUPERSPACE_MODEL_SETS
+    if by_domain.get("theoretical_physics", 0) > 3:
+        return DYNAMICAL_SYSTEMS
+
+    return SUPERSPACE_MODEL_SETS  # default
+
+
+# ══════════════════════════════════════════════════════════════
 # Paper Kernel Extractor
 # ══════════════════════════════════════════════════════════════
 
@@ -395,23 +617,35 @@ class ConjectureGenerator:
       - Connection to parent frontier nodes
     """
 
-    # Strategy → specialized prompt template
+    # Strategy → domain-general prompt template.
+    # Placeholders: {parent_statement}, {parent_proof}, {second_statement}, {context}
+    #   plus DomainContext fields prefixed with "domain_":
+    #   {domain_name}, {domain_key_structures}, {domain_typical_theorems},
+    #   {domain_canonical_examples}, {domain_known_open_problems},
+    #   {domain_boundary_questions}, {domain_computable_quantities},
+    #   {domain_target_transfer_domains}, {domain_known_dualities},
+    #   {domain_higher_dim_challenges}
     _STRATEGY_PROMPTS: dict[str, str] = {
-        "generalization": """Given the following theorem from the theory of superspace
-model sets and information-theoretic time, find a STRICT GENERALIZATION — weaken
-one or more hypotheses while preserving a meaningful (possibly weakened) conclusion.
+        "generalization": """Given the following theorem from the theory of {domain_name},
+find a STRICT GENERALIZATION — weaken one or more hypotheses while preserving a
+meaningful (possibly weakened) conclusion.
 
 The generalization must be NON-TRIVIAL: it should require genuine mathematical work
 to prove, not just removing an unused hypothesis.
 
 PARENT THEOREM:
-{parent_statement}
+{{parent_statement}}
 
 PROOF SKETCH OF PARENT:
-{parent_proof}
+{{parent_proof}}
 
 THEORY CONTEXT:
-{context}
+{{context}}
+
+KEY STRUCTURES:
+{domain_key_structures}
+
+{domain_typical_theorems}
 
 Produce a generalized result. Use rigorous mathematical language suitable for
 Inventiones Mathematicae or Annals of Mathematics. Provide:
@@ -420,21 +654,23 @@ Inventiones Mathematicae or Annals of Mathematics. Provide:
 3. An intuitive explanation of WHY the generalization works
 4. What new cases or applications the generalization covers""",
 
-        "composition": """Given two results from the theory of superspace model sets
-and information-theoretic time, find a NON-TRIVIAL COMPOSITION that combines them
-into a single deeper result.
+        "composition": """Given two results from the theory of {domain_name},
+find a NON-TRIVIAL COMPOSITION that combines them into a single deeper result.
 
 The composition should not be a mere conjunction (A and B); it should produce
 a genuinely new insight that neither result alone implies.
 
 RESULT A:
-{parent_statement}
+{{parent_statement}}
 
 RESULT B:
-{second_statement}
+{{second_statement}}
 
 THEORY CONTEXT:
-{context}
+{{context}}
+
+KEY STRUCTURES:
+{domain_key_structures}
 
 Produce a composed result. Use rigorous mathematical language. Provide:
 1. A precise formal statement (LaTeX notation)
@@ -442,23 +678,18 @@ Produce a composed result. Use rigorous mathematical language. Provide:
 3. An intuitive explanation of the new insight
 4. Why this composition is non-trivial""",
 
-        "analogy_transfer": """Given the following result from the theory of superspace
-model sets, identify a STRUCTURAL ANALOGY with another mathematical domain and
-TRANSFER the result to produce a new theorem in that domain.
+        "analogy_transfer": """Given the following result from the theory of {domain_name},
+identify a STRUCTURAL ANALOGY with another mathematical domain and TRANSFER
+the result to produce a new theorem in that domain.
 
 TARGET DOMAINS for transfer (pick the most natural one):
-  - Operator algebras / quantum information
-  - Ergodic theory / dynamical systems
-  - Coding theory / information theory
-  - Algebraic topology / homological algebra
-  - Number theory / arithmetic geometry
-  - Statistical mechanics / phase transitions
+{domain_target_transfer_domains}
 
 PARENT RESULT:
-{parent_statement}
+{{parent_statement}}
 
 THEORY CONTEXT:
-{context}
+{{context}}
 
 Produce an analogous result in the target domain. Provide:
 1. The precise structural analogy (what maps to what)
@@ -466,22 +697,18 @@ Produce an analogous result in the target domain. Provide:
 3. A proof sketch (or explanation why the analogy works formally)
 4. What new insight the transfer provides in the target domain""",
 
-        "boundary_analysis": """Given the following result from the theory of superspace
-model sets, investigate its BOUNDARY BEHAVIOR — what happens at extreme parameter
-values, degenerate cases, or critical transitions.
+        "boundary_analysis": """Given the following result from the theory of {domain_name},
+investigate its BOUNDARY BEHAVIOR — what happens at extreme parameter values,
+degenerate cases, or critical transitions.
 
 PARENT RESULT:
-{parent_statement}
+{{parent_statement}}
 
 THEORY CONTEXT:
-{context}
+{{context}}
 
-Investigate at least one of:
-  - What happens as m → ∞ (infinite resolution limit)?
-  - What happens as m → 1 or m → 2 (minimal resolution)?
-  - What happens when the golden ratio φ is replaced by other algebraic numbers?
-  - What happens at the boundary of the acceptance window W?
-  - What happens when the lattice Γ degenerates?
+Investigate at least one of the following boundary regimes:
+{domain_boundary_questions}
 
 Produce a boundary result. Provide:
 1. The precise limiting/degenerate regime
@@ -492,17 +719,14 @@ Produce a boundary result. Provide:
         "duality": """Given the following result, identify and apply a DUALITY
 transformation to produce a dual theorem.
 
-Known dualities in this theory:
-  - Resolution ↔ time depth (Remark 4.2: lost DOF recovered as temporal context)
-  - Visible entropy H(π) ↔ fiber degeneracy E_π[log d_m(X)] (KL-ledger identity)
-  - Synchronization budget ↔ collision budget (capacity law)
-  - Physical space E ↔ internal space H (CPS duality)
+Known dualities in the theory of {domain_name}:
+{domain_known_dualities}
 
 PARENT RESULT:
-{parent_statement}
+{{parent_statement}}
 
 THEORY CONTEXT:
-{context}
+{{context}}
 
 Apply a duality to produce the DUAL statement. Provide:
 1. Which duality you are applying and why
@@ -510,15 +734,18 @@ Apply a duality to produce the DUAL statement. Provide:
 3. A proof that the duality indeed exchanges the two sides
 4. New insight from the dual perspective""",
 
-        "unification": """Given the following results from the theory of superspace
-model sets, find a UNIFYING PRINCIPLE that explains all of them as special cases
-of a deeper structural pattern.
+        "unification": """Given the following results from the theory of {domain_name},
+find a UNIFYING PRINCIPLE that explains all of them as special cases of a deeper
+structural pattern.
 
 RESULTS TO UNIFY:
-{parent_statement}
+{{parent_statement}}
 
 THEORY CONTEXT:
-{context}
+{{context}}
+
+OPEN PROBLEMS (may hint at unifying principles):
+{domain_known_open_problems}
 
 Produce a unifying theorem or framework. Provide:
 1. The unifying principle (formal statement in LaTeX)
@@ -527,23 +754,20 @@ Produce a unifying theorem or framework. Provide:
 4. What new predictions the unification makes beyond the known cases""",
 
         "numerical_exploration": """Given the following result involving computable
-quantities from the theory of superspace model sets, design a NUMERICAL EXPERIMENT
-to discover NEW PATTERNS that extend beyond what is currently proved.
+quantities from the theory of {domain_name}, design a NUMERICAL EXPERIMENT to
+discover NEW PATTERNS that extend beyond what is currently proved.
 
 PARENT RESULT:
-{parent_statement}
+{{parent_statement}}
 
 Key computable quantities in this theory:
-  - Gauge anomaly density δ_m = E[G_m]/m → 4/9
-  - Gauge anomaly variance σ² = 118/243
-  - Fiber sizes |F_m(x)| for x ∈ X_m
-  - Scan error ε_m(P; μ) decay rates
-  - Boundary cylinder counts N_m(∂P)
-  - Entropy rate h_μ = log φ for golden-mean Parry measure
-  - Refinement functional τ(t) = -log μ(C(a_{0:t-1}))
+{domain_computable_quantities}
 
 THEORY CONTEXT:
-{context}
+{{context}}
+
+CANONICAL EXAMPLES:
+{domain_canonical_examples}
 
 Design a numerical investigation and CONJECTURE a new result. Provide:
 1. The computational experiment (what to compute, parameter ranges)
@@ -551,27 +775,45 @@ Design a numerical investigation and CONJECTURE a new result. Provide:
 3. A precise CONJECTURE based on the pattern (formal LaTeX)
 4. Why the conjecture is plausible (heuristic argument or connection to theory)""",
 
-        "dimensional_lifting": """Given the following result in the theory of 1D
-superspace readout (d=1), lift it to HIGHER DIMENSIONS (d≥2).
+        "dimensional_lifting": """Given the following result from the theory of
+{domain_name}, lift it to HIGHER DIMENSIONS or broader settings.
 
-PARENT RESULT (1D):
-{parent_statement}
+PARENT RESULT:
+{{parent_statement}}
 
 THEORY CONTEXT:
-{context}
+{{context}}
 
-Challenges of higher-dimensional lifting:
-  - The golden-mean language becomes a higher-dimensional SFT
-  - Zeckendorf stabilization generalizes to multi-dimensional carry rules
-  - Boundary cylinder dimension depends on window geometry in R^n
-  - The Sturmian coding becomes a multidimensional symbolic dynamics
+Challenges of higher-dimensional / broader extension:
+{domain_higher_dim_challenges}
 
-Produce a d-dimensional extension. Provide:
-1. The precise d-dimensional generalization (LaTeX)
-2. What changes and what remains from the 1D case
+Produce a higher-dimensional extension. Provide:
+1. The precise generalization (LaTeX)
+2. What changes and what remains from the original setting
 3. A proof sketch or argument for the generalization
-4. New phenomena that appear only in d ≥ 2""",
+4. New phenomena that appear only in the extended setting""",
     }
+
+    @classmethod
+    def _render_template(cls, strategy: str, domain: DomainContext) -> str:
+        """Two-phase render: first fill domain fields, then return a
+        template that still has {parent_statement} etc. for .format()."""
+        raw = cls._STRATEGY_PROMPTS[strategy]
+        # Phase 1: fill domain_* placeholders
+        rendered = raw.format(
+            domain_name=domain.name,
+            domain_key_structures=domain.key_structures,
+            domain_typical_theorems=domain.typical_theorems,
+            domain_canonical_examples=domain.canonical_examples,
+            domain_known_open_problems=domain.known_open_problems,
+            domain_boundary_questions=domain.boundary_questions,
+            domain_computable_quantities=domain.computable_quantities,
+            domain_target_transfer_domains=domain.target_transfer_domains,
+            domain_known_dualities=domain.known_dualities,
+            domain_higher_dim_challenges=domain.higher_dim_challenges,
+        )
+        # Phase 2 unescapes the double-braces back to single (for later .format())
+        return rendered
 
     async def generate(
         self,
@@ -582,8 +824,13 @@ Produce a d-dimensional extension. Provide:
         *,
         round_number: int = 1,
         existing_count: int = 0,
+        domain_context: DomainContext | None = None,
     ) -> list[ConceptNode]:
         """Generate candidate discoveries using a specific strategy.
+
+        Args:
+            domain_context: If provided, specialises prompts for the given domain.
+                            Defaults to SUPERSPACE_MODEL_SETS for backward compat.
 
         Returns list of ConceptNode candidates (not yet validated).
         """
@@ -593,7 +840,8 @@ Produce a d-dimensional extension. Provide:
             logger.warning(f"[ConjectureGenerator] Unknown strategy: {strategy}")
             return []
 
-        template = self._STRATEGY_PROMPTS[strategy]
+        domain = domain_context or SUPERSPACE_MODEL_SETS
+        template = self._render_template(strategy, domain)
 
         # Select parent nodes based on strategy
         if strategy == "composition" and len(frontier_nodes) >= 2:
@@ -726,6 +974,7 @@ class DiscoveryOrchestrator:
         llm: Any,
         *,
         output_dir: Path | None = None,
+        domain_context: DomainContext | None = None,
     ) -> list[DiscoveryResult]:
         """Execute the autonomous discovery loop.
 
@@ -733,10 +982,16 @@ class DiscoveryOrchestrator:
             graph: TheoryGraph containing the paper's theory
             llm: LLM router for reasoning calls
             output_dir: Optional directory to save results incrementally
+            domain_context: If None, auto-detected from graph content
 
         Returns:
             List of accepted discoveries
         """
+        if domain_context is None:
+            domain_context = detect_domain_context(graph)
+            logger.info(f"[Discovery] Auto-detected domain: {domain_context.name}")
+
+        self._domain_context = domain_context
         logger.info(f"[Discovery] Starting autonomous discovery on '{graph.title}'")
 
         # Extract kernel and frontier
@@ -782,6 +1037,7 @@ class DiscoveryOrchestrator:
                 llm=llm,
                 round_number=round_num,
                 existing_count=len(self._results),
+                domain_context=domain_context,
             )
 
             for candidate in candidates:
