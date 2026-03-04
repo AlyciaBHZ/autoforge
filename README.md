@@ -1,4 +1,4 @@
-# AutoForge v2.0
+# AutoForge v2.7
 
 AI 多 Agent 协作开发平台 —— 从想法到产品，不需要编程基础。
 
@@ -404,6 +404,42 @@ AutoForge 有 **3 条流水线**，由 **8 个 AI Agent** 协作完成。
 | **Scanner** | 项目分析师 | Opus | 分析已有项目，逆向生成项目规格 |
 | **DirectorFix** | 修复调度员 | Opus | 测试失败时，分析问题并生成修复任务 |
 
+### AI 智能层架构总览
+
+AutoForge 的 AI 智能层从 v2.1 到 v2.7 逐步构建，形成了完整的自我进化闭环：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   v2.7 跨域科研推理引擎                        │
+│  TheoryGraph · 多模态验证 · 12 种推理策略 · 理论演化 · 论文生成  │
+├─────────────────────────────────────────────────────────────┤
+│                   v2.6 知识图谱 + 形式证明                     │
+│  CapabilityDAG（社区可合并）· Lean 4 定理证明（MCTS+STP+COPRA）│
+├─────────────────────────────────────────────────────────────┤
+│                   v2.5 自适应执行                              │
+│  Reflexion 情景记忆 · 自适应计算 · LDB 块级调试                 │
+│  推测执行流水线 · 层级任务分解                                   │
+├─────────────────────────────────────────────────────────────┤
+│                   v2.4 多 Agent 协同优化                       │
+│  EvoMAC 文本梯度 · SICA 自我改进 · RAG 代码检索                │
+│  形式化验证 · 条件辩论 · 安全扫描                               │
+├─────────────────────────────────────────────────────────────┤
+│                   v2.3 闭环自优化                              │
+│  DSPy/OPRO 提示优化 · CodePRM 过程奖励 · RethinkMCTS          │
+├─────────────────────────────────────────────────────────────┤
+│                   v2.2 跨项目进化                              │
+│  Evolution 基因组 · MAP-Elites · LLM 自省                     │
+├─────────────────────────────────────────────────────────────┤
+│                   v2.1 搜索与检查                              │
+│  搜索树 · 中途检查点 · 动态 Constitution · GitHub 集成          │
+├─────────────────────────────────────────────────────────────┤
+│                   v2.0 核心流水线                              │
+│  6 Agent · 3 Pipeline · TaskDAG · Git Worktree · Sandbox     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+自下而上：核心流水线 → 搜索探索 → 跨项目进化 → 闭环自优化 → 多 Agent 协同 → 自适应执行 → 知识图谱 → 跨域科研推理。每一层都建立在下层之上，CapabilityDAG 作为统一的知识持久化层贯穿全部模块。
+
 ### 关键技术特性
 
 **GitHub 开源搜索集成 (v2.1 新增)**
@@ -596,6 +632,37 @@ AutoForge 有 **3 条流水线**，由 **8 个 AI Agent** 协作完成。
 - 灵感来自：Voyager (NeurIPS 2023) 技能库 + FunSearch (Nature 2024) LLM 引导搜索 + EUREKA (ICLR 2024) 进化搜索
 - 配置：`capability_dag_enabled=True`
 
+**跨域科研推理引擎 (v2.7 新增)**
+- 核心能力：不仅验证证明（Lean），更能进行跨学科的理论推理与发现
+- Lean 是一种语法，不是目标——真正的目标是跨域理论洞察
+- **TheoryGraph 知识结构**：将理论论文抽象为有向图——概念是节点（定义/定理/猜想/公理），逻辑依赖/类比/对偶/泛化是边。10 个科学领域（纯数学、理论物理、理论化学、理论生物、统计力学、信息论等），14 种概念类型，12 种关系类型
+- **多模态验证**（不只是形式证明）：
+  - 形式证明（Lean/Z3/Isabelle）：100% 确定，适用于数学
+  - 数值实验：高置信，适用于所有定量学科
+  - 量纲分析：物理/化学必备
+  - 对称性/守恒律检查：物理定律必须满足
+  - 极限情形验证：已知极端情况必须正确
+  - 统计检验：生物/社会科学
+  - 一致性检查：跨结论不矛盾
+  - 系统根据领域自动选择验证组合
+- **12 种推理策略**（枚举化人类科学推理模式）：
+  - 类比迁移（最有价值）：A 领域的结构 → B 领域的同构
+  - 泛化/特化：放宽假设 / 添加约束
+  - 组合/统一：合并独立结果
+  - 对偶/边界分析/量纲提升
+  - 数值探索 → 符号猜想（Ramanujan Machine 风格）
+  - 结构归纳/反证法
+- **ArticleParser**：从已有论文中提取 TheoryGraph（节/概念/关系）
+- **TheoryEvolver**：自主演化——从现有理论出发，尝试多种策略和目标领域，生成新理论分支
+- **ArticleGenerator**：从 TheoryGraph 生成结构化研究论文（LaTeX/Markdown），按拓扑序组织
+- **与 CapabilityDAG 联动**：理论概念自动注入 DAG，跨域桥梁作为高价值知识持久化
+- **管线集成**：
+  - BUILD 阶段：已有理论知识注入 builder agents 作为上下文
+  - VERIFY 阶段：自动解析理论文件 → 验证 → 演化 → 注入 DAG
+  - 结束时：理论状态保存到项目级 + 全局级存储，支持跨项目复用
+- 灵感来自：FunSearch (Nature 2024) + AlphaEvolve/AlphaProof (DeepMind 2025) + HERMES (2025) + SciAgent (2025) + Graph of Thought (2024) + LacMaterial (2024) + Ramanujan Machine (Nature 2021)
+- 配置：`theoretical_reasoning_enabled=True`
+
 **任务 DAG 调度**
 - 任务之间有依赖关系，形成有向无环图
 - 没有依赖的任务可以并行执行
@@ -764,10 +831,26 @@ autoforge/                   ← pip install 后可用的 Python 包
 │   │   ├── config.py        ← 配置管理 + 预算追踪
 │   │   ├── llm_router.py    ← LLM 路由：多提供商自动切换（Anthropic/OpenAI/Google）
 │   │   ├── agent_base.py    ← Agent 基类：tool-use 循环 + 检查点 + 动态 prompt
-│   │   ├── search_tree.py   ← 搜索树：分支/评估/回溯（SWE-Search 风格）
-│   │   ├── checkpoints.py   ← 中途检查点：Process Reward Model 式方向检查
-│   │   ├── dynamic_constitution.py ← 动态 Constitution + Meta-Learning 知识库
+│   │   ├── search_tree.py   ← 搜索树 + RethinkMCTS
+│   │   ├── checkpoints.py   ← 中途检查点：PRM 式方向检查
+│   │   ├── dynamic_constitution.py ← 动态 Constitution + Meta-Learning
 │   │   ├── evolution.py     ← 进化引擎：跨项目工作流自我进化
+│   │   ├── prompt_optimizer.py ← DSPy/OPRO 提示自优化
+│   │   ├── process_reward.py   ← CodePRM 过程奖励模型
+│   │   ├── evomac.py           ← EvoMAC 文本反向传播
+│   │   ├── sica.py             ← SICA 自我改进编码智能体
+│   │   ├── rag_retrieval.py    ← 跨项目 RAG 代码检索
+│   │   ├── formal_verify.py    ← 形式化验证（多层次静态分析）
+│   │   ├── agent_debate.py     ← 条件多 Agent 辩论
+│   │   ├── security_scan.py    ← RedCode 安全扫描
+│   │   ├── reflexion.py        ← Reflexion 情景记忆
+│   │   ├── adaptive_compute.py ← 自适应推理计算
+│   │   ├── ldb_debugger.py     ← LDB 块级调试器
+│   │   ├── speculative_pipeline.py ← 推测执行流水线
+│   │   ├── hierarchical_decomp.py  ← 层级任务分解
+│   │   ├── lean_prover.py      ← Lean 4 形式化定理证明
+│   │   ├── capability_dag.py   ← CapabilityDAG 自增长知识图谱
+│   │   ├── theoretical_reasoning.py ← 跨域科研推理引擎
 │   │   ├── task_dag.py      ← 任务 DAG：依赖分析 + 调度
 │   │   ├── lock_manager.py  ← 跨平台原子锁
 │   │   ├── git_manager.py   ← Git worktree 管理

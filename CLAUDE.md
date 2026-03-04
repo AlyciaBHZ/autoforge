@@ -70,6 +70,7 @@ engine/speculative_pipeline.py  Speculative pipeline — overlapping phase pre-e
 engine/hierarchical_decomp.py   Hierarchical decomposition — Parsel-style function-level task planning
 engine/lean_prover.py           Lean 4 theorem proving — Hilbert+COPRA+MCTS+STP multi-strategy formal prover
 engine/capability_dag.py        CapabilityDAG — self-growing universal knowledge graph, community-mergeable
+engine/theoretical_reasoning.py Cross-domain scientific reasoning — TheoryGraph, multi-modal verification, theory evolution & article generation
 engine/task_dag.py           TaskDAG — dependency graph, scheduling, persistence
 engine/lock_manager.py      Cross-platform atomic task locking (symlink on POSIX, O_CREAT|O_EXCL on Windows)
 engine/git_manager.py       Git worktree isolation for parallel builders
