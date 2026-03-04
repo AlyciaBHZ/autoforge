@@ -216,6 +216,33 @@ class ForgeConfig:
     capability_dag_enabled: bool = True        # Enable universal self-growing knowledge graph
     theoretical_reasoning_enabled: bool = True # Enable cross-domain scientific reasoning & theory evolution
 
+    # Project goal declaration (v2.8) — users declare workspace intent during setup
+    # so the engine can allocate resources, context, and agent strategies to match.
+    # Valid goal_type values: "general", "formal_verification", "web_app", "api_service",
+    #   "data_pipeline", "mobile_app", "cli_tool", "library", "research"
+    project_goal_type: str = "general"       # Workspace development goal category
+    project_goal_description: str = ""       # Free-text description of what the project aims to achieve
+    project_goal_disciplines: list[str] = field(default_factory=list)
+    # e.g. ["mathematics", "physics", "cs_theory"] — guides which formal tools to load
+
+    # Context budget management (v2.7)
+    context_budget_tokens: int = 4000          # Max total supplementary context injected per agent call
+    dag_ingest_confidence_threshold: float = 0.4  # Min confidence to ingest a concept into CapabilityDAG
+    dag_ingest_relevance_threshold: float = 0.3   # Min relevance score for DAG retrieval results
+
+    # Lean prover deep settings (v2.8)
+    lean_mcts_iterations: int = 200           # Max MCTS iterations for proof search
+    lean_decomposition_depth: int = 5         # Max recursive decomposition depth
+    lean_auto_repair_passes: int = 3          # Max sorry-elimination repair passes
+    lean_mathlib_search_enabled: bool = True   # Enable Mathlib-aware premise selection
+    lean_pantograph_repl: bool = True          # Enable Pantograph interactive REPL mode
+
+    # Multi-prover formal verification (v2.8)
+    coq_enabled: bool = False                  # Coq theorem prover
+    isabelle_enabled: bool = False             # Isabelle/HOL prover
+    tlaplus_enabled: bool = False              # TLA+ model checker (distributed systems)
+    z3_smt_enabled: bool = False               # Z3 SMT solver (program verification)
+    dafny_enabled: bool = False                # Dafny (verified programming)
     # Known model name patterns for validation (prefix-based)
     _KNOWN_MODEL_PATTERNS: tuple[str, ...] = (
         "claude-",

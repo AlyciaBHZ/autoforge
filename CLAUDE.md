@@ -68,7 +68,8 @@ engine/adaptive_compute.py      Adaptive test-time compute — difficulty-aware 
 engine/ldb_debugger.py          LDB — block-level fault localization via runtime simulation
 engine/speculative_pipeline.py  Speculative pipeline — overlapping phase pre-execution for speed
 engine/hierarchical_decomp.py   Hierarchical decomposition — Parsel-style function-level task planning
-engine/lean_prover.py           Lean 4 theorem proving — Hilbert+COPRA+MCTS+STP multi-strategy formal prover
+engine/lean_prover.py           Lean 4 theorem proving — Hilbert+COPRA+MCTS+STP+Pantograph+PaperReview+ProofRepair
+engine/multi_prover.py          Multi-prover formal verification — Coq, Isabelle, TLA+, Z3/SMT, Dafny cross-verification
 engine/capability_dag.py        CapabilityDAG — self-growing universal knowledge graph, community-mergeable
 engine/theoretical_reasoning.py Cross-domain scientific reasoning — TheoryGraph, multi-modal verification, theory evolution & article generation
 engine/task_dag.py           TaskDAG — dependency graph, scheduling, persistence

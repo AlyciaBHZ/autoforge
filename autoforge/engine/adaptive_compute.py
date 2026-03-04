@@ -42,6 +42,18 @@ class DifficultyLevel(str, Enum):
     EXTREME = "extreme"
 
 
+class ReasoningType(str, Enum):
+    """Task-specific reasoning strategies inspired by SciAgent (2025).
+
+    Different reasoning tasks benefit from specialized worker systems.
+    """
+    SYMBOLIC = "symbolic"      # Formal logic, proofs, type systems
+    NUMERICAL = "numerical"    # Math computation, optimization, algorithms
+    CONCEPTUAL = "conceptual"  # Architecture design, API design, high-level planning
+    GENERATIVE = "generative"  # Code generation, content creation
+    VERIFICATION = "verification"  # Testing, reviewing, debugging
+
+
 @dataclass
 class ComputeProfile:
     """Resource allocation for a difficulty level."""
@@ -54,6 +66,7 @@ class ComputeProfile:
     preferred_complexity: str  # Maps to TaskComplexity for LLM routing
     builder_max_turns: int
     enable_prm: bool  # Process Reward Model
+    sub_agent_hints: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +78,7 @@ class ComputeProfile:
             "preferred_complexity": self.preferred_complexity,
             "builder_max_turns": self.builder_max_turns,
             "enable_prm": self.enable_prm,
+            "sub_agent_hints": self.sub_agent_hints,
         }
 
 
@@ -112,6 +126,115 @@ PROFILES: dict[DifficultyLevel, ComputeProfile] = {
     ),
 }
 
+# Sub-agent strategy hints by (difficulty, reasoning_type)
+# Maps to specialized worker system configurations (SciAgent-style dispatch)
+SUB_AGENT_HINTS: dict[tuple[DifficultyLevel, ReasoningType], dict[str, Any]] = {
+    # VERIFICATION strategies
+    (DifficultyLevel.TRIVIAL, ReasoningType.VERIFICATION): {
+        "run_security_scan": False,
+        "ldb_enabled": False,
+        "debate_rounds": 0,
+    },
+    (DifficultyLevel.STANDARD, ReasoningType.VERIFICATION): {
+        "run_security_scan": False,
+        "ldb_enabled": False,
+        "debate_rounds": 1,
+    },
+    (DifficultyLevel.COMPLEX, ReasoningType.VERIFICATION): {
+        "run_security_scan": True,
+        "ldb_enabled": True,
+        "debate_rounds": 2,
+        "enable_reflexion": True,
+    },
+    (DifficultyLevel.EXTREME, ReasoningType.VERIFICATION): {
+        "run_security_scan": True,
+        "ldb_enabled": True,
+        "debate_rounds": 3,
+        "enable_reflexion": True,
+        "formal_verify": True,
+    },
+    # SYMBOLIC strategies (formal logic, proofs, type systems)
+    (DifficultyLevel.TRIVIAL, ReasoningType.SYMBOLIC): {
+        "use_lean": False,
+        "debate_rounds": 0,
+    },
+    (DifficultyLevel.STANDARD, ReasoningType.SYMBOLIC): {
+        "use_lean": False,
+        "debate_rounds": 1,
+    },
+    (DifficultyLevel.COMPLEX, ReasoningType.SYMBOLIC): {
+        "use_lean": True,
+        "debate_rounds": 2,
+        "enable_theorem_proving": True,
+    },
+    (DifficultyLevel.EXTREME, ReasoningType.SYMBOLIC): {
+        "use_lean": True,
+        "debate_rounds": 3,
+        "enable_theorem_proving": True,
+        "mcts_strategy": "proof_search",
+    },
+    # NUMERICAL strategies (math, optimization, algorithms)
+    (DifficultyLevel.TRIVIAL, ReasoningType.NUMERICAL): {
+        "enable_symbolic_compute": False,
+        "mcts_iterations": 0,
+    },
+    (DifficultyLevel.STANDARD, ReasoningType.NUMERICAL): {
+        "enable_symbolic_compute": False,
+        "mcts_iterations": 3,
+    },
+    (DifficultyLevel.COMPLEX, ReasoningType.NUMERICAL): {
+        "enable_symbolic_compute": True,
+        "mcts_iterations": 7,
+        "algorithm_synthesis": True,
+    },
+    (DifficultyLevel.EXTREME, ReasoningType.NUMERICAL): {
+        "enable_symbolic_compute": True,
+        "mcts_iterations": 12,
+        "algorithm_synthesis": True,
+        "performance_profiling": True,
+    },
+    # CONCEPTUAL strategies (architecture, design, planning)
+    (DifficultyLevel.TRIVIAL, ReasoningType.CONCEPTUAL): {
+        "debate_rounds": 0,
+        "hierarchical_decomp": False,
+    },
+    (DifficultyLevel.STANDARD, ReasoningType.CONCEPTUAL): {
+        "debate_rounds": 1,
+        "hierarchical_decomp": True,
+    },
+    (DifficultyLevel.COMPLEX, ReasoningType.CONCEPTUAL): {
+        "debate_rounds": 2,
+        "hierarchical_decomp": True,
+        "enable_capability_dag": True,
+    },
+    (DifficultyLevel.EXTREME, ReasoningType.CONCEPTUAL): {
+        "debate_rounds": 3,
+        "hierarchical_decomp": True,
+        "enable_capability_dag": True,
+        "theoretical_reasoning": True,
+    },
+    # GENERATIVE strategies (code generation, content creation)
+    (DifficultyLevel.TRIVIAL, ReasoningType.GENERATIVE): {
+        "max_retries": 1,
+        "mcts_iterations": 0,
+    },
+    (DifficultyLevel.STANDARD, ReasoningType.GENERATIVE): {
+        "max_retries": 2,
+        "mcts_iterations": 3,
+    },
+    (DifficultyLevel.COMPLEX, ReasoningType.GENERATIVE): {
+        "max_retries": 3,
+        "mcts_iterations": 7,
+        "enable_evomac": True,
+    },
+    (DifficultyLevel.EXTREME, ReasoningType.GENERATIVE): {
+        "max_retries": 5,
+        "mcts_iterations": 12,
+        "enable_evomac": True,
+        "enable_sica": True,
+    },
+}
+
 # ──────────────────────────────────────────────
 # Difficulty estimation heuristics
 # ──────────────────────────────────────────────
@@ -148,6 +271,27 @@ COMPLEXITY_SIGNALS: dict[str, float] = {
     "readme": -0.3,
 }
 
+# Reasoning type indicators (keywords → reasoning strategy)
+REASONING_TYPE_SIGNALS: dict[ReasoningType, list[str]] = {
+    ReasoningType.VERIFICATION: [
+        "test", "verify", "review", "debug", "validation", "check",
+        "assert", "audit", "security", "bug", "error", "fail"
+    ],
+    ReasoningType.SYMBOLIC: [
+        "proof", "theorem", "type", "formal", "logic", "constraint",
+        "invariant", "precondition", "postcondition", "hoare"
+    ],
+    ReasoningType.NUMERICAL: [
+        "algorithm", "optimize", "compute", "solve", "calculate", "math",
+        "numerical", "matrix", "tensor", "performance", "speed"
+    ],
+    ReasoningType.CONCEPTUAL: [
+        "design", "architect", "plan", "structure", "organize", "pattern",
+        "api", "schema", "interface", "framework", "refactor"
+    ],
+    # GENERATIVE is default for code generation, content creation
+}
+
 
 @dataclass
 class DifficultyEstimate:
@@ -157,6 +301,7 @@ class DifficultyEstimate:
     score: float  # 0.0 = trivial, 1.0 = extreme
     confidence: float  # How confident we are in this estimate
     signals: list[str]  # What drove the estimate
+    reasoning_type: ReasoningType = ReasoningType.GENERATIVE
     profile: ComputeProfile = field(default_factory=lambda: PROFILES[DifficultyLevel.STANDARD])
 
     def to_dict(self) -> dict[str, Any]:
@@ -165,6 +310,7 @@ class DifficultyEstimate:
             "score": round(self.score, 3),
             "confidence": round(self.confidence, 3),
             "signals": self.signals,
+            "reasoning_type": self.reasoning_type.value,
             "profile": self.profile.to_dict(),
         }
 
@@ -198,6 +344,50 @@ class AdaptiveComputeRouter:
         self._bias: float = 0.0  # Learned bias from calibration
         self._profiles = dict(PROFILES)
 
+    # ── Reasoning type classification ──────────
+
+    def _classify_reasoning_type(self, task_description: str) -> ReasoningType:
+        """Classify reasoning type using keyword signals.
+
+        Matches task keywords against reasoning-type-specific indicators:
+          - VERIFICATION: test, verify, review, debug, validation
+          - SYMBOLIC: proof, theorem, type check, formal logic
+          - NUMERICAL: algorithm, optimize, compute, numerical
+          - CONCEPTUAL: design, architect, plan, api, schema
+          - GENERATIVE: default (code generation, content creation)
+
+        Args:
+            task_description: Task or requirement description
+
+        Returns:
+            ReasoningType classification
+        """
+        desc_lower = task_description.lower()
+        scores: dict[ReasoningType, int] = {t: 0 for t in ReasoningType}
+
+        # Score each reasoning type by keyword matches
+        for reasoning_type, keywords in REASONING_TYPE_SIGNALS.items():
+            for keyword in keywords:
+                if keyword in desc_lower:
+                    scores[reasoning_type] += 1
+
+        # Find highest scoring type (or GENERATIVE if tied/no matches)
+        max_score = max(scores.values()) if scores else 0
+        if max_score == 0:
+            return ReasoningType.GENERATIVE
+
+        # Return first reasoning type with max score (except GENERATIVE preference)
+        for reasoning_type in [
+            ReasoningType.VERIFICATION,
+            ReasoningType.SYMBOLIC,
+            ReasoningType.NUMERICAL,
+            ReasoningType.CONCEPTUAL,
+        ]:
+            if scores[reasoning_type] == max_score:
+                return reasoning_type
+
+        return ReasoningType.GENERATIVE
+
     # ── Core API ─────────────────────────────────
 
     def estimate_difficulty(
@@ -213,6 +403,10 @@ class AdaptiveComputeRouter:
           - Module/file count from spec
           - Architecture complexity indicators
           - Self-calibration bias from past runs
+          - Reasoning type classification for sub-agent routing
+
+        Returns:
+            DifficultyEstimate with difficulty level and reasoning type
         """
         score = 0.5  # Baseline: standard
         signals: list[str] = []
@@ -275,6 +469,10 @@ class AdaptiveComputeRouter:
 
         profile = self._profiles[level]
 
+        # Classify reasoning type for sub-agent routing
+        reasoning_type = self._classify_reasoning_type(task_description)
+        signals.append(f"reasoning_type:{reasoning_type.value}")
+
         # Confidence: higher when we have more calibration data
         n_cal = len(self._calibration)
         confidence = min(0.9, 0.5 + 0.04 * n_cal)
@@ -284,6 +482,7 @@ class AdaptiveComputeRouter:
             score=score,
             confidence=confidence,
             signals=signals,
+            reasoning_type=reasoning_type,
             profile=profile,
         )
 
@@ -296,6 +495,7 @@ class AdaptiveComputeRouter:
         """Use LLM to estimate difficulty (more accurate but costs tokens).
 
         Falls back to heuristic if LLM call fails.
+        Maintains reasoning type classification from heuristic estimate.
         """
         heuristic = self.estimate_difficulty(task_description, spec)
 
@@ -352,6 +552,41 @@ Reply with ONLY a JSON object: {{"score": 0.X, "reason": "brief reason"}}"""
             logger.debug(f"LLM difficulty estimation failed, using heuristic: {e}")
 
         return heuristic
+
+    # ── Sub-agent configuration ──────────────────
+
+    def get_sub_agent_config(self, estimate: DifficultyEstimate) -> dict[str, Any]:
+        """Get merged compute profile + sub-agent hints for specialized routing.
+
+        Implements SciAgent-style hierarchical dispatch: routes tasks to
+        specialized worker systems based on both difficulty and reasoning type.
+
+        Args:
+            estimate: DifficultyEstimate with level and reasoning_type
+
+        Returns:
+            Merged dict with base ComputeProfile fields + reasoning-specific hints
+        """
+        # Start with base profile
+        config = estimate.profile.to_dict().copy()
+
+        # Look up reasoning-type-specific hints
+        hint_key = (estimate.level, estimate.reasoning_type)
+        if hint_key in SUB_AGENT_HINTS:
+            hints = SUB_AGENT_HINTS[hint_key]
+            config.setdefault("sub_agent_hints", {}).update(hints)
+            logger.debug(
+                f"[AdaptiveCompute] Sub-agent config: "
+                f"({estimate.level.value}, {estimate.reasoning_type.value}) "
+                f"→ {len(hints)} hints"
+            )
+        else:
+            logger.debug(
+                f"[AdaptiveCompute] No sub-agent hints for "
+                f"({estimate.level.value}, {estimate.reasoning_type.value})"
+            )
+
+        return config
 
     # ── Calibration ──────────────────────────────
 
