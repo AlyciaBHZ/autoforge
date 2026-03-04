@@ -427,7 +427,86 @@ class Orchestrator:
         if not spec.get("project_name"):
             raise ValueError("Director did not specify project_name")
 
+        # Validate build contract
+        self._validate_build_contract(spec)
+
         return spec
+
+    def _validate_build_contract(self, spec: dict[str, Any]) -> None:
+        """Validate the build contract defines overnight-sized scope."""
+        contract = spec.get("build_contract")
+        if not contract:
+            # Synthesize a default contract so older prompts still work
+            contract = self._default_build_contract(spec)
+            spec["build_contract"] = contract
+            logger.info("Build contract missing from spec — using defaults")
+
+        required_keys = ["deliverables", "test_requirements", "stop_conditions"]
+        for key in required_keys:
+            if key not in contract:
+                raise ValueError(f"Build contract missing required key: {key}")
+
+        # Enforce scope limits
+        stops = contract.get("stop_conditions", {})
+        max_tasks = stops.get("max_tasks", 15)
+        max_modules = stops.get("max_modules", 8)
+
+        if max_tasks > 20:
+            raise ValueError(
+                f"Build contract max_tasks={max_tasks} exceeds hard cap of 20 — "
+                f"reduce scope or move features to 'excluded'"
+            )
+        if max_modules > 10:
+            raise ValueError(
+                f"Build contract max_modules={max_modules} exceeds hard cap of 10"
+            )
+
+        n_modules = len(spec.get("modules", []))
+        if n_modules > max_modules:
+            raise ValueError(
+                f"Spec has {n_modules} modules but build contract caps at {max_modules} — "
+                f"reduce modules or raise max_modules (hard cap: 10)"
+            )
+
+        # Apply budget cap from contract if lower than global
+        budget_cap = stops.get("budget_cap_usd")
+        if budget_cap is not None and budget_cap < self.config.budget_limit_usd:
+            self.config.budget_limit_usd = budget_cap
+            console.print(
+                f"  [cyan]Budget:[/cyan] capped at ${budget_cap:.2f} by build contract"
+            )
+
+        deliverables = contract.get("deliverables", [])
+        if not deliverables:
+            raise ValueError("Build contract must list at least one deliverable")
+
+        console.print(
+            f"  [cyan]Build contract:[/cyan] {len(deliverables)} deliverables, "
+            f"max {max_tasks} tasks, max {max_modules} modules"
+        )
+
+    @staticmethod
+    def _default_build_contract(spec: dict[str, Any]) -> dict[str, Any]:
+        """Generate a sensible default contract when Director omits it."""
+        return {
+            "deliverables": [
+                "Source code for all modules",
+                "README.md with setup instructions",
+            ],
+            "test_requirements": {
+                "build_must_pass": True,
+                "start_must_pass": True,
+                "minimum_test_coverage": "smoke",
+            },
+            "reports": ["test_results.json"],
+            "stop_conditions": {
+                "max_tasks": 15,
+                "max_source_files": 30,
+                "max_modules": min(len(spec.get("modules", [])), 8),
+                "budget_cap_usd": 10.0,
+            },
+            "scope_justification": "Auto-generated default contract",
+        }
 
     # ──────────────────────────────────────────────
     # Phase 2: BUILD
@@ -460,6 +539,16 @@ class Orchestrator:
             # Fallback: create a simple task per module
             logger.warning("Architect produced no tasks, creating from modules")
             tasks_data = self._tasks_from_modules()
+
+        # Enforce build contract task cap
+        contract = self.spec.get("build_contract", {})
+        max_tasks = contract.get("stop_conditions", {}).get("max_tasks", 15)
+        if len(tasks_data) > max_tasks:
+            console.print(
+                f"  [yellow]Task cap:[/yellow] Architect produced {len(tasks_data)} tasks, "
+                f"trimming to contract limit of {max_tasks}"
+            )
+            tasks_data = tasks_data[:max_tasks]
 
         self.dag = TaskDAG.from_dict(tasks_data)
         console.print(f"  [green]Task DAG:[/green] {self.dag.total_tasks()} tasks created")
@@ -1170,7 +1259,8 @@ class Orchestrator:
         """Independent verification before BUILD → VERIFY transition (Section C).
 
         Enforces the BUILD → VERIFY quality gate from quality_gates.md:
-        all BUILD tasks done, no blocked tasks, declared files exist.
+        all BUILD tasks done, no blocked tasks, declared files exist,
+        and build contract limits respected.
         """
         build_tasks = [t for t in dag.get_all_tasks() if t.phase == TaskPhase.BUILD]
 
@@ -1216,7 +1306,32 @@ class Orchestrator:
                 console.print(f"    - {m}")
             if len(missing) > 10:
                 console.print(f"    ... and {len(missing) - 10} more")
-        else:
+
+        # Check 4: Build contract limits
+        contract = self.spec.get("build_contract", {})
+        stops = contract.get("stop_conditions", {})
+
+        max_tasks = stops.get("max_tasks", 15)
+        if len(build_tasks) > max_tasks:
+            console.print(
+                f"  [yellow]Build gate warning:[/yellow] {len(build_tasks)} tasks "
+                f"exceeds contract limit of {max_tasks}"
+            )
+
+        max_files = stops.get("max_source_files", 30)
+        source_files = list(project_dir.rglob("*"))
+        source_count = sum(
+            1 for f in source_files
+            if f.is_file()
+            and not any(p in f.parts for p in (".git", "node_modules", ".autoforge", "__pycache__", ".venv"))
+        )
+        if source_count > max_files:
+            console.print(
+                f"  [yellow]Build gate warning:[/yellow] {source_count} source files "
+                f"exceeds contract limit of {max_files}"
+            )
+
+        if not missing and len(build_tasks) <= max_tasks:
             console.print("  [green]Build gate passed[/green]")
 
     def _detect_file_overlaps(

@@ -11,15 +11,22 @@ Each phase transition must pass its quality gate before proceeding.
 | File coverage | Each module lists at least 1 file |
 | Tech stack | Framework, language, and runtime specified |
 | Naming | project_name is kebab-case, valid as directory name |
+| Build contract | `build_contract` present with `deliverables`, `test_requirements`, `reports`, `stop_conditions` |
+| Scope limit | Module count ≤ `stop_conditions.max_modules` (default 8, hard cap 10) |
+| Task cap | `stop_conditions.max_tasks` ≤ 20 |
+| Justification | `scope_justification` is a non-empty string |
 
 ## Gate: BUILD → VERIFY
 
 | Check | Criteria |
 |-------|----------|
 | Task completion | All BUILD tasks are "done" |
+| Task count | Task count ≤ `build_contract.stop_conditions.max_tasks` |
 | File existence | All files listed in tasks actually exist |
+| File count | Total source files ≤ `build_contract.stop_conditions.max_source_files` |
 | No blocked tasks | No tasks stuck in "blocked" state |
 | Review pass | All code reviewed and approved (score >= 6) |
+| Deliverables | All items in `build_contract.deliverables` are present |
 
 ## Gate: VERIFY → REFACTOR
 
