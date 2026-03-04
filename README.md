@@ -406,6 +406,152 @@ AutoForge 有 **3 条流水线**，由 **8 个 AI Agent** 协作完成。
 
 ### 关键技术特性
 
+**GitHub 开源搜索集成 (v2.1 新增)**
+- Director 和 Architect 可主动搜索 GitHub 发现已有的开源解决方案
+- 自动评估仓库质量（stars、活跃度、license、issue 关闭率）
+- Builder 在实现阶段可搜索特定 npm/pip 包
+- 支持仓库详情检查（README、文件结构、依赖声明）
+- 可选 `GITHUB_TOKEN` 环境变量提升 API 速率限制
+
+**搜索树与回溯机制 (v2.1 新增)**
+- 架构设计阶段生成多个候选方案（而非线性单一路径）
+- 基于 SWE-Search (ICLR 2025) 思路：分支-评估-选择-回溯
+- 多样性过滤：自动去除本质相同的候选方案
+- 失败时自动回溯到次优分支，而非从头重来
+- 配置：`FORGE_SEARCH_TREE=true`，`FORGE_SEARCH_CANDIDATES=3`
+
+**中途检查点 (v2.1 新增)**
+- Builder 每 8 轮插入轻量方向检查（Process Reward Model 风格）
+- 检测方向偏离、空转、过度工程等问题
+- 低分时注入课程修正反馈，极低分时回滚到上一个好的检查点
+- 配置：`FORGE_CHECKPOINTS=true`，`FORGE_CHECKPOINT_INTERVAL=8`
+
+**动态 Constitution (v2.1 新增)**
+- SPEC 阶段后，Director 根据项目特点生成针对性的 Agent 指令
+- 例如 WebSocket 项目会给 Builder 注入异步错误处理指南
+- 支持从失败中学习：自动生成防止同类问题的规则（Meta-Learning）
+- 规则持久化到 `.autoforge/knowledge_base.json`，跨项目复用
+
+**进化引擎 (v2.2 新增)**
+- 跨项目工作流自我进化：每次运行是一个"基因组"，包含所有策略参数
+- **策略记忆**：成功的工作流配置持久化到 `~/.autoforge/evolution_memory.json`
+- **变异机制**：新项目继承最佳策略并施加小变异，探索更优配置
+- **适应度追踪**：质量×完成率×测试通过率×成本效率 = 综合适应度
+- **LLM 自省**：项目完成后 AI 分析什么有效什么可改进，指导下一代进化
+- **交叉繁殖**：不同项目类型的成功策略可以交叉组合
+- **MAP-Elites 式多样性**：按技术栈分 niche 保留多种优秀策略
+- 配置：`FORGE_EVOLUTION=true`（默认开启）
+
+**DSPy/OPRO 提示自优化 (v2.3 新增)**
+- 灵感来自 Stanford DSPy 和 DeepMind OPRO：用 LLM 优化 LLM 的提示词
+- **Thompson Sampling 选择**：在多个提示变体中自动平衡探索与利用
+- **OPRO 优化**：积累足够数据后，LLM 分析当前提示词的表现并提出改进
+- **AMPO 变异**：支持 focus_shift / simplify / elaborate / restructure 四种变异策略
+- **适应度追踪**：每个变体记录使用次数、平均/最优/最差适应度
+- 状态持久化到 `~/.autoforge/prompt_optimization/state.json`，跨项目累积优化
+- 配置：`prompt_optimization_enabled=True`（默认开启）
+
+**CodePRM 过程奖励模型 (v2.3 新增)**
+- 灵感来自 ACL 2025 CodePRM：对代码生成的每一步打分，而非只看最终结果
+- **步骤级评估**：PLANNING / FILE_CREATE / FILE_MODIFY / TEST_WRITE 等 8 种步骤类型
+- **双信号融合**：LLM 判断（60%）+ 执行反馈（40%）= 综合过程奖励
+- **执行验证**：自动运行 py_compile / node --check 验证语法，执行测试获取真实反馈
+- **轨迹分析**：加权评估整条轨迹（后期步骤权重更高），自动识别瓶颈步骤
+- **课程修正预警**：连续 3 步低分或趋势恶化时触发预警，提前介入
+- 轨迹数据保存到 `.autoforge/prm_trajectories/`，供进化引擎分析
+- 配置：`process_reward_enabled=True`（默认开启）
+
+**RethinkMCTS 增强搜索 (v2.3 新增)**
+- 灵感来自 RethinkMCTS (2024) 和 RPM-MCTS (2025)：用执行反馈矫正错误推理
+- **完整 MCTS 循环**：SELECT（UCB1）→ EXPAND → SIMULATE → BACKPROPAGATE → REFINE
+- **思维链修正（核心创新）**：执行失败时，LLM 分析思维链找到出错步骤，创建修正兄弟节点
+- **过程奖励集成**：SIMULATE 阶段融合 CodePRM 信号（LLM 评估 60% + PRM 40%）
+- **鲁棒选择**：最终选择访问次数最多的节点（而非最高值），更稳定
+- 与原有 SearchTree 共存：架构探索用 SearchTree，具体实现用 MCTSSearchTree
+- 配置：`mcts_enabled=True`，`mcts_max_iterations=9`
+
+**三模块闭环优化**
+- DSPy 优化提示 → RethinkMCTS 探索方案 → CodePRM 评估每步 → 适应度反馈回 DSPy
+- 形成自动化的 "优化-探索-评估" 循环，每个项目都让系统变得更聪明
+
+**EvoMAC 文本反向传播 (v2.4 新增)**
+- 灵感来自 EvoMAC (ICLR 2025)：多 Agent 之间传递自然语言"梯度"
+- **前向传播**：Builder 写代码 → Tester/Reviewer 测试/审查
+- **反向传播**：LLM 从测试/审查结果中提取"文本梯度"，描述每个 Agent 应该如何改进
+- **拓扑进化**：追踪哪些反馈路径有效，自动增强或剪枝 Agent 之间的通信边
+- 配置：`evomac_enabled=True`
+
+**SICA 自我改进编码智能体 (v2.4 新增)**
+- 灵感来自 SICA (ICLR 2025 Workshop) + STO (NeurIPS 2025)：Agent 自己编辑自己的提示规则
+- **性能分析**：每次运行后 LLM 分析质量数据，提出 constitution 文件的具体编辑建议
+- **安全护栏**：保护关键文件不被修改（orchestrator.py, config.py 等），编辑必须通过验证
+- **自动回滚**：如果改进后性能下降超过 10%，自动恢复到之前的版本
+- 配置：`sica_enabled=True`
+
+**跨项目 RAG 代码检索 (v2.4 新增)**
+- 灵感来自 arXiv 2510.04905：从历史项目中检索相关代码片段，辅助新项目生成
+- **BM25 + TF-IDF 混合检索**：无需外部向量模型，纯 Python 实现
+- **代码感知分词**：识别 camelCase 和 snake_case，按函数/类粒度提取
+- **质量加权**：高质量项目的代码片段在检索中获得更高权重
+- 配置：`rag_enabled=True`
+
+**形式化验证 (v2.4 新增)**
+- 灵感来自 Vericoding：多层次代码验证（静态分析 → 类型检查 → 安全扫描 → LLM 形式化分析）
+- **自动检测工具**：自动发现可用的 flake8、mypy、bandit、eslint 等工具
+- **LLM 形式化分析**：检查不变量违反、资源泄漏、并发问题、逻辑错误
+- 配置：`formal_verify_enabled=True`
+
+**条件多 Agent 辩论 (v2.4 新增)**
+- 灵感来自条件辩论 (ICLR 2025)：只在候选方案分数接近时触发辩论，避免不必要的开销
+- **不确定性检测**：LLM 评估是否需要辩论（分数差 < 0.15 时触发）
+- **奖励引导**：每轮辩论后 LLM 给论证打分，引导辩论方向
+- **收敛停止**：单一立场胜出、奖励分差明显、或达到共识时自动终止
+- 配置：`debate_enabled=True`
+
+**RedCode 安全扫描 (v2.4 新增)**
+- 灵感来自 RedCode (NeurIPS 2024)：生成代码的安全漏洞扫描
+- **模式匹配**：15+ Python 规则、10+ JavaScript 规则，覆盖 OWASP Top 10 和 CWE 常见漏洞
+- **依赖扫描**：集成 pip-audit 和 npm audit 检查已知漏洞
+- **LLM 深度分析**：对关键文件进行逻辑级安全审查
+- 配置：`security_scan_enabled=True`
+
+**Reflexion 情景记忆 (v2.5 新增)**
+- 灵感来自 Reflexion (NeurIPS 2023, Shinn et al.)：HumanEval +11%
+- **语言强化学习**：Agent 失败后生成自然语言"反思"，而非简单重试
+- **情景记忆**：跨任务、跨项目积累的失败反思库，避免重蹈覆辙
+- **解析标签**：自动从错误信息提取失败类型（import_error、type_error 等）
+- 配置：`reflexion_enabled=True`
+
+**自适应推理计算 (v2.5 新增)**
+- 灵感来自 "Scaling LLM Test-Time Compute" (ICLR 2025)：自适应分配比均匀 best-of-N 高效 4×
+- **难度估计**：关键词信号 + 项目规模 + LLM 评估，混合判断任务复杂度
+- **四级计算配置**：TRIVIAL → STANDARD → COMPLEX → EXTREME，自动调整重试次数、MCTS 深度、模型选择
+- **自校准**：追踪预测 vs 实际难度，用指数移动平均自动修正偏差
+- 配置：`adaptive_compute_enabled=True`
+
+**LDB 块级调试器 (v2.5 新增)**
+- 灵感来自 LDB (ACL 2024, Zhong et al.)：HumanEval +9.8%，GPT-4o 达到 98.2%
+- **控制流分解**：将代码拆分为基本块（条件、循环、赋值、返回）
+- **运行时追踪**：通过沙盒或 LLM 模拟追踪每个块的变量值
+- **精确定位**：LLM 逐块验证，找到第一个输出不符预期的块
+- **靶向修复**：只修改出错的块，而非盲目重写整个函数
+- 配置：`ldb_debugger_enabled=True`
+
+**推测执行流水线 (v2.5 新增)**
+- 灵感来自 Speculative Actions (arXiv 2510.04371) 和 Sherlock (arXiv 2511.00330)
+- **阶段重叠**：SPEC 完成时已提前创建好项目骨架、BUILD 完成时已准备好测试框架
+- **投机验证**：推测性工作完成后验证是否与实际流水线兼容，冲突则丢弃
+- **预计加速 20-40%**：减少阶段间的等待时间
+- 配置：`speculative_enabled=True`
+
+**层级任务分解 (v2.5 新增)**
+- 灵感来自 Parsel (NeurIPS 2023)：竞赛题通过率比直接生成高 75%
+- 灵感来自 CodePlan (ACM 2024)：仓库级依赖感知代码规划
+- **函数级分解**：LLM 将复杂任务拆分为 3-15 个有依赖关系的函数规格
+- **拓扑排序**：Kahn 算法确定实现顺序，叶子函数先实现
+- **自底向上实现**：每个函数实现时已有依赖函数作为上下文
+- 配置：`hierarchical_decomp_enabled=True`
+
 **任务 DAG 调度**
 - 任务之间有依赖关系，形成有向无环图
 - 没有依赖的任务可以并行执行
@@ -494,6 +640,17 @@ FORGE_MAX_AGENTS=3
 FORGE_DOCKER_ENABLED=true
 FORGE_LOG_LEVEL=INFO
 
+# GitHub 集成（可选，提升搜索能力）
+GITHUB_TOKEN=                    # GitHub Personal Access Token（提升 API 速率限制）
+
+# 搜索树（v2.1 新增）
+FORGE_SEARCH_TREE=true           # 启用多方案搜索树（架构阶段）
+FORGE_SEARCH_CANDIDATES=3        # 每次分支生成的候选方案数
+
+# 中途检查点（v2.1 新增）
+FORGE_CHECKPOINTS=true           # 启用 Builder 中途方向检查
+FORGE_CHECKPOINT_INTERVAL=8      # 每 N 轮检查一次方向
+
 # 守护进程模式（可选）
 FORGE_TELEGRAM_TOKEN=            # Telegram Bot Token（从 @BotFather 获取）
 FORGE_TELEGRAM_ALLOWED_USERS=    # 允许的用户（逗号分隔，空=全部允许）
@@ -562,7 +719,11 @@ autoforge/                   ← pip install 后可用的 Python 包
 │   │   ├── orchestrator.py  ← 总编排器：管理 3 条流水线
 │   │   ├── config.py        ← 配置管理 + 预算追踪
 │   │   ├── llm_router.py    ← LLM 路由：多提供商自动切换（Anthropic/OpenAI/Google）
-│   │   ├── agent_base.py    ← Agent 基类：tool-use 循环 + 模式过滤
+│   │   ├── agent_base.py    ← Agent 基类：tool-use 循环 + 检查点 + 动态 prompt
+│   │   ├── search_tree.py   ← 搜索树：分支/评估/回溯（SWE-Search 风格）
+│   │   ├── checkpoints.py   ← 中途检查点：Process Reward Model 式方向检查
+│   │   ├── dynamic_constitution.py ← 动态 Constitution + Meta-Learning 知识库
+│   │   ├── evolution.py     ← 进化引擎：跨项目工作流自我进化
 │   │   ├── task_dag.py      ← 任务 DAG：依赖分析 + 调度
 │   │   ├── lock_manager.py  ← 跨平台原子锁
 │   │   ├── git_manager.py   ← Git worktree 管理
@@ -573,6 +734,10 @@ autoforge/                   ← pip install 后可用的 Python 包
 │   │   ├── channels/        ← 输入渠道
 │   │   │   ├── telegram_bot.py ← Telegram 机器人
 │   │   │   └── webhook.py   ← REST API 接口
+│   │   ├── tools/           ← Agent 工具
+│   │   │   ├── web.py       ← Web 搜索 + URL 抓取
+│   │   │   ├── search.py    ← 代码搜索 (grep)
+│   │   │   └── github_search.py ← GitHub 仓库/代码搜索
 │   │   └── agents/          ← 8 个 Agent 实现
 │   │       ├── director.py  ← 产品经理 + 修复调度
 │   │       ├── architect.py ← 架构师

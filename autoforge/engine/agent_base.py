@@ -1,4 +1,10 @@
-"""Agent base class — the core agentic tool-use loop."""
+"""Agent base class — the core agentic tool-use loop.
+
+Enhanced with:
+  - Mid-task checkpoints (process reward model style)
+  - Search tree integration for branching decisions
+  - Dynamic constitution support
+"""
 
 from __future__ import annotations
 
@@ -72,11 +78,18 @@ class AgentBase(ABC):
         self.llm = llm
         self.mode: str = getattr(config, "mode", "developer")
         self._system_prompt: str = ""
+        self._dynamic_supplement: str = ""  # Dynamic constitution patches
         self._tools: list[ToolDefinition] = []
         self._output_parts: list[str] = []
         self._artifacts: dict[str, Any] = {}
+        self._checkpoint_mgr: Any = None  # Lazy-initialized CheckpointManager
         self._load_system_prompt()
         self._register_tools()
+
+    def set_dynamic_constitution(self, supplement: str) -> None:
+        """Set dynamic constitution supplement (project-specific instructions)."""
+        self._dynamic_supplement = supplement
+        logger.debug(f"[{self.ROLE}] Dynamic constitution set ({len(supplement)} chars)")
 
     def _load_system_prompt(self) -> None:
         """Load system prompt from constitution/agents/{role}.md."""
@@ -140,6 +153,8 @@ class AgentBase(ABC):
     async def run(self, context: dict[str, Any]) -> AgentResult:
         """Execute the agentic tool-use loop.
 
+        Enhanced with mid-task checkpoints and dynamic constitution support.
+
         Args:
             context: Dictionary with task-specific data for build_prompt().
 
@@ -150,6 +165,11 @@ class AgentBase(ABC):
         self._artifacts = {}
         start_time = time.monotonic()
 
+        # Build effective system prompt (static + dynamic)
+        effective_system = self._system_prompt
+        if self._dynamic_supplement:
+            effective_system += self._dynamic_supplement
+
         user_prompt = self.build_prompt(context)
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
         tool_defs = self._get_tool_definitions()
@@ -158,9 +178,19 @@ class AgentBase(ABC):
         # --- Metrics tracking (Section D) ---
         tool_counts: dict[str, int] = {}
         files_written = 0
+        files_written_list: list[str] = []
         # --- Anti-spin tracking (Section B) ---
         last_write_turn = 0  # last turn that called write_file
         is_write_agent = bool(self.WRITE_TOOLS)  # spin detection only for write-capable agents
+
+        # --- Checkpoint setup (Section E) ---
+        checkpoint_enabled = is_write_agent and self.MAX_TURNS >= 15
+        if checkpoint_enabled:
+            from autoforge.engine.checkpoints import CheckpointManager
+            self._checkpoint_mgr = CheckpointManager(
+                config=self.config, llm=self.llm,
+                checkpoint_interval=8,
+            )
 
         self._log_action("started", f"prompt length={len(user_prompt)}")
 
@@ -184,7 +214,7 @@ class AgentBase(ABC):
 
                 response = await self.llm.call(
                     complexity=self.COMPLEXITY,
-                    system=self._system_prompt,
+                    system=effective_system,
                     messages=messages,
                     tools=tool_defs if tool_defs else None,
                 )
@@ -214,6 +244,9 @@ class AgentBase(ABC):
                             if block.name == "write_file":
                                 files_written += 1
                                 wrote_this_turn = True
+                                # Track file paths for checkpoint system
+                                if block.input.get("path"):
+                                    files_written_list.append(block.input["path"])
 
                             tool_results.append({
                                 "type": "tool_result",
@@ -249,6 +282,46 @@ class AgentBase(ABC):
                                 "spin_warning",
                                 f"nudge injected at turn {turns} ({idle_turns} idle)",
                             )
+
+                    # --- Mid-task checkpoint (Section E) ---
+                    if (checkpoint_enabled and self._checkpoint_mgr
+                            and self._checkpoint_mgr.should_check(turns)):
+                        task_desc = context.get("task", {}).get("description", user_prompt[:500])
+                        verdict = await self._checkpoint_mgr.check_direction(
+                            task_description=task_desc,
+                            messages_so_far=messages,
+                            files_written=files_written_list,
+                            turn=turns,
+                        )
+                        if verdict.suggested_action == "adjust" and verdict.feedback:
+                            # Inject course-correction guidance into tool results
+                            correction = (
+                                f"\n\n[CHECKPOINT REVIEW — Turn {turns}]\n"
+                                f"Direction score: {verdict.score:.1f}/1.0\n"
+                                f"Feedback: {verdict.feedback}\n"
+                                f"Action: Adjust your approach based on this feedback."
+                            )
+                            tool_results[-1]["content"] += correction
+                            self._log_action("checkpoint_adjust", verdict.feedback[:100])
+                        elif verdict.should_reset:
+                            # Rollback to last good checkpoint
+                            good_cp = self._checkpoint_mgr.get_last_good_checkpoint()
+                            if good_cp:
+                                messages = good_cp.messages_snapshot
+                                reset_msg = (
+                                    f"\n\n[CHECKPOINT RESET — Turn {turns}]\n"
+                                    f"Your previous approach scored {verdict.score:.1f}/1.0.\n"
+                                    f"Feedback: {verdict.feedback}\n"
+                                    f"You have been reset to turn {good_cp.turn}. "
+                                    f"Try a DIFFERENT approach this time."
+                                )
+                                messages.append({
+                                    "role": "user",
+                                    "content": reset_msg,
+                                })
+                                self._log_action("checkpoint_reset",
+                                    f"Reset to turn {good_cp.turn}, score={verdict.score:.2f}")
+                                continue  # Skip appending, restart loop with reset messages
 
                     # Append assistant response + tool results to conversation
                     messages.append({"role": "assistant", "content": response.content})

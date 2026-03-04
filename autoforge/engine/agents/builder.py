@@ -130,7 +130,7 @@ class BuilderAgent(AgentBase):
             handler=partial(handle_grep_search, working_dir=self.working_dir),
         ))
 
-        # Add fetch_url if web tools enabled
+        # Add fetch_url and GitHub tools if web tools enabled
         if getattr(self.config, "web_tools_enabled", True):
             from autoforge.engine.tools.web import (
                 FETCH_URL_TOOL_SCHEMA,
@@ -145,6 +145,25 @@ class BuilderAgent(AgentBase):
                 ),
                 input_schema=FETCH_URL_TOOL_SCHEMA,
                 handler=handle_fetch_url,
+            ))
+
+            # GitHub search for discovering libraries during implementation
+            import os
+            from autoforge.engine.tools.github_search import (
+                SEARCH_GITHUB_TOOL_SCHEMA,
+                handle_search_github,
+            )
+
+            github_token = os.environ.get("GITHUB_TOKEN", "")
+
+            self._tools.append(ToolDefinition(
+                name="search_github",
+                description=(
+                    "Search GitHub for libraries when you need a specific package. "
+                    "Use to find the right npm/pip package for a sub-task."
+                ),
+                input_schema=SEARCH_GITHUB_TOOL_SCHEMA,
+                handler=partial(handle_search_github, github_token=github_token),
             ))
 
     def _validate_path(self, rel_path: str) -> Path:

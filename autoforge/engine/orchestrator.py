@@ -33,6 +33,22 @@ from autoforge.engine.git_manager import GitManager, is_git_available
 from autoforge.engine.llm_router import BudgetExceededError, LLMRouter
 from autoforge.engine.lock_manager import LockManager
 from autoforge.engine.sandbox import SandboxBase, create_sandbox
+from autoforge.engine.dynamic_constitution import DynamicConstitution
+from autoforge.engine.evolution import EvolutionEngine, FitnessScore, WorkflowGenome
+from autoforge.engine.process_reward import ProcessRewardModel, StepType
+from autoforge.engine.prompt_optimizer import PromptOptimizer
+from autoforge.engine.search_tree import MCTSSearchTree, SearchTree, evaluate_candidate
+from autoforge.engine.evomac import EvoMACEngine
+from autoforge.engine.sica import SICAEngine
+from autoforge.engine.rag_retrieval import RAGRetrievalEngine
+from autoforge.engine.formal_verify import FormalVerifier
+from autoforge.engine.agent_debate import ConditionalDebateEngine
+from autoforge.engine.security_scan import SecurityScanner
+from autoforge.engine.reflexion import ReflexionEngine
+from autoforge.engine.adaptive_compute import AdaptiveComputeRouter
+from autoforge.engine.ldb_debugger import LDBDebugger
+from autoforge.engine.speculative_pipeline import SpeculativePipeline
+from autoforge.engine.hierarchical_decomp import HierarchicalDecomposer
 from autoforge.engine.task_dag import Task, TaskDAG, TaskPhase, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -55,6 +71,23 @@ class Orchestrator:
         self.architecture: dict[str, Any] = {}
         self._state_file: Path | None = None
         self._start_time: float = 0
+        self._dynamic_constitution: DynamicConstitution | None = None
+        self._search_tree: SearchTree | None = None
+        self._evolution = EvolutionEngine()
+        self._genome: WorkflowGenome | None = None
+        self._prompt_optimizer = PromptOptimizer()
+        self._process_reward: ProcessRewardModel | None = None
+        self._evomac = EvoMACEngine()
+        self._sica = SICAEngine()
+        self._rag = RAGRetrievalEngine()
+        self._formal_verifier = FormalVerifier()
+        self._debate = ConditionalDebateEngine()
+        self._security_scanner = SecurityScanner()
+        self._reflexion = ReflexionEngine()
+        self._adaptive_compute = AdaptiveComputeRouter()
+        self._ldb = LDBDebugger()
+        self._speculative = SpeculativePipeline()
+        self._decomposer = HierarchicalDecomposer()
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
@@ -78,12 +111,55 @@ class Orchestrator:
             n_modules = len(self.spec.get("modules", []))
             console.print(f"  [green]Spec generated:[/green] {project_name} — {n_modules} modules")
 
+            # Evolution: prepare genome based on project type + past experience
+            self._genome = self._evolution.prepare_genome(
+                project_type=EvolutionEngine.infer_project_type(self.spec),
+                tech_fingerprint=EvolutionEngine.extract_tech_fingerprint(self.spec),
+                config=self.config,
+            )
+            self._evolution.apply_genome_to_config(self._genome, self.config)
+            if self._genome.generation > 0:
+                console.print(
+                    f"  [cyan]Evolution:[/cyan] gen {self._genome.generation} "
+                    f"(from {self._genome.parent_id})"
+                )
+                if self._genome.mutations:
+                    console.print(f"    Mutations: {', '.join(self._genome.mutations)}")
+
+            # Dynamic constitution: generate project-specific agent instructions
+            await self._init_dynamic_constitution()
+
+            # Prompt optimizer: register baselines and get optimized prompts
+            await self._init_prompt_optimizer()
+
+            # EvoMAC: start iteration for text backpropagation
+            if self.config.evomac_enabled:
+                self._evomac.start_iteration()
+
+            # Speculative: start build scaffolding while we checkpoint
+            if self.config.speculative_enabled:
+                await self._speculative.speculate_build_scaffold(self.spec, self.project_dir)
+
+            # Adaptive compute: estimate project-level difficulty
+            if self.config.adaptive_compute_enabled:
+                self._difficulty = self._adaptive_compute.estimate_difficulty(
+                    requirement, self.spec,
+                )
+                console.print(
+                    f"  [cyan]Compute router:[/cyan] difficulty={self._difficulty.level.value} "
+                    f"(score={self._difficulty.score:.2f})"
+                )
+
             # Checkpoint: review spec before building
             await self._checkpoint(
                 "spec",
                 f"Generated spec with {n_modules} modules. "
                 f"Review: {self.project_dir / 'spec.json'}",
             )
+
+            # Speculative: validate build scaffold before BUILD
+            if self.config.speculative_enabled:
+                await self._speculative.validate_and_commit("spec-build-scaffold")
 
             # Phase 2: BUILD
             console.print("\n[bold blue]Phase 2: BUILD[/bold blue] — Building project...")
@@ -101,13 +177,30 @@ class Orchestrator:
                     f"Built {done}/{total} tasks. Review generated code in: {self.project_dir}",
                 )
 
+            # Speculative: start test scaffolding while we checkpoint
+            if self.config.speculative_enabled:
+                await self._speculative.speculate_test_scaffold(self.spec, self.project_dir)
+
             # Phase 3: VERIFY
             console.print("\n[bold blue]Phase 3: VERIFY[/bold blue] — Verifying project...")
             await self._phase_verify()
+
+            # Formal verification: static analysis + LLM formal checks
+            if self.config.formal_verify_enabled:
+                await self._run_formal_verification()
+
+            # Security scan: vulnerability detection
+            if self.config.security_scan_enabled:
+                await self._run_security_scan()
+
             self._save_state("verify_complete")
 
             # Checkpoint: review test results
             await self._checkpoint("verify", "Verification complete. Review test_results.json.")
+
+            # EvoMAC: generate text gradients from verify results
+            if self.config.evomac_enabled:
+                await self._evomac_backward_pass()
 
             # Phase 4: REFACTOR
             console.print("\n[bold blue]Phase 4: REFACTOR[/bold blue] — Improving quality...")
@@ -118,6 +211,33 @@ class Orchestrator:
             console.print("\n[bold blue]Phase 5: DELIVER[/bold blue] — Packaging...")
             await self._phase_deliver()
             self._save_state("complete")
+
+            # Evolution: record fitness and reflect on the run
+            await self._evolution_record_and_reflect(project_name)
+
+            # Prompt optimizer: record fitness for active variants + trigger optimization
+            await self._prompt_optimizer_record_and_optimize(project_name)
+
+            # RAG: index completed project for future retrieval
+            if self.config.rag_enabled:
+                self._rag.index_project(self.project_dir, project_name)
+                console.print(f"  [cyan]RAG:[/cyan] indexed for future projects")
+
+            # SICA: propose self-improvements based on this run
+            if self.config.sica_enabled:
+                await self._sica_propose_improvements(project_name)
+
+            # EvoMAC: save state
+            if self.config.evomac_enabled and self.project_dir:
+                self._evomac.save_state(self.project_dir / ".autoforge")
+
+            # Reflexion: save episodic memory for future projects
+            if self.config.reflexion_enabled and self.project_dir:
+                self._reflexion.save_state(self.project_dir / ".autoforge")
+
+            # Adaptive compute: save calibration data
+            if self.config.adaptive_compute_enabled and self.project_dir:
+                self._adaptive_compute.save_state(self.project_dir / ".autoforge")
 
             self._print_summary()
             return self.project_dir
@@ -206,12 +326,22 @@ class Orchestrator:
         # Step 1: Architect designs and creates task DAG
         console.print("  Designing architecture...")
         architect = ArchitectAgent(self.config, self.llm)
-        arch_result = await architect.run({"spec": self.spec})
 
-        if not arch_result.success:
-            raise RuntimeError(f"Architect failed: {arch_result.error}")
+        # Inject dynamic constitution into architect
+        if self._dynamic_constitution:
+            supplement = self._dynamic_constitution.build_supplementary_prompt("architect")
+            if supplement:
+                architect.set_dynamic_constitution(supplement)
 
-        arch_data = architect.parse_architecture(arch_result.output)
+        # Optionally use search tree for architecture exploration
+        if getattr(self.config, "search_tree_enabled", False):
+            arch_data = await self._explore_architectures(architect)
+        else:
+            arch_result = await architect.run({"spec": self.spec})
+            if not arch_result.success:
+                raise RuntimeError(f"Architect failed: {arch_result.error}")
+            arch_data = architect.parse_architecture(arch_result.output)
+
         self.architecture = arch_data.get("architecture", {})
         tasks_data = arch_data.get("tasks", [])
 
@@ -408,6 +538,73 @@ class Orchestrator:
                 agent_id=agent_id,
             )
 
+            # Inject dynamic constitution into builder
+            if self._dynamic_constitution:
+                supplement = self._dynamic_constitution.build_supplementary_prompt("builder")
+                if supplement:
+                    builder.set_dynamic_constitution(supplement)
+
+            # Inject optimized prompt if available
+            _, opt_prompt = self._prompt_optimizer.get_active_prompt("builder")
+            if opt_prompt:
+                builder.set_dynamic_constitution(
+                    (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + opt_prompt
+                )
+
+            # RAG: inject relevant code from past projects
+            if self.config.rag_enabled:
+                rag_context = self._rag.build_context(
+                    task.description, top_k=3,
+                )
+                if rag_context:
+                    builder.set_dynamic_constitution(
+                        (getattr(builder, "_dynamic_supplement", "") or "") + rag_context
+                    )
+
+            # Hierarchical decomposition: for complex tasks, provide structured plan
+            if self.config.hierarchical_decomp_enabled:
+                difficulty = getattr(self, "_difficulty", None)
+                is_complex = (
+                    difficulty and difficulty.level.value in ("complex", "extreme")
+                ) or len(task.files) > 3
+                if is_complex:
+                    try:
+                        mod_name = task.files[0].rsplit("/", 1)[-1].rsplit(".", 1)[0] if task.files else task.id
+                        plan = await self._decomposer.decompose(
+                            task.description, mod_name, self.spec, self.llm,
+                        )
+                        if plan:
+                            decomp_ctx = self._decomposer.build_context_for_agent(plan)
+                            builder.set_dynamic_constitution(
+                                (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + decomp_ctx
+                            )
+                            console.print(
+                                f"    [{agent_id}] [cyan]Decomp:[/cyan] {len(plan.functions)} functions planned"
+                            )
+                    except Exception as e:
+                        logger.debug(f"Hierarchical decomposition skipped: {e}")
+
+            # Reflexion: inject past failure reflections
+            if self.config.reflexion_enabled:
+                reflexion_ctx = self._reflexion.build_retry_context(
+                    task.description, project=self.spec.get("project_name", ""),
+                )
+                if reflexion_ctx:
+                    builder.set_dynamic_constitution(
+                        (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + reflexion_ctx
+                    )
+
+            # Initialize process reward model for this task
+            prm = ProcessRewardModel(
+                self.config, self.llm, sandbox=sandbox, working_dir=working_dir,
+            )
+            prm.start_trajectory(task.id, task.description)
+            prm.record_step(
+                task.id, StepType.PLANNING,
+                f"Starting build: {task.description}",
+                files_touched=task.files,
+            )
+
             result = await builder.run({
                 "task": task.to_dict(),
                 "spec": self.spec,
@@ -416,6 +613,12 @@ class Orchestrator:
             })
 
             if result.success:
+                # Record build success step in PRM
+                prm.record_step(
+                    task.id, StepType.FILE_CREATE,
+                    f"Build completed for {task.id}",
+                    files_touched=task.files,
+                )
                 if use_git:
                     # Commit work in the worktree
                     await git.commit_worktree(branch_name, task.description, task.id)
@@ -447,6 +650,10 @@ class Orchestrator:
 
                 # Quick review
                 reviewer = ReviewerAgent(self.config, self.llm, working_dir)
+                if self._dynamic_constitution:
+                    supplement = self._dynamic_constitution.build_supplementary_prompt("reviewer")
+                    if supplement:
+                        reviewer.set_dynamic_constitution(supplement)
                 review_result = await reviewer.run({
                     "task": task.to_dict(),
                     "spec": self.spec,
@@ -459,6 +666,16 @@ class Orchestrator:
                         await git.merge_branch(branch_name)
                     self.dag.mark_done(task.id, f"score={review.score}")
                     console.print(f"  [green][{agent_id}] Done:[/green] {task.id} (score: {review.score})")
+
+                    # PRM: evaluate trajectory and save
+                    traj_result = await prm.evaluate_trajectory(task.id, "success")
+                    if traj_result.get("final_score", 0) > 0:
+                        console.print(
+                            f"  [{agent_id}] PRM: score={traj_result['final_score']:.2f} "
+                            f"trend={traj_result.get('reward_trend', '?')}"
+                        )
+                    if self.project_dir:
+                        prm.save_trajectory(task.id, self.project_dir / ".autoforge")
                 else:
                     # Revision needed — retry with feedback
                     logger.info(f"Task {task.id} needs revision: {review.summary}")
@@ -483,9 +700,25 @@ class Orchestrator:
                 self.dag.mark_failed(task.id, result.error)
                 console.print(f"  [red][{agent_id}] Failed:[/red] {task.id} — {result.error[:80]}")
 
+                # PRM: record failure and evaluate trajectory
+                prm.record_step(
+                    task.id, StepType.DEBUG,
+                    f"Build failed: {result.error[:200]}",
+                    files_touched=task.files,
+                )
+                await prm.evaluate_trajectory(task.id, "failure")
+                if self.project_dir:
+                    prm.save_trajectory(task.id, self.project_dir / ".autoforge")
+
+                # Meta-learning: analyze failure to create preventive rules
+                await self._learn_from_task_failure(task, result.error, agent_id)
+
         except Exception as e:
             self.dag.mark_failed(task.id, str(e))
             console.print(f"  [red][{agent_id}] Error:[/red] {task.id} — {e}")
+
+            # Meta-learning: analyze exception to create preventive rules
+            await self._learn_from_task_failure(task, str(e), agent_id)
         finally:
             lock_manager.release(task.id, agent_id)
             # Always clean up the worktree (if we created one)
@@ -761,7 +994,17 @@ class Orchestrator:
                 await self._fix_failures(test_results, sandbox)
 
     async def _fix_failures(self, test_results, sandbox: SandboxBase) -> None:
-        """Attempt to fix test failures using Director + Builder."""
+        """Attempt to fix test failures using Director + Builder + Reflexion + LDB.
+
+        Enhanced pipeline:
+          1. LDB: block-level fault localization on each failure
+          2. Director: create fix tasks (enriched with LDB analysis)
+          3. Builder: execute fixes (with Reflexion context)
+          4. Reflexion: reflect on failure if fix didn't work
+          5. Repeat with accumulated reflections
+        """
+        project_name = self.spec.get("project_name", "")
+
         for attempt in range(self.config.max_retries):
             failures = test_results.failures
             if not failures:
@@ -772,6 +1015,34 @@ class Orchestrator:
             # Director creates fix tasks
             fix_director = DirectorFixAgent(self.config, self.llm)
             for failure in failures[:3]:  # Limit fixes per attempt
+                failure_id = f"fix-{hash(str(failure)) % 10000}"
+                failure_msg = failure if isinstance(failure, str) else str(failure)
+
+                # LDB: block-level fault localization
+                ldb_context = ""
+                if self.config.ldb_debugger_enabled:
+                    try:
+                        failure_dict = failure if isinstance(failure, dict) else {"error": failure_msg}
+                        debug_report = await self._ldb.debug_test_failure(
+                            self.project_dir, failure_dict, self.llm, sandbox,
+                        )
+                        if debug_report:
+                            ldb_context = self._ldb.format_for_agent(debug_report)
+                            if debug_report.faulty_block is not None:
+                                console.print(
+                                    f"    [cyan]LDB:[/cyan] fault in {debug_report.function_name} "
+                                    f"block {debug_report.faulty_block}"
+                                )
+                    except Exception as e:
+                        logger.debug(f"LDB debugging skipped: {e}")
+
+                # Reflexion: build context from past reflections
+                reflexion_ctx = ""
+                if self.config.reflexion_enabled:
+                    reflexion_ctx = self._reflexion.build_retry_context(
+                        failure_msg, project=project_name,
+                    )
+
                 fix_result = await fix_director.run({
                     "failure": failure,
                     "spec": self.spec,
@@ -779,12 +1050,22 @@ class Orchestrator:
                 if fix_result.success:
                     fix_task = fix_director.parse_fix_task(fix_result.output)
 
-                    # Builder executes fix
+                    # Builder executes fix (with LDB + Reflexion context)
                     builder = BuilderAgent(
                         self.config, self.llm,
                         working_dir=self.project_dir,
                         sandbox=sandbox,
                     )
+
+                    # Inject LDB + Reflexion context
+                    extra_ctx = ""
+                    if ldb_context:
+                        extra_ctx += "\n" + ldb_context
+                    if reflexion_ctx:
+                        extra_ctx += "\n" + reflexion_ctx
+                    if extra_ctx:
+                        builder.set_dynamic_constitution(extra_ctx)
+
                     await builder.run({
                         "task": fix_task,
                         "spec": self.spec,
@@ -798,7 +1079,34 @@ class Orchestrator:
 
             if test_results.all_passed:
                 console.print("  [green]Fixes successful — all tests pass[/green]")
+                # Reflexion: mark as resolved
+                if self.config.reflexion_enabled:
+                    for failure in failures[:3]:
+                        fid = f"fix-{hash(str(failure)) % 10000}"
+                        self._reflexion.mark_success(fid)
                 return
+
+            # Reflexion: reflect on why fixes didn't work
+            if self.config.reflexion_enabled:
+                for failure in failures[:3]:
+                    failure_msg = failure if isinstance(failure, str) else str(failure)
+                    fid = f"fix-{hash(str(failure)) % 10000}"
+                    try:
+                        await self._reflexion.reflect_on_failure(
+                            task_id=fid,
+                            task_description=f"Fix test failure: {failure_msg[:200]}",
+                            failure_summary=failure_msg[:500],
+                            llm=self.llm,
+                            project=project_name,
+                        )
+                    except Exception as e:
+                        logger.debug(f"Reflexion skipped: {e}")
+
+        # Mark persistent failures
+        if self.config.reflexion_enabled:
+            for failure in (test_results.failures or [])[:3]:
+                fid = f"fix-{hash(str(failure)) % 10000}"
+                self._reflexion.mark_persistent(fid)
 
         console.print("  [yellow]Some issues remain after fix attempts[/yellow]")
 
@@ -1105,6 +1413,537 @@ class Orchestrator:
 
         # Build new modules
         await self._phase_build()
+
+    # ──────────────────────────────────────────────
+    # Evolution — Cross-Project Self-Improvement
+    # ──────────────────────────────────────────────
+
+    async def _evolution_record_and_reflect(self, project_name: str) -> None:
+        """Record fitness of this run and perform LLM-assisted reflection.
+
+        Called at the end of a successful pipeline run. The fitness data
+        drives evolution: future projects inherit strategies that scored well.
+        """
+        elapsed = time.monotonic() - self._start_time
+
+        # Gather fitness metrics
+        quality = 0.0
+        test_pass_rate = 0.0
+        refactor_needed = True
+
+        # Try to read test results
+        test_file = self.project_dir / ".autoforge" / "test_results.json"
+        if not test_file.exists():
+            test_file = self.project_dir / "test_results.json"
+        if test_file.exists():
+            try:
+                test_data = json.loads(test_file.read_text(encoding="utf-8"))
+                test_pass_rate = 1.0 if test_data.get("all_passed") else 0.5
+            except Exception:
+                pass
+
+        # Try to read review score
+        review_file = self.project_dir / ".autoforge" / "review_report.json"
+        if review_file.exists():
+            try:
+                review_data = json.loads(review_file.read_text(encoding="utf-8"))
+                quality = float(review_data.get("score", 0))
+                refactor_needed = quality < (self.config.quality_threshold * 10)
+            except Exception:
+                pass
+
+        tasks_completed = 0
+        tasks_total = 0
+        if self.dag:
+            build_tasks = [t for t in self.dag.get_all_tasks() if t.phase == TaskPhase.BUILD]
+            tasks_total = len(build_tasks)
+            tasks_completed = len([t for t in build_tasks if t.status == TaskStatus.DONE])
+
+        fitness = FitnessScore(
+            quality_score=quality,
+            test_pass_rate=test_pass_rate,
+            cost_usd=self.config.estimated_cost_usd,
+            duration_seconds=elapsed,
+            tasks_completed=tasks_completed,
+            tasks_total=tasks_total,
+            build_success_rate=(tasks_completed / tasks_total) if tasks_total > 0 else 0.0,
+            refactor_needed=refactor_needed,
+        )
+
+        # Update genome with actual architecture strategy used
+        if self._genome and self.architecture:
+            self._genome.arch_strategy = json.dumps(
+                self.architecture, ensure_ascii=False
+            )[:500]
+
+        # Record to evolution memory
+        record = self._evolution.record_result(
+            project_name=project_name,
+            fitness=fitness,
+            genome=self._genome,
+        )
+
+        console.print(
+            f"\n  [cyan]Evolution:[/cyan] fitness={fitness.composite_score:.2f} "
+            f"(quality={quality}/10, tests={test_pass_rate:.0%}, "
+            f"build={tasks_completed}/{tasks_total})"
+        )
+
+        # LLM-assisted reflection (analyze what worked)
+        try:
+            reflection = await self._evolution.reflect(record, self.llm)
+            if reflection:
+                console.print(f"  [cyan]Reflection:[/cyan] {reflection[:120]}...")
+        except Exception as e:
+            logger.debug(f"Evolution reflection skipped: {e}")
+
+        # Show evolution stats
+        stats = self._evolution.get_evolution_stats()
+        if stats.get("total_runs", 0) > 1:
+            console.print(
+                f"  [dim]Evolution history: {stats['total_runs']} runs, "
+                f"{stats['niches']} niches, "
+                f"best fitness={stats.get('best_fitness', 0):.2f}[/dim]"
+            )
+
+    # ──────────────────────────────────────────────
+    # Dynamic Constitution & Meta-Learning
+    # ──────────────────────────────────────────────
+
+    async def _init_dynamic_constitution(self) -> None:
+        """Initialize dynamic constitution and generate patches from spec.
+
+        Called after SPEC phase. The Director analyzes the spec and generates
+        project-specific instructions for each agent role.
+        """
+        self._dynamic_constitution = DynamicConstitution(self.project_dir)
+
+        try:
+            patches = await self._dynamic_constitution.generate_patches_from_spec(
+                self.spec, self.llm,
+            )
+            if patches:
+                console.print(
+                    f"  [green]Dynamic constitution:[/green] "
+                    f"{len(patches)} project-specific instructions generated"
+                )
+            else:
+                console.print("  [dim]Dynamic constitution: no patches generated[/dim]")
+        except Exception as e:
+            logger.warning(f"Dynamic constitution generation failed: {e}")
+            console.print(f"  [yellow]Dynamic constitution skipped:[/yellow] {e}")
+
+    async def _explore_architectures(
+        self, architect: ArchitectAgent,
+    ) -> dict[str, Any]:
+        """Use search tree to explore multiple architecture candidates.
+
+        Instead of committing to the first architecture the LLM generates,
+        this generates N candidates, evaluates them, and selects the best.
+
+        Inspired by SWE-Search (ICLR 2025) and Tree of Thoughts (NeurIPS 2023).
+        """
+        num_candidates = getattr(self.config, "search_tree_max_candidates", 3)
+        console.print(f"  [cyan]Search tree:[/cyan] generating {num_candidates} architecture candidates...")
+
+        # Step 1: Generate diverse architecture candidates
+        candidates = await architect.generate_diverse_architectures(
+            self.spec, num_candidates=num_candidates,
+        )
+
+        if not candidates:
+            # Fallback to single architecture
+            console.print("  [yellow]No candidates generated, falling back to single architecture[/yellow]")
+            arch_result = await architect.run({"spec": self.spec})
+            if not arch_result.success:
+                raise RuntimeError(f"Architect failed: {arch_result.error}")
+            return architect.parse_architecture(arch_result.output)
+
+        # Step 2: Set up search tree
+        self._search_tree = SearchTree()
+        root = self._search_tree.create_root(
+            description="Architecture exploration",
+            strategy="Evaluate multiple architecture candidates",
+        )
+
+        # Step 3: Create branch nodes and evaluate candidates
+        branch_nodes = self._search_tree.branch(root.id, candidates)
+
+        context = json.dumps(self.spec, indent=2, ensure_ascii=False)
+        task_desc = f"Design architecture for '{self.spec.get('project_name', '')}'"
+
+        for node, cand in zip(branch_nodes, candidates):
+            score, confidence, reason = await evaluate_candidate(
+                self.llm, cand, task_desc, context,
+            )
+            self._search_tree.evaluate_node(node.id, score, confidence, reason)
+            console.print(
+                f"    Candidate '{cand.get('description', '')[:40]}': "
+                f"score={score:.2f} confidence={confidence:.2f}"
+            )
+
+        # Step 3.5: Conditional debate — if top candidates are close, debate
+        if getattr(self.config, "debate_enabled", True) and len(branch_nodes) >= 2:
+            try:
+                scored = [
+                    (n, c) for n, c in zip(branch_nodes, candidates)
+                    if n.score is not None
+                ]
+                scored.sort(key=lambda x: x[0].score, reverse=True)
+                if (
+                    len(scored) >= 2
+                    and scored[0][0].score - scored[1][0].score < 0.15
+                ):
+                    console.print("  [cyan]Debate:[/cyan] Close candidates — initiating architecture debate...")
+                    debate_topic = (
+                        f"Architecture choice for '{self.spec.get('project_name', '')}': "
+                        f"Option A ({scored[0][1].get('description', 'A')[:50]}) vs "
+                        f"Option B ({scored[1][1].get('description', 'B')[:50]})"
+                    )
+                    positions = [
+                        {"role": "architect_A", "position": json.dumps(scored[0][1], ensure_ascii=False)[:500]},
+                        {"role": "architect_B", "position": json.dumps(scored[1][1], ensure_ascii=False)[:500]},
+                    ]
+                    should = await self._debate.should_debate(debate_topic, positions, self.llm)
+                    if should:
+                        outcome = await self._debate.run_debate(
+                            debate_topic,
+                            [{"role": "architect_A", "expertise": "system design"},
+                             {"role": "architect_B", "expertise": "system design"}],
+                            context, self.llm,
+                        )
+                        if outcome and outcome.confidence > 0.6:
+                            console.print(
+                                f"  [cyan]Debate result:[/cyan] {outcome.convergence_reason} "
+                                f"(confidence={outcome.confidence:.2f})"
+                            )
+                            # Use the winning position to re-rank
+                            if "A" in outcome.winner_position[:20]:
+                                best_idx = 0
+                            elif "B" in outcome.winner_position[:20]:
+                                best_idx = 1
+                            else:
+                                best_idx = 0
+                            # Boost the debate winner's search tree score
+                            winner_node = scored[best_idx][0]
+                            self._search_tree.evaluate_node(
+                                winner_node.id,
+                                min(1.0, winner_node.score + 0.1),
+                                0.9,
+                                f"Debate winner: {outcome.convergence_reason}",
+                            )
+            except Exception as e:
+                logger.debug(f"Architecture debate skipped: {e}")
+
+        # Step 4: Select the best candidate
+        best = self._search_tree.select_best(root.id)
+        if not best:
+            console.print("  [yellow]No winning candidate, falling back[/yellow]")
+            arch_result = await architect.run({"spec": self.spec})
+            if not arch_result.success:
+                raise RuntimeError(f"Architect failed: {arch_result.error}")
+            return architect.parse_architecture(arch_result.output)
+
+        console.print(
+            f"  [green]Selected:[/green] '{best.description}' "
+            f"(score={best.score:.2f})"
+        )
+
+        # Step 5: Run architect with the selected strategy as guidance
+        arch_result = await architect.run({
+            "spec": self.spec,
+            "strategy_guidance": best.strategy,
+        })
+
+        if not arch_result.success:
+            # Backtrack: try the next-best candidate
+            alt = self._search_tree.backtrack()
+            if alt:
+                console.print(f"  [yellow]Backtracking to:[/yellow] '{alt.description}'")
+                arch_result = await architect.run({
+                    "spec": self.spec,
+                    "strategy_guidance": alt.strategy,
+                })
+                if not arch_result.success:
+                    raise RuntimeError(f"Architect failed after backtrack: {arch_result.error}")
+            else:
+                raise RuntimeError(f"Architect failed, no alternatives: {arch_result.error}")
+
+        return architect.parse_architecture(arch_result.output)
+
+    async def _learn_from_task_failure(
+        self,
+        task: Task,
+        error: str,
+        agent_id: str,
+    ) -> None:
+        """Analyze a task failure and create preventive rules via meta-learning.
+
+        This is the self-skill generation mechanism: when agents fail, the system
+        analyzes the failure pattern and creates reusable rules that are injected
+        into future agent prompts.
+        """
+        if not self._dynamic_constitution:
+            return
+
+        try:
+            failure_context = {
+                "task_description": task.description,
+                "error": error,
+                "agent_role": task.owner,
+                "files_involved": task.files,
+                "turn_count": 0,
+                "approach_used": agent_id,
+            }
+            rule = await self._dynamic_constitution.learn_from_failure(
+                failure_context, self.llm,
+            )
+            if rule:
+                console.print(
+                    f"  [cyan]Meta-learning:[/cyan] New rule from failure — "
+                    f"'{rule.rule[:60]}...'"
+                )
+        except Exception as e:
+            logger.debug(f"Meta-learning failed: {e}")
+
+    # ──────────────────────────────────────────────
+    # Prompt Optimizer — DSPy/OPRO-Style Self-Improvement
+    # ──────────────────────────────────────────────
+
+    async def _init_prompt_optimizer(self) -> None:
+        """Initialize prompt optimizer and register baseline constitutions.
+
+        Called after SPEC phase. Registers the current constitution prompts
+        as baselines if they haven't been registered before.
+        """
+        if not getattr(self.config, "prompt_optimization_enabled", True):
+            return
+
+        roles = ["director", "architect", "builder", "reviewer", "tester", "gardener"]
+        for role in roles:
+            # Try to get the dynamic supplement as the optimizable part
+            if self._dynamic_constitution:
+                supplement = self._dynamic_constitution.build_supplementary_prompt(role)
+                if supplement:
+                    self._prompt_optimizer.register_baseline(role, supplement)
+
+        logger.info("[PromptOpt] Initialized with baselines for all roles")
+
+    async def _prompt_optimizer_record_and_optimize(
+        self, project_name: str,
+    ) -> None:
+        """Record fitness for prompt variants and trigger optimization if ready.
+
+        Called at the end of a successful pipeline run.
+        """
+        if not getattr(self.config, "prompt_optimization_enabled", True):
+            return
+
+        # Compute fitness (reuse evolution fitness logic)
+        quality = 0.0
+        test_file = self.project_dir / ".autoforge" / "test_results.json"
+        if not test_file.exists():
+            test_file = self.project_dir / "test_results.json"
+        if test_file.exists():
+            try:
+                test_data = json.loads(test_file.read_text(encoding="utf-8"))
+                quality += 0.5 if test_data.get("all_passed") else 0.2
+            except Exception:
+                pass
+
+        review_file = self.project_dir / ".autoforge" / "review_report.json"
+        if review_file.exists():
+            try:
+                review_data = json.loads(review_file.read_text(encoding="utf-8"))
+                quality += float(review_data.get("score", 0)) / 10.0 * 0.5
+            except Exception:
+                pass
+
+        if quality <= 0:
+            quality = 0.5  # Neutral default
+
+        # Record fitness for each active variant
+        roles = ["director", "architect", "builder", "reviewer", "tester", "gardener"]
+        for role in roles:
+            variant_id = self._prompt_optimizer.get_active_variant_id(role)
+            if variant_id:
+                self._prompt_optimizer.record_result(role, variant_id, quality)
+
+        # Trigger optimization for roles that have enough data
+        optimized_count = 0
+        for role in roles:
+            if self._prompt_optimizer.should_optimize(role):
+                try:
+                    context = f"Project: {project_name}, quality={quality:.2f}"
+                    variant = await self._prompt_optimizer.optimize_role(
+                        role, self.llm, context,
+                    )
+                    if variant:
+                        optimized_count += 1
+                except Exception as e:
+                    logger.debug(f"Prompt optimization for {role} skipped: {e}")
+
+        if optimized_count > 0:
+            console.print(
+                f"  [cyan]Prompt optimizer:[/cyan] {optimized_count} role(s) optimized"
+            )
+
+        # Show stats
+        stats = self._prompt_optimizer.get_stats()
+        total_variants = sum(
+            r.get("total_variants", 0) for r in stats.get("roles", {}).values()
+        )
+        if total_variants > len(roles):
+            console.print(
+                f"  [dim]Prompt variants: {total_variants} across {len(stats.get('roles', {}))} roles[/dim]"
+            )
+
+    # ──────────────────────────────────────────────
+    # Formal Verification & Security Scan
+    # ──────────────────────────────────────────────
+
+    async def _run_formal_verification(self) -> None:
+        """Run formal verification on the generated project."""
+        if not self.project_dir:
+            return
+        try:
+            report = await self._formal_verifier.verify(
+                self.project_dir, llm=self.llm,
+                run_security=False,  # Security scan runs separately
+            )
+            # Save report
+            forge_dir = self.project_dir / ".autoforge"
+            forge_dir.mkdir(exist_ok=True)
+            (forge_dir / "formal_verify_report.json").write_text(
+                json.dumps(report.to_dict(), indent=2), encoding="utf-8",
+            )
+            if report.errors > 0:
+                console.print(
+                    f"  [yellow]Formal verification:[/yellow] {report.errors} errors, "
+                    f"{report.warnings} warnings"
+                )
+            else:
+                console.print(f"  [green]Formal verification passed[/green] ({report.warnings} warnings)")
+        except Exception as e:
+            logger.warning(f"Formal verification failed: {e}")
+
+    async def _run_security_scan(self) -> None:
+        """Run RedCode security scan on the generated project."""
+        if not self.project_dir:
+            return
+        try:
+            report = await self._security_scanner.scan(
+                self.project_dir, llm=self.llm,
+            )
+            forge_dir = self.project_dir / ".autoforge"
+            forge_dir.mkdir(exist_ok=True)
+            (forge_dir / "security_report.json").write_text(
+                json.dumps(report.to_dict(), indent=2), encoding="utf-8",
+            )
+            if not report.passed:
+                console.print(
+                    f"  [red]Security scan:[/red] {report.critical_count} critical, "
+                    f"{report.high_count} high, {report.medium_count} medium"
+                )
+            else:
+                console.print(f"  [green]Security scan passed[/green] ({report.low_count} low issues)")
+        except Exception as e:
+            logger.warning(f"Security scan failed: {e}")
+
+    # ──────────────────────────────────────────────
+    # EvoMAC Text Backpropagation
+    # ──────────────────────────────────────────────
+
+    async def _evomac_backward_pass(self) -> None:
+        """Generate and apply text gradients from test/review results."""
+        if not self.project_dir:
+            return
+        try:
+            # Gather evaluation data
+            eval_data: dict[str, Any] = {}
+
+            test_file = self.project_dir / ".autoforge" / "test_results.json"
+            if not test_file.exists():
+                test_file = self.project_dir / "test_results.json"
+            if test_file.exists():
+                eval_data["test_results"] = json.loads(test_file.read_text(encoding="utf-8"))
+
+            review_file = self.project_dir / ".autoforge" / "review_report.json"
+            if review_file.exists():
+                review_data = json.loads(review_file.read_text(encoding="utf-8"))
+                eval_data["review_score"] = review_data.get("score", 0)
+                eval_data["review_issues"] = review_data.get("issues", [])
+
+            if self.dag:
+                failed_tasks = [
+                    f"{t.id}: {t.result}" for t in self.dag.get_all_tasks()
+                    if t.phase == TaskPhase.BUILD and t.status == TaskStatus.FAILED
+                ]
+                eval_data["build_failures"] = failed_tasks
+
+            if eval_data:
+                gradients = await self._evomac.generate_gradients(eval_data, self.llm)
+                if gradients:
+                    console.print(
+                        f"  [cyan]EvoMAC:[/cyan] {len(gradients)} text gradients generated"
+                    )
+                    # Apply gradients to dynamic constitution
+                    for role in ("builder", "architect", "reviewer"):
+                        if self._dynamic_constitution:
+                            current = self._dynamic_constitution.build_supplementary_prompt(role)
+                            updated = await self._evomac.apply_gradients(role, current, self.llm)
+                            if updated != current:
+                                from autoforge.engine.dynamic_constitution import ConstitutionPatch
+                                self._dynamic_constitution.add_patch(ConstitutionPatch(
+                                    id=f"evomac-{role}-{self._evomac._iteration}",
+                                    target_role=role,
+                                    content=updated,
+                                    source="evomac",
+                                    priority=5,
+                                    project_specific=True,
+                                ))
+        except Exception as e:
+            logger.warning(f"EvoMAC backward pass failed: {e}")
+
+    # ──────────────────────────────────────────────
+    # SICA Self-Improvement
+    # ──────────────────────────────────────────────
+
+    async def _sica_propose_improvements(self, project_name: str) -> None:
+        """Propose self-improvements based on project run data."""
+        try:
+            # Gather performance data
+            perf_data: dict[str, Any] = {"recent_runs": [project_name]}
+
+            review_file = self.project_dir / ".autoforge" / "review_report.json"
+            if review_file.exists():
+                review = json.loads(review_file.read_text(encoding="utf-8"))
+                perf_data["avg_quality"] = review.get("score", 0)
+
+            test_file = self.project_dir / ".autoforge" / "test_results.json"
+            if test_file.exists():
+                test_data = json.loads(test_file.read_text(encoding="utf-8"))
+                perf_data["avg_test_pass_rate"] = 1.0 if test_data.get("all_passed") else 0.5
+
+            # Only propose if quality is below threshold
+            if perf_data.get("avg_quality", 10) >= 8:
+                return
+
+            proposals = await self._sica.propose_improvements(
+                perf_data, self.config.constitution_dir, self.llm,
+            )
+            if proposals:
+                console.print(
+                    f"  [cyan]SICA:[/cyan] {len(proposals)} self-improvement proposals"
+                )
+                for p in proposals:
+                    valid, reason = self._sica.validate_proposal(p)
+                    if valid:
+                        logger.info(f"[SICA] Validated: {p.description}")
+                    else:
+                        logger.debug(f"[SICA] Rejected: {p.description} — {reason}")
+        except Exception as e:
+            logger.warning(f"SICA self-improvement failed: {e}")
 
     # ──────────────────────────────────────────────
     # State management
