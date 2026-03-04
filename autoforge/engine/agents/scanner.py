@@ -91,6 +91,25 @@ class ScannerAgent(AgentBase):
             ),
         ]
 
+        # Add grep_search for efficient codebase analysis
+        from functools import partial
+
+        from autoforge.engine.tools.search import (
+            GREP_SEARCH_TOOL_SCHEMA,
+            handle_grep_search,
+        )
+
+        self._tools.append(ToolDefinition(
+            name="grep_search",
+            description=(
+                "Search project files for a pattern (regex). "
+                "More efficient than reading files one by one. "
+                "Use to find function definitions, imports, TODOs, and patterns."
+            ),
+            input_schema=GREP_SEARCH_TOOL_SCHEMA,
+            handler=partial(handle_grep_search, working_dir=self.working_dir),
+        ))
+
     async def _handle_read_file(self, input_data: dict[str, Any]) -> str:
         rel_path = input_data["path"]
         full_path = (self.working_dir / rel_path).resolve()

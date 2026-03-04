@@ -19,6 +19,9 @@ dependencies = [
     "InquirerPy>=0.3.4",
     "tomli-w>=1.0",
     "aiosqlite>=0.20.0",
+    "httpx>=0.27",
+    "duckduckgo-search>=7.0",
+    "html2text>=2024.2",
 ]
 
 [project.scripts]

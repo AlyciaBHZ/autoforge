@@ -74,6 +74,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level",
     )
+    parser.add_argument(
+        "--confirm",
+        default=None,
+        help="Phases to pause for confirmation: spec,build,verify,refactor,all",
+    )
+    parser.add_argument(
+        "--tdd",
+        type=int,
+        default=None,
+        help="TDD iterations per build task (0=disabled, 1-3 recommended)",
+    )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -135,6 +146,10 @@ def _build_config_overrides(args: argparse.Namespace) -> dict:
         overrides["verbose"] = True
     if args.log_level:
         overrides["log_level"] = args.log_level
+    if getattr(args, "confirm", None) is not None:
+        overrides["confirm_phases"] = [p.strip() for p in args.confirm.split(",")]
+    if getattr(args, "tdd", None) is not None:
+        overrides["build_test_loops"] = max(0, min(args.tdd, 5))
     return overrides
 
 
@@ -143,7 +158,7 @@ async def _run_generate(config, description: str) -> int:
     from autoforge.cli.display import show_startup_info
     from autoforge.engine.orchestrator import Orchestrator
 
-    if not config.anthropic_api_key:
+    if not config.has_api_key:
         console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
         return 1
 
@@ -173,7 +188,7 @@ async def _run_review(config, project_path: str) -> int:
     from autoforge.cli.display import show_startup_info
     from autoforge.engine.orchestrator import Orchestrator
 
-    if not config.anthropic_api_key:
+    if not config.has_api_key:
         console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
         return 1
 
@@ -207,7 +222,7 @@ async def _run_import(config, project_path: str, enhance: str = "") -> int:
     from autoforge.cli.display import show_startup_info
     from autoforge.engine.orchestrator import Orchestrator
 
-    if not config.anthropic_api_key:
+    if not config.has_api_key:
         console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
         return 1
 
@@ -237,100 +252,40 @@ async def _run_import(config, project_path: str, enhance: str = "") -> int:
         return 1
 
 
-async def async_main() -> int:
-    """Main async entry point."""
+def _resolve_command(argv: list[str]) -> tuple[argparse.Namespace, str | None]:
+    """Parse CLI args, handling legacy bare-description mode.
+
+    Returns (parsed_args, legacy_description_or_None).
+    """
     parser = build_parser()
 
     # Pre-scan for legacy bare description: python forge.py "Build a todo app"
     # If the first non-flag arg isn't a known subcommand, treat as generate.
-    argv = sys.argv[1:]
     legacy_description = None
+    clean_argv = list(argv)
     for i, arg in enumerate(argv):
         if arg.startswith("-"):
             continue
         if arg not in _KNOWN_COMMANDS:
             legacy_description = arg
-            argv = argv[:i] + argv[i + 1:]
+            clean_argv = argv[:i] + argv[i + 1:]
         break
 
-    args = parser.parse_args(argv)
-
-    # Handle: no command at all → interactive mode or legacy mode
-    if args.command is None:
-        # Legacy: python forge.py --status
-        if args.legacy_status:
-            args.command = "status"
-        # Legacy: python forge.py --resume
-        elif args.legacy_resume is not None:
-            args.command = "resume"
-            args.path = None if args.legacy_resume == "auto" else args.legacy_resume
-        # Legacy: python forge.py "description"
-        elif legacy_description:
-            args.command = "generate"
-            args.description = legacy_description
-        # No args at all → interactive mode
-        else:
-            return await _run_interactive(args)
-
-    # Build config
-    from autoforge.engine.config import ForgeConfig
-
-    overrides = _build_config_overrides(args)
-    config = ForgeConfig.from_env(**overrides)
-    setup_logging(config.log_level, config.verbose)
-
-    # Dispatch subcommand
-    if args.command == "setup":
-        from autoforge.cli.setup_wizard import run_setup_wizard
-        run_setup_wizard()
-        return 0
-
-    elif args.command == "generate":
-        return await _run_generate(config, args.description)
-
-    elif args.command == "review":
-        return await _run_review(config, args.path)
-
-    elif args.command == "import":
-        enhance = getattr(args, "enhance", "")
-        return await _run_import(config, args.path, enhance)
-
-    elif args.command == "status":
-        from autoforge.engine.orchestrator import Orchestrator
-        orchestrator = Orchestrator(config)
-        orchestrator.show_status()
-        return 0
-
-    elif args.command == "resume":
-        from autoforge.engine.orchestrator import Orchestrator
-
-        if not config.anthropic_api_key:
-            console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
-            return 1
-
-        orchestrator = Orchestrator(config)
-        resume_path = getattr(args, "path", None)
-        resume_path = Path(resume_path) if resume_path else None
-        try:
-            await orchestrator.resume(resume_path)
-            return 0
-        except Exception as e:
-            console.print(f"[red]Resume failed:[/red] {e}")
-            return 1
-
-    else:
-        parser.print_help()
-        return 1
+    args = parser.parse_args(clean_argv)
+    return args, legacy_description
 
 
-async def _run_interactive(args: argparse.Namespace) -> int:
-    """Run interactive mode with InquirerPy menus."""
+def _run_interactive_sync(args: argparse.Namespace) -> int:
+    """Run interactive mode — all InquirerPy prompts happen here (sync).
+
+    Returns exit code. May call asyncio.run() for the actual pipeline.
+    """
     from autoforge.cli.display import show_banner
     from autoforge.cli.setup_wizard import needs_setup
 
     show_banner()
 
-    # Check if setup is needed
+    # Check if setup is needed — runs InquirerPy (sync, no event loop)
     if needs_setup():
         console.print("[yellow]First time? Let's set up AutoForge.[/yellow]\n")
         from autoforge.cli.setup_wizard import run_setup_wizard
@@ -344,6 +299,7 @@ async def _run_interactive(args: argparse.Namespace) -> int:
         console.print("Or use subcommands directly: autoforge generate \"your description\"")
         return 1
 
+    # Run InquirerPy menus (sync, no event loop)
     choices = run_interactive()
     action = choices.get("action")
 
@@ -369,23 +325,99 @@ async def _run_interactive(args: argparse.Namespace) -> int:
     config = ForgeConfig.from_env(**overrides)
     setup_logging(config.log_level, config.verbose)
 
+    # Now enter the async event loop only for the pipeline execution
     if action == "generate":
-        return await _run_generate(config, choices["description"])
+        return asyncio.run(_run_generate(config, choices["description"]))
     elif action == "review":
-        return await _run_review(config, choices["project_path"])
+        return asyncio.run(_run_review(config, choices["project_path"]))
     elif action == "import":
-        return await _run_import(
+        return asyncio.run(_run_import(
             config,
             choices["project_path"],
             choices.get("enhance_description", ""),
-        )
+        ))
 
     return 0
 
 
+async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
+    """Dispatch a resolved subcommand to its async handler."""
+    from autoforge.engine.config import ForgeConfig
+
+    config = ForgeConfig.from_env(**overrides)
+    setup_logging(config.log_level, config.verbose)
+
+    if args.command == "generate":
+        return await _run_generate(config, args.description)
+
+    elif args.command == "review":
+        return await _run_review(config, args.path)
+
+    elif args.command == "import":
+        enhance = getattr(args, "enhance", "")
+        return await _run_import(config, args.path, enhance)
+
+    elif args.command == "status":
+        from autoforge.engine.orchestrator import Orchestrator
+        orchestrator = Orchestrator(config)
+        orchestrator.show_status()
+        return 0
+
+    elif args.command == "resume":
+        from autoforge.engine.orchestrator import Orchestrator
+
+        if not config.has_api_key:
+            console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
+            return 1
+
+        orchestrator = Orchestrator(config)
+        resume_path = getattr(args, "path", None)
+        resume_path = Path(resume_path) if resume_path else None
+        try:
+            await orchestrator.resume(resume_path)
+            return 0
+        except Exception as e:
+            console.print(f"[red]Resume failed:[/red] {e}")
+            return 1
+
+    return 1
+
+
 def main() -> None:
-    """Synchronous entry point."""
-    sys.exit(asyncio.run(async_main()))
+    """Synchronous entry point.
+
+    All InquirerPy interactions (setup wizard, interactive menus) run here
+    in the sync context. Only orchestrator pipelines use asyncio.run().
+    """
+    args, legacy_description = _resolve_command(sys.argv[1:])
+
+    # Handle: no command at all -> interactive mode or legacy mode
+    if args.command is None:
+        # Legacy: python forge.py --status
+        if args.legacy_status:
+            args.command = "status"
+        # Legacy: python forge.py --resume
+        elif args.legacy_resume is not None:
+            args.command = "resume"
+            args.path = None if args.legacy_resume == "auto" else args.legacy_resume
+        # Legacy: python forge.py "description"
+        elif legacy_description:
+            args.command = "generate"
+            args.description = legacy_description
+        # No args at all -> interactive mode (sync, InquirerPy runs here)
+        else:
+            sys.exit(_run_interactive_sync(args))
+            return
+
+    # Subcommand: "setup" runs InquirerPy directly (sync, no event loop)
+    if args.command == "setup":
+        from autoforge.cli.setup_wizard import run_setup_wizard
+        run_setup_wizard()
+        sys.exit(0)
+
+    # All other subcommands dispatch through asyncio
+    overrides = _build_config_overrides(args)
+    sys.exit(asyncio.run(_async_dispatch(args, overrides)))
 
 
 if __name__ == "__main__":

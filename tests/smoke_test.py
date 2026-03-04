@@ -92,7 +92,7 @@ def test_agent_imports():
 
 
 def test_cli_imports():
-    from autoforge.cli.app import build_parser, async_main  # noqa: F401
+    from autoforge.cli.app import build_parser, main  # noqa: F401
     from autoforge.cli.display import show_banner, show_startup_info, show_review_report  # noqa: F401
     from autoforge.cli.setup_wizard import needs_setup, load_global_config  # noqa: F401
 
@@ -147,7 +147,7 @@ def test_cli_legacy_compat():
     assert args.legacy_resume == "auto"
 
     # Verify legacy pre-scan detects bare descriptions
-    # (bare descriptions are handled by argv pre-scanning in async_main,
+    # (bare descriptions are handled by argv pre-scanning in _resolve_command,
     #  not by argparse, so we test the detection logic here)
     assert "Build a todo app" not in _KNOWN_COMMANDS
     assert "generate" in _KNOWN_COMMANDS
@@ -366,6 +366,206 @@ def test_git_manager_instantiation():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_agent_result_metrics_fields():
+    """Test AgentResult has files_written and tool_calls fields."""
+    from autoforge.engine.agent_base import AgentResult
+    r = AgentResult(agent_name="builder", success=True)
+    assert r.files_written == 0
+    assert r.tool_calls == {}
+    r2 = AgentResult(
+        agent_name="builder", success=True,
+        files_written=3, tool_calls={"write_file": 3, "read_file": 5},
+    )
+    assert r2.files_written == 3
+    assert r2.tool_calls["write_file"] == 3
+
+
+def test_anti_spin_constants():
+    """Test anti-spin detection constants on AgentBase."""
+    from autoforge.engine.agent_base import AgentBase
+    assert hasattr(AgentBase, "SPIN_WARN_TURNS")
+    assert hasattr(AgentBase, "SPIN_FAIL_TURNS")
+    assert AgentBase.SPIN_WARN_TURNS == 10
+    assert AgentBase.SPIN_FAIL_TURNS == 20
+    assert AgentBase.SPIN_FAIL_TURNS > AgentBase.SPIN_WARN_TURNS
+
+
+def test_build_gate_enforcement():
+    """Test _enforce_build_gate catches missing/failed tasks."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
+    from autoforge.engine.task_dag import TaskDAG, Task, TaskPhase, TaskStatus
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    orch = Orchestrator(config)
+
+    # All done → no error
+    dag = TaskDAG()
+    dag.add_task(Task(id="T1", description="test", phase=TaskPhase.BUILD, status=TaskStatus.DONE, files=[]))
+    try:
+        asyncio.run(orch._enforce_build_gate(dag, Path(tempfile.mkdtemp())))
+    except RuntimeError:
+        raise AssertionError("Should not raise for completed tasks")
+
+    # Zero completed → RuntimeError
+    dag2 = TaskDAG()
+    dag2.add_task(Task(id="T2", description="fail", phase=TaskPhase.BUILD, status=TaskStatus.FAILED))
+    dag2.add_task(Task(id="T3", description="fail2", phase=TaskPhase.BUILD, status=TaskStatus.FAILED))
+    try:
+        asyncio.run(orch._enforce_build_gate(dag2, Path(tempfile.mkdtemp())))
+        raise AssertionError("Should raise for all-failed tasks")
+    except RuntimeError as e:
+        assert "failed" in str(e).lower()
+
+
+def test_file_overlap_detection():
+    """Test _detect_file_overlaps finds overlapping files."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
+    from autoforge.engine.task_dag import TaskDAG, Task, TaskPhase
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    orch = Orchestrator(config)
+
+    dag = TaskDAG()
+    dag.add_task(Task(id="A", description="task A", phase=TaskPhase.BUILD, files=["shared.py", "a.py"]))
+    dag.add_task(Task(id="B", description="task B", phase=TaskPhase.BUILD, files=["shared.py", "b.py"]))
+    dag.add_task(Task(id="C", description="task C", phase=TaskPhase.BUILD, files=["c.py"]))
+
+    overlaps = orch._detect_file_overlaps(dag)
+    assert "shared.py" in overlaps
+    assert set(overlaps["shared.py"]) == {"A", "B"}
+    assert "a.py" not in overlaps
+    assert "c.py" not in overlaps
+
+
+def test_smoke_check_missing_files():
+    """Test _smoke_check catches missing files."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
+    from autoforge.engine.task_dag import Task, TaskPhase
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    orch = Orchestrator(config)
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        task = Task(id="T1", description="test", phase=TaskPhase.BUILD, files=["missing.py"])
+        ok, msg = asyncio.run(orch._smoke_check(task, d))
+        assert ok is False
+        assert "Missing files" in msg
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_smoke_check_syntax_error():
+    """Test _smoke_check catches Python syntax errors."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
+    from autoforge.engine.task_dag import Task, TaskPhase
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    orch = Orchestrator(config)
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        # Write a file with a syntax error
+        (d / "bad.py").write_text("def f(\n  pass", encoding="utf-8")
+        task = Task(id="T1", description="test", phase=TaskPhase.BUILD, files=["bad.py"])
+        ok, msg = asyncio.run(orch._smoke_check(task, d))
+        assert ok is False
+        assert "Syntax errors" in msg
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_smoke_check_valid_file():
+    """Test _smoke_check passes for valid Python files."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
+    from autoforge.engine.task_dag import Task, TaskPhase
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    orch = Orchestrator(config)
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "good.py").write_text("def hello():\n    return 'world'\n", encoding="utf-8")
+        task = Task(id="T1", description="test", phase=TaskPhase.BUILD, files=["good.py"])
+        ok, msg = asyncio.run(orch._smoke_check(task, d))
+        assert ok is True
+        assert msg == "OK"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_constitution_builder_mandatory_rules():
+    """Test builder.md contains mandatory rules section."""
+    builder_path = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "agents" / "builder.md"
+    content = builder_path.read_text(encoding="utf-8")
+    assert "MANDATORY" in content
+    assert "write_file" in content
+    assert "read_file" in content
+    assert "py_compile" in content
+
+
+def test_constitution_architect_composition():
+    """Test architect.md contains composition principle."""
+    arch_path = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "agents" / "architect.md"
+    content = arch_path.read_text(encoding="utf-8")
+    assert "Composition" in content
+    assert "library" in content.lower() or "libraries" in content.lower()
+
+
+def test_constitution_quality_gates_enforcement():
+    """Test quality_gates.md documents enforcement status."""
+    qg_path = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "quality_gates.md"
+    content = qg_path.read_text(encoding="utf-8")
+    assert "Enforcement" in content
+    assert "_enforce_build_gate" in content
+    assert "Anti-Spin" in content or "anti-spin" in content.lower()
+
+
+def test_git_available_detection():
+    from autoforge.engine.git_manager import is_git_available, _git_available
+    import autoforge.engine.git_manager as gm_mod
+    # Reset cache so we test fresh
+    old = gm_mod._git_available
+    gm_mod._git_available = None
+    try:
+        result = is_git_available()
+        assert isinstance(result, bool)
+        # On most CI/dev systems git is installed; just verify it returns bool
+        # Also verify caching works
+        assert gm_mod._git_available is result
+        assert is_git_available() is result  # cached
+    finally:
+        gm_mod._git_available = old
+
+
+def test_git_version_async():
+    from autoforge.engine.git_manager import get_git_version, is_git_available
+    version = asyncio.run(get_git_version())
+    if is_git_available():
+        assert version is not None
+        assert "git version" in version.lower()
+    else:
+        assert version is None
+
+
+def test_config_has_api_key():
+    from autoforge.engine.config import ForgeConfig
+    # No keys → has_api_key is False
+    config = ForgeConfig(api_keys={})
+    assert config.has_api_key is False
+    # With a key → has_api_key is True
+    config2 = ForgeConfig(api_keys={"openai": "sk-test123"})
+    assert config2.has_api_key is True
+    # Empty string key → has_api_key is False
+    config3 = ForgeConfig(api_keys={"anthropic": ""})
+    assert config3.has_api_key is False
+
+
 def test_all_agents_instantiate():
     from autoforge.engine.config import ForgeConfig
     from autoforge.engine.llm_router import LLMRouter
@@ -384,22 +584,22 @@ def test_all_agents_instantiate():
 
     try:
         d = DirectorAgent(config, llm)
-        assert d.ROLE == "director" and len(d._tools) == 0
+        assert d.ROLE == "director" and len(d._tools) == 2  # search_web + fetch_url
         df = DirectorFixAgent(config, llm)
         assert df.ROLE == "director"
         a = ArchitectAgent(config, llm)
-        assert a.ROLE == "architect" and len(a._tools) == 1
+        assert a.ROLE == "architect" and len(a._tools) == 3  # read_template + search_web + fetch_url
         sb = SubprocessSandbox(wd)
         b = BuilderAgent(config, llm, working_dir=wd, sandbox=sb)
-        assert b.ROLE == "builder" and len(b._tools) == 4
+        assert b.ROLE == "builder" and len(b._tools) == 6  # write/read/list/run + grep_search + fetch_url
         r = ReviewerAgent(config, llm, working_dir=wd)
         assert r.ROLE == "reviewer" and len(r._tools) == 2
         t = TesterAgent(config, llm, working_dir=wd, sandbox=sb)
         assert t.ROLE == "tester" and len(t._tools) == 2
         g = GardenerAgent(config, llm, working_dir=wd)
-        assert g.ROLE == "gardener" and len(g._tools) == 3
+        assert g.ROLE == "gardener" and len(g._tools) == 5  # write/read/list + grep_search + fetch_url
         s = ScannerAgent(config, llm, working_dir=wd)
-        assert s.ROLE == "scanner" and len(s._tools) == 3
+        assert s.ROLE == "scanner" and len(s._tools) == 4  # read/list/run + grep_search
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 
@@ -821,6 +1021,320 @@ def test_display_module():
 
 
 # ────────────────────────────────────────────
+# Phase 7: Web Tools, Code Search, Checkpoints, TDD
+# ────────────────────────────────────────────
+
+def test_tools_package_imports():
+    """Test that the tools package can be imported."""
+    from autoforge.engine.tools import web  # noqa: F401
+    from autoforge.engine.tools import search  # noqa: F401
+    from autoforge.engine.tools.web import (
+        handle_fetch_url,  # noqa: F401
+        handle_search_web,  # noqa: F401
+        FETCH_URL_TOOL_SCHEMA,
+        SEARCH_WEB_TOOL_SCHEMA,
+    )
+    from autoforge.engine.tools.search import (
+        handle_grep_search,  # noqa: F401
+        GREP_SEARCH_TOOL_SCHEMA,
+    )
+    # Validate schemas have required fields
+    assert "properties" in FETCH_URL_TOOL_SCHEMA
+    assert "url" in FETCH_URL_TOOL_SCHEMA["properties"]
+    assert "properties" in SEARCH_WEB_TOOL_SCHEMA
+    assert "query" in SEARCH_WEB_TOOL_SCHEMA["properties"]
+    assert "properties" in GREP_SEARCH_TOOL_SCHEMA
+    assert "pattern" in GREP_SEARCH_TOOL_SCHEMA["properties"]
+
+
+def test_config_new_fields():
+    """Test new config fields for web tools, checkpoints, TDD."""
+    from autoforge.engine.config import ForgeConfig
+    config = ForgeConfig()
+    # Web tools
+    assert config.web_tools_enabled is True
+    assert config.search_backend == "duckduckgo"
+    assert config.search_api_key == ""
+    # Checkpoints
+    assert config.confirm_phases == []
+    # TDD
+    assert config.build_test_loops == 0
+
+
+def test_config_with_overrides():
+    """Test new config fields can be overridden."""
+    from autoforge.engine.config import ForgeConfig
+    config = ForgeConfig(
+        web_tools_enabled=False,
+        search_backend="google",
+        search_api_key="test-key:cx123",
+        confirm_phases=["spec", "build"],
+        build_test_loops=2,
+    )
+    assert config.web_tools_enabled is False
+    assert config.search_backend == "google"
+    assert config.search_api_key == "test-key:cx123"
+    assert config.confirm_phases == ["spec", "build"]
+    assert config.build_test_loops == 2
+
+
+def test_cli_confirm_flag():
+    """Test --confirm flag parsing."""
+    from autoforge.cli.app import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["--confirm", "spec,build", "generate", "test"])
+    assert args.confirm == "spec,build"
+
+
+def test_cli_tdd_flag():
+    """Test --tdd flag parsing."""
+    from autoforge.cli.app import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["--tdd", "2", "generate", "test"])
+    assert args.tdd == 2
+
+
+def test_cli_config_overrides_confirm():
+    """Test --confirm wiring to config overrides."""
+    from autoforge.cli.app import build_parser, _build_config_overrides
+    parser = build_parser()
+    args = parser.parse_args(["--confirm", "spec,build,verify", "generate", "test"])
+    overrides = _build_config_overrides(args)
+    assert overrides["confirm_phases"] == ["spec", "build", "verify"]
+
+
+def test_cli_config_overrides_tdd():
+    """Test --tdd wiring to config overrides."""
+    from autoforge.cli.app import build_parser, _build_config_overrides
+    parser = build_parser()
+    args = parser.parse_args(["--tdd", "3", "generate", "test"])
+    overrides = _build_config_overrides(args)
+    assert overrides["build_test_loops"] == 3
+
+
+def test_grep_search_basic():
+    """Test grep_search on a temporary directory."""
+    from autoforge.engine.tools.search import handle_grep_search
+    d = Path(tempfile.mkdtemp())
+    try:
+        # Create test files
+        (d / "hello.py").write_text("def hello_world():\n    print('hello')\n", encoding="utf-8")
+        (d / "utils.py").write_text("def helper_func():\n    pass\n", encoding="utf-8")
+
+        result = asyncio.run(handle_grep_search({"pattern": "def.*hello"}, d))
+        data = json.loads(result)
+        assert data["total_matches"] >= 1
+        assert any("hello.py" in m["file"] for m in data["matches"])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_grep_search_file_glob():
+    """Test grep_search with file_glob filter."""
+    from autoforge.engine.tools.search import handle_grep_search
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "app.py").write_text("import flask\n", encoding="utf-8")
+        (d / "style.css").write_text("/* import reset */\n", encoding="utf-8")
+
+        result = asyncio.run(handle_grep_search({"pattern": "import", "file_glob": "*.py"}, d))
+        data = json.loads(result)
+        # Should only find .py files
+        for m in data["matches"]:
+            assert m["file"].endswith(".py"), f"Expected .py file but got {m['file']}"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_grep_search_empty_pattern():
+    """Test grep_search rejects empty pattern."""
+    from autoforge.engine.tools.search import handle_grep_search
+    d = Path(tempfile.mkdtemp())
+    try:
+        result = asyncio.run(handle_grep_search({"pattern": ""}, d))
+        data = json.loads(result)
+        assert "error" in data
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_web_tool_schemas():
+    """Test web tool schema structures are valid."""
+    from autoforge.engine.tools.web import FETCH_URL_TOOL_SCHEMA, SEARCH_WEB_TOOL_SCHEMA
+    # fetch_url schema
+    assert FETCH_URL_TOOL_SCHEMA["type"] == "object"
+    assert "url" in FETCH_URL_TOOL_SCHEMA["properties"]
+    assert FETCH_URL_TOOL_SCHEMA["required"] == ["url"]
+    # search_web schema
+    assert SEARCH_WEB_TOOL_SCHEMA["type"] == "object"
+    assert "query" in SEARCH_WEB_TOOL_SCHEMA["properties"]
+    assert SEARCH_WEB_TOOL_SCHEMA["required"] == ["query"]
+
+
+def test_html_strip_fallback():
+    """Test the HTML stripping fallback (no html2text dependency needed)."""
+    from autoforge.engine.tools.web import _strip_html_tags
+    html = "<html><body><h1>Title</h1><p>Hello <b>world</b></p><script>evil()</script></body></html>"
+    text = _strip_html_tags(html)
+    assert "Title" in text
+    assert "Hello" in text
+    assert "world" in text
+    assert "evil()" not in text
+    assert "<script>" not in text
+
+
+def test_orchestrator_checkpoint_method():
+    """Test that orchestrator has _checkpoint method."""
+    from autoforge.engine.orchestrator import Orchestrator, UserPausedError
+    assert hasattr(Orchestrator, "_checkpoint")
+    assert callable(getattr(Orchestrator, "_checkpoint"))
+    # UserPausedError should be an Exception subclass
+    assert issubclass(UserPausedError, Exception)
+
+
+def test_orchestrator_tdd_loop_method():
+    """Test that orchestrator has _tdd_loop and _detect_test_command methods."""
+    from autoforge.engine.orchestrator import Orchestrator
+    assert hasattr(Orchestrator, "_tdd_loop")
+    assert hasattr(Orchestrator, "_detect_test_command")
+
+
+def test_detect_test_command_npm():
+    """Test _detect_test_command detects npm test."""
+    from autoforge.engine.orchestrator import Orchestrator
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "package.json").write_text(json.dumps({
+            "scripts": {"test": "jest"}
+        }), encoding="utf-8")
+        cmd = Orchestrator._detect_test_command(d)
+        assert cmd is not None
+        assert "npm test" in cmd
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_detect_test_command_pytest():
+    """Test _detect_test_command detects pytest."""
+    from autoforge.engine.orchestrator import Orchestrator
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        cmd = Orchestrator._detect_test_command(d)
+        assert cmd is not None
+        assert "pytest" in cmd
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_detect_test_command_none():
+    """Test _detect_test_command returns None for unknown project type."""
+    from autoforge.engine.orchestrator import Orchestrator
+    d = Path(tempfile.mkdtemp())
+    try:
+        cmd = Orchestrator._detect_test_command(d)
+        assert cmd is None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_agents_have_new_tools():
+    """Test that agents have the new tools registered."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
+    llm = LLMRouter(config)
+    _td = Path(tempfile.mkdtemp())
+
+    try:
+        # Builder should have grep_search and fetch_url
+        from autoforge.engine.agents.builder import BuilderAgent
+        builder = BuilderAgent(config, llm, _td)
+        builder_tool_names = {t.name for t in builder._tools}
+        assert "grep_search" in builder_tool_names, f"Builder tools: {builder_tool_names}"
+        assert "fetch_url" in builder_tool_names, f"Builder tools: {builder_tool_names}"
+
+        # Scanner should have grep_search
+        from autoforge.engine.agents.scanner import ScannerAgent
+        scanner = ScannerAgent(config, llm, _td)
+        scanner_tool_names = {t.name for t in scanner._tools}
+        assert "grep_search" in scanner_tool_names, f"Scanner tools: {scanner_tool_names}"
+
+        # Gardener should have grep_search and fetch_url
+        from autoforge.engine.agents.gardener import GardenerAgent
+        gardener = GardenerAgent(config, llm, _td)
+        gardener_tool_names = {t.name for t in gardener._tools}
+        assert "grep_search" in gardener_tool_names, f"Gardener tools: {gardener_tool_names}"
+        assert "fetch_url" in gardener_tool_names, f"Gardener tools: {gardener_tool_names}"
+
+        # Director should have search_web and fetch_url
+        from autoforge.engine.agents.director import DirectorAgent
+        director = DirectorAgent(config, llm)
+        director_tool_names = {t.name for t in director._tools}
+        assert "search_web" in director_tool_names, f"Director tools: {director_tool_names}"
+        assert "fetch_url" in director_tool_names, f"Director tools: {director_tool_names}"
+
+        # Architect should have search_web and fetch_url
+        from autoforge.engine.agents.architect import ArchitectAgent
+        architect = ArchitectAgent(config, llm)
+        architect_tool_names = {t.name for t in architect._tools}
+        assert "search_web" in architect_tool_names, f"Architect tools: {architect_tool_names}"
+        assert "fetch_url" in architect_tool_names, f"Architect tools: {architect_tool_names}"
+    finally:
+        shutil.rmtree(_td, ignore_errors=True)
+
+
+def test_agents_web_tools_disabled():
+    """Test that web tools are not registered when disabled."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"}, web_tools_enabled=False)
+    llm = LLMRouter(config)
+
+    # Director should NOT have search_web or fetch_url when disabled
+    from autoforge.engine.agents.director import DirectorAgent
+    director = DirectorAgent(config, llm)
+    director_tool_names = {t.name for t in director._tools}
+    assert "search_web" not in director_tool_names
+    assert "fetch_url" not in director_tool_names
+
+
+def test_constitution_builder_has_new_tools():
+    """Test that builder constitution documents grep_search and fetch_url."""
+    builder_md = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "agents" / "builder.md"
+    content = builder_md.read_text(encoding="utf-8")
+    assert "grep_search" in content
+    assert "fetch_url" in content
+
+
+def test_constitution_architect_has_web_tools():
+    """Test that architect constitution documents search_web and fetch_url."""
+    architect_md = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "agents" / "architect.md"
+    content = architect_md.read_text(encoding="utf-8")
+    assert "search_web" in content
+    assert "fetch_url" in content
+
+
+def test_constitution_quality_gates_has_agent_capabilities():
+    """Test that quality_gates documents agent capabilities table."""
+    qg_md = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "quality_gates.md"
+    content = qg_md.read_text(encoding="utf-8")
+    assert "Agent Capabilities" in content
+    assert "grep_search" in content
+    assert "TDD Loop" in content
+    assert "Human Checkpoints" in content
+
+
+def test_pyproject_has_new_dependencies():
+    """Test that pyproject.toml includes httpx, duckduckgo-search, html2text."""
+    toml_path = PROJECT_ROOT / "pyproject.toml"
+    content = toml_path.read_text(encoding="utf-8")
+    assert "httpx" in content
+    assert "duckduckgo-search" in content
+    assert "html2text" in content
+
+
+# ────────────────────────────────────────────
 # Runner
 # ────────────────────────────────────────────
 
@@ -846,6 +1360,7 @@ def main():
             ("from_env with overrides", test_forge_config_from_env),
             ("Budget tracking + exhaustion", test_forge_config_budget_tracking),
             ("Mobile config fields", test_forge_config_mobile),
+            ("has_api_key property", test_config_has_api_key),
         ]),
         ("Unit: TaskDAG", [
             ("Basic operations + dependency resolution", test_task_dag_basic),
@@ -866,6 +1381,20 @@ def main():
         ]),
         ("Unit: GitManager", [
             ("Instantiation", test_git_manager_instantiation),
+            ("Git available detection", test_git_available_detection),
+            ("Git version async", test_git_version_async),
+        ]),
+        ("Pipeline Hardening", [
+            ("AgentResult metrics fields", test_agent_result_metrics_fields),
+            ("Anti-spin detection constants", test_anti_spin_constants),
+            ("Build gate enforcement", test_build_gate_enforcement),
+            ("File overlap detection", test_file_overlap_detection),
+            ("Smoke check: missing files", test_smoke_check_missing_files),
+            ("Smoke check: syntax error", test_smoke_check_syntax_error),
+            ("Smoke check: valid file", test_smoke_check_valid_file),
+            ("Constitution: builder mandatory rules", test_constitution_builder_mandatory_rules),
+            ("Constitution: architect composition", test_constitution_architect_composition),
+            ("Constitution: quality gates enforcement", test_constitution_quality_gates_enforcement),
         ]),
         ("Unit: Agents", [
             ("All 8 agents instantiate", test_all_agents_instantiate),
@@ -911,6 +1440,31 @@ def main():
         ]),
         ("Display", [
             ("Display module functions", test_display_module),
+        ]),
+        ("Web Tools & Code Search", [
+            ("Tools package imports", test_tools_package_imports),
+            ("Config new fields (web, checkpoints, TDD)", test_config_new_fields),
+            ("Config with overrides", test_config_with_overrides),
+            ("CLI --confirm flag parsing", test_cli_confirm_flag),
+            ("CLI --tdd flag parsing", test_cli_tdd_flag),
+            ("CLI config overrides: confirm", test_cli_config_overrides_confirm),
+            ("CLI config overrides: tdd", test_cli_config_overrides_tdd),
+            ("grep_search: basic pattern match", test_grep_search_basic),
+            ("grep_search: file_glob filter", test_grep_search_file_glob),
+            ("grep_search: empty pattern rejected", test_grep_search_empty_pattern),
+            ("Web tool schemas valid", test_web_tool_schemas),
+            ("HTML strip fallback", test_html_strip_fallback),
+            ("Orchestrator _checkpoint method", test_orchestrator_checkpoint_method),
+            ("Orchestrator _tdd_loop method", test_orchestrator_tdd_loop_method),
+            ("Test command detection: npm", test_detect_test_command_npm),
+            ("Test command detection: pytest", test_detect_test_command_pytest),
+            ("Test command detection: none", test_detect_test_command_none),
+            ("Agents have new tools", test_agents_have_new_tools),
+            ("Agents web tools disabled", test_agents_web_tools_disabled),
+            ("Constitution: builder has new tools", test_constitution_builder_has_new_tools),
+            ("Constitution: architect has web tools", test_constitution_architect_has_web_tools),
+            ("Constitution: quality gates agent capabilities", test_constitution_quality_gates_has_agent_capabilities),
+            ("pyproject.toml has new dependencies", test_pyproject_has_new_dependencies),
         ]),
     ]
 

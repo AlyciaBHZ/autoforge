@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+from functools import partial
 from typing import Any
 
-from autoforge.engine.agent_base import AgentBase
+from autoforge.engine.agent_base import AgentBase, ToolDefinition
 from autoforge.engine.llm_router import TaskComplexity
 
 logger = logging.getLogger(__name__)
@@ -24,8 +25,40 @@ class DirectorAgent(AgentBase):
     COMPLEXITY = TaskComplexity.HIGH  # Uses Opus for deep understanding
 
     def _register_tools(self) -> None:
-        """Director has no tools — it produces output through text only."""
+        """Director has web tools for researching frameworks and tech stacks."""
         self._tools = []
+
+        # Add web tools if enabled
+        if getattr(self.config, "web_tools_enabled", True):
+            from autoforge.engine.tools.web import (
+                FETCH_URL_TOOL_SCHEMA,
+                SEARCH_WEB_TOOL_SCHEMA,
+                handle_fetch_url,
+                handle_search_web,
+            )
+
+            self._tools.append(ToolDefinition(
+                name="search_web",
+                description=(
+                    "Search the web for information about frameworks, libraries, "
+                    "and best practices. Use to research the latest tech options."
+                ),
+                input_schema=SEARCH_WEB_TOOL_SCHEMA,
+                handler=partial(
+                    handle_search_web,
+                    backend=self.config.search_backend,
+                    api_key=self.config.search_api_key,
+                ),
+            ))
+            self._tools.append(ToolDefinition(
+                name="fetch_url",
+                description=(
+                    "Fetch a web page and return its text content. "
+                    "Use to read documentation, API references, or framework guides."
+                ),
+                input_schema=FETCH_URL_TOOL_SCHEMA,
+                handler=handle_fetch_url,
+            ))
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         description = context.get("project_description", "")

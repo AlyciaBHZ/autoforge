@@ -37,6 +37,8 @@ class AgentResult:
     error: str = ""
     total_turns: int = 0
     duration_seconds: float = 0.0
+    files_written: int = 0
+    tool_calls: dict[str, int] = field(default_factory=dict)
 
 
 class AgentBase(ABC):
@@ -60,6 +62,10 @@ class AgentBase(ABC):
 
     # Tools that modify state — blocked in research mode
     WRITE_TOOLS: set[str] = {"write_file", "run_command", "delete_file"}
+
+    # Anti-spin detection: turns without write_file before warning/failure
+    SPIN_WARN_TURNS: int = 10
+    SPIN_FAIL_TURNS: int = 20
 
     def __init__(self, config: ForgeConfig, llm: LLMRouter) -> None:
         self.config = config
@@ -138,7 +144,7 @@ class AgentBase(ABC):
             context: Dictionary with task-specific data for build_prompt().
 
         Returns:
-            AgentResult with success status, output text, and artifacts.
+            AgentResult with success status, output text, artifacts, and metrics.
         """
         self._output_parts = []
         self._artifacts = {}
@@ -149,7 +155,28 @@ class AgentBase(ABC):
         tool_defs = self._get_tool_definitions()
         turns = 0
 
+        # --- Metrics tracking (Section D) ---
+        tool_counts: dict[str, int] = {}
+        files_written = 0
+        # --- Anti-spin tracking (Section B) ---
+        last_write_turn = 0  # last turn that called write_file
+        is_write_agent = bool(self.WRITE_TOOLS)  # spin detection only for write-capable agents
+
         self._log_action("started", f"prompt length={len(user_prompt)}")
+
+        def _build_result(success: bool, error: str = "") -> AgentResult:
+            elapsed = time.monotonic() - start_time
+            return AgentResult(
+                agent_name=self.ROLE,
+                success=success,
+                output="\n".join(self._output_parts),
+                artifacts=self._artifacts,
+                error=error,
+                total_turns=turns,
+                duration_seconds=elapsed,
+                files_written=files_written,
+                tool_calls=dict(tool_counts),
+            )
 
         try:
             while turns < self.MAX_TURNS:
@@ -175,15 +202,53 @@ class AgentBase(ABC):
                 # Process tool calls
                 if response.stop_reason == "tool_use":
                     tool_results = []
+                    wrote_this_turn = False
+
                     for block in response.content:
                         if block.type == "tool_use":
                             self._log_action("tool_call", f"{block.name}")
                             result = await self._execute_tool(block.name, block.input)
+
+                            # Track metrics (Section D)
+                            tool_counts[block.name] = tool_counts.get(block.name, 0) + 1
+                            if block.name == "write_file":
+                                files_written += 1
+                                wrote_this_turn = True
+
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": result,
                             })
+
+                    # Update last write turn for spin detection
+                    if wrote_this_turn:
+                        last_write_turn = turns
+
+                    # --- Anti-spin detection (Section B) ---
+                    if is_write_agent and self.mode != "research":
+                        idle_turns = turns - last_write_turn
+
+                        # Hard fail: too many turns without writing
+                        if idle_turns >= self.SPIN_FAIL_TURNS:
+                            spin_msg = (
+                                f"Agent spinning: no file output in {idle_turns} turns"
+                            )
+                            self._log_action("spin_detected", spin_msg)
+                            return _build_result(False, error=spin_msg)
+
+                        # Warning nudge: inject reminder into last tool result
+                        if idle_turns >= self.SPIN_WARN_TURNS and tool_results:
+                            nudge = (
+                                f"\n\nWARNING: You have not written any files in "
+                                f"{idle_turns} turns. Focus on writing code now. "
+                                f"If blocked, report the issue explicitly."
+                            )
+                            tool_results[-1]["content"] += nudge
+                            self._log_action(
+                                "spin_warning",
+                                f"nudge injected at turn {turns} ({idle_turns} idle)",
+                            )
 
                     # Append assistant response + tool results to conversation
                     messages.append({"role": "assistant", "content": response.content})
@@ -191,35 +256,20 @@ class AgentBase(ABC):
             else:
                 # MAX_TURNS exceeded — this is a failure
                 self._log_action("max_turns_reached", f"turns={turns}")
-                elapsed = time.monotonic() - start_time
-                return AgentResult(
-                    agent_name=self.ROLE,
-                    success=False,
-                    output="\n".join(self._output_parts),
-                    artifacts=self._artifacts,
+                return _build_result(
+                    False,
                     error=f"Agent exceeded maximum turns ({self.MAX_TURNS})",
-                    total_turns=turns,
-                    duration_seconds=elapsed,
                 )
 
-            elapsed = time.monotonic() - start_time
-            return AgentResult(
-                agent_name=self.ROLE,
-                success=True,
-                output="\n".join(self._output_parts),
-                artifacts=self._artifacts,
-                total_turns=turns,
-                duration_seconds=elapsed,
+            # Log metrics summary (Section D)
+            total_calls = sum(tool_counts.values())
+            self._log_action(
+                "metrics",
+                f"{files_written} files written, {total_calls} tool calls in {turns} turns",
             )
 
+            return _build_result(True)
+
         except Exception as e:
-            elapsed = time.monotonic() - start_time
             self._log_action("failed", str(e))
-            return AgentResult(
-                agent_name=self.ROLE,
-                success=False,
-                output="\n".join(self._output_parts),
-                error=str(e),
-                total_turns=turns,
-                duration_seconds=elapsed,
-            )
+            return _build_result(False, error=str(e))

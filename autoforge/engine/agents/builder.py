@@ -111,6 +111,42 @@ class BuilderAgent(AgentBase):
             ),
         ]
 
+        # Add grep_search for finding code patterns
+        from functools import partial
+
+        from autoforge.engine.tools.search import (
+            GREP_SEARCH_TOOL_SCHEMA,
+            handle_grep_search,
+        )
+
+        self._tools.append(ToolDefinition(
+            name="grep_search",
+            description=(
+                "Search project files for a pattern (regex). "
+                "Use to find imports, function definitions, existing patterns, "
+                "and integration points before writing code."
+            ),
+            input_schema=GREP_SEARCH_TOOL_SCHEMA,
+            handler=partial(handle_grep_search, working_dir=self.working_dir),
+        ))
+
+        # Add fetch_url if web tools enabled
+        if getattr(self.config, "web_tools_enabled", True):
+            from autoforge.engine.tools.web import (
+                FETCH_URL_TOOL_SCHEMA,
+                handle_fetch_url,
+            )
+
+            self._tools.append(ToolDefinition(
+                name="fetch_url",
+                description=(
+                    "Fetch a web page and return its text content. "
+                    "Use to read API documentation or code examples while implementing."
+                ),
+                input_schema=FETCH_URL_TOOL_SCHEMA,
+                handler=handle_fetch_url,
+            ))
+
     def _validate_path(self, rel_path: str) -> Path:
         """Validate and resolve a relative path, preventing path traversal."""
         full_path = (self.working_dir / rel_path).resolve()
