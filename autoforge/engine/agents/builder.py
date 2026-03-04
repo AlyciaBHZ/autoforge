@@ -118,9 +118,16 @@ class BuilderAgent(AgentBase):
             raise ValueError(f"Path traversal detected: {rel_path}")
         return full_path
 
+    # 2 MB per file limit to prevent runaway writes
+    MAX_FILE_SIZE = 2 * 1024 * 1024
+
     async def _handle_write_file(self, input_data: dict[str, Any]) -> str:
         rel_path = input_data["path"]
         content = input_data["content"]
+        if len(content) > self.MAX_FILE_SIZE:
+            return json.dumps({
+                "error": f"File too large ({len(content)} bytes). Max is {self.MAX_FILE_SIZE} bytes.",
+            })
         full_path = self._validate_path(rel_path)
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(content, encoding="utf-8")
@@ -159,9 +166,10 @@ class BuilderAgent(AgentBase):
                 "stderr": result.stderr[:2000],
             })
         else:
-            # No sandbox available — skip command execution
+            logger.warning(f"[{self.agent_id}] No sandbox available, skipping: {command[:80]}")
             return json.dumps({
-                "warning": "No sandbox available, command not executed",
+                "warning": "No sandbox available — command was NOT executed. "
+                           "This is expected when running without Docker.",
                 "command": command,
             })
 

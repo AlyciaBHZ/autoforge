@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -59,8 +60,17 @@ class GitManager:
         await self._run_git("commit", "-m", "Initial project scaffold")
         logger.info(f"Git repo initialized at {self.project_dir}")
 
+    @staticmethod
+    def _sanitize_branch_name(name: str) -> str:
+        """Sanitize branch name to prevent command injection."""
+        sanitized = re.sub(r"[^a-zA-Z0-9._/-]", "-", name)
+        if sanitized.startswith("-"):
+            sanitized = "b" + sanitized
+        return sanitized
+
     async def create_worktree(self, branch_name: str) -> Path:
         """Create a git worktree for an agent to work in isolation."""
+        branch_name = self._sanitize_branch_name(branch_name)
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
         worktree_path = self.worktrees_dir / branch_name
 

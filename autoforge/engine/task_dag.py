@@ -141,25 +141,55 @@ class TaskDAG:
             task.status = TaskStatus.TODO
             task.claimed_by = None
 
+    def validate_acyclic(self) -> None:
+        """Check for cycles in the DAG. Raises ValueError if a cycle exists."""
+        visited: set[str] = set()
+        path: set[str] = set()
+
+        def _dfs(task_id: str) -> None:
+            if task_id in path:
+                raise ValueError(f"Cycle detected in task DAG involving task: {task_id}")
+            if task_id in visited:
+                return
+            path.add(task_id)
+            task = self._tasks.get(task_id)
+            if task:
+                for dep in task.depends_on:
+                    _dfs(dep)
+            path.discard(task_id)
+            visited.add(task_id)
+
+        for tid in self._tasks:
+            _dfs(tid)
+
     @classmethod
     def from_dict(cls, tasks_data: list[dict]) -> TaskDAG:
         """Build DAG from a list of task dictionaries (e.g. from Architect output)."""
         dag = cls()
         for item in tasks_data:
-            task = Task(
-                id=item["id"],
-                description=item["description"],
-                owner=item.get("owner", "builder"),
-                phase=TaskPhase(item.get("phase", "build")),
-                status=TaskStatus(item.get("status", "todo")),
-                depends_on=item.get("depends_on", []),
-                files=item.get("files", []),
-                claimed_by=item.get("claimed_by"),
-                result=item.get("result"),
-                acceptance_criteria=item.get("acceptance_criteria", ""),
-                retry_count=item.get("retry_count", 0),
-            )
-            dag.add_task(task)
+            if "id" not in item or "description" not in item:
+                logger.warning(f"Skipping malformed task entry (missing id/description): {item}")
+                continue
+            try:
+                task = Task(
+                    id=item["id"],
+                    description=item["description"],
+                    owner=item.get("owner", "builder"),
+                    phase=TaskPhase(item.get("phase", "build")),
+                    status=TaskStatus(item.get("status", "todo")),
+                    depends_on=item.get("depends_on", []),
+                    files=item.get("files", []),
+                    claimed_by=item.get("claimed_by"),
+                    result=item.get("result"),
+                    acceptance_criteria=item.get("acceptance_criteria", ""),
+                    retry_count=item.get("retry_count", 0),
+                )
+                dag.add_task(task)
+            except (ValueError, KeyError) as e:
+                logger.warning(f"Skipping invalid task {item.get('id', '?')}: {e}")
+
+        # Validate no cycles
+        dag.validate_acyclic()
         return dag
 
     def save(self, path: Path) -> None:
@@ -172,7 +202,12 @@ class TaskDAG:
     @classmethod
     def load(cls, path: Path) -> TaskDAG:
         """Load DAG state from JSON for resume."""
-        data = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in task DAG file {path}: {e}") from e
+        if not isinstance(data, list):
+            raise ValueError(f"Task DAG file must contain a JSON array, got {type(data).__name__}")
         return cls.from_dict(data)
 
     def to_markdown(self) -> str:

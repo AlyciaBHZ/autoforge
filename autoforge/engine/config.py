@@ -1,6 +1,6 @@
 """AutoForge configuration.
 
-Config priority chain (highest → lowest):
+Config priority chain (highest -> lowest):
     1. CLI arguments
     2. Project .env file (in repo root)
     3. Global ~/.autoforge/config.toml (user-level defaults)
@@ -9,6 +9,7 @@ Config priority chain (highest → lowest):
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -30,6 +31,32 @@ MODEL_PRICING = {
 DEFAULT_PRICING = {"input": 5.0, "output": 25.0}
 
 
+def _safe_float(key: str, default: float) -> float:
+    raw = os.getenv(key, "")
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            f"Invalid value for {key}={raw!r}, using default {default}"
+        )
+        return default
+
+
+def _safe_int(key: str, default: int) -> int:
+    raw = os.getenv(key, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            f"Invalid value for {key}={raw!r}, using default {default}"
+        )
+        return default
+
+
 @dataclass
 class ForgeConfig:
     """Central configuration for an AutoForge run."""
@@ -49,7 +76,7 @@ class ForgeConfig:
     # Budget
     budget_limit_usd: float = 10.0
 
-    # Token tracking — per-model accumulators
+    # Token tracking -- per-model accumulators
     token_usage: dict[str, dict[str, int]] = field(default_factory=dict)
 
     # Execution
@@ -73,11 +100,28 @@ class ForgeConfig:
     sandbox_image: str = "autoforge-sandbox:latest"
     docker_enabled: bool = False  # Default off; setup.sh enables if available
 
+    # Daemon mode
+    daemon_enabled: bool = False
+    daemon_poll_interval: int = 10  # seconds between queue checks
+    db_path: Path | None = None  # SQLite database for project registry
+
+    # Telegram bot
+    telegram_token: str = ""
+    telegram_allowed_users: list[str] = field(default_factory=list)
+
+    # Webhook API
+    webhook_enabled: bool = False
+    webhook_host: str = "127.0.0.1"
+    webhook_port: int = 8420
+    webhook_secret: str = ""  # Bearer token for webhook auth
+
     def __post_init__(self) -> None:
         if self.workspace_dir is None:
             self.workspace_dir = self.project_root / "workspace"
         if self.constitution_dir is None:
             self.constitution_dir = autoforge.DATA_DIR / "constitution"
+        if self.db_path is None:
+            self.db_path = self.project_root / "autoforge.db"
         if not self.run_id:
             self.run_id = uuid.uuid4().hex[:12]
 
@@ -97,6 +141,37 @@ class ForgeConfig:
         # Layer 2: Load .env (overrides global)
         load_dotenv()
 
+        # Parse allowed Telegram users (comma-separated)
+        allowed_raw = os.getenv("FORGE_TELEGRAM_ALLOWED_USERS", "")
+        allowed_users = [u.strip() for u in allowed_raw.split(",") if u.strip()]
+
+        # Validate log level
+        log_level = (
+            os.getenv("FORGE_LOG_LEVEL")
+            or global_config.get("log_level", "INFO")
+        ).upper()
+        if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            logging.getLogger(__name__).warning(
+                f"Invalid FORGE_LOG_LEVEL={log_level!r}, using INFO"
+            )
+            log_level = "INFO"
+
+        budget = _safe_float(
+            "FORGE_BUDGET_LIMIT",
+            float(global_config.get("budget_limit_usd", 10.0)),
+        )
+        if budget <= 0:
+            budget = 10.0
+
+        max_agents = _safe_int(
+            "FORGE_MAX_AGENTS",
+            int(global_config.get("max_agents", 3)),
+        )
+        if max_agents < 1:
+            max_agents = 1
+        elif max_agents > 50:
+            max_agents = 50
+
         # Start with global config values, then override with .env, then CLI
         config = cls(
             anthropic_api_key=(
@@ -111,24 +186,25 @@ class ForgeConfig:
                 os.getenv("FORGE_MODEL_FAST")
                 or global_config.get("model_fast", "claude-sonnet-4-5-20250929")
             ),
-            budget_limit_usd=float(
-                os.getenv("FORGE_BUDGET_LIMIT")
-                or global_config.get("budget_limit_usd", 10.0)
-            ),
-            max_agents=int(
-                os.getenv("FORGE_MAX_AGENTS")
-                or global_config.get("max_agents", 3)
-            ),
-            log_level=(
-                os.getenv("FORGE_LOG_LEVEL")
-                or global_config.get("log_level", "INFO")
-            ),
+            budget_limit_usd=budget,
+            max_agents=max_agents,
+            log_level=log_level,
             docker_enabled=(
                 os.getenv("FORGE_DOCKER_ENABLED", "").lower() in ("true", "1", "yes")
                 or global_config.get("docker_enabled", False)
             ),
             mode=global_config.get("mode", "developer"),
             mobile_target=global_config.get("mobile_target", "none"),
+            # Daemon
+            daemon_poll_interval=_safe_int("FORGE_DAEMON_POLL_INTERVAL", 10),
+            # Telegram
+            telegram_token=os.getenv("FORGE_TELEGRAM_TOKEN", ""),
+            telegram_allowed_users=allowed_users,
+            # Webhook
+            webhook_enabled=os.getenv("FORGE_WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes"),
+            webhook_host=os.getenv("FORGE_WEBHOOK_HOST", "127.0.0.1"),
+            webhook_port=_safe_int("FORGE_WEBHOOK_PORT", 8420),
+            webhook_secret=os.getenv("FORGE_WEBHOOK_SECRET", ""),
         )
 
         # Layer 1: CLI overrides (highest priority)

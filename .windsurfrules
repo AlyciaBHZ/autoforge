@@ -1,0 +1,50 @@
+# AutoForge
+
+AI multi-agent project generation framework. 6 agents build complete projects from natural language.
+
+## Commands
+
+```
+./setup.sh                              # Setup (macOS/Linux)
+setup.bat                               # Setup (Windows)
+source .venv/bin/activate               # Activate venv
+python forge.py "project description"   # Generate project
+python forge.py --status                # Show projects
+python forge.py --resume                # Resume run
+python tests/smoke_test.py              # 31-check smoke test
+python forge.py daemon start            # 24/7 daemon
+python forge.py queue "description"     # Queue project
+python forge.py projects                # List projects
+```
+
+## Architecture
+
+Pipeline: SPEC -> BUILD -> VERIFY -> REFACTOR -> DELIVER
+Agents: Director (Opus), Architect (Opus), Builder (Sonnet), Reviewer (Sonnet), Tester (Sonnet), Gardener (Sonnet)
+
+## Key Files
+
+- forge.py: CLI entry point
+- engine/orchestrator.py: 5-phase pipeline
+- engine/config.py: Config + budget
+- engine/llm_router.py: Model routing
+- engine/agent_base.py: Tool-use loop
+- engine/task_dag.py: Task scheduler
+- engine/lock_manager.py: Cross-platform locking
+- engine/git_manager.py: Worktree isolation
+- engine/sandbox.py: Subprocess/Docker sandbox
+- engine/daemon.py: 24/7 daemon + project_registry.py + deploy_guide.py
+- engine/channels/: Telegram bot + webhook API
+- engine/agents/: 6 agent implementations
+- constitution/: Agent behavior rules (editable)
+
+## Coding Standards
+
+- Python 3.11+, from __future__ import annotations
+- Async (async/await, asyncio)
+- Type hints on all signatures
+- pathlib.Path for file paths
+- rich for terminal output
+- Cross-platform (Windows + macOS + Linux)
+- Path traversal prevention in agents
+- Test with python tests/smoke_test.py
