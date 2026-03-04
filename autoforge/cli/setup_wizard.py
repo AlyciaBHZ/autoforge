@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 
@@ -28,6 +29,9 @@ PROVIDERS = {
             {"name": "Claude Sonnet 4.5 (recommended)", "value": "claude-sonnet-4-5-20250929"},
             {"name": "Claude Haiku 4.5 (faster, cheaper)", "value": "claude-haiku-4-5-20251001"},
         ],
+        "auth_methods": [
+            {"name": "API Key", "value": "api_key"},
+        ],
     },
     "openai": {
         "name": "OpenAI (GPT / o-series)",
@@ -41,6 +45,11 @@ PROVIDERS = {
         "models_fast": [
             {"name": "GPT-4o-mini (recommended)", "value": "gpt-4o-mini"},
             {"name": "o4-mini (reasoning, cheaper)", "value": "o4-mini"},
+        ],
+        "auth_methods": [
+            {"name": "API Key", "value": "api_key"},
+            {"name": "Bearer Token + Custom URL (Azure, LiteLLM)", "value": "oauth_bearer"},
+            {"name": "OAuth2 Client Credentials", "value": "oauth2_client_credentials"},
         ],
     },
     "google": {
@@ -56,6 +65,11 @@ PROVIDERS = {
             {"name": "Gemini 2.5 Flash (recommended)", "value": "gemini-2.5-flash"},
             {"name": "Gemini 2.0 Flash (fastest, cheapest)", "value": "gemini-2.0-flash"},
         ],
+        "auth_methods": [
+            {"name": "API Key", "value": "api_key"},
+            {"name": "Application Default Credentials (ADC)", "value": "adc"},
+            {"name": "Service Account JSON", "value": "service_account"},
+        ],
     },
 }
 
@@ -65,12 +79,13 @@ def needs_setup() -> bool:
     if not CONFIG_FILE.exists():
         return True
     content = CONFIG_FILE.read_text(encoding="utf-8")
-    # Need at least one API key configured
+    # Need at least one API key or auth config
     has_key = any(
         key_name in content and f'{key_name} = ""' not in content
         for key_name in ("anthropic_key", "openai_key", "google_key")
     )
-    return not has_key
+    has_auth = "[auth." in content
+    return not (has_key or has_auth)
 
 
 def run_setup_wizard() -> None:
@@ -85,7 +100,7 @@ def run_setup_wizard() -> None:
     selected_providers = inquirer.checkbox(
         message="Which LLM providers do you want to use?",
         choices=[
-            {"name": info["name"], "value": pid, "enabled": pid == "anthropic"}
+            {"name": info["name"], "value": pid, "enabled": False}
             for pid, info in PROVIDERS.items()
         ],
         validate=lambda x: len(x) > 0,
@@ -96,31 +111,118 @@ def run_setup_wizard() -> None:
         console.print("[red]Setup cancelled.[/red]")
         return
 
-    # Step 2: API keys for each provider
+    # Step 2: Auth method + credentials per provider
     api_keys: dict[str, str] = {}
+    auth_configs: dict[str, dict[str, str]] = {}
+
     for pid in selected_providers:
         info = PROVIDERS[pid]
-        key = inquirer.secret(
-            message=f"{info['name']} API key:",
-            validate=info["validate"],
-            invalid_message=info["invalid_msg"],
-            long_instruction=info["key_hint"],
-        ).execute()
-        if key:
-            api_keys[pid] = key
+        auth_methods = info["auth_methods"]
 
-    if not api_keys:
-        console.print("[red]No API keys provided. Setup cancelled.[/red]")
+        # Ask auth method (skip if only one option)
+        if len(auth_methods) > 1:
+            auth_method = inquirer.select(
+                message=f"{info['name']} — authentication method:",
+                choices=auth_methods,
+                default="api_key",
+            ).execute()
+        else:
+            auth_method = "api_key"
+
+        if auth_method == "api_key":
+            key = inquirer.secret(
+                message=f"{info['name']} API key:",
+                validate=info["validate"],
+                invalid_message=info["invalid_msg"],
+                long_instruction=info["key_hint"],
+            ).execute()
+            if key:
+                api_keys[pid] = key
+
+        elif auth_method == "oauth_bearer":
+            base_url = inquirer.text(
+                message="Base URL (e.g. https://your-proxy.com/v1):",
+                validate=lambda x: x.startswith("http"),
+                invalid_message="Must be a valid URL starting with http",
+            ).execute()
+            bearer = inquirer.secret(
+                message="Bearer token:",
+                validate=lambda x: len(x) > 5,
+                invalid_message="Token seems too short",
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "oauth_bearer",
+                "base_url": base_url,
+                "bearer_token": bearer,
+            }
+            # Also set as api_key so has_api_key returns True
+            api_keys[pid] = bearer
+
+        elif auth_method == "oauth2_client_credentials":
+            token_url = inquirer.text(
+                message="Token URL:",
+                validate=lambda x: x.startswith("http"),
+                invalid_message="Must be a valid URL",
+            ).execute()
+            client_id = inquirer.text(message="Client ID:").execute()
+            client_secret = inquirer.secret(
+                message="Client Secret:",
+                validate=lambda x: len(x) > 5,
+                invalid_message="Secret seems too short",
+            ).execute()
+            scope = inquirer.text(
+                message="Scope (optional, press Enter to skip):",
+                default="",
+            ).execute()
+            base_url = inquirer.text(
+                message="Base URL (optional, for proxy — press Enter to skip):",
+                default="",
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "oauth2_client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "token_url": token_url,
+            }
+            if scope:
+                auth_configs[pid]["scope"] = scope
+            if base_url:
+                auth_configs[pid]["base_url"] = base_url
+
+        elif auth_method == "adc":
+            auth_configs[pid] = {"auth_method": "adc"}
+            console.print(
+                "[dim]Ensure GOOGLE_APPLICATION_CREDENTIALS is set or "
+                "run 'gcloud auth application-default login'.[/dim]"
+            )
+
+        elif auth_method == "service_account":
+            sa_path = inquirer.filepath(
+                message="Path to service account JSON:",
+                validate=lambda x: Path(x).is_file() and x.endswith(".json"),
+                invalid_message="Must be a valid .json file",
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "service_account",
+                "service_account_path": sa_path,
+            }
+
+    if not api_keys and not auth_configs:
+        console.print("[red]No credentials provided. Setup cancelled.[/red]")
         return
 
     # Step 3: Model selection — choices from selected providers only
     strong_choices = []
     fast_choices = []
     for pid in selected_providers:
-        if pid in api_keys:
+        if pid in api_keys or pid in auth_configs:
             info = PROVIDERS[pid]
             strong_choices.extend(info["models_strong"])
             fast_choices.extend(info["models_fast"])
+
+    if not strong_choices:
+        console.print("[red]No models available. Setup cancelled.[/red]")
+        return
 
     model_strong = inquirer.select(
         message="Model for complex tasks (Director, Architect):",
@@ -133,6 +235,10 @@ def run_setup_wizard() -> None:
         choices=fast_choices,
         default=fast_choices[0]["value"] if fast_choices else None,
     ).execute()
+
+    # Step 3b: Validate model → provider mapping
+    _validate_model_provider(inquirer, api_keys, auth_configs, model_strong, "strong")
+    _validate_model_provider(inquirer, api_keys, auth_configs, model_fast, "fast")
 
     # Step 4: Budget
     budget = inquirer.number(
@@ -158,12 +264,53 @@ def run_setup_wizard() -> None:
     ).execute()
 
     # Write config
-    _write_config(api_keys, model_strong, model_fast, float(budget), int(max_agents), docker_enabled)
+    _write_config(
+        api_keys, model_strong, model_fast,
+        float(budget), int(max_agents), docker_enabled,
+        auth_configs=auth_configs,
+    )
 
     console.print()
     console.print(f"[green]Configuration saved to {CONFIG_FILE}[/green]")
     console.print("You can re-run setup anytime with: [bold]autoforge setup[/bold]")
     console.print()
+
+
+def _validate_model_provider(
+    inquirer: Any,
+    api_keys: dict[str, str],
+    auth_configs: dict[str, dict[str, str]],
+    model: str,
+    label: str,
+) -> None:
+    """Validate that a selected model has a configured provider."""
+    from autoforge.engine.llm_router import detect_provider
+
+    required_provider = detect_provider(model)
+    if required_provider in api_keys or required_provider in auth_configs:
+        return
+
+    info = PROVIDERS.get(required_provider)
+    if not info:
+        return
+
+    console.print(
+        f"[yellow]Warning:[/yellow] {label} model '{model}' requires "
+        f"{info['name']} but no credentials were provided."
+    )
+    fix = inquirer.confirm(
+        message=f"Add credentials for {info['name']}?",
+        default=True,
+    ).execute()
+    if fix:
+        key = inquirer.secret(
+            message=f"{info['name']} API key:",
+            validate=info["validate"],
+            invalid_message=info["invalid_msg"],
+            long_instruction=info["key_hint"],
+        ).execute()
+        if key:
+            api_keys[required_provider] = key
 
 
 def _write_config(
@@ -173,6 +320,7 @@ def _write_config(
     budget: float,
     max_agents: int,
     docker_enabled: bool,
+    auth_configs: dict[str, dict[str, str]] | None = None,
 ) -> None:
     """Write configuration to ~/.autoforge/config.toml."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -188,7 +336,7 @@ def _write_config(
         if "google" in api_keys:
             api_section["google_key"] = api_keys["google"]
 
-        data = {
+        data: dict[str, Any] = {
             "api": api_section,
             "models": {"strong": model_strong, "fast": model_fast},
             "defaults": {
@@ -198,6 +346,14 @@ def _write_config(
                 "mode": "developer",
             },
         }
+
+        # Add auth config sections
+        if auth_configs:
+            auth_section: dict[str, Any] = {}
+            for provider, auth_data in auth_configs.items():
+                auth_section[provider] = dict(auth_data)
+            data["auth"] = auth_section
+
         CONFIG_FILE.write_bytes(tomli_w.dumps(data).encode("utf-8"))
     except ImportError:
         # Fallback: write TOML manually
@@ -221,6 +377,15 @@ def _write_config(
         lines.append('mode = "developer"')
         lines.append("")
 
+        # Write auth configs
+        if auth_configs:
+            for provider, auth_data in auth_configs.items():
+                lines.append(f"[auth.{provider}]")
+                for k, v in auth_data.items():
+                    if v:
+                        lines.append(f'{k} = "{v}"')
+                lines.append("")
+
         CONFIG_FILE.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -243,7 +408,7 @@ def load_global_config() -> dict:
         # Manual parse fallback for simple TOML
         return _parse_toml_simple(CONFIG_FILE)
 
-    result = {}
+    result: dict[str, Any] = {}
     api = data.get("api", {})
     if api.get("anthropic_key"):
         result["anthropic_api_key"] = api["anthropic_key"]
@@ -268,40 +433,71 @@ def load_global_config() -> dict:
     if "mode" in defaults:
         result["mode"] = defaults["mode"]
 
+    # Load per-provider auth config
+    auth = data.get("auth", {})
+    for provider in ("anthropic", "openai", "google"):
+        auth_section = auth.get(provider, {})
+        if auth_section:
+            result[f"auth_{provider}"] = dict(auth_section)
+
     return result
 
 
 def _parse_toml_simple(path: Path) -> dict:
-    """Simple TOML parser fallback for basic key=value pairs."""
-    result = {}
+    """Simple TOML parser fallback for basic key=value pairs.
+
+    Handles nested sections like [auth.openai] by tracking the current
+    section path and mapping dotted keys to auth_{provider} config keys.
+    """
+    result: dict[str, Any] = {}
+    current_section = ""
+
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if not line or line.startswith("#") or line.startswith("["):
+        if not line or line.startswith("#"):
             continue
-        if "=" in line:
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"')
-            # Map TOML keys to config fields
-            key_map = {
-                "anthropic_key": "anthropic_api_key",
-                "openai_key": "openai_api_key",
-                "google_key": "google_api_key",
-                "strong": "model_strong",
-                "fast": "model_fast",
-                "budget": "budget_limit_usd",
-                "max_agents": "max_agents",
-                "docker": "docker_enabled",
-                "mode": "mode",
-            }
-            config_key = key_map.get(key)
-            if config_key:
-                if config_key in ("budget_limit_usd",):
-                    result[config_key] = float(value)
-                elif config_key in ("max_agents",):
-                    result[config_key] = int(value)
-                elif config_key in ("docker_enabled",):
-                    result[config_key] = value.lower() in ("true", "1", "yes")
-                else:
-                    result[config_key] = value
+
+        # Section header
+        if line.startswith("[") and line.endswith("]"):
+            current_section = line[1:-1].strip()
+            continue
+
+        if "=" not in line:
+            continue
+
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"')
+
+        # Auth sections: [auth.openai], [auth.google], etc.
+        if current_section.startswith("auth."):
+            provider = current_section.split(".", 1)[1]
+            auth_key = f"auth_{provider}"
+            if auth_key not in result:
+                result[auth_key] = {}
+            result[auth_key][key] = value
+            continue
+
+        # Standard key mapping
+        key_map = {
+            "anthropic_key": "anthropic_api_key",
+            "openai_key": "openai_api_key",
+            "google_key": "google_api_key",
+            "strong": "model_strong",
+            "fast": "model_fast",
+            "budget": "budget_limit_usd",
+            "max_agents": "max_agents",
+            "docker": "docker_enabled",
+            "mode": "mode",
+        }
+        config_key = key_map.get(key)
+        if config_key:
+            if config_key in ("budget_limit_usd",):
+                result[config_key] = float(value)
+            elif config_key in ("max_agents",):
+                result[config_key] = int(value)
+            elif config_key in ("docker_enabled",):
+                result[config_key] = value.lower() in ("true", "1", "yes")
+            else:
+                result[config_key] = value
     return result

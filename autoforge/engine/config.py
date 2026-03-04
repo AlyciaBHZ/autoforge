@@ -14,6 +14,7 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -79,6 +80,8 @@ class ForgeConfig:
 
     # LLM settings — multi-provider API keys
     api_keys: dict[str, str] = field(default_factory=dict)
+    # Per-provider auth config (OAuth bearer, client_credentials, Google ADC, etc.)
+    auth_config: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_strong: str = "claude-opus-4-6"
     model_fast: str = "claude-sonnet-4-5-20250929"
     max_tokens_strong: int = 16384
@@ -149,8 +152,8 @@ class ForgeConfig:
 
     @property
     def has_api_key(self) -> bool:
-        """Check if at least one LLM API key is configured."""
-        return any(v for v in self.api_keys.values())
+        """Check if at least one LLM provider is configured (API key or OAuth)."""
+        return any(v for v in self.api_keys.values()) or bool(self.auth_config)
 
     @property
     def anthropic_api_key(self) -> str:
@@ -198,6 +201,24 @@ class ForgeConfig:
         if os.getenv("GOOGLE_API_KEY"):
             api_keys["google"] = os.getenv("GOOGLE_API_KEY", "")
 
+        # Load per-provider auth config (OAuth bearer, client_credentials, ADC)
+        auth_config: dict[str, dict[str, Any]] = {}
+        for provider in ("anthropic", "openai", "google"):
+            provider_auth = global_config.get(f"auth_{provider}", {})
+            if provider_auth:
+                auth_config[provider] = dict(provider_auth)
+
+        # Env var overrides for auth
+        if os.getenv("OPENAI_BASE_URL"):
+            auth_config.setdefault("openai", {})
+            auth_config["openai"]["base_url"] = os.getenv("OPENAI_BASE_URL", "")
+            if "auth_method" not in auth_config["openai"]:
+                auth_config["openai"]["auth_method"] = "oauth_bearer"
+        if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+            auth_config.setdefault("google", {})
+            if "auth_method" not in auth_config["google"]:
+                auth_config["google"]["auth_method"] = "adc"
+
         # Parse allowed Telegram users (comma-separated)
         allowed_raw = os.getenv("FORGE_TELEGRAM_ALLOWED_USERS", "")
         allowed_users = [u.strip() for u in allowed_raw.split(",") if u.strip()]
@@ -231,6 +252,7 @@ class ForgeConfig:
 
         config = cls(
             api_keys=api_keys,
+            auth_config=auth_config,
             model_strong=(
                 os.getenv("FORGE_MODEL_STRONG")
                 or global_config.get("model_strong", "claude-opus-4-6")
