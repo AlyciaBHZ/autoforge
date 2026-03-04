@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,6 +143,11 @@ class EvoMACEngine:
         self._iteration = 0
         self._init_topology()
 
+    @property
+    def iteration(self) -> int:
+        """Current iteration number."""
+        return self._iteration
+
     def _init_topology(self) -> None:
         """Initialize the default agent communication topology."""
         self._topology = [
@@ -244,7 +250,6 @@ class EvoMACEngine:
 
     def _parse_gradients(self, text: str, task_context: str) -> list[TextGradient]:
         """Parse LLM output into TextGradient objects."""
-        import re
         gradients = []
 
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)

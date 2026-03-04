@@ -1604,7 +1604,7 @@ class Orchestrator:
                         {"role": "architect_A", "position": json.dumps(scored[0][1], ensure_ascii=False)[:500]},
                         {"role": "architect_B", "position": json.dumps(scored[1][1], ensure_ascii=False)[:500]},
                     ]
-                    should = await self._debate.should_debate(debate_topic, positions, self.llm)
+                    should, uncertainty = await self._debate.should_debate(debate_topic, positions, self.llm)
                     if should:
                         outcome = await self._debate.run_debate(
                             debate_topic,
@@ -1895,7 +1895,7 @@ class Orchestrator:
                             if updated != current:
                                 from autoforge.engine.dynamic_constitution import ConstitutionPatch
                                 self._dynamic_constitution.add_patch(ConstitutionPatch(
-                                    id=f"evomac-{role}-{self._evomac._iteration}",
+                                    id=f"evomac-{role}-{self._evomac.iteration}",
                                     target_role=role,
                                     content=updated,
                                     source="evomac",

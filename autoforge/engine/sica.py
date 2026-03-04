@@ -27,10 +27,11 @@ References:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import time
-import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -236,7 +237,6 @@ class SICAEngine:
         self, text: str, constitution_dir: Path,
     ) -> list[SelfEditProposal]:
         """Parse LLM output into validated proposals."""
-        import re
         proposals = []
 
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
@@ -358,6 +358,7 @@ class SICAEngine:
                 target_path.write_text(updated, encoding="utf-8")
             else:
                 logger.warning(f"[SICA] Target file not found: {target_path}")
+                proposal.status = "failed"
                 return False
 
             proposal.status = "applied"
@@ -484,7 +485,6 @@ class SICAEngine:
                 if block.type == "text":
                     text += block.text
 
-            import re
             match = re.search(r"```python\s*\n?(.*?)\n?```", text, re.DOTALL)
             if not match:
                 return None
