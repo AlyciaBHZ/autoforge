@@ -134,11 +134,53 @@ class ForgeConfig:
     search_backend: str = "duckduckgo"  # "duckduckgo" | "google" | "bing"
     search_api_key: str = ""  # API key for Google/Bing search backends
 
+    # GitHub integration
+    github_token: str = ""  # Personal access token for GitHub API (optional, increases rate limit)
+
+    # Search tree (branching/backtracking)
+    search_tree_enabled: bool = True  # Enable tree search for architecture exploration
+    search_tree_max_candidates: int = 3  # Candidates per branch point
+
+    # Mid-task checkpoints
+    checkpoints_enabled: bool = True  # Enable mid-task direction checking
+    checkpoint_interval: int = 8  # Check direction every N turns
+
     # Human-in-the-loop checkpoints
     confirm_phases: list[str] = field(default_factory=list)  # e.g. ["spec", "build"] or ["all"]
 
     # Build-phase TDD loops
     build_test_loops: int = 0  # 0=disabled, 1-3=test-fix iterations per task
+
+    # Evolution engine
+    evolution_enabled: bool = True  # Enable cross-project workflow evolution
+
+    # Prompt optimization (DSPy/OPRO-style)
+    prompt_optimization_enabled: bool = True  # Enable automatic prompt self-improvement
+
+    # Process reward model (CodePRM)
+    process_reward_enabled: bool = True  # Enable step-level code generation evaluation
+
+    # RethinkMCTS
+    mcts_enabled: bool = True        # Enable MCTS-enhanced search during BUILD
+    mcts_max_iterations: int = 9     # Max MCTS iterations per decision point
+
+    # EvoMAC text backpropagation
+    evomac_enabled: bool = True      # Enable text gradient feedback between agents
+
+    # SICA self-improvement
+    sica_enabled: bool = True        # Enable self-improving constitution edits
+
+    # Library-level RAG retrieval
+    rag_enabled: bool = True         # Enable cross-project code knowledge base
+
+    # Formal verification
+    formal_verify_enabled: bool = True  # Enable static analysis + LLM formal checks
+
+    # Conditional multi-agent debate
+    debate_enabled: bool = True      # Enable reward-guided architecture debates
+
+    # RedCode security scanning
+    security_scan_enabled: bool = True  # Enable security vulnerability scanning
 
     def __post_init__(self) -> None:
         if self.workspace_dir is None:
@@ -286,6 +328,14 @@ class ForgeConfig:
             search_api_key=os.getenv("FORGE_SEARCH_API_KEY", global_config.get("search_api_key", "")),
             # Build TDD
             build_test_loops=_safe_int("FORGE_BUILD_TEST_LOOPS", int(global_config.get("build_test_loops", 0))),
+            # GitHub
+            github_token=os.getenv("GITHUB_TOKEN", global_config.get("github_token", "")),
+            # Search tree
+            search_tree_enabled=os.getenv("FORGE_SEARCH_TREE", "true").lower() not in ("false", "0", "no"),
+            search_tree_max_candidates=_safe_int("FORGE_SEARCH_CANDIDATES", int(global_config.get("search_tree_max_candidates", 3))),
+            # Checkpoints
+            checkpoints_enabled=os.getenv("FORGE_CHECKPOINTS", "true").lower() not in ("false", "0", "no"),
+            checkpoint_interval=_safe_int("FORGE_CHECKPOINT_INTERVAL", int(global_config.get("checkpoint_interval", 8))),
         )
 
         # Layer 1: CLI overrides (highest priority)

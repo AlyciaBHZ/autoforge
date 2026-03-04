@@ -1,9 +1,16 @@
-"""Architect Agent — architecture design and task decomposition."""
+"""Architect Agent — architecture design and task decomposition.
+
+Enhanced with:
+  - GitHub search for discovering open-source solutions
+  - Multi-architecture generation with diversity filtering
+  - Search tree integration for exploring multiple designs
+"""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -87,6 +94,36 @@ class ArchitectAgent(AgentBase):
                 handler=handle_fetch_url,
             ))
 
+            # GitHub tools for discovering open-source components
+            from autoforge.engine.tools.github_search import (
+                SEARCH_GITHUB_TOOL_SCHEMA,
+                INSPECT_REPO_TOOL_SCHEMA,
+                handle_search_github,
+                handle_inspect_repo,
+            )
+
+            github_token = os.environ.get("GITHUB_TOKEN", "")
+
+            self._tools.append(ToolDefinition(
+                name="search_github",
+                description=(
+                    "Search GitHub for open-source libraries and frameworks. "
+                    "Use to find existing solutions for project components instead of "
+                    "building from scratch. Check stars, activity, and license."
+                ),
+                input_schema=SEARCH_GITHUB_TOOL_SCHEMA,
+                handler=partial(handle_search_github, github_token=github_token),
+            ))
+            self._tools.append(ToolDefinition(
+                name="inspect_repo",
+                description=(
+                    "Inspect a GitHub repo's README and structure to evaluate "
+                    "whether it's suitable for the project. Use after search_github."
+                ),
+                input_schema=INSPECT_REPO_TOOL_SCHEMA,
+                handler=partial(handle_inspect_repo, github_token=github_token),
+            ))
+
     async def _handle_read_template(self, input_data: dict[str, Any]) -> str:
         rel_path = input_data["path"]
         full_path = (self.templates_dir / rel_path).resolve()
@@ -127,3 +164,79 @@ class ArchitectAgent(AgentBase):
             return json.loads(output[start : end + 1])
 
         raise ValueError("Could not extract architecture from Architect output")
+
+    async def generate_diverse_architectures(
+        self,
+        spec: dict[str, Any],
+        num_candidates: int = 3,
+    ) -> list[dict[str, str]]:
+        """Generate multiple distinct architecture proposals for diversity.
+
+        Uses the search tree module to create and evaluate candidates.
+        This enables exploring fundamentally different approaches rather than
+        committing to the first one the LLM generates.
+
+        Inspired by SWE-Search (ICLR 2025) diversity mechanism:
+        - Generate candidates with varied strategies
+        - Filter out semantically similar proposals
+        - Evaluate remaining candidates
+
+        Returns list of {"description": ..., "strategy": ...} candidate dicts.
+        """
+        from autoforge.engine.search_tree import generate_candidates
+
+        context = json.dumps(spec, indent=2, ensure_ascii=False)
+        task_desc = (
+            f"Design the architecture for project '{spec.get('project_name', '')}'.\n"
+            f"Tech stack: {json.dumps(spec.get('tech_stack', {}))}\n"
+            f"Modules: {[m.get('name', '') for m in spec.get('modules', [])]}"
+        )
+
+        candidates = await generate_candidates(
+            llm=self.llm,
+            task_description=task_desc,
+            context=context,
+            num_candidates=num_candidates,
+            system_prompt=(
+                "You are a software architect. Generate genuinely different "
+                "architectural approaches — different libraries, patterns, or "
+                "structural decisions. NOT just variations of the same idea."
+            ),
+        )
+
+        # Diversity filter: remove candidates that are too similar
+        if len(candidates) > 1:
+            candidates = self._filter_similar(candidates)
+
+        logger.info(f"[Architect] Generated {len(candidates)} diverse architecture candidates")
+        return candidates
+
+    @staticmethod
+    def _filter_similar(
+        candidates: list[dict[str, str]],
+        threshold: float = 0.7,
+    ) -> list[dict[str, str]]:
+        """Remove candidates with high textual overlap (simple Jaccard similarity).
+
+        A more sophisticated version would use embeddings, but word-level
+        Jaccard is fast and sufficient for catching obviously duplicate proposals.
+        """
+        filtered = [candidates[0]]
+        for cand in candidates[1:]:
+            is_unique = True
+            cand_words = set(cand.get("strategy", "").lower().split())
+            for kept in filtered:
+                kept_words = set(kept.get("strategy", "").lower().split())
+                if not cand_words or not kept_words:
+                    continue
+                intersection = len(cand_words & kept_words)
+                union = len(cand_words | kept_words)
+                similarity = intersection / union if union > 0 else 0
+                if similarity > threshold:
+                    is_unique = False
+                    logger.debug(f"[Architect] Filtered similar candidate "
+                                 f"(similarity={similarity:.2f})")
+                    break
+            if is_unique:
+                filtered.append(cand)
+        return filtered
