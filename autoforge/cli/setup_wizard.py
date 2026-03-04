@@ -247,15 +247,15 @@ def run_setup_wizard() -> None:
     if not api_keys and not auth_configs:
         console.print()
         console.print("[yellow]No API keys configured yet.[/yellow]")
-        console.print("Add one anytime with: [bold]autoforge setup[/bold]")
+        console.print("Add one anytime with: [bold]forgeai setup[/bold]")
         console.print("Or set environment variables: ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY")
     else:
         console.print()
         console.print("[bold green]Ready to go![/bold green]")
-        console.print('Try: [bold]autoforge generate "Build a todo app with Flask"[/bold]')
+        console.print('Try: [bold]forgeai[/bold] to start an interactive session')
 
     console.print()
-    console.print("[dim]Reconfigure anytime: autoforge setup[/dim]")
+    console.print("[dim]Reconfigure anytime: forgeai setup[/dim]")
     console.print()
 
 

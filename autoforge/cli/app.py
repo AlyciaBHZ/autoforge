@@ -50,16 +50,16 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  autoforge                                   # Interactive mode\n"
-            '  autoforge generate "Build a Todo app"       # Generate new project\n'
-            "  autoforge review ./my-project               # Review existing project\n"
-            "  autoforge import ./my-project               # Import & improve\n"
-            "  autoforge setup                             # Configure settings\n"
-            "  autoforge status                            # Show project status\n"
-            "  autoforge daemon start                      # Start queue daemon\n"
-            '  autoforge queue "Build an API"              # Queue project\n'
-            "  autoforge projects                          # List queued/history\n"
-            "  autoforge deploy <project_id>               # Print deploy guide\n"
+            "  forgeai                                     # Interactive session\n"
+            '  forgeai generate "Build a Todo app"         # Generate new project\n'
+            "  forgeai review ./my-project                 # Review existing project\n"
+            "  forgeai import ./my-project                 # Import & improve\n"
+            "  forgeai setup                               # Configure settings\n"
+            "  forgeai status                              # Show project status\n"
+            "  forgeai daemon start                        # Start queue daemon\n"
+            '  forgeai queue "Build an API"                # Queue project\n'
+            "  forgeai projects                            # List queued/history\n"
+            "  forgeai deploy <project_id>                 # Print deploy guide\n"
         ),
     )
 
@@ -233,7 +233,7 @@ async def _run_generate(config, description: str) -> int:
     from autoforge.engine.orchestrator import Orchestrator
 
     if not config.has_api_key:
-        console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
+        console.print("[red]Error:[/red] No API key configured. Run: forgeai setup")
         return 1
 
     show_startup_info(
@@ -263,7 +263,7 @@ async def _run_review(config, project_path: str) -> int:
     from autoforge.engine.orchestrator import Orchestrator
 
     if not config.has_api_key:
-        console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
+        console.print("[red]Error:[/red] No API key configured. Run: forgeai setup")
         return 1
 
     path = Path(project_path).resolve()
@@ -297,7 +297,7 @@ async def _run_import(config, project_path: str, enhance: str = "") -> int:
     from autoforge.engine.orchestrator import Orchestrator
 
     if not config.has_api_key:
-        console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
+        console.print("[red]Error:[/red] No API key configured. Run: forgeai setup")
         return 1
 
     path = Path(project_path).resolve()
@@ -380,7 +380,7 @@ async def _run_daemon_start(config) -> int:
     from autoforge.engine.daemon import ForgeDaemon
 
     if not config.has_api_key:
-        console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
+        console.print("[red]Error:[/red] No API key configured. Run: forgeai setup")
         return 1
 
     running_pid = _read_daemon_pid_file(config.daemon_pid_file)
@@ -473,7 +473,7 @@ async def _run_daemon_install(config) -> int:
         console.print("  launchctl load ~/Library/LaunchAgents/com.autoforge.daemon.plist")
     else:
         console.print("Windows service install is not automated yet.")
-        console.print("Run daemon manually: autoforge daemon start")
+        console.print("Run daemon manually: forgeai daemon start")
     return 0
 
 
@@ -603,18 +603,18 @@ def _resolve_command(argv: list[str]) -> tuple[argparse.Namespace, str | None]:
 
 
 def _run_interactive_sync(args: argparse.Namespace) -> int:
-    """Run interactive mode — all InquirerPy prompts happen here (sync).
+    """Run interactive session — setup on first run, then session loop.
 
-    Returns exit code. May call asyncio.run() for the actual pipeline.
+    Flow: banner → first-run setup → mode select → build → (repeat)
     """
     from autoforge.cli.display import show_banner
     from autoforge.cli.setup_wizard import needs_setup
 
     show_banner()
 
-    # Check if setup is needed — runs InquirerPy (sync, no event loop)
+    # First-run setup: API key, GitHub, preferences
     if needs_setup():
-        console.print("[yellow]First time? Let's set up AutoForge.[/yellow]\n")
+        console.print("[yellow]First time? Let's set up ForgeAI.[/yellow]\n")
         from autoforge.cli.setup_wizard import run_setup_wizard
         run_setup_wizard()
         console.print()
@@ -623,48 +623,74 @@ def _run_interactive_sync(args: argparse.Namespace) -> int:
         from autoforge.cli.interactive import run_interactive
     except ImportError:
         console.print("[red]Error:[/red] InquirerPy not installed. Run: pip install InquirerPy")
-        console.print("Or use subcommands directly: autoforge generate \"your description\"")
+        console.print("Or use subcommands directly: forgeai generate \"your description\"")
         return 1
 
-    # Run InquirerPy menus (sync, no event loop)
-    choices = run_interactive()
-    action = choices.get("action")
+    # Session loop: mode → action → build → next session
+    while True:
+        try:
+            choices = run_interactive()
+        except KeyboardInterrupt:
+            console.print("\n[dim]Goodbye![/dim]")
+            return 0
 
-    if action == "setup":
-        from autoforge.cli.setup_wizard import run_setup_wizard
-        run_setup_wizard()
-        return 0
+        action = choices.get("action")
+        if action == "setup":
+            from autoforge.cli.setup_wizard import run_setup_wizard
+            run_setup_wizard()
+            continue
 
-    # Build config from global config + interactive choices
-    from autoforge.engine.config import ForgeConfig
+        # Build config from global config + interactive choices
+        from autoforge.engine.config import ForgeConfig
 
-    overrides = _build_config_overrides(args)
-    # Apply interactive choices as overrides
-    if "budget" in choices:
-        overrides["budget_limit_usd"] = choices["budget"]
-    if "max_agents" in choices:
-        overrides["max_agents"] = choices["max_agents"]
-    if "mode" in choices:
-        overrides["mode"] = choices["mode"]
-    if "mobile_target" in choices:
-        overrides["mobile_target"] = choices["mobile_target"]
+        overrides = _build_config_overrides(args)
+        if "budget" in choices:
+            overrides["budget_limit_usd"] = choices["budget"]
+        if "max_agents" in choices:
+            overrides["max_agents"] = choices["max_agents"]
 
-    config = ForgeConfig.from_env(**overrides)
-    setup_logging(config.log_level, config.verbose)
+        # Map interactive modes to engine modes
+        mode = choices.get("mode", "developer")
+        if mode == "academic":
+            overrides["mode"] = "research"
+            # Enable academic engines
+            overrides["lean_prover_enabled"] = True
+            overrides["theoretical_reasoning_enabled"] = True
+            overrides["formal_verify_enabled"] = True
+        elif mode == "verification":
+            overrides["mode"] = "research"
+            overrides["formal_verify_enabled"] = True
+            overrides["security_scan_enabled"] = True
+        else:
+            overrides["mode"] = mode
 
-    # Now enter the async event loop only for the pipeline execution
-    if action == "generate":
-        return asyncio.run(_run_generate(config, choices["description"]))
-    elif action == "review":
-        return asyncio.run(_run_review(config, choices["project_path"]))
-    elif action == "import":
-        return asyncio.run(_run_import(
-            config,
-            choices["project_path"],
-            choices.get("enhance_description", ""),
-        ))
+        if "mobile_target" in choices:
+            overrides["mobile_target"] = choices["mobile_target"]
 
-    return 0
+        config = ForgeConfig.from_env(**overrides)
+        setup_logging(config.log_level, config.verbose)
+
+        # Execute the pipeline
+        exit_code = 0
+        if action == "generate":
+            exit_code = asyncio.run(_run_generate(config, choices["description"]))
+        elif action == "review":
+            exit_code = asyncio.run(_run_review(config, choices["project_path"]))
+        elif action == "import":
+            exit_code = asyncio.run(_run_import(
+                config,
+                choices["project_path"],
+                choices.get("enhance_description", ""),
+            ))
+
+        # Session complete — prompt for next
+        console.print()
+        if exit_code == 0:
+            console.print("[bold green]Session complete![/bold green]")
+        else:
+            console.print("[bold yellow]Session ended with errors.[/bold yellow]")
+
+        console.print("[dim]Starting next session... (Ctrl+C to exit)[/dim]\n")
 
 
 async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
@@ -694,7 +720,7 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
         from autoforge.engine.orchestrator import Orchestrator
 
         if not config.has_api_key:
-            console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
+            console.print("[red]Error:[/red] No API key configured. Run: forgeai setup")
             return 1
 
         orchestrator = Orchestrator(config)

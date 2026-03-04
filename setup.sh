@@ -68,7 +68,7 @@ fi
 # ── Verify installation ──
 echo ""
 echo "Verifying installation..."
-.venv/bin/autoforge --help >/dev/null 2>&1 && echo "  AutoForge CLI: OK" || echo "  AutoForge CLI: FAILED"
+.venv/bin/forgeai --help >/dev/null 2>&1 && echo "  ForgeAI CLI: OK" || echo "  ForgeAI CLI: FAILED"
 .venv/bin/python -c "from autoforge.engine.orchestrator import Orchestrator; print('  Engine: OK')" 2>&1 || echo "  Engine: FAILED"
 
 # ── Auto-launch setup wizard if needed ──
@@ -76,18 +76,18 @@ echo ""
 if .venv/bin/python -c "from autoforge.cli.setup_wizard import needs_setup; exit(0 if needs_setup() else 1)" 2>/dev/null; then
     echo "First-time setup — launching configuration wizard..."
     echo ""
-    .venv/bin/autoforge setup
+    .venv/bin/forgeai setup
 fi
 
 echo ""
 echo "=== Setup complete! ==="
 echo ""
 echo "Usage:"
-echo '  .venv/bin/autoforge                          # Run from this directory'
-echo '  .venv/bin/autoforge generate "your prompt"   # Generate a project'
-echo '  .venv/bin/autoforge review ./my-project      # Review existing code'
-echo '  .venv/bin/autoforge setup                    # Reconfigure settings'
+echo '  forgeai                                      # Interactive session'
+echo '  forgeai generate "your prompt"               # Generate a project'
+echo '  forgeai review ./my-project                  # Review existing code'
+echo '  forgeai setup                                # Reconfigure settings'
 echo ""
 echo "Or install globally:"
-echo '  pip install -e .    # Then "autoforge" works from anywhere'
+echo '  pip install -e .    # Then "forgeai" works from anywhere'
 echo ""

@@ -355,7 +355,7 @@ class Orchestrator:
 
         except UserPausedError as e:
             console.print(f"\n[bold yellow]Paused:[/bold yellow] {e}")
-            console.print("Use [bold]autoforge resume[/bold] to continue.")
+            console.print("Use [bold]forgeai resume[/bold] to continue.")
             if self.project_dir:
                 return self.project_dir
             raise
@@ -403,7 +403,7 @@ class Orchestrator:
         if not proceed:
             self._save_state(f"paused_after_{phase}")
             raise UserPausedError(
-                f"User paused after {phase}. Resume with: autoforge resume"
+                f"User paused after {phase}. Resume with: forgeai resume"
             )
 
         console.print("  [green]Continuing...[/green]\n")

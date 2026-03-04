@@ -20,21 +20,21 @@
 ## 快速开始
 
 ```bash
-pip install autoforge                         # 安装
-autoforge "带用户登录的待办事项应用"              # 生成项目
+pip install forgeai                           # 安装
+forgeai                                       # 启动交互式会话
 ```
 
-首次运行会引导配置 API Key（支持 Anthropic / OpenAI / Google 任意一家）。项目输出到 `workspace/` 目录，开箱即用。
+首次启动自动引导配置 API Key（Anthropic / OpenAI / Google 任选一家）、GitHub 环境和运行模式。之后直接进入会话，描述项目即开始构建。
 
 <details>
 <summary>可选依赖</summary>
 
 ```bash
-pip install autoforge[openai]     # OpenAI 支持
-pip install autoforge[google]     # Google Gemini 支持
-pip install autoforge[search]     # Web 搜索能力
-pip install autoforge[channels]   # Telegram / Webhook 频道
-pip install autoforge[all]        # 全部安装
+pip install forgeai[openai]       # OpenAI 支持
+pip install forgeai[google]       # Google Gemini 支持
+pip install forgeai[search]       # Web 搜索能力
+pip install forgeai[channels]     # Telegram / Webhook 频道
+pip install forgeai[all]          # 全部安装
 ```
 
 </details>
@@ -121,19 +121,22 @@ export FORGE_MODEL_FAST=gemini-2.5-flash  # 快模型用 Google
 ## 使用方法
 
 ```bash
-# 生成项目
-autoforge "用 Flask + Vue 做一个书店管理系统，带 JWT 认证"
-autoforge "SaaS 产品落地页" --budget 3.00
+# 交互式会话（推荐）
+forgeai                           # 选择模式 → 描述项目 → 开始构建
+
+# 直接生成
+forgeai generate "用 Flask + Vue 做一个书店管理系统，带 JWT 认证"
+forgeai generate "SaaS 产品落地页" --budget 3.00
 
 # 管理运行
-autoforge --status                # 查看所有项目
-autoforge --resume                # 恢复中断的任务
+forgeai status                    # 查看所有项目
+forgeai resume                    # 恢复中断的任务
 
 # 守护进程模式（24/7 后台服务）
-autoforge daemon start
-autoforge queue "支持 Markdown 的博客系统"
-autoforge projects
-autoforge deploy <project_id>
+forgeai daemon start
+forgeai queue "支持 Markdown 的博客系统"
+forgeai projects
+forgeai deploy <project_id>
 ```
 
 <details>

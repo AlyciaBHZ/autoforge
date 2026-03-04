@@ -20,21 +20,21 @@
 ## Quick Start
 
 ```bash
-pip install autoforge                         # Install
-autoforge "Todo app with user auth"           # Generate a project
+pip install forgeai                           # Install
+forgeai                                       # Start interactive session
 ```
 
-On first run, the setup wizard guides you through API key configuration (Anthropic / OpenAI / Google — any one will do). Output lands in `workspace/`, ready to run.
+On first launch, the setup wizard guides you through API key configuration (Anthropic / OpenAI / Google — any one), GitHub environment, and operating mode. Then you're dropped into a session where you describe a project and it gets built.
 
 <details>
 <summary>Optional dependencies</summary>
 
 ```bash
-pip install autoforge[openai]     # OpenAI support
-pip install autoforge[google]     # Google Gemini support
-pip install autoforge[search]     # Web search capabilities
-pip install autoforge[channels]   # Telegram / Webhook channels
-pip install autoforge[all]        # Install everything
+pip install forgeai[openai]       # OpenAI support
+pip install forgeai[google]       # Google Gemini support
+pip install forgeai[search]       # Web search capabilities
+pip install forgeai[channels]     # Telegram / Webhook channels
+pip install forgeai[all]          # Install everything
 ```
 
 </details>
@@ -121,19 +121,22 @@ export FORGE_MODEL_FAST=gemini-2.5-flash  # Fast model from Google
 ## Usage
 
 ```bash
-# Generate projects
-autoforge "REST API for a bookstore with JWT auth"
-autoforge "Landing page for a SaaS product" --budget 3.00
+# Interactive session (recommended)
+forgeai                           # Select mode → describe project → build
+
+# Direct generation
+forgeai generate "REST API for a bookstore with JWT auth"
+forgeai generate "Landing page for a SaaS product" --budget 3.00
 
 # Manage runs
-autoforge --status                # Show all projects
-autoforge --resume                # Resume interrupted run
+forgeai status                    # Show all projects
+forgeai resume                    # Resume interrupted run
 
 # Daemon mode (24/7 background service)
-autoforge daemon start
-autoforge queue "Blog with markdown support"
-autoforge projects
-autoforge deploy <project_id>
+forgeai daemon start
+forgeai queue "Blog with markdown support"
+forgeai projects
+forgeai deploy <project_id>
 ```
 
 <details>
