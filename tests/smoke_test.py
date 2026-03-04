@@ -1485,9 +1485,11 @@ def test_setup_wizard_auth_methods():
     """Each provider has valid auth method options."""
     from autoforge.cli.setup_wizard import PROVIDERS
 
-    # Anthropic: only api_key
+    # Anthropic: api_key + bearer + oauth2
     ant_methods = [m["value"] for m in PROVIDERS["anthropic"]["auth_methods"]]
-    assert ant_methods == ["api_key"]
+    assert "api_key" in ant_methods
+    assert "oauth_bearer" in ant_methods
+    assert "oauth2_client_credentials" in ant_methods
 
     # OpenAI: api_key + bearer + oauth2
     oai_methods = [m["value"] for m in PROVIDERS["openai"]["auth_methods"]]

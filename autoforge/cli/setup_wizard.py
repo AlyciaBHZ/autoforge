@@ -31,6 +31,8 @@ PROVIDERS = {
         ],
         "auth_methods": [
             {"name": "API Key", "value": "api_key"},
+            {"name": "Bearer Token + Custom URL (proxy)", "value": "oauth_bearer"},
+            {"name": "OAuth2 Client Credentials", "value": "oauth2_client_credentials"},
         ],
     },
     "openai": {
