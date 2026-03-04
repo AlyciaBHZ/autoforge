@@ -99,7 +99,7 @@ class ForgeDaemon:
                 channel_tasks.append(task)
                 console.print("  Telegram bot: [green]active[/green]")
             except ImportError:
-                console.print("  Telegram bot: [yellow]skipped[/yellow] (pip install autoforge[channels])")
+                console.print("  Telegram bot: [yellow]skipped[/yellow] (pip install forgeai[channels])")
                 logger.warning("python-telegram-bot not installed, skipping Telegram")
             except Exception as exc:
                 console.print(f"  Telegram bot: [red]failed[/red] ({exc})")
@@ -115,7 +115,7 @@ class ForgeDaemon:
                     f"  Webhook API: [green]http://{self.config.webhook_host}:{self.config.webhook_port}[/green]"
                 )
             except ImportError:
-                console.print("  Webhook API: [yellow]skipped[/yellow] (pip install autoforge[channels])")
+                console.print("  Webhook API: [yellow]skipped[/yellow] (pip install forgeai[channels])")
                 logger.warning("fastapi/uvicorn not installed, skipping webhook")
             except Exception as exc:
                 console.print(f"  Webhook API: [red]failed[/red] ({exc})")

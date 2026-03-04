@@ -43,11 +43,42 @@ You must output a single JSON code block with this exact structure:
       "android": { "min_sdk": 26 }
     }
   },
+  "build_contract": {
+    "deliverables": [
+      "Source code for all modules",
+      "README.md with setup instructions",
+      "Working dev server / CLI entry point"
+    ],
+    "test_requirements": {
+      "build_must_pass": true,
+      "start_must_pass": true,
+      "minimum_test_coverage": "smoke",
+      "test_commands": ["npm test", "npm run build"]
+    },
+    "reports": ["test_results.json", "architecture.md"],
+    "stop_conditions": {
+      "max_tasks": 15,
+      "max_source_files": 30,
+      "max_modules": 8,
+      "budget_cap_usd": 10.0
+    },
+    "scope_justification": "One sentence explaining why this fits in an overnight build"
+  },
   "excluded": ["Feature X - out of scope for MVP", "Feature Y - too complex"]
 }
 ```
 
 Note: The `mobile` field is only required when generating a mobile app. Omit it for non-mobile projects.
+
+### Build Contract
+
+The `build_contract` section is **required** and defines what the project must deliver and when to stop. This prevents scope creep and ensures the project is completable in a single overnight run.
+
+- **deliverables**: Exhaustive list of concrete artifacts the pipeline must produce. If it's not listed here, it won't be built.
+- **test_requirements**: What "verified" means for this project. `build_must_pass` and `start_must_pass` are booleans. `minimum_test_coverage` is one of `"none"`, `"smoke"`, or `"unit"`. `test_commands` lists the exact commands the Tester will run.
+- **reports**: Which report files the DELIVER phase must produce (always includes `test_results.json`).
+- **stop_conditions**: Hard limits that prevent runaway builds. `max_tasks` caps Architect's task DAG (default 15). `max_source_files` caps total generated files (default 30). `max_modules` caps module count (default 8). `budget_cap_usd` overrides the global budget if lower.
+- **scope_justification**: One sentence explaining why this project is appropriately scoped for an automated build. If you can't justify it, the project is too big — move features to `excluded`.
 
 ## Supported Project Types
 

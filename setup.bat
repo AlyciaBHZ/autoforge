@@ -34,7 +34,7 @@ echo Virtual environment: .venv
 
 :: ── Activate and install ──
 call .venv\Scripts\activate.bat
-echo Installing AutoForge...
+echo Installing ForgeAI...
 pip install -q --upgrade pip
 pip install -q -e .
 
@@ -72,7 +72,7 @@ if %errorlevel% equ 0 (
 :: ── Verify installation ──
 echo.
 echo Verifying installation...
-.venv\Scripts\autoforge --help >nul 2>&1 && echo   AutoForge CLI: OK || echo   AutoForge CLI: FAILED
+.venv\Scripts\forgeai --help >nul 2>&1 && echo   ForgeAI CLI: OK || echo   ForgeAI CLI: FAILED
 .venv\Scripts\python -c "from autoforge.engine.orchestrator import Orchestrator; print('  Engine: OK')" 2>&1 || echo   Engine: FAILED
 
 :: ── Auto-launch setup wizard if needed ──
@@ -81,20 +81,20 @@ echo.
 if !errorlevel! equ 0 (
     echo First-time setup — launching configuration wizard...
     echo.
-    .venv\Scripts\autoforge setup
+    .venv\Scripts\forgeai setup
 )
 
 echo.
 echo === Setup complete! ===
 echo.
 echo Usage:
-echo   .venv\Scripts\autoforge                          :: Run from this directory
-echo   .venv\Scripts\autoforge generate "your prompt"   :: Generate a project
-echo   .venv\Scripts\autoforge review .\my-project      :: Review existing code
-echo   .venv\Scripts\autoforge setup                    :: Reconfigure settings
+echo   forgeai                                      :: Interactive session
+echo   forgeai generate "your prompt"               :: Generate a project
+echo   forgeai review .\my-project                  :: Review existing code
+echo   forgeai setup                                :: Reconfigure settings
 echo.
 echo Or install globally:
-echo   pip install -e .    :: Then "autoforge" works from anywhere
+echo   pip install -e .    :: Then "forgeai" works from anywhere
 echo.
 
 endlocal

@@ -31,7 +31,7 @@ async def start_telegram_bot(
     except ImportError:
         raise ImportError(
             "Telegram bot requires 'python-telegram-bot'. "
-            "Install it with: pip install autoforge[channels]"
+            "Install it with: pip install forgeai[channels]"
         ) from None
 
     intake = RequestIntakeService(config, registry)

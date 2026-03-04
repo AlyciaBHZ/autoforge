@@ -1,4 +1,9 @@
-"""Interactive mode for AutoForge — InquirerPy-based menus."""
+"""Interactive session mode for AutoForge — session-based workflow.
+
+Flow:
+  forgeai → first-run setup (API key / GitHub / mode) → session loop
+  Each session: describe project → build → show result → next session
+"""
 
 from __future__ import annotations
 
@@ -9,52 +14,69 @@ from rich.console import Console
 
 console = Console()
 
+# Operating modes with descriptions
+MODES = [
+    {
+        "name": "Development — generate complete runnable projects",
+        "value": "developer",
+    },
+    {
+        "name": "Academic — scientific reasoning, theorem proving, theory evolution",
+        "value": "academic",
+    },
+    {
+        "name": "Verification — review & verify existing codebases",
+        "value": "verification",
+    },
+]
+
 
 def run_interactive() -> dict[str, Any]:
-    """Run interactive mode and return user choices as a config dict.
+    """Run interactive session mode.
 
-    Returns a dict with keys:
+    Returns a dict with keys for the first session:
         action: "generate" | "review" | "import" | "setup"
-        mode: "developer" | "research"
+        mode: "developer" | "academic" | "verification"
         description: str (for generate)
         project_path: str (for review/import)
-        enhance_description: str (for import, optional)
         budget: float
         max_agents: int
-        mobile_target: "none" | "ios" | "android" | "both"
     """
     from InquirerPy import inquirer
-    from InquirerPy.separator import Separator
 
-    # Step 1: What to do
+    # Step 1: Select operating mode
+    mode = inquirer.select(
+        message="Select mode:",
+        choices=MODES,
+        default="developer",
+    ).execute()
+
+    result: dict[str, Any] = {"mode": mode}
+
+    # Step 2: Mode-specific flow
+    if mode == "developer":
+        result.update(_developer_session(inquirer))
+    elif mode == "academic":
+        result.update(_academic_session(inquirer))
+    elif mode == "verification":
+        result.update(_verification_session(inquirer))
+
+    return result
+
+
+def _developer_session(inquirer: Any) -> dict[str, Any]:
+    """Developer mode: generate or import a project."""
     action = inquirer.select(
         message="What would you like to do?",
         choices=[
             {"name": "Generate a new project", "value": "generate"},
-            {"name": "Review an existing project", "value": "review"},
-            {"name": "Import & improve a project", "value": "import"},
-            Separator(),
-            {"name": "Configure settings", "value": "setup"},
+            {"name": "Import & improve an existing project", "value": "import"},
         ],
         default="generate",
     ).execute()
 
-    if action == "setup":
-        return {"action": "setup"}
+    result: dict[str, Any] = {"action": action}
 
-    # Step 2: Operating mode
-    mode = inquirer.select(
-        message="Operating mode:",
-        choices=[
-            {"name": "Developer (will modify code)", "value": "developer"},
-            {"name": "Research (analysis only, no changes)", "value": "research"},
-        ],
-        default="developer",
-    ).execute()
-
-    result: dict[str, Any] = {"action": action, "mode": mode}
-
-    # Step 3: Action-specific input
     if action == "generate":
         description = inquirer.text(
             message="Describe your project:",
@@ -64,7 +86,7 @@ def run_interactive() -> dict[str, Any]:
         ).execute()
         result["description"] = description
 
-    elif action == "review":
+    elif action == "import":
         project_path = inquirer.filepath(
             message="Path to project:",
             validate=lambda x: Path(x).is_dir(),
@@ -73,17 +95,8 @@ def run_interactive() -> dict[str, Any]:
         ).execute()
         result["project_path"] = project_path
 
-    elif action == "import":
-        project_path = inquirer.filepath(
-            message="Path to project to import:",
-            validate=lambda x: Path(x).is_dir(),
-            invalid_message="Must be a valid directory",
-            only_directories=True,
-        ).execute()
-        result["project_path"] = project_path
-
         enhance = inquirer.confirm(
-            message="Do you want to add new features to this project?",
+            message="Add new features to this project?",
             default=False,
         ).execute()
 
@@ -94,7 +107,7 @@ def run_interactive() -> dict[str, Any]:
             ).execute()
             result["enhance_description"] = enhance_desc
 
-    # Step 4: Budget
+    # Budget
     budget = inquirer.number(
         message="Budget limit (USD):",
         default=10.0,
@@ -104,7 +117,7 @@ def run_interactive() -> dict[str, Any]:
     ).execute()
     result["budget"] = float(budget)
 
-    # Step 5: Max agents
+    # Max agents
     max_agents = inquirer.number(
         message="Max parallel agents:",
         default=3,
@@ -113,20 +126,74 @@ def run_interactive() -> dict[str, Any]:
     ).execute()
     result["max_agents"] = int(max_agents)
 
-    # Step 6: Mobile target (for generate/import only)
-    if action in ("generate", "import"):
-        mobile = inquirer.select(
-            message="Generate mobile app?",
-            choices=[
-                {"name": "No", "value": "none"},
-                {"name": "iOS only", "value": "ios"},
-                {"name": "Android only", "value": "android"},
-                {"name": "Both iOS & Android", "value": "both"},
-            ],
-            default="none",
+    return result
+
+
+def _academic_session(inquirer: Any) -> dict[str, Any]:
+    """Academic mode: scientific reasoning and theorem proving."""
+    action = inquirer.select(
+        message="What would you like to do?",
+        choices=[
+            {"name": "Generate a research project", "value": "generate"},
+            {"name": "Analyze an existing codebase", "value": "review"},
+        ],
+        default="generate",
+    ).execute()
+
+    result: dict[str, Any] = {"action": action}
+
+    if action == "generate":
+        description = inquirer.text(
+            message="Describe your research task:",
+            long_instruction="E.g., 'Implement a formal proof of the Goldbach conjecture bounds'",
+            validate=lambda x: len(x.strip()) >= 10,
+            invalid_message="Please provide at least 10 characters",
         ).execute()
-        result["mobile_target"] = mobile
-    else:
-        result["mobile_target"] = "none"
+        result["description"] = description
+    elif action == "review":
+        project_path = inquirer.filepath(
+            message="Path to project:",
+            validate=lambda x: Path(x).is_dir(),
+            invalid_message="Must be a valid directory",
+            only_directories=True,
+        ).execute()
+        result["project_path"] = project_path
+
+    budget = inquirer.number(
+        message="Budget limit (USD):",
+        default=10.0,
+        float_allowed=True,
+        min_allowed=0.5,
+        max_allowed=100.0,
+    ).execute()
+    result["budget"] = float(budget)
+    result["max_agents"] = 3
+
+    return result
+
+
+def _verification_session(inquirer: Any) -> dict[str, Any]:
+    """Verification mode: review and verify existing codebases."""
+    project_path = inquirer.filepath(
+        message="Path to project to verify:",
+        validate=lambda x: Path(x).is_dir(),
+        invalid_message="Must be a valid directory",
+        only_directories=True,
+    ).execute()
+
+    result: dict[str, Any] = {
+        "action": "review",
+        "project_path": project_path,
+    }
+
+    budget = inquirer.number(
+        message="Budget limit (USD):",
+        default=5.0,
+        float_allowed=True,
+        min_allowed=0.5,
+        max_allowed=50.0,
+    ).execute()
+    result["budget"] = float(budget)
+    result["max_agents"] = 3
 
     return result

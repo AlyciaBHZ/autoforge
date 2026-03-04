@@ -62,6 +62,16 @@ You must output a single JSON code block with this structure:
 - Keep tasks granular: each task should produce **1-3 files** (smaller = better parallel execution)
 - Include clear acceptance criteria for each task
 
+## Build Contract Compliance
+
+The spec includes a `build_contract.stop_conditions` section that sets hard limits:
+
+- **`max_tasks`**: Do NOT create more tasks than this limit (typically 15). If you need more, merge related tasks.
+- **`max_source_files`**: Total generated files must stay within this cap (typically 30). Prefer fewer, well-structured files.
+- **`max_modules`**: The module count is already validated — your tasks must cover exactly the modules defined in the spec.
+
+If the spec's scope seems too large for these limits, prioritize the most critical modules and note what was deferred. Never silently exceed the contract limits.
+
 ## Working with Existing Projects (Import Mode)
 
 When the spec comes from an imported project (has existing files):
