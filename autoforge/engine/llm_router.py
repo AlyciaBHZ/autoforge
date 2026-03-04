@@ -110,12 +110,16 @@ class LLMRouter:
         """Get or create an async client for the given provider.
 
         Uses the auth module to determine authentication method (API key,
-        OAuth bearer, OAuth2 client_credentials, Google ADC/service account).
+        OAuth bearer, OAuth2 client_credentials, Google ADC/service account,
+        AWS Bedrock, Google Vertex AI, Codex OAuth, Device Code).
         """
         if provider in self._clients:
             return self._clients[provider]
 
-        from autoforge.engine.auth import create_auth_provider
+        from autoforge.engine.auth import (
+            AWSBedrockAuth, CodexOAuthAuth, DeviceCodeAuth, VertexAIAuth,
+            create_auth_provider,
+        )
 
         auth_config = getattr(self.config, "auth_config", {})
         auth = create_auth_provider(provider, self.config.api_keys, auth_config)
@@ -123,12 +127,25 @@ class LLMRouter:
         client_kwargs = auth.get_client_kwargs()
 
         if provider == "anthropic":
-            from anthropic import AsyncAnthropic
-            client = AsyncAnthropic(**client_kwargs)
+            # Check for Bedrock or Vertex AI auth
+            if isinstance(auth, AWSBedrockAuth):
+                from anthropic import AsyncAnthropicBedrock
+                client = AsyncAnthropicBedrock(**client_kwargs)
+            elif isinstance(auth, VertexAIAuth):
+                from anthropic import AsyncAnthropicVertex
+                client = AsyncAnthropicVertex(**client_kwargs)
+            else:
+                from anthropic import AsyncAnthropic
+                client = AsyncAnthropic(**client_kwargs)
 
         elif provider == "openai":
             from openai import AsyncOpenAI
-            client = AsyncOpenAI(**client_kwargs)
+            if isinstance(auth, (CodexOAuthAuth, DeviceCodeAuth)):
+                # Token-based auth: client gets a dummy key, real token
+                # injected via _ensure_fresh_token before each call
+                client = AsyncOpenAI(api_key="placeholder")
+            else:
+                client = AsyncOpenAI(**client_kwargs)
 
         elif provider == "google":
             from google import genai
@@ -147,11 +164,17 @@ class LLMRouter:
         return client
 
     async def _ensure_fresh_token(self, provider: str) -> None:
-        """Refresh OAuth token if needed and update the client."""
-        from autoforge.engine.auth import OAuth2ClientCredentialsAuth
+        """Refresh OAuth/dynamic token if needed and update the client."""
+        from autoforge.engine.auth import (
+            CodexOAuthAuth, DeviceCodeAuth, OAuth2ClientCredentialsAuth,
+        )
 
         auth = self._auth_providers.get(provider)
-        if auth is None or not isinstance(auth, OAuth2ClientCredentialsAuth):
+        if auth is None:
+            return
+
+        # Only refresh for token-based auth providers
+        if not isinstance(auth, (OAuth2ClientCredentialsAuth, CodexOAuthAuth, DeviceCodeAuth)):
             return
 
         token = await auth.get_token()

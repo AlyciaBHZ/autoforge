@@ -219,6 +219,24 @@ class ForgeConfig:
             if "auth_method" not in auth_config["google"]:
                 auth_config["google"]["auth_method"] = "adc"
 
+        # AWS Bedrock env overrides
+        if os.getenv("CLAUDE_CODE_USE_BEDROCK", "").lower() in ("1", "true", "yes"):
+            auth_config.setdefault("anthropic", {})
+            if "auth_method" not in auth_config["anthropic"]:
+                auth_config["anthropic"]["auth_method"] = "bedrock"
+            if os.getenv("AWS_REGION"):
+                auth_config["anthropic"]["aws_region"] = os.getenv("AWS_REGION", "")
+
+        # Google Vertex AI env overrides
+        if os.getenv("CLAUDE_CODE_USE_VERTEX", "").lower() in ("1", "true", "yes"):
+            auth_config.setdefault("anthropic", {})
+            if "auth_method" not in auth_config["anthropic"]:
+                auth_config["anthropic"]["auth_method"] = "vertex_ai"
+            if os.getenv("ANTHROPIC_VERTEX_PROJECT_ID"):
+                auth_config["anthropic"]["project_id"] = os.getenv("ANTHROPIC_VERTEX_PROJECT_ID", "")
+            if os.getenv("CLOUD_ML_REGION"):
+                auth_config["anthropic"]["region"] = os.getenv("CLOUD_ML_REGION", "")
+
         # Parse allowed Telegram users (comma-separated)
         allowed_raw = os.getenv("FORGE_TELEGRAM_ALLOWED_USERS", "")
         allowed_users = [u.strip() for u in allowed_raw.split(",") if u.strip()]

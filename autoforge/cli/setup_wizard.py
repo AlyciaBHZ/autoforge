@@ -33,6 +33,8 @@ PROVIDERS = {
             {"name": "API Key", "value": "api_key"},
             {"name": "Bearer Token + Custom URL (proxy)", "value": "oauth_bearer"},
             {"name": "OAuth2 Client Credentials", "value": "oauth2_client_credentials"},
+            {"name": "Amazon Bedrock (AWS credentials)", "value": "bedrock"},
+            {"name": "Google Vertex AI (ADC)", "value": "vertex_ai"},
         ],
     },
     "openai": {
@@ -51,6 +53,8 @@ PROVIDERS = {
         "auth_methods": [
             {"name": "API Key", "value": "api_key"},
             {"name": "Bearer Token + Custom URL (Azure, LiteLLM)", "value": "oauth_bearer"},
+            {"name": "Codex OAuth (browser login, uses subscription)", "value": "codex_oauth"},
+            {"name": "Device Code (headless/SSH)", "value": "device_code"},
             {"name": "OAuth2 Client Credentials", "value": "oauth2_client_credentials"},
         ],
     },
@@ -68,7 +72,7 @@ PROVIDERS = {
             {"name": "Gemini 2.0 Flash (fastest, cheapest)", "value": "gemini-2.0-flash"},
         ],
         "auth_methods": [
-            {"name": "API Key", "value": "api_key"},
+            {"name": "API Key (recommended)", "value": "api_key"},
             {"name": "Application Default Credentials (ADC)", "value": "adc"},
             {"name": "Service Account JSON", "value": "service_account"},
         ],
@@ -208,6 +212,96 @@ def run_setup_wizard() -> None:
                 "auth_method": "service_account",
                 "service_account_path": sa_path,
             }
+
+        elif auth_method == "bedrock":
+            console.print("[dim]Amazon Bedrock — Claude via AWS[/dim]")
+            aws_region = inquirer.text(
+                message="AWS Region:",
+                default="us-east-1",
+            ).execute()
+            auth_type = inquirer.select(
+                message="AWS authentication:",
+                choices=[
+                    {"name": "AWS Profile (SSO/IAM Identity Center)", "value": "profile"},
+                    {"name": "Access Keys (static)", "value": "keys"},
+                    {"name": "Instance Role (automatic on EC2/ECS/Lambda)", "value": "instance"},
+                ],
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "bedrock",
+                "aws_region": aws_region,
+            }
+            if auth_type == "profile":
+                profile = inquirer.text(
+                    message="AWS Profile name:",
+                    default="default",
+                ).execute()
+                auth_configs[pid]["aws_profile"] = profile
+                console.print(
+                    f"[dim]Run 'aws sso login --profile {profile}' if using SSO.[/dim]"
+                )
+            elif auth_type == "keys":
+                access_key = inquirer.secret(
+                    message="AWS Access Key ID:",
+                    validate=lambda x: len(x) >= 16,
+                    invalid_message="Access key too short",
+                ).execute()
+                secret_key = inquirer.secret(
+                    message="AWS Secret Access Key:",
+                    validate=lambda x: len(x) >= 20,
+                    invalid_message="Secret key too short",
+                ).execute()
+                session_token = inquirer.secret(
+                    message="AWS Session Token (optional, press Enter to skip):",
+                    default="",
+                ).execute()
+                auth_configs[pid]["aws_access_key_id"] = access_key
+                auth_configs[pid]["aws_secret_access_key"] = secret_key
+                if session_token:
+                    auth_configs[pid]["aws_session_token"] = session_token
+            else:
+                console.print(
+                    "[dim]Instance role will be auto-detected on AWS compute.[/dim]"
+                )
+
+        elif auth_method == "vertex_ai":
+            console.print("[dim]Google Vertex AI — Claude via Google Cloud[/dim]")
+            project_id = inquirer.text(
+                message="GCP Project ID:",
+                validate=lambda x: len(x) > 0,
+                invalid_message="Project ID is required",
+            ).execute()
+            region = inquirer.text(
+                message="GCP Region:",
+                default="us-east5",
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "vertex_ai",
+                "project_id": project_id,
+                "region": region,
+            }
+            console.print(
+                "[dim]Ensure you've run 'gcloud auth application-default login' "
+                "or set GOOGLE_APPLICATION_CREDENTIALS.[/dim]"
+            )
+
+        elif auth_method == "codex_oauth":
+            console.print(
+                "[dim]Codex OAuth — will open browser for ChatGPT login.\n"
+                "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.\n"
+                "Uses subscription quota (not API billing).[/dim]"
+            )
+            auth_configs[pid] = {"auth_method": "codex_oauth"}
+            # Interactive login happens at runtime when first API call is made
+
+        elif auth_method == "device_code":
+            console.print(
+                "[dim]Device Code Flow — for headless/SSH environments.\n"
+                "Will display a URL and code to enter on another device.\n"
+                "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.[/dim]"
+            )
+            auth_configs[pid] = {"auth_method": "device_code"}
+            # Device flow happens at runtime when first API call is made
 
     if not api_keys and not auth_configs:
         console.print("[red]No credentials provided. Setup cancelled.[/red]")

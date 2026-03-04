@@ -1348,6 +1348,10 @@ def test_auth_module_imports():
         OAuthBearerAuth,
         OAuth2ClientCredentialsAuth,
         GoogleADCAuth,
+        AWSBedrockAuth,
+        VertexAIAuth,
+        CodexOAuthAuth,
+        DeviceCodeAuth,
         TokenResult,
         create_auth_provider,
     )
@@ -1469,6 +1473,107 @@ def test_config_has_api_key_with_auth_config():
     assert config2.has_api_key is True
 
 
+def test_auth_bedrock_provider():
+    """AWSBedrockAuth stores region and returns correct kwargs."""
+    from autoforge.engine.auth import AWSBedrockAuth
+
+    auth = AWSBedrockAuth(aws_region="us-west-2", aws_profile="myprofile")
+    kwargs = auth.get_client_kwargs()
+    assert kwargs["aws_region"] == "us-west-2"
+    assert kwargs["aws_profile"] == "myprofile"
+
+    # With static keys
+    auth2 = AWSBedrockAuth(
+        aws_region="eu-west-1",
+        aws_access_key_id="AKID",
+        aws_secret_access_key="SECRET",
+    )
+    kwargs2 = auth2.get_client_kwargs()
+    assert kwargs2["aws_access_key"] == "AKID"
+    assert kwargs2["aws_secret_key"] == "SECRET"
+
+
+def test_auth_vertex_provider():
+    """VertexAIAuth stores project_id and region."""
+    from autoforge.engine.auth import VertexAIAuth
+
+    auth = VertexAIAuth(project_id="my-project", region="us-east5")
+    kwargs = auth.get_client_kwargs()
+    assert kwargs["region"] == "us-east5"
+    assert kwargs["project_id"] == "my-project"
+
+
+def test_auth_codex_oauth_provider():
+    """CodexOAuthAuth initializes correctly."""
+    from autoforge.engine.auth import CodexOAuthAuth
+
+    auth = CodexOAuthAuth()
+    # No token yet — get_client_kwargs returns empty (token injected dynamically)
+    kwargs = auth.get_client_kwargs()
+    assert kwargs == {}
+    # Has correct endpoints
+    assert "openai.com" in auth.AUTH_URL
+    assert "openai.com" in auth.TOKEN_URL
+
+
+def test_auth_device_code_provider():
+    """DeviceCodeAuth initializes correctly."""
+    from autoforge.engine.auth import DeviceCodeAuth
+
+    auth = DeviceCodeAuth()
+    kwargs = auth.get_client_kwargs()
+    assert kwargs == {}
+    assert "openai.com" in auth.DEVICE_URL
+    assert "openai.com" in auth.TOKEN_URL
+
+
+def test_auth_factory_bedrock():
+    """create_auth_provider creates AWSBedrockAuth."""
+    from autoforge.engine.auth import AWSBedrockAuth, create_auth_provider
+
+    auth = create_auth_provider("anthropic", {}, {
+        "anthropic": {
+            "auth_method": "bedrock",
+            "aws_region": "us-west-2",
+        }
+    })
+    assert isinstance(auth, AWSBedrockAuth)
+
+
+def test_auth_factory_vertex():
+    """create_auth_provider creates VertexAIAuth."""
+    from autoforge.engine.auth import VertexAIAuth, create_auth_provider
+
+    auth = create_auth_provider("anthropic", {}, {
+        "anthropic": {
+            "auth_method": "vertex_ai",
+            "project_id": "proj-123",
+            "region": "us-east5",
+        }
+    })
+    assert isinstance(auth, VertexAIAuth)
+
+
+def test_auth_factory_codex_oauth():
+    """create_auth_provider creates CodexOAuthAuth."""
+    from autoforge.engine.auth import CodexOAuthAuth, create_auth_provider
+
+    auth = create_auth_provider("openai", {}, {
+        "openai": {"auth_method": "codex_oauth"}
+    })
+    assert isinstance(auth, CodexOAuthAuth)
+
+
+def test_auth_factory_device_code():
+    """create_auth_provider creates DeviceCodeAuth."""
+    from autoforge.engine.auth import DeviceCodeAuth, create_auth_provider
+
+    auth = create_auth_provider("openai", {}, {
+        "openai": {"auth_method": "device_code"}
+    })
+    assert isinstance(auth, DeviceCodeAuth)
+
+
 def test_setup_wizard_no_precheck():
     """PROVIDERS dict does not pre-enable any provider."""
     from autoforge.cli.setup_wizard import PROVIDERS
@@ -1485,19 +1590,23 @@ def test_setup_wizard_auth_methods():
     """Each provider has valid auth method options."""
     from autoforge.cli.setup_wizard import PROVIDERS
 
-    # Anthropic: api_key + bearer + oauth2
+    # Anthropic: api_key + bearer + oauth2 + bedrock + vertex_ai
     ant_methods = [m["value"] for m in PROVIDERS["anthropic"]["auth_methods"]]
     assert "api_key" in ant_methods
     assert "oauth_bearer" in ant_methods
     assert "oauth2_client_credentials" in ant_methods
+    assert "bedrock" in ant_methods
+    assert "vertex_ai" in ant_methods
 
-    # OpenAI: api_key + bearer + oauth2
+    # OpenAI: api_key + bearer + codex_oauth + device_code + oauth2
     oai_methods = [m["value"] for m in PROVIDERS["openai"]["auth_methods"]]
     assert "api_key" in oai_methods
     assert "oauth_bearer" in oai_methods
+    assert "codex_oauth" in oai_methods
+    assert "device_code" in oai_methods
     assert "oauth2_client_credentials" in oai_methods
 
-    # Google: api_key + adc + service_account
+    # Google: api_key + adc + service_account (no OAuth)
     ggl_methods = [m["value"] for m in PROVIDERS["google"]["auth_methods"]]
     assert "api_key" in ggl_methods
     assert "adc" in ggl_methods
@@ -1525,9 +1634,16 @@ def test_env_example_no_required_anthropic():
     assert "ANTHROPIC_API_KEY" in content
     assert "OPENAI_API_KEY" in content
     assert "GOOGLE_API_KEY" in content
-    # OAuth env vars should be present
+    # OAuth/proxy env vars
     assert "OPENAI_BASE_URL" in content
     assert "GOOGLE_APPLICATION_CREDENTIALS" in content
+    # Bedrock env vars
+    assert "CLAUDE_CODE_USE_BEDROCK" in content
+    assert "AWS_REGION" in content
+    # Vertex AI env vars
+    assert "CLAUDE_CODE_USE_VERTEX" in content
+    assert "ANTHROPIC_VERTEX_PROJECT_ID" in content
+    assert "CLOUD_ML_REGION" in content
 
 
 def test_pyproject_has_google_auth():
@@ -1678,6 +1794,14 @@ def main():
             ("Auth factory bearer", test_auth_factory_bearer),
             ("Auth factory OAuth2", test_auth_factory_oauth2),
             ("Auth factory ADC", test_auth_factory_adc),
+            ("AWSBedrockAuth provider", test_auth_bedrock_provider),
+            ("VertexAIAuth provider", test_auth_vertex_provider),
+            ("CodexOAuthAuth provider", test_auth_codex_oauth_provider),
+            ("DeviceCodeAuth provider", test_auth_device_code_provider),
+            ("Auth factory Bedrock", test_auth_factory_bedrock),
+            ("Auth factory Vertex AI", test_auth_factory_vertex),
+            ("Auth factory Codex OAuth", test_auth_factory_codex_oauth),
+            ("Auth factory Device Code", test_auth_factory_device_code),
             ("Config auth_config field", test_config_auth_config_field),
             ("Config has_api_key with auth_config", test_config_has_api_key_with_auth_config),
             ("Setup wizard no pre-check", test_setup_wizard_no_precheck),
