@@ -94,11 +94,15 @@ class Orchestrator:
         self._lean_prover: LeanProver | None = None
         self._capability_dag = CapabilityDAG()
         self._dag_bridge = DAGBridge(self._capability_dag)
+        self._agent_counter: int = 0
+        self._wall_start: float = 0.0
+        self._difficulty: float | None = None
         self._theoretical_reasoning = TheoreticalReasoningEngine()
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
         self._start_time = time.monotonic()
+        self._wall_start = time.time()
         logger.info(f"AutoForge run {self.config.run_id} starting")
 
         # Load capability DAG from global storage
@@ -481,6 +485,8 @@ class Orchestrator:
         # Track which files are being written by active tasks (Section F)
         active_files: set[str] = set()
         overlap_files = file_overlaps or {}
+        max_resets = 3
+        reset_count = 0
 
         while self.dag.has_pending_tasks(TaskPhase.BUILD):
             ready = self.dag.get_ready_tasks()
@@ -489,10 +495,18 @@ class Orchestrator:
             if not ready_build and not active_tasks:
                 # No tasks ready and none running — check for failures
                 if self.dag.has_failures():
+                    if reset_count >= max_resets:
+                        logger.error(
+                            "Max failed-task resets (%d) exceeded — "
+                            "breaking out of build loop to avoid infinite retry",
+                            max_resets,
+                        )
+                        break
                     # Retry failed tasks
                     for task in self.dag.get_tasks_by_phase(TaskPhase.BUILD):
                         if task.status == TaskStatus.FAILED:
                             self.dag.reset_failed(task.id)
+                    reset_count += 1
                     continue
                 break
 
@@ -509,7 +523,8 @@ class Orchestrator:
                     )
                     continue
 
-                agent_id = f"builder-{len(active_tasks):02d}"
+                self._agent_counter += 1
+                agent_id = f"builder-{self._agent_counter:02d}"
                 if not lock_manager.enforce_single_task(agent_id):
                     continue
 
@@ -1247,6 +1262,7 @@ class Orchestrator:
         Pipeline: SCAN → REVIEW → [REFACTOR in developer mode] → REPORT
         """
         self._start_time = time.monotonic()
+        self._wall_start = time.time()
         self.project_dir = Path(project_path).resolve()
         logger.info(f"AutoForge review {self.config.run_id} starting: {self.project_dir}")
 
@@ -1309,18 +1325,8 @@ class Orchestrator:
         })
         review = reviewer.parse_review(review_result.output)
 
-        # Save review report
-        forge_dir = self.project_dir / ".autoforge"
-        forge_dir.mkdir(exist_ok=True)
-        (forge_dir / "review_report.json").write_text(
-            json.dumps({
-                "score": review.score,
-                "approved": review.approved,
-                "issues": review.issues,
-                "summary": review.summary,
-            }, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        # Note: review report is written by _generate_review_report, not here,
+        # to avoid a redundant write that gets immediately overwritten.
 
         return review
 
@@ -1380,6 +1386,7 @@ class Orchestrator:
         Pipeline: SCAN → REVIEW → [ENHANCE] → VERIFY → [REFACTOR] → DELIVER
         """
         self._start_time = time.monotonic()
+        self._wall_start = time.time()
         source_dir = Path(project_path).resolve()
         logger.info(f"AutoForge import {self.config.run_id}: {source_dir}")
 
@@ -1958,11 +1965,11 @@ class Orchestrator:
 
             # 3. Debugging knowledge from reflexion memories
             if self.config.reflexion_enabled:
-                for ref in self._reflexion._memory[:10]:
+                for ref in self._reflexion.get_recent_memories(10):
                     self._dag_bridge.ingest_debug_pattern(
-                        error_pattern=ref.failure_description,
+                        error_pattern=ref.failure_summary,
                         fix_strategy=ref.reflection,
-                        success=ref.led_to_success,
+                        success=ref.outcome == "resolved",
                         source_project=project_name,
                     )
 
@@ -2356,7 +2363,7 @@ class Orchestrator:
             "cost_usd": self.config.estimated_cost_usd,
             "total_input_tokens": self.config.total_input_tokens,
             "total_output_tokens": self.config.total_output_tokens,
-            "elapsed_seconds": time.monotonic() - self._start_time,
+            "elapsed_seconds": time.time() - self._wall_start,
         }
         self._state_file.write_text(
             json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -2396,6 +2403,10 @@ class Orchestrator:
         self.spec = state.get("spec", {})
         self.architecture = state.get("architecture", {})
         phase = state.get("phase", "")
+
+        # Restore wall-clock start so elapsed time accumulates across resumes
+        self._wall_start = time.time() - state.get("elapsed_seconds", 0)
+        self._start_time = time.monotonic()
 
         console.print(f"Resuming from phase: {phase}")
 

@@ -23,9 +23,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from autoforge.engine.llm_router import TaskComplexity
 
 logger = logging.getLogger(__name__)
 
@@ -384,6 +387,34 @@ class LDBDebugger:
 
     # ── Execution tracing ────────────────────────
 
+    @staticmethod
+    def _validate_identifier(name: str, label: str) -> None:
+        """Validate that a string is a safe Python identifier.
+
+        Raises:
+            ValueError: If the name is not a valid Python identifier.
+        """
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+            raise ValueError(
+                f"Invalid {label}: {name!r} is not a valid Python identifier"
+            )
+
+    @staticmethod
+    def _validate_path_component(component: str, label: str) -> None:
+        """Validate that a path component contains no injection characters.
+
+        Rejects strings with quotes, backslashes, semicolons, newlines, or
+        other characters that could break out of a string literal or command.
+
+        Raises:
+            ValueError: If the component contains unsafe characters.
+        """
+        # Allow only alphanumeric, underscore, hyphen, dot, and forward slash
+        if not re.match(r'^[a-zA-Z0-9_./ -]+$', component):
+            raise ValueError(
+                f"Unsafe characters in {label}: {component!r}"
+            )
+
     async def _trace_execution(
         self,
         sandbox: Any,
@@ -391,18 +422,69 @@ class LDBDebugger:
         function_name: str,
         test_input: str,
     ) -> dict[str, Any] | None:
-        """Try to trace execution via sandbox (optional, best-effort)."""
-        # Generate a tracing script
+        """Try to trace execution via sandbox (optional, best-effort).
+
+        Generates a tracing script that instruments the target function and
+        captures variable state at each line.  All dynamic values are
+        sanitised before being interpolated into the script to prevent
+        code-injection attacks:
+
+        - ``function_name`` must be a valid Python identifier.
+        - ``file_path.stem`` (module name) must be a valid Python identifier.
+        - ``file_path.parent`` is validated to contain no injection chars.
+        - ``test_input`` is passed via a temporary JSON file rather than
+          being embedded in code, eliminating the injection vector entirely.
+        """
+        # ── Validate all dynamic values ──────────────
+        try:
+            self._validate_identifier(function_name, "function_name")
+            self._validate_identifier(file_path.stem, "module name (file_path.stem)")
+            self._validate_path_component(str(file_path.parent), "file_path.parent")
+        except ValueError as e:
+            logger.warning(f"[LDB] Trace skipped — sanitisation failed: {e}")
+            return None
+
+        module_name = file_path.stem
+        parent_dir = str(file_path.parent)
+
+        # Write test_input to a temporary JSON file so the trace script reads
+        # it from disk instead of embedding it as a Python literal.  This
+        # eliminates injection via crafted test_input strings.
+        try:
+            input_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, encoding="utf-8",
+            )
+            json.dump({"test_input": test_input}, input_file)
+            input_file.close()
+            input_file_path = input_file.name
+        except Exception as e:
+            logger.debug(f"[LDB] Failed to write trace input file: {e}")
+            return None
+
+        # Build the trace script.  Only validated identifiers and the
+        # safe-by-construction JSON file path are interpolated.
         trace_script = f"""\
-import sys, json, traceback
-sys.path.insert(0, '{file_path.parent}')
+import sys, json, ast, traceback, os
+
+# Read test input from the safe JSON file
+_input_path = {repr(input_file_path)}
+with open(_input_path, 'r') as _f:
+    _input_data = json.load(_f)
+_test_input_str = _input_data['test_input']
+
+# Clean up the temp file
+try:
+    os.unlink(_input_path)
+except OSError:
+    pass
+
+sys.path.insert(0, {repr(parent_dir)})
 
 # Simple variable tracer
 _trace_log = []
-_original_settrace = sys.settrace
 
 def _tracer(frame, event, arg):
-    if event == 'line' and frame.f_code.co_name == '{function_name}':
+    if event == 'line' and frame.f_code.co_name == {repr(function_name)}:
         _trace_log.append({{
             'line': frame.f_lineno,
             'locals': {{k: repr(v)[:100] for k, v in frame.f_locals.items()
@@ -412,8 +494,12 @@ def _tracer(frame, event, arg):
 
 sys.settrace(_tracer)
 try:
-    from {file_path.stem} import {function_name}
-    result = {function_name}({test_input})
+    from {module_name} import {function_name}
+    # Safely evaluate the test_input string as a Python literal
+    _args = ast.literal_eval(_test_input_str)
+    if not isinstance(_args, tuple):
+        _args = (_args,)
+    result = {function_name}(*_args)
     print(json.dumps({{"trace": _trace_log[:50], "result": repr(result)}}))
 except Exception as e:
     print(json.dumps({{"trace": _trace_log[:50], "error": str(e)}}))
@@ -421,11 +507,18 @@ finally:
     sys.settrace(None)
 """
         try:
-            result = await sandbox.run(f"python3 -c {repr(trace_script)}", timeout=10)
-            if result.returncode == 0 and result.stdout.strip():
+            result = await sandbox.exec(f"python3 -c {repr(trace_script)}", timeout=10)
+            if result.exit_code == 0 and result.stdout.strip():
                 return json.loads(result.stdout.strip())
         except Exception as e:
             logger.debug(f"[LDB] Tracing failed: {e}")
+        finally:
+            # Belt-and-suspenders: ensure the temp file is cleaned up even
+            # if the sandbox never ran.
+            try:
+                Path(input_file_path).unlink(missing_ok=True)
+            except Exception:
+                pass
         return None
 
     # ── Block verification ───────────────────────
@@ -481,10 +574,10 @@ Reply with a JSON array:
 ]"""
 
         try:
-            response = await llm.query(
+            response = await llm.call(
                 system="You are a precise code debugger. Verify each block step-by-step.",
                 messages=[{"role": "user", "content": prompt}],
-                complexity="complex",
+                complexity=TaskComplexity.HIGH,
             )
 
             text = ""
@@ -565,10 +658,10 @@ Reply with JSON:
 {{"root_cause": "one sentence explanation", "fixed_block": "the corrected code for block {faulty_idx} only"}}"""
 
         try:
-            response = await llm.query(
+            response = await llm.call(
                 system="You are a code repair expert. Fix only the faulty block.",
                 messages=[{"role": "user", "content": prompt}],
-                complexity="standard",
+                complexity=TaskComplexity.STANDARD,
             )
 
             text = ""

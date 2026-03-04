@@ -112,8 +112,9 @@ class ScannerAgent(AgentBase):
 
     async def _handle_read_file(self, input_data: dict[str, Any]) -> str:
         rel_path = input_data["path"]
-        full_path = (self.working_dir / rel_path).resolve()
-        if not str(full_path).startswith(str(self.working_dir.resolve())):
+        try:
+            full_path = self.validate_path(rel_path, self.working_dir)
+        except ValueError:
             return json.dumps({"error": "Path traversal not allowed"})
         if not full_path.exists():
             return json.dumps({"error": f"File not found: {rel_path}"})
@@ -128,12 +129,19 @@ class ScannerAgent(AgentBase):
 
     async def _handle_list_files(self, input_data: dict[str, Any]) -> str:
         rel_path = input_data.get("path", ".")
-        full_path = (self.working_dir / rel_path).resolve()
+        try:
+            full_path = self.validate_path(rel_path, self.working_dir)
+        except ValueError:
+            return json.dumps({"error": "Path traversal not allowed"})
         if not full_path.is_dir():
             return json.dumps({"error": f"Not a directory: {rel_path}"})
+        base_resolved = self.working_dir.resolve()
         files = []
         for p in sorted(full_path.rglob("*")):
             if p.is_file() and ".git" not in p.parts and "node_modules" not in p.parts:
+                # Prevent symlinks from escaping the workspace
+                if not p.resolve().is_relative_to(base_resolved):
+                    continue
                 try:
                     files.append(str(p.relative_to(self.working_dir)))
                 except ValueError:

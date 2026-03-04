@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,10 @@ PROVIDERS = {
         ],
         "auth_methods": [
             {"name": "API Key", "value": "api_key"},
+            {"name": "Bearer Token + Custom URL (proxy)", "value": "oauth_bearer"},
+            {"name": "OAuth2 Client Credentials", "value": "oauth2_client_credentials"},
+            {"name": "Amazon Bedrock (AWS credentials)", "value": "bedrock"},
+            {"name": "Google Vertex AI (ADC)", "value": "vertex_ai"},
         ],
     },
     "openai": {
@@ -49,6 +54,8 @@ PROVIDERS = {
         "auth_methods": [
             {"name": "API Key", "value": "api_key"},
             {"name": "Bearer Token + Custom URL (Azure, LiteLLM)", "value": "oauth_bearer"},
+            {"name": "Codex OAuth (browser login, uses subscription)", "value": "codex_oauth"},
+            {"name": "Device Code (headless/SSH)", "value": "device_code"},
             {"name": "OAuth2 Client Credentials", "value": "oauth2_client_credentials"},
         ],
     },
@@ -66,7 +73,7 @@ PROVIDERS = {
             {"name": "Gemini 2.0 Flash (fastest, cheapest)", "value": "gemini-2.0-flash"},
         ],
         "auth_methods": [
-            {"name": "API Key", "value": "api_key"},
+            {"name": "API Key (recommended)", "value": "api_key"},
             {"name": "Application Default Credentials (ADC)", "value": "adc"},
             {"name": "Service Account JSON", "value": "service_account"},
         ],
@@ -78,8 +85,31 @@ def needs_setup() -> bool:
     """Check if first-run setup is needed."""
     if not CONFIG_FILE.exists():
         return True
+
     content = CONFIG_FILE.read_text(encoding="utf-8")
-    # Need at least one API key or auth config
+
+    # Try proper TOML parsing first
+    try:
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            import tomli as tomllib  # type: ignore[no-redef]
+
+        data = tomllib.loads(content)
+
+        # Check for non-empty API keys
+        api = data.get("api", {})
+        has_key = any(
+            bool(api.get(key_name))
+            for key_name in ("anthropic_key", "openai_key", "google_key")
+        )
+        # Check for any auth config section
+        has_auth = bool(data.get("auth"))
+        return not (has_key or has_auth)
+    except Exception:
+        pass
+
+    # Fallback: raw string matching if TOML parsing fails
     has_key = any(
         key_name in content and f'{key_name} = ""' not in content
         for key_name in ("anthropic_key", "openai_key", "google_key")
@@ -207,6 +237,96 @@ def run_setup_wizard() -> None:
                 "service_account_path": sa_path,
             }
 
+        elif auth_method == "bedrock":
+            console.print("[dim]Amazon Bedrock — Claude via AWS[/dim]")
+            aws_region = inquirer.text(
+                message="AWS Region:",
+                default="us-east-1",
+            ).execute()
+            auth_type = inquirer.select(
+                message="AWS authentication:",
+                choices=[
+                    {"name": "AWS Profile (SSO/IAM Identity Center)", "value": "profile"},
+                    {"name": "Access Keys (static)", "value": "keys"},
+                    {"name": "Instance Role (automatic on EC2/ECS/Lambda)", "value": "instance"},
+                ],
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "bedrock",
+                "aws_region": aws_region,
+            }
+            if auth_type == "profile":
+                profile = inquirer.text(
+                    message="AWS Profile name:",
+                    default="default",
+                ).execute()
+                auth_configs[pid]["aws_profile"] = profile
+                console.print(
+                    f"[dim]Run 'aws sso login --profile {profile}' if using SSO.[/dim]"
+                )
+            elif auth_type == "keys":
+                access_key = inquirer.secret(
+                    message="AWS Access Key ID:",
+                    validate=lambda x: len(x) >= 16,
+                    invalid_message="Access key too short",
+                ).execute()
+                secret_key = inquirer.secret(
+                    message="AWS Secret Access Key:",
+                    validate=lambda x: len(x) >= 20,
+                    invalid_message="Secret key too short",
+                ).execute()
+                session_token = inquirer.secret(
+                    message="AWS Session Token (optional, press Enter to skip):",
+                    default="",
+                ).execute()
+                auth_configs[pid]["aws_access_key_id"] = access_key
+                auth_configs[pid]["aws_secret_access_key"] = secret_key
+                if session_token:
+                    auth_configs[pid]["aws_session_token"] = session_token
+            else:
+                console.print(
+                    "[dim]Instance role will be auto-detected on AWS compute.[/dim]"
+                )
+
+        elif auth_method == "vertex_ai":
+            console.print("[dim]Google Vertex AI — Claude via Google Cloud[/dim]")
+            project_id = inquirer.text(
+                message="GCP Project ID:",
+                validate=lambda x: len(x) > 0,
+                invalid_message="Project ID is required",
+            ).execute()
+            region = inquirer.text(
+                message="GCP Region:",
+                default="us-east5",
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "vertex_ai",
+                "project_id": project_id,
+                "region": region,
+            }
+            console.print(
+                "[dim]Ensure you've run 'gcloud auth application-default login' "
+                "or set GOOGLE_APPLICATION_CREDENTIALS.[/dim]"
+            )
+
+        elif auth_method == "codex_oauth":
+            console.print(
+                "[dim]Codex OAuth — will open browser for ChatGPT login.\n"
+                "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.\n"
+                "Uses subscription quota (not API billing).[/dim]"
+            )
+            auth_configs[pid] = {"auth_method": "codex_oauth"}
+            # Interactive login happens at runtime when first API call is made
+
+        elif auth_method == "device_code":
+            console.print(
+                "[dim]Device Code Flow — for headless/SSH environments.\n"
+                "Will display a URL and code to enter on another device.\n"
+                "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.[/dim]"
+            )
+            auth_configs[pid] = {"auth_method": "device_code"}
+            # Device flow happens at runtime when first API call is made
+
     if not api_keys and not auth_configs:
         console.print("[red]No credentials provided. Setup cancelled.[/red]")
         return
@@ -303,14 +423,105 @@ def _validate_model_provider(
         default=True,
     ).execute()
     if fix:
-        key = inquirer.secret(
-            message=f"{info['name']} API key:",
-            validate=info["validate"],
-            invalid_message=info["invalid_msg"],
-            long_instruction=info["key_hint"],
-        ).execute()
-        if key:
-            api_keys[required_provider] = key
+        auth_methods = info.get("auth_methods", [{"name": "API Key", "value": "api_key"}])
+
+        # Offer full auth method selection (same as initial setup)
+        if len(auth_methods) > 1:
+            auth_method = inquirer.select(
+                message=f"{info['name']} — authentication method:",
+                choices=auth_methods,
+                default="api_key",
+            ).execute()
+        else:
+            auth_method = "api_key"
+
+        if auth_method == "api_key":
+            key = inquirer.secret(
+                message=f"{info['name']} API key:",
+                validate=info["validate"],
+                invalid_message=info["invalid_msg"],
+                long_instruction=info["key_hint"],
+            ).execute()
+            if key:
+                api_keys[required_provider] = key
+
+        elif auth_method == "oauth_bearer":
+            base_url = inquirer.text(
+                message="Base URL (e.g. https://your-proxy.com/v1):",
+                validate=lambda x: x.startswith("http"),
+                invalid_message="Must be a valid URL starting with http",
+            ).execute()
+            bearer = inquirer.secret(
+                message="Bearer token:",
+                validate=lambda x: len(x) > 5,
+                invalid_message="Token seems too short",
+            ).execute()
+            auth_configs[required_provider] = {
+                "auth_method": "oauth_bearer",
+                "base_url": base_url,
+                "bearer_token": bearer,
+            }
+            api_keys[required_provider] = bearer
+
+        elif auth_method == "oauth2_client_credentials":
+            token_url = inquirer.text(
+                message="Token URL:",
+                validate=lambda x: x.startswith("http"),
+                invalid_message="Must be a valid URL",
+            ).execute()
+            client_id = inquirer.text(message="Client ID:").execute()
+            client_secret = inquirer.secret(
+                message="Client Secret:",
+                validate=lambda x: len(x) > 5,
+                invalid_message="Secret seems too short",
+            ).execute()
+            auth_configs[required_provider] = {
+                "auth_method": "oauth2_client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "token_url": token_url,
+            }
+
+        elif auth_method == "bedrock":
+            aws_region = inquirer.text(
+                message="AWS Region:", default="us-east-1",
+            ).execute()
+            auth_configs[required_provider] = {
+                "auth_method": "bedrock",
+                "aws_region": aws_region,
+            }
+
+        elif auth_method == "vertex_ai":
+            project_id = inquirer.text(
+                message="GCP Project ID:",
+                validate=lambda x: len(x) > 0,
+                invalid_message="Project ID is required",
+            ).execute()
+            region = inquirer.text(
+                message="GCP Region:", default="us-east5",
+            ).execute()
+            auth_configs[required_provider] = {
+                "auth_method": "vertex_ai",
+                "project_id": project_id,
+                "region": region,
+            }
+
+        elif auth_method in ("adc", "service_account", "codex_oauth", "device_code"):
+            auth_configs[required_provider] = {"auth_method": auth_method}
+
+
+def _escape_toml_value(value: str) -> str:
+    """Escape a string value for safe inclusion in a TOML quoted string.
+
+    Handles backslashes, double quotes, and control characters that would
+    otherwise allow TOML injection via user-supplied input.
+    """
+    value = value.replace("\\", "\\\\")  # Backslashes first
+    value = value.replace('"', '\\"')
+    value = value.replace("\n", "\\n")
+    value = value.replace("\r", "\\r")
+    value = value.replace("\t", "\\t")
+    return value
 
 
 def _write_config(
@@ -324,6 +535,10 @@ def _write_config(
 ) -> None:
     """Write configuration to ~/.autoforge/config.toml."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Set restrictive permissions on config directory (Unix only)
+    if sys.platform != "win32":
+        os.chmod(CONFIG_DIR, 0o700)
 
     try:
         import tomli_w
@@ -356,19 +571,19 @@ def _write_config(
 
         CONFIG_FILE.write_bytes(tomli_w.dumps(data).encode("utf-8"))
     except ImportError:
-        # Fallback: write TOML manually
+        # Fallback: write TOML manually (with proper escaping to prevent injection)
         lines = ["[api]"]
         if "anthropic" in api_keys:
-            lines.append(f'anthropic_key = "{api_keys["anthropic"]}"')
+            lines.append(f'anthropic_key = "{_escape_toml_value(api_keys["anthropic"])}"')
         if "openai" in api_keys:
-            lines.append(f'openai_key = "{api_keys["openai"]}"')
+            lines.append(f'openai_key = "{_escape_toml_value(api_keys["openai"])}"')
         if "google" in api_keys:
-            lines.append(f'google_key = "{api_keys["google"]}"')
+            lines.append(f'google_key = "{_escape_toml_value(api_keys["google"])}"')
 
         lines.append("")
         lines.append("[models]")
-        lines.append(f'strong = "{model_strong}"')
-        lines.append(f'fast = "{model_fast}"')
+        lines.append(f'strong = "{_escape_toml_value(model_strong)}"')
+        lines.append(f'fast = "{_escape_toml_value(model_fast)}"')
         lines.append("")
         lines.append("[defaults]")
         lines.append(f"budget = {budget}")
@@ -380,13 +595,19 @@ def _write_config(
         # Write auth configs
         if auth_configs:
             for provider, auth_data in auth_configs.items():
-                lines.append(f"[auth.{provider}]")
+                lines.append(f"[auth.{_escape_toml_value(provider)}]")
                 for k, v in auth_data.items():
                     if v:
-                        lines.append(f'{k} = "{v}"')
+                        lines.append(f'{_escape_toml_value(k)} = "{_escape_toml_value(v)}"')
                 lines.append("")
 
         CONFIG_FILE.write_text("\n".join(lines), encoding="utf-8")
+
+    # Set restrictive permissions on config file (Unix only).
+    # On Windows, chmod doesn't meaningfully restrict access;
+    # file ACLs would be needed but are outside scope here.
+    if sys.platform != "win32":
+        os.chmod(CONFIG_FILE, 0o600)
 
 
 def load_global_config() -> dict:

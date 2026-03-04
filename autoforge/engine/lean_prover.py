@@ -47,6 +47,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -815,7 +816,6 @@ class MCTSProofSearch:
         """Select leaf node using UCB1."""
         while node.children and not node.is_terminal:
             # UCB1 selection
-            import math
             best_score = -float("inf")
             best_child = node.children[0]
 

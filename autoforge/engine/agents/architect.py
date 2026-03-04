@@ -126,8 +126,9 @@ class ArchitectAgent(AgentBase):
 
     async def _handle_read_template(self, input_data: dict[str, Any]) -> str:
         rel_path = input_data["path"]
-        full_path = (self.templates_dir / rel_path).resolve()
-        if not str(full_path).startswith(str(self.templates_dir.resolve())):
+        try:
+            full_path = self.validate_path(rel_path, self.templates_dir)
+        except ValueError:
             return json.dumps({"error": "Path traversal not allowed"})
         if not full_path.exists():
             return json.dumps({"error": f"Template not found: {rel_path}"})

@@ -62,6 +62,7 @@ import logging
 import re
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -1034,10 +1035,10 @@ Return JSON array:
 
         # BFS from target to see if we can reach source
         visited: set[str] = set()
-        queue = [target_id]
+        queue = deque([target_id])
 
         while queue:
-            current = queue.pop(0)
+            current = queue.popleft()
             if current == source_id:
                 return True
             if current in visited:
@@ -1132,7 +1133,7 @@ Return JSON array:
             elif node.confidence < 0.9:
                 confidence_dist["high"] += 1
             else:
-                confidence_dist["formal"] += 1
+                confidence_dist["high"] += 1
 
         return {
             "total_nodes": len(self._nodes),
