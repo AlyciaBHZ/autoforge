@@ -584,14 +584,14 @@ def test_all_agents_instantiate():
 
     try:
         d = DirectorAgent(config, llm)
-        assert d.ROLE == "director" and len(d._tools) == 2  # search_web + fetch_url
+        assert d.ROLE == "director" and len(d._tools) == 4  # search_web + fetch_url + search_github + inspect_repo
         df = DirectorFixAgent(config, llm)
         assert df.ROLE == "director"
         a = ArchitectAgent(config, llm)
-        assert a.ROLE == "architect" and len(a._tools) == 3  # read_template + search_web + fetch_url
+        assert a.ROLE == "architect" and len(a._tools) == 5  # read_template + search_web + fetch_url + search_github + inspect_repo
         sb = SubprocessSandbox(wd)
         b = BuilderAgent(config, llm, working_dir=wd, sandbox=sb)
-        assert b.ROLE == "builder" and len(b._tools) == 6  # write/read/list/run + grep_search + fetch_url
+        assert b.ROLE == "builder" and len(b._tools) == 7  # write/read/list/run + grep_search + fetch_url + search_github
         r = ReviewerAgent(config, llm, working_dir=wd)
         assert r.ROLE == "reviewer" and len(r._tools) == 2
         t = TesterAgent(config, llm, working_dir=wd, sandbox=sb)
