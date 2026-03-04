@@ -129,11 +129,17 @@ class OAuth2ClientCredentialsAuth(AuthProvider):
         self._scope = scope
         self._base_url = base_url
         self._cached_token: TokenResult | None = None
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy-initialize the asyncio.Lock to avoid cross-event-loop issues."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def get_token(self) -> TokenResult:
         """Get a valid token, refreshing if expired."""
-        async with self._lock:
+        async with self._get_lock():
             if self._cached_token and not self._cached_token.is_expired:
                 return self._cached_token
 
@@ -185,6 +191,13 @@ class GoogleADCAuth(AuthProvider):
     def __init__(self, service_account_path: str | None = None) -> None:
         self._sa_path = service_account_path
         self._credentials: Any = None
+        self._lock: asyncio.Lock | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy-initialize the asyncio.Lock to avoid cross-event-loop issues."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def get_token(self) -> TokenResult:
         """Get a valid Google access token."""
@@ -197,31 +210,33 @@ class GoogleADCAuth(AuthProvider):
                 "Install it with: pip install autoforge[google]"
             ) from None
 
-        if self._credentials is None:
-            if self._sa_path:
-                from google.oauth2 import service_account
+        async with self._get_lock():
+            if self._credentials is None:
+                if self._sa_path:
+                    from google.oauth2 import service_account
 
-                self._credentials = service_account.Credentials.from_service_account_file(
-                    self._sa_path,
-                    scopes=["https://www.googleapis.com/auth/generative-language"],
-                )
-            else:
-                self._credentials, _ = google.auth.default(
-                    scopes=["https://www.googleapis.com/auth/generative-language"],
-                )
+                    self._credentials = service_account.Credentials.from_service_account_file(
+                        self._sa_path,
+                        scopes=["https://www.googleapis.com/auth/generative-language"],
+                    )
+                else:
+                    self._credentials, _ = google.auth.default(
+                        scopes=["https://www.googleapis.com/auth/generative-language"],
+                    )
 
-        if not self._credentials.valid:
-            request = google.auth.transport.requests.Request()
-            self._credentials.refresh(request)
+            if not self._credentials.valid:
+                request = google.auth.transport.requests.Request()
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._credentials.refresh, request)
 
-        expires_at = 0.0
-        if self._credentials.expiry:
-            expires_at = self._credentials.expiry.timestamp()
+            expires_at = 0.0
+            if self._credentials.expiry:
+                expires_at = self._credentials.expiry.timestamp()
 
-        return TokenResult(
-            access_token=self._credentials.token or "",
-            expires_at=expires_at,
-        )
+            return TokenResult(
+                access_token=self._credentials.token or "",
+                expires_at=expires_at,
+            )
 
     def get_client_kwargs(self) -> dict[str, Any]:
         """Google genai.Client() uses ADC automatically when no api_key given."""
@@ -336,11 +351,17 @@ class CodexOAuthAuth(AuthProvider):
         self._access_token = access_token
         self._refresh_token = refresh_token
         self._expires_at = expires_at
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy-initialize the asyncio.Lock to avoid cross-event-loop issues."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def get_token(self) -> TokenResult:
         """Get a valid token, refreshing via refresh_token if expired."""
-        async with self._lock:
+        async with self._get_lock():
             token = TokenResult(
                 access_token=self._access_token,
                 expires_at=self._expires_at,
@@ -431,8 +452,25 @@ class CodexOAuthAuth(AuthProvider):
                 pass  # Suppress server logs
 
         # Start callback server
-        server = HTTPServer(("127.0.0.1", self.REDIRECT_PORT), CallbackHandler)
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
+        try:
+            server = HTTPServer(("127.0.0.1", self.REDIRECT_PORT), CallbackHandler)
+        except OSError as e:
+            raise RuntimeError(
+                f"OAuth callback port {self.REDIRECT_PORT} is in use. "
+                "Close the other application or try again."
+            ) from e
+
+        received: dict[str, bool] = {}
+
+        def _serve_until_callback() -> None:
+            server.timeout = 1.0
+            deadline = time.time() + 120
+            while time.time() < deadline and not received:
+                server.handle_request()
+                if auth_code is not None or error_msg is not None:
+                    received["done"] = True
+
+        server_thread = threading.Thread(target=_serve_until_callback, daemon=True)
         server_thread.start()
 
         # Build auth URL
@@ -516,11 +554,17 @@ class DeviceCodeAuth(AuthProvider):
         self._access_token = access_token
         self._refresh_token = refresh_token
         self._expires_at = expires_at
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy-initialize the asyncio.Lock to avoid cross-event-loop issues."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def get_token(self) -> TokenResult:
         """Get a valid token, refreshing or doing device flow if needed."""
-        async with self._lock:
+        async with self._get_lock():
             token = TokenResult(
                 access_token=self._access_token,
                 expires_at=self._expires_at,
@@ -616,7 +660,13 @@ class DeviceCodeAuth(AuthProvider):
                         expires_at=self._expires_at,
                     )
 
-                error_body = resp.json()
+                try:
+                    error_body = resp.json()
+                except (ValueError, Exception):
+                    raise RuntimeError(
+                        f"Device code poll failed with HTTP {resp.status_code} "
+                        f"and non-JSON response: {resp.text[:200]}"
+                    )
                 error = error_body.get("error", "")
                 if error == "authorization_pending":
                     continue
@@ -715,5 +765,10 @@ def create_auth_provider(
         )
 
     # Unknown method — fallback with warning
+    if not api_key:
+        raise ValueError(
+            f"Unknown auth_method '{auth_method}' for provider '{provider}' "
+            f"and no API key configured. Set an API key or fix the auth_method."
+        )
     logger.warning(f"Unknown auth_method '{auth_method}' for {provider}, using api_key")
     return ApiKeyAuth(api_key=api_key)

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -404,7 +404,6 @@ class EvolutionEngine:
         Mutations are conservative — only change 1-2 parameters at a time.
         The idea is to explore the neighborhood of known-good solutions.
         """
-        import random
         mutations = []
 
         # Mutation 1: Toggle search tree (10% chance)
@@ -558,8 +557,6 @@ class EvolutionEngine:
         This is used when the engine has enough history to identify which
         specific parameters contributed to success.
         """
-        import random
-
         child = WorkflowGenome(
             # Take architecture from the higher-scoring parent
             arch_strategy=genome_a.arch_strategy or genome_b.arch_strategy,

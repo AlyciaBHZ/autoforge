@@ -139,6 +139,21 @@ class OptimizationRound:
             "timestamp": self.timestamp,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> OptimizationRound:
+        """Create from a dict, tolerant of extra or missing keys."""
+        return cls(
+            round_id=data.get("round_id", uuid.uuid4().hex[:8]),
+            role=data.get("role", ""),
+            baseline_id=data.get("baseline_id", ""),
+            candidate_id=data.get("candidate_id", ""),
+            baseline_fitness=data.get("baseline_fitness", 0.0),
+            candidate_fitness=data.get("candidate_fitness", 0.0),
+            accepted=data.get("accepted", False),
+            reason=data.get("reason", ""),
+            timestamp=data.get("timestamp", time.time()),
+        )
+
 
 # ──────────────────────────────────────────────
 # Prompt Optimizer Engine
@@ -625,7 +640,7 @@ class PromptOptimizer:
                 ]
             self._active = data.get("active", {})
             self._history = [
-                OptimizationRound(**h) for h in data.get("history", [])
+                OptimizationRound.from_dict(h) for h in data.get("history", [])
             ]
             logger.info(
                 f"[PromptOpt] Loaded state: "

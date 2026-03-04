@@ -7,8 +7,12 @@ provider-specific code.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import random
 import uuid
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -61,6 +65,14 @@ class TaskComplexity(Enum):
 
 class BudgetExceededError(Exception):
     """Raised when the API budget limit is reached."""
+
+
+# ── Retry configuration ───────────────────────────────────────────
+
+MAX_RETRIES = 3
+"""Maximum number of retry attempts for transient API errors."""
+
+_RETRY_BASE_DELAY = 1.0  # seconds — base delay for exponential backoff
 
 
 # ── Provider detection ─────────────────────────────────────────────
@@ -196,6 +208,67 @@ class LLMRouter:
             if hasattr(client, "api_key"):
                 client.api_key = token.access_token
 
+    async def _retry_with_backoff(
+        self,
+        fn: Callable[[], Coroutine[Any, Any, Any]],
+        *,
+        max_retries: int = MAX_RETRIES,
+    ) -> Any:
+        """Retry an async callable with exponential backoff for transient errors.
+
+        Retries on rate-limit (HTTP 429), server errors (5xx), and network
+        errors (ConnectionError, TimeoutError, OSError).  Non-transient errors
+        (400, 401, 403, etc.) are re-raised immediately.
+
+        Backoff schedule: 1s, 2s, 4s (with +-25 % jitter).
+        """
+        last_exc: BaseException | None = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                return await fn()
+            except Exception as exc:
+                last_exc = exc
+
+                # --- Classify the error ---
+                status: int | None = None
+                if hasattr(exc, "status_code"):          # Anthropic / httpx
+                    status = exc.status_code
+                elif hasattr(exc, "status"):              # OpenAI / aiohttp
+                    status = exc.status
+                elif hasattr(exc, "code"):                # Google / gRPC
+                    code = getattr(exc, "code", None)
+                    if isinstance(code, int):
+                        status = code
+
+                is_transient = False
+
+                # Rate-limit or server error
+                if status is not None and (status == 429 or 500 <= status < 600):
+                    is_transient = True
+
+                # Network-level failures
+                if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+                    is_transient = True
+
+                if not is_transient or attempt == max_retries:
+                    raise
+
+                # Exponential backoff with jitter (+-25 %)
+                delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                jitter = delay * 0.25 * (2 * random.random() - 1)
+                delay = max(0, delay + jitter)
+
+                logger.warning(
+                    "Transient error on attempt %d/%d (status=%s): %s — "
+                    "retrying in %.1fs",
+                    attempt, max_retries, status, exc, delay,
+                )
+                await asyncio.sleep(delay)
+
+        # Should never reach here, but satisfy type checker
+        assert last_exc is not None
+        raise last_exc
+
     def _select_model(self, complexity: TaskComplexity) -> tuple[str, int]:
         """Return (model_name, max_tokens) for the given complexity."""
         if complexity == TaskComplexity.HIGH:
@@ -279,7 +352,9 @@ class LLMRouter:
         if tools:
             kwargs["tools"] = tools  # Already in Anthropic format
 
-        raw = await client.messages.create(**kwargs)
+        raw = await self._retry_with_backoff(
+            lambda: client.messages.create(**kwargs)
+        )
 
         # Normalize response
         content = []
@@ -343,15 +418,22 @@ class LLMRouter:
         # Convert messages to OpenAI format
         oai_messages = self._messages_to_openai(system, messages)
 
+        # OpenAI reasoning models (o1, o3, o4) use max_completion_tokens
+        model_lower = model.lower()
+        is_reasoning = model_lower.startswith(("o1", "o3", "o4"))
+        token_key = "max_completion_tokens" if is_reasoning else "max_tokens"
+
         kwargs: dict[str, Any] = {
             "model": model,
-            "max_tokens": max_tokens,
+            token_key: max_tokens,
             "messages": oai_messages,
         }
         if tools:
             kwargs["tools"] = self._tools_to_openai(tools)
 
-        raw = await client.chat.completions.create(**kwargs)
+        raw = await self._retry_with_backoff(
+            lambda: client.chat.completions.create(**kwargs)
+        )
         choice = raw.choices[0]
         message = choice.message
 
@@ -366,7 +448,6 @@ class LLMRouter:
         if message.tool_calls:
             stop_reason = "tool_use"
             for tc in message.tool_calls:
-                import json
                 try:
                     args = json.loads(tc.function.arguments)
                 except (json.JSONDecodeError, TypeError):
@@ -409,7 +490,6 @@ class LLMRouter:
                         if item.type == "text":
                             text_parts.append(item.text)
                         elif item.type == "tool_use":
-                            import json
                             tool_calls.append({
                                 "id": item.id,
                                 "type": "function",
@@ -422,7 +502,6 @@ class LLMRouter:
                         if item.get("type") == "text":
                             text_parts.append(item.get("text", ""))
                         elif item.get("type") == "tool_use":
-                            import json
                             tool_calls.append({
                                 "id": item["id"],
                                 "type": "function",
@@ -440,20 +519,31 @@ class LLMRouter:
                 result.append(oai_msg)
 
             elif role == "user":
-                # May contain tool_result items or plain text
+                # May contain tool_result items or plain text.
+                # Collect tool results and user text separately to avoid
+                # interleaving — OpenAI expects all tool messages grouped
+                # right after the assistant tool_calls message.
                 if isinstance(content, list):
-                    # Check if these are tool results
+                    tool_msgs: list[dict[str, Any]] = []
+                    user_text_parts: list[str] = []
                     for item in content:
                         if isinstance(item, dict) and item.get("type") == "tool_result":
-                            result.append({
+                            tool_msgs.append({
                                 "role": "tool",
                                 "tool_call_id": item["tool_use_id"],
                                 "content": item.get("content", ""),
                             })
                         else:
-                            # Regular user content
                             text = item if isinstance(item, str) else str(item)
-                            result.append({"role": "user", "content": text})
+                            user_text_parts.append(text)
+                    # Emit tool messages first (they belong to the preceding
+                    # assistant turn), then a single user message if any.
+                    result.extend(tool_msgs)
+                    if user_text_parts:
+                        result.append({
+                            "role": "user",
+                            "content": "\n".join(user_text_parts),
+                        })
                 elif isinstance(content, str):
                     result.append({"role": "user", "content": content})
                 else:
@@ -502,10 +592,12 @@ class LLMRouter:
             gemini_tools = self._tools_to_gemini(tools)
             config["tools"] = gemini_tools
 
-        raw = await client.aio.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(**config),
+        raw = await self._retry_with_backoff(
+            lambda: client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(**config),
+            )
         )
 
         # Normalize response

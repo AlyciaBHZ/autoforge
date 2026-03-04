@@ -219,7 +219,7 @@ class SpeculativePipeline:
                 try:
                     deps = ["pytest"]
                     for dep in deps:
-                        cmd_result = await sandbox.run(
+                        cmd_result = await sandbox.exec(
                             f"pip install {dep} -q",
                             timeout=30,
                         )
@@ -254,7 +254,7 @@ class SpeculativePipeline:
 
             if sandbox:
                 try:
-                    lint_result = await sandbox.run(
+                    lint_result = await sandbox.exec(
                         f"cd {project_dir} && python -m py_compile *.py 2>&1 || true",
                         timeout=15,
                     )
@@ -310,12 +310,14 @@ class SpeculativePipeline:
         self,
         task_id: str,
         current_state: dict[str, Any] | None = None,
+        project_dir: Path | None = None,
     ) -> bool:
         """Validate speculative work and commit if compatible.
 
         Args:
             task_id: The speculative task to validate.
             current_state: Current pipeline state to validate against.
+            project_dir: Project directory for writing committed results.
 
         Returns:
             True if the speculative work was committed, False if invalidated.
@@ -361,10 +363,41 @@ class SpeculativePipeline:
             return False
 
         # Commit: write config files that weren't already created
-        for filename, content in result.configs_generated.items():
-            # Only write if the file doesn't already exist (actual pipeline didn't create it)
-            # The actual path resolution would depend on project_dir stored elsewhere
-            logger.info(f"[Speculative] Would commit: {filename}")
+        if project_dir is not None:
+            for filename, content in result.configs_generated.items():
+                target = project_dir / filename
+                if not target.exists():
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(content, encoding="utf-8")
+                        logger.info(f"[Speculative] Committed config: {filename}")
+                    except OSError as e:
+                        logger.warning(f"[Speculative] Failed to write {filename}: {e}")
+
+        # Persist validated speculative results to a JSON file
+        if project_dir is not None:
+            spec_dir = project_dir / ".autoforge"
+            spec_dir.mkdir(parents=True, exist_ok=True)
+            commit_record = {
+                "task_id": task_id,
+                "phase": task.phase.value,
+                "description": task.description,
+                "files_created": result.files_created,
+                "configs_generated": list(result.configs_generated.keys()),
+                "commands_run": result.commands_run,
+                "scaffolding": result.scaffolding,
+                "duration": task.duration,
+                "committed_at": time.time(),
+            }
+            commit_path = spec_dir / f"speculative_{task_id}.json"
+            try:
+                commit_path.write_text(
+                    json.dumps(commit_record, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                logger.info(f"[Speculative] Persisted commit record to {commit_path}")
+            except OSError as e:
+                logger.warning(f"[Speculative] Failed to persist commit record: {e}")
 
         task.status = SpecTaskStatus.VALIDATED
         task.validated = True
@@ -372,7 +405,7 @@ class SpeculativePipeline:
         self._stats["validated"] += 1
         self._stats["total_time_saved"] += task.time_saved
         logger.info(
-            f"[Speculative] {task_id} validated (saved ~{task.time_saved:.1f}s)"
+            f"[Speculative] {task_id} validated and committed (saved ~{task.time_saved:.1f}s)"
         )
         return True
 

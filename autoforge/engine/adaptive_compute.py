@@ -30,6 +30,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from autoforge.engine.llm_router import TaskComplexity
+
 logger = logging.getLogger(__name__)
 
 
@@ -308,10 +310,10 @@ error handling needs, testing requirements.
 
 Reply with ONLY a JSON object: {{"score": 0.X, "reason": "brief reason"}}"""
 
-            response = await llm.query(
+            response = await llm.call(
                 system="You are a software estimation expert. Be concise.",
                 messages=[{"role": "user", "content": prompt}],
-                complexity="quick",
+                complexity=TaskComplexity.STANDARD,
             )
 
             text = ""

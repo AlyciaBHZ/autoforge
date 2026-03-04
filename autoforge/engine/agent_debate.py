@@ -250,8 +250,13 @@ class ConditionalDebateEngine:
         )
 
         if not should_trigger:
-            # No debate needed — return the best initial position
-            best = max(participants, key=lambda p: len(p.get("position", "")))
+            # No debate needed — return the best initial position.
+            # Use score if available (from reward-scored candidates), otherwise
+            # pick the first participant which is the top candidate from the
+            # search tree.
+            best = max(participants, key=lambda p: p.get("score", 0.0)) if any(
+                "score" in p for p in participants
+            ) else participants[0]
             outcome = DebateOutcome(
                 topic=topic,
                 winner_position=best.get("position", ""),

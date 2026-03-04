@@ -347,17 +347,38 @@ class SICAEngine:
 
         target_path = constitution_dir / proposal.target_file
         try:
-            if target_path.exists():
-                # Append new instruction to existing constitution
-                current = target_path.read_text(encoding="utf-8")
-                updated = current + (
-                    f"\n\n## Self-Improvement: {proposal.description}\n"
-                    f"<!-- SICA proposal {proposal.id} -->\n"
-                    f"{proposal.proposed_content}\n"
+            if proposal.edit_type == "constitution":
+                # Constitution edits: append to existing file
+                if target_path.exists():
+                    current = target_path.read_text(encoding="utf-8")
+                    updated = current + (
+                        f"\n\n## Self-Improvement: {proposal.description}\n"
+                        f"<!-- SICA proposal {proposal.id} -->\n"
+                        f"{proposal.proposed_content}\n"
+                    )
+                    target_path.write_text(updated, encoding="utf-8")
+                else:
+                    logger.warning(f"[SICA] Constitution file not found: {target_path}")
+                    proposal.status = "failed"
+                    return False
+            elif proposal.edit_type == "tool_script":
+                # Tool scripts are new files — create parent dirs and write
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                header = (
+                    f"# Auto-generated tool script — SICA proposal {proposal.id}\n"
+                    f"# {proposal.description}\n\n"
                 )
-                target_path.write_text(updated, encoding="utf-8")
+                target_path.write_text(header + proposal.proposed_content, encoding="utf-8")
+            elif proposal.edit_type == "workflow":
+                # Workflow definitions are new files — create parent dirs and write
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                header = (
+                    f"<!-- Auto-generated workflow — SICA proposal {proposal.id} -->\n"
+                    f"<!-- {proposal.description} -->\n\n"
+                )
+                target_path.write_text(header + proposal.proposed_content, encoding="utf-8")
             else:
-                logger.warning(f"[SICA] Target file not found: {target_path}")
+                logger.warning(f"[SICA] Unknown edit type '{proposal.edit_type}' for proposal {proposal.id}")
                 proposal.status = "failed"
                 return False
 

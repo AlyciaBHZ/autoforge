@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -86,8 +87,31 @@ def needs_setup() -> bool:
     """Check if first-run setup is needed."""
     if not CONFIG_FILE.exists():
         return True
+
     content = CONFIG_FILE.read_text(encoding="utf-8")
-    # Need at least one API key or auth config
+
+    # Try proper TOML parsing first
+    try:
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            import tomli as tomllib  # type: ignore[no-redef]
+
+        data = tomllib.loads(content)
+
+        # Check for non-empty API keys
+        api = data.get("api", {})
+        has_key = any(
+            bool(api.get(key_name))
+            for key_name in ("anthropic_key", "openai_key", "google_key")
+        )
+        # Check for any auth config section
+        has_auth = bool(data.get("auth"))
+        return not (has_key or has_auth)
+    except Exception:
+        pass
+
+    # Fallback: raw string matching if TOML parsing fails
     has_key = any(
         key_name in content and f'{key_name} = ""' not in content
         for key_name in ("anthropic_key", "openai_key", "google_key")
@@ -97,285 +121,328 @@ def needs_setup() -> bool:
 
 
 def run_setup_wizard() -> None:
-    """Run the interactive setup wizard."""
+    """Run the interactive setup wizard.
+
+    All steps are optional — users can skip everything and configure later.
+    The wizard always completes with a summary of what AutoForge can do.
+    """
     from InquirerPy import inquirer
 
     console.print()
-    console.print("[bold cyan]AutoForge Setup Wizard[/bold cyan]")
-    console.print("Let's configure your environment.\n")
+    console.print("[bold cyan]Welcome to AutoForge[/bold cyan]")
+    console.print(
+        "AI-powered multi-agent platform that turns ideas into working projects.\n"
+    )
 
-    # Step 1: Select providers
-    selected_providers = inquirer.checkbox(
-        message="Which LLM providers do you want to use?",
-        choices=[
-            {"name": info["name"], "value": pid, "enabled": False}
-            for pid, info in PROVIDERS.items()
-        ],
-        validate=lambda x: len(x) > 0,
-        invalid_message="Select at least one provider",
-    ).execute()
+    # Show what AutoForge can do
+    console.print("[bold]What AutoForge can do:[/bold]")
+    console.print("  [green]1.[/green] Generate complete projects from a description")
+    console.print("  [green]2.[/green] Review and improve existing codebases")
+    console.print("  [green]3.[/green] Build web apps, APIs, CLI tools, mobile scaffolds")
+    console.print("  [green]4.[/green] Conduct research and analysis tasks")
+    console.print("  [green]5.[/green] Run as a 24/7 daemon with Telegram/webhook input")
+    console.print()
+    console.print("[dim]All settings below are optional. Press Ctrl+C anytime to skip.[/dim]")
+    console.print()
 
-    if not selected_providers:
-        console.print("[red]Setup cancelled.[/red]")
-        return
-
-    # Step 2: Auth method + credentials per provider
     api_keys: dict[str, str] = {}
     auth_configs: dict[str, dict[str, str]] = {}
+    model_strong = "claude-sonnet-4-5-20250929"
+    model_fast = "claude-haiku-4-5-20251001"
+    budget = 10.0
+    max_agents = 3
+    docker_enabled = False
+    github_config: dict[str, Any] = {}
 
-    for pid in selected_providers:
-        info = PROVIDERS[pid]
-        auth_methods = info["auth_methods"]
+    try:
+        # Step 1: Select providers (optional)
+        configure_llm = inquirer.confirm(
+            message="Configure an LLM provider now?",
+            default=True,
+        ).execute()
 
-        # Ask auth method (skip if only one option)
-        if len(auth_methods) > 1:
-            auth_method = inquirer.select(
-                message=f"{info['name']} — authentication method:",
-                choices=auth_methods,
-                default="api_key",
-            ).execute()
-        else:
-            auth_method = "api_key"
-
-        if auth_method == "api_key":
-            key = inquirer.secret(
-                message=f"{info['name']} API key:",
-                validate=info["validate"],
-                invalid_message=info["invalid_msg"],
-                long_instruction=info["key_hint"],
-            ).execute()
-            if key:
-                api_keys[pid] = key
-
-        elif auth_method == "oauth_bearer":
-            base_url = inquirer.text(
-                message="Base URL (e.g. https://your-proxy.com/v1):",
-                validate=lambda x: x.startswith("http"),
-                invalid_message="Must be a valid URL starting with http",
-            ).execute()
-            bearer = inquirer.secret(
-                message="Bearer token:",
-                validate=lambda x: len(x) > 5,
-                invalid_message="Token seems too short",
-            ).execute()
-            auth_configs[pid] = {
-                "auth_method": "oauth_bearer",
-                "base_url": base_url,
-                "bearer_token": bearer,
-            }
-            # Also set as api_key so has_api_key returns True
-            api_keys[pid] = bearer
-
-        elif auth_method == "oauth2_client_credentials":
-            token_url = inquirer.text(
-                message="Token URL:",
-                validate=lambda x: x.startswith("http"),
-                invalid_message="Must be a valid URL",
-            ).execute()
-            client_id = inquirer.text(message="Client ID:").execute()
-            client_secret = inquirer.secret(
-                message="Client Secret:",
-                validate=lambda x: len(x) > 5,
-                invalid_message="Secret seems too short",
-            ).execute()
-            scope = inquirer.text(
-                message="Scope (optional, press Enter to skip):",
-                default="",
-            ).execute()
-            base_url = inquirer.text(
-                message="Base URL (optional, for proxy — press Enter to skip):",
-                default="",
-            ).execute()
-            auth_configs[pid] = {
-                "auth_method": "oauth2_client_credentials",
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "token_url": token_url,
-            }
-            if scope:
-                auth_configs[pid]["scope"] = scope
-            if base_url:
-                auth_configs[pid]["base_url"] = base_url
-
-        elif auth_method == "adc":
-            auth_configs[pid] = {"auth_method": "adc"}
-            console.print(
-                "[dim]Ensure GOOGLE_APPLICATION_CREDENTIALS is set or "
-                "run 'gcloud auth application-default login'.[/dim]"
-            )
-
-        elif auth_method == "service_account":
-            sa_path = inquirer.filepath(
-                message="Path to service account JSON:",
-                validate=lambda x: Path(x).is_file() and x.endswith(".json"),
-                invalid_message="Must be a valid .json file",
-            ).execute()
-            auth_configs[pid] = {
-                "auth_method": "service_account",
-                "service_account_path": sa_path,
-            }
-
-        elif auth_method == "bedrock":
-            console.print("[dim]Amazon Bedrock — Claude via AWS[/dim]")
-            aws_region = inquirer.text(
-                message="AWS Region:",
-                default="us-east-1",
-            ).execute()
-            auth_type = inquirer.select(
-                message="AWS authentication:",
+        if configure_llm:
+            selected_providers = inquirer.checkbox(
+                message="Which LLM providers do you want to use?",
                 choices=[
-                    {"name": "AWS Profile (SSO/IAM Identity Center)", "value": "profile"},
-                    {"name": "Access Keys (static)", "value": "keys"},
-                    {"name": "Instance Role (automatic on EC2/ECS/Lambda)", "value": "instance"},
+                    {"name": info["name"], "value": pid, "enabled": False}
+                    for pid, info in PROVIDERS.items()
                 ],
-            ).execute()
-            auth_configs[pid] = {
-                "auth_method": "bedrock",
-                "aws_region": aws_region,
-            }
-            if auth_type == "profile":
-                profile = inquirer.text(
-                    message="AWS Profile name:",
-                    default="default",
-                ).execute()
-                auth_configs[pid]["aws_profile"] = profile
-                console.print(
-                    f"[dim]Run 'aws sso login --profile {profile}' if using SSO.[/dim]"
-                )
-            elif auth_type == "keys":
-                access_key = inquirer.secret(
-                    message="AWS Access Key ID:",
-                    validate=lambda x: len(x) >= 16,
-                    invalid_message="Access key too short",
-                ).execute()
-                secret_key = inquirer.secret(
-                    message="AWS Secret Access Key:",
-                    validate=lambda x: len(x) >= 20,
-                    invalid_message="Secret key too short",
-                ).execute()
-                session_token = inquirer.secret(
-                    message="AWS Session Token (optional, press Enter to skip):",
-                    default="",
-                ).execute()
-                auth_configs[pid]["aws_access_key_id"] = access_key
-                auth_configs[pid]["aws_secret_access_key"] = secret_key
-                if session_token:
-                    auth_configs[pid]["aws_session_token"] = session_token
-            else:
-                console.print(
-                    "[dim]Instance role will be auto-detected on AWS compute.[/dim]"
-                )
-
-        elif auth_method == "vertex_ai":
-            console.print("[dim]Google Vertex AI — Claude via Google Cloud[/dim]")
-            project_id = inquirer.text(
-                message="GCP Project ID:",
                 validate=lambda x: len(x) > 0,
-                invalid_message="Project ID is required",
+                invalid_message="Select at least one provider",
             ).execute()
-            region = inquirer.text(
-                message="GCP Region:",
-                default="us-east5",
-            ).execute()
-            auth_configs[pid] = {
-                "auth_method": "vertex_ai",
-                "project_id": project_id,
-                "region": region,
-            }
-            console.print(
-                "[dim]Ensure you've run 'gcloud auth application-default login' "
-                "or set GOOGLE_APPLICATION_CREDENTIALS.[/dim]"
-            )
 
-        elif auth_method == "codex_oauth":
-            console.print(
-                "[dim]Codex OAuth — will open browser for ChatGPT login.\n"
-                "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.\n"
-                "Uses subscription quota (not API billing).[/dim]"
-            )
-            auth_configs[pid] = {"auth_method": "codex_oauth"}
-            # Interactive login happens at runtime when first API call is made
+            if selected_providers:
+                # Step 2: Auth method + credentials per provider
+                for pid in selected_providers:
+                    _collect_provider_credentials(inquirer, pid, api_keys, auth_configs)
 
-        elif auth_method == "device_code":
-            console.print(
-                "[dim]Device Code Flow — for headless/SSH environments.\n"
-                "Will display a URL and code to enter on another device.\n"
-                "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.[/dim]"
-            )
-            auth_configs[pid] = {"auth_method": "device_code"}
-            # Device flow happens at runtime when first API call is made
+                # Step 3: Model selection
+                strong_choices = []
+                fast_choices = []
+                for pid in selected_providers:
+                    if pid in api_keys or pid in auth_configs:
+                        info = PROVIDERS[pid]
+                        strong_choices.extend(info["models_strong"])
+                        fast_choices.extend(info["models_fast"])
 
-    if not api_keys and not auth_configs:
-        console.print("[red]No credentials provided. Setup cancelled.[/red]")
-        return
+                if strong_choices:
+                    model_strong = inquirer.select(
+                        message="Model for complex tasks (Director, Architect):",
+                        choices=strong_choices,
+                        default=strong_choices[0]["value"],
+                    ).execute()
 
-    # Step 3: Model selection — choices from selected providers only
-    strong_choices = []
-    fast_choices = []
-    for pid in selected_providers:
-        if pid in api_keys or pid in auth_configs:
-            info = PROVIDERS[pid]
-            strong_choices.extend(info["models_strong"])
-            fast_choices.extend(info["models_fast"])
+                if fast_choices:
+                    model_fast = inquirer.select(
+                        message="Model for routine tasks (Builder, Reviewer, Tester):",
+                        choices=fast_choices,
+                        default=fast_choices[0]["value"],
+                    ).execute()
 
-    if not strong_choices:
-        console.print("[red]No models available. Setup cancelled.[/red]")
-        return
+                # Validate model → provider mapping
+                _validate_model_provider(inquirer, api_keys, auth_configs, model_strong, "strong")
+                _validate_model_provider(inquirer, api_keys, auth_configs, model_fast, "fast")
 
-    model_strong = inquirer.select(
-        message="Model for complex tasks (Director, Architect):",
-        choices=strong_choices,
-        default=strong_choices[0]["value"] if strong_choices else None,
-    ).execute()
+        # Step 4: Budget
+        budget = float(inquirer.number(
+            message="Default budget limit (USD):",
+            default=10.0,
+            float_allowed=True,
+            min_allowed=1.0,
+            max_allowed=100.0,
+        ).execute())
 
-    model_fast = inquirer.select(
-        message="Model for routine tasks (Builder, Reviewer, Tester):",
-        choices=fast_choices,
-        default=fast_choices[0]["value"] if fast_choices else None,
-    ).execute()
+        # Step 5: Max agents
+        max_agents = int(inquirer.number(
+            message="Max parallel builder agents:",
+            default=3,
+            min_allowed=1,
+            max_allowed=8,
+        ).execute())
 
-    # Step 3b: Validate model → provider mapping
-    _validate_model_provider(inquirer, api_keys, auth_configs, model_strong, "strong")
-    _validate_model_provider(inquirer, api_keys, auth_configs, model_fast, "fast")
+        # Step 6: Docker
+        docker_enabled = inquirer.confirm(
+            message="Enable Docker sandbox for isolated builds?",
+            default=False,
+        ).execute()
 
-    # Step 4: Budget
-    budget = inquirer.number(
-        message="Default budget limit (USD):",
-        default=10.0,
-        float_allowed=True,
-        min_allowed=1.0,
-        max_allowed=100.0,
-    ).execute()
+        # Step 7: GitHub environment
+        github_config = _setup_github(inquirer)
 
-    # Step 5: Max agents
-    max_agents = inquirer.number(
-        message="Max parallel builder agents:",
-        default=3,
-        min_allowed=1,
-        max_allowed=8,
-    ).execute()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Setup interrupted — saving what we have.[/yellow]")
 
-    # Step 6: Docker
-    docker_enabled = inquirer.confirm(
-        message="Enable Docker sandbox for isolated builds?",
-        default=False,
-    ).execute()
-
-    # Step 7: GitHub environment
-    github_config = _setup_github(inquirer)
-
-    # Write config
+    # Always write config (even with defaults / no API keys)
     _write_config(
         api_keys, model_strong, model_fast,
-        float(budget), int(max_agents), docker_enabled,
+        budget, max_agents, docker_enabled,
         auth_configs=auth_configs,
         github_config=github_config,
     )
 
     console.print()
     console.print(f"[green]Configuration saved to {CONFIG_FILE}[/green]")
-    console.print("You can re-run setup anytime with: [bold]autoforge setup[/bold]")
+
+    if not api_keys and not auth_configs:
+        console.print()
+        console.print("[yellow]No API keys configured yet.[/yellow]")
+        console.print("Add one anytime with: [bold]autoforge setup[/bold]")
+        console.print("Or set environment variables: ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY")
+    else:
+        console.print()
+        console.print("[bold green]Ready to go![/bold green]")
+        console.print('Try: [bold]autoforge generate "Build a todo app with Flask"[/bold]')
+
     console.print()
+    console.print("[dim]Reconfigure anytime: autoforge setup[/dim]")
+    console.print()
+
+
+def _collect_provider_credentials(
+    inquirer: Any,
+    pid: str,
+    api_keys: dict[str, str],
+    auth_configs: dict[str, dict[str, str]],
+) -> None:
+    """Collect credentials for a single provider."""
+    info = PROVIDERS[pid]
+    auth_methods = info["auth_methods"]
+
+    # Ask auth method (skip if only one option)
+    if len(auth_methods) > 1:
+        auth_method = inquirer.select(
+            message=f"{info['name']} — authentication method:",
+            choices=auth_methods,
+            default="api_key",
+        ).execute()
+    else:
+        auth_method = "api_key"
+
+    if auth_method == "api_key":
+        key = inquirer.secret(
+            message=f"{info['name']} API key:",
+            validate=info["validate"],
+            invalid_message=info["invalid_msg"],
+            long_instruction=info["key_hint"],
+        ).execute()
+        if key:
+            api_keys[pid] = key
+
+    elif auth_method == "oauth_bearer":
+        base_url = inquirer.text(
+            message="Base URL (e.g. https://your-proxy.com/v1):",
+            validate=lambda x: x.startswith("http"),
+            invalid_message="Must be a valid URL starting with http",
+        ).execute()
+        bearer = inquirer.secret(
+            message="Bearer token:",
+            validate=lambda x: len(x) > 5,
+            invalid_message="Token seems too short",
+        ).execute()
+        auth_configs[pid] = {
+            "auth_method": "oauth_bearer",
+            "base_url": base_url,
+            "bearer_token": bearer,
+        }
+        api_keys[pid] = bearer
+
+    elif auth_method == "oauth2_client_credentials":
+        token_url = inquirer.text(
+            message="Token URL:",
+            validate=lambda x: x.startswith("http"),
+            invalid_message="Must be a valid URL",
+        ).execute()
+        client_id = inquirer.text(message="Client ID:").execute()
+        client_secret = inquirer.secret(
+            message="Client Secret:",
+            validate=lambda x: len(x) > 5,
+            invalid_message="Secret seems too short",
+        ).execute()
+        scope = inquirer.text(
+            message="Scope (optional, press Enter to skip):",
+            default="",
+        ).execute()
+        base_url = inquirer.text(
+            message="Base URL (optional, for proxy — press Enter to skip):",
+            default="",
+        ).execute()
+        auth_configs[pid] = {
+            "auth_method": "oauth2_client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "token_url": token_url,
+        }
+        if scope:
+            auth_configs[pid]["scope"] = scope
+        if base_url:
+            auth_configs[pid]["base_url"] = base_url
+
+    elif auth_method == "adc":
+        auth_configs[pid] = {"auth_method": "adc"}
+        console.print(
+            "[dim]Ensure GOOGLE_APPLICATION_CREDENTIALS is set or "
+            "run 'gcloud auth application-default login'.[/dim]"
+        )
+
+    elif auth_method == "service_account":
+        sa_path = inquirer.filepath(
+            message="Path to service account JSON:",
+            validate=lambda x: Path(x).is_file() and x.endswith(".json"),
+            invalid_message="Must be a valid .json file",
+        ).execute()
+        auth_configs[pid] = {
+            "auth_method": "service_account",
+            "service_account_path": sa_path,
+        }
+
+    elif auth_method == "bedrock":
+        console.print("[dim]Amazon Bedrock — Claude via AWS[/dim]")
+        aws_region = inquirer.text(
+            message="AWS Region:",
+            default="us-east-1",
+        ).execute()
+        auth_type = inquirer.select(
+            message="AWS authentication:",
+            choices=[
+                {"name": "AWS Profile (SSO/IAM Identity Center)", "value": "profile"},
+                {"name": "Access Keys (static)", "value": "keys"},
+                {"name": "Instance Role (automatic on EC2/ECS/Lambda)", "value": "instance"},
+            ],
+        ).execute()
+        auth_configs[pid] = {
+            "auth_method": "bedrock",
+            "aws_region": aws_region,
+        }
+        if auth_type == "profile":
+            profile = inquirer.text(
+                message="AWS Profile name:",
+                default="default",
+            ).execute()
+            auth_configs[pid]["aws_profile"] = profile
+            console.print(
+                f"[dim]Run 'aws sso login --profile {profile}' if using SSO.[/dim]"
+            )
+        elif auth_type == "keys":
+            access_key = inquirer.secret(
+                message="AWS Access Key ID:",
+                validate=lambda x: len(x) >= 16,
+                invalid_message="Access key too short",
+            ).execute()
+            secret_key = inquirer.secret(
+                message="AWS Secret Access Key:",
+                validate=lambda x: len(x) >= 20,
+                invalid_message="Secret key too short",
+            ).execute()
+            session_token = inquirer.secret(
+                message="AWS Session Token (optional, press Enter to skip):",
+                default="",
+            ).execute()
+            auth_configs[pid]["aws_access_key_id"] = access_key
+            auth_configs[pid]["aws_secret_access_key"] = secret_key
+            if session_token:
+                auth_configs[pid]["aws_session_token"] = session_token
+        else:
+            console.print(
+                "[dim]Instance role will be auto-detected on AWS compute.[/dim]"
+            )
+
+    elif auth_method == "vertex_ai":
+        console.print("[dim]Google Vertex AI — Claude via Google Cloud[/dim]")
+        project_id = inquirer.text(
+            message="GCP Project ID:",
+            validate=lambda x: len(x) > 0,
+            invalid_message="Project ID is required",
+        ).execute()
+        region = inquirer.text(
+            message="GCP Region:",
+            default="us-east5",
+        ).execute()
+        auth_configs[pid] = {
+            "auth_method": "vertex_ai",
+            "project_id": project_id,
+            "region": region,
+        }
+        console.print(
+            "[dim]Ensure you've run 'gcloud auth application-default login' "
+            "or set GOOGLE_APPLICATION_CREDENTIALS.[/dim]"
+        )
+
+    elif auth_method == "codex_oauth":
+        console.print(
+            "[dim]Codex OAuth — will open browser for ChatGPT login.\n"
+            "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.\n"
+            "Uses subscription quota (not API billing).[/dim]"
+        )
+        auth_configs[pid] = {"auth_method": "codex_oauth"}
+
+    elif auth_method == "device_code":
+        console.print(
+            "[dim]Device Code Flow — for headless/SSH environments.\n"
+            "Will display a URL and code to enter on another device.\n"
+            "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.[/dim]"
+        )
+        auth_configs[pid] = {"auth_method": "device_code"}
 
 
 def _setup_github(inquirer: Any) -> dict[str, Any]:
@@ -494,14 +561,105 @@ def _validate_model_provider(
         default=True,
     ).execute()
     if fix:
-        key = inquirer.secret(
-            message=f"{info['name']} API key:",
-            validate=info["validate"],
-            invalid_message=info["invalid_msg"],
-            long_instruction=info["key_hint"],
-        ).execute()
-        if key:
-            api_keys[required_provider] = key
+        auth_methods = info.get("auth_methods", [{"name": "API Key", "value": "api_key"}])
+
+        # Offer full auth method selection (same as initial setup)
+        if len(auth_methods) > 1:
+            auth_method = inquirer.select(
+                message=f"{info['name']} — authentication method:",
+                choices=auth_methods,
+                default="api_key",
+            ).execute()
+        else:
+            auth_method = "api_key"
+
+        if auth_method == "api_key":
+            key = inquirer.secret(
+                message=f"{info['name']} API key:",
+                validate=info["validate"],
+                invalid_message=info["invalid_msg"],
+                long_instruction=info["key_hint"],
+            ).execute()
+            if key:
+                api_keys[required_provider] = key
+
+        elif auth_method == "oauth_bearer":
+            base_url = inquirer.text(
+                message="Base URL (e.g. https://your-proxy.com/v1):",
+                validate=lambda x: x.startswith("http"),
+                invalid_message="Must be a valid URL starting with http",
+            ).execute()
+            bearer = inquirer.secret(
+                message="Bearer token:",
+                validate=lambda x: len(x) > 5,
+                invalid_message="Token seems too short",
+            ).execute()
+            auth_configs[required_provider] = {
+                "auth_method": "oauth_bearer",
+                "base_url": base_url,
+                "bearer_token": bearer,
+            }
+            api_keys[required_provider] = bearer
+
+        elif auth_method == "oauth2_client_credentials":
+            token_url = inquirer.text(
+                message="Token URL:",
+                validate=lambda x: x.startswith("http"),
+                invalid_message="Must be a valid URL",
+            ).execute()
+            client_id = inquirer.text(message="Client ID:").execute()
+            client_secret = inquirer.secret(
+                message="Client Secret:",
+                validate=lambda x: len(x) > 5,
+                invalid_message="Secret seems too short",
+            ).execute()
+            auth_configs[required_provider] = {
+                "auth_method": "oauth2_client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "token_url": token_url,
+            }
+
+        elif auth_method == "bedrock":
+            aws_region = inquirer.text(
+                message="AWS Region:", default="us-east-1",
+            ).execute()
+            auth_configs[required_provider] = {
+                "auth_method": "bedrock",
+                "aws_region": aws_region,
+            }
+
+        elif auth_method == "vertex_ai":
+            project_id = inquirer.text(
+                message="GCP Project ID:",
+                validate=lambda x: len(x) > 0,
+                invalid_message="Project ID is required",
+            ).execute()
+            region = inquirer.text(
+                message="GCP Region:", default="us-east5",
+            ).execute()
+            auth_configs[required_provider] = {
+                "auth_method": "vertex_ai",
+                "project_id": project_id,
+                "region": region,
+            }
+
+        elif auth_method in ("adc", "service_account", "codex_oauth", "device_code"):
+            auth_configs[required_provider] = {"auth_method": auth_method}
+
+
+def _escape_toml_value(value: str) -> str:
+    """Escape a string value for safe inclusion in a TOML quoted string.
+
+    Handles backslashes, double quotes, and control characters that would
+    otherwise allow TOML injection via user-supplied input.
+    """
+    value = value.replace("\\", "\\\\")  # Backslashes first
+    value = value.replace('"', '\\"')
+    value = value.replace("\n", "\\n")
+    value = value.replace("\r", "\\r")
+    value = value.replace("\t", "\\t")
+    return value
 
 
 def _write_config(
@@ -516,6 +674,10 @@ def _write_config(
 ) -> None:
     """Write configuration to ~/.autoforge/config.toml."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Set restrictive permissions on config directory (Unix only)
+    if sys.platform != "win32":
+        os.chmod(CONFIG_DIR, 0o700)
 
     # Build github section
     gh_section: dict[str, Any] = {}
@@ -562,19 +724,19 @@ def _write_config(
 
         CONFIG_FILE.write_bytes(tomli_w.dumps(data).encode("utf-8"))
     except ImportError:
-        # Fallback: write TOML manually
+        # Fallback: write TOML manually (with proper escaping to prevent injection)
         lines = ["[api]"]
         if "anthropic" in api_keys:
-            lines.append(f'anthropic_key = "{api_keys["anthropic"]}"')
+            lines.append(f'anthropic_key = "{_escape_toml_value(api_keys["anthropic"])}"')
         if "openai" in api_keys:
-            lines.append(f'openai_key = "{api_keys["openai"]}"')
+            lines.append(f'openai_key = "{_escape_toml_value(api_keys["openai"])}"')
         if "google" in api_keys:
-            lines.append(f'google_key = "{api_keys["google"]}"')
+            lines.append(f'google_key = "{_escape_toml_value(api_keys["google"])}"')
 
         lines.append("")
         lines.append("[models]")
-        lines.append(f'strong = "{model_strong}"')
-        lines.append(f'fast = "{model_fast}"')
+        lines.append(f'strong = "{_escape_toml_value(model_strong)}"')
+        lines.append(f'fast = "{_escape_toml_value(model_fast)}"')
         lines.append("")
         lines.append("[defaults]")
         lines.append(f"budget = {budget}")
@@ -586,10 +748,10 @@ def _write_config(
         # Write auth configs
         if auth_configs:
             for provider, auth_data in auth_configs.items():
-                lines.append(f"[auth.{provider}]")
+                lines.append(f"[auth.{_escape_toml_value(provider)}]")
                 for k, v in auth_data.items():
                     if v:
-                        lines.append(f'{k} = "{v}"')
+                        lines.append(f'{_escape_toml_value(k)} = "{_escape_toml_value(v)}"')
                 lines.append("")
 
         # Write github config
@@ -599,10 +761,14 @@ def _write_config(
                 if isinstance(v, bool):
                     lines.append(f'{k} = {"true" if v else "false"}')
                 elif isinstance(v, str):
-                    lines.append(f'{k} = "{v}"')
-                lines.append("")
+                    lines.append(f'{k} = "{_escape_toml_value(v)}"')
+            lines.append("")
 
         CONFIG_FILE.write_text("\n".join(lines), encoding="utf-8")
+
+    # Set restrictive permissions on config file (Unix only).
+    if sys.platform != "win32":
+        os.chmod(CONFIG_FILE, 0o600)
 
 
 def load_global_config() -> dict:

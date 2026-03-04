@@ -168,10 +168,7 @@ class BuilderAgent(AgentBase):
 
     def _validate_path(self, rel_path: str) -> Path:
         """Validate and resolve a relative path, preventing path traversal."""
-        full_path = (self.working_dir / rel_path).resolve()
-        if not str(full_path).startswith(str(self.working_dir.resolve())):
-            raise ValueError(f"Path traversal detected: {rel_path}")
-        return full_path
+        return self.validate_path(rel_path, self.working_dir)
 
     # 2 MB per file limit to prevent runaway writes
     MAX_FILE_SIZE = 2 * 1024 * 1024
@@ -202,9 +199,13 @@ class BuilderAgent(AgentBase):
         full_path = self._validate_path(rel_path)
         if not full_path.is_dir():
             return json.dumps({"error": f"Not a directory: {rel_path}"})
+        base_resolved = self.working_dir.resolve()
         files = []
         for p in sorted(full_path.rglob("*")):
             if p.is_file() and ".git" not in p.parts:
+                # Prevent symlinks from escaping the workspace
+                if not p.resolve().is_relative_to(base_resolved):
+                    continue
                 try:
                     files.append(str(p.relative_to(self.working_dir)))
                 except ValueError:
