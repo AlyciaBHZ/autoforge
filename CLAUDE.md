@@ -61,6 +61,8 @@ engine/evomac.py                EvoMAC — text backpropagation, natural-languag
 engine/sica.py                  SICA — self-improving coding agent, constitution self-editing + rollback
 engine/rag_retrieval.py         Library-level RAG — BM25+TF-IDF hybrid cross-project code retrieval
 engine/formal_verify.py         Formal verification — multi-level linting, type checking, LLM formal analysis
+engine/reasoning_extension.py   Autonomous reasoning extension — minimal kernel self-growth, numbered conclusions, publication gate
+engine/article_verifier.py      Article verification pipeline — claim extraction, Lean 4 formalization, cross-prover verification
 engine/agent_debate.py          Conditional debate — reward-guided multi-agent architecture debate
 engine/security_scan.py         RedCode security scanning — pattern matching + LLM deep vulnerability analysis
 engine/reflexion.py             Reflexion — verbal RL with episodic memory for failure-informed retries

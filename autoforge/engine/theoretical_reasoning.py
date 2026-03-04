@@ -1939,6 +1939,108 @@ class TheoreticalReasoningEngine:
                     self._theories[theory.title] = theory
         logger.info(f"[TheoreticalReasoning] Loaded {len(self._theories)} theories")
 
+    # ── Autonomous Reasoning Extension ──
+
+    async def run_reasoning_extension(
+        self,
+        llm: Any,
+        *,
+        max_rounds: int = 10,
+        formalize: bool = False,
+        target_conclusions: int = 0,
+    ) -> dict[str, Any]:
+        """Run the autonomous reasoning extension engine.
+
+        Derives structure from the minimal kernel via growth operators,
+        producing numbered, publication-worthy conclusions in academic
+        mathematical language. Each round extends the kernel autonomously.
+
+        Args:
+            llm: LLM router
+            max_rounds: Maximum reasoning rounds
+            formalize: Whether to formalize conclusions in Lean 4
+            target_conclusions: Stop when this many conclusions reached (0 = no limit)
+
+        Returns:
+            Dict with rounds, conclusions, stats, and formatted report.
+        """
+        from autoforge.engine.reasoning_extension import ReasoningExtensionEngine
+
+        engine = ReasoningExtensionEngine()
+
+        # Load existing state if available
+        state_dir = self._get_extension_state_dir()
+        if state_dir:
+            engine.load(state_dir)
+
+        # Run continuous reasoning
+        rounds = await engine.run_continuous(
+            llm,
+            max_rounds=max_rounds,
+            formalize=formalize,
+            target_conclusions=target_conclusions,
+        )
+
+        # Save state
+        if state_dir:
+            engine.save(state_dir)
+
+        return {
+            "rounds": [r.to_dict() for r in rounds],
+            "total_conclusions": engine.conclusion_count,
+            "stats": engine.get_stats(),
+            "report_markdown": engine.generate_report(latex=False),
+            "report_latex": engine.generate_report(latex=True),
+        }
+
+    async def verify_article_claims(
+        self,
+        article_text: str,
+        llm: Any,
+        *,
+        title: str = "Untitled",
+        cross_verify: bool = False,
+    ) -> dict[str, Any]:
+        """Verify an existing article's mathematical claims.
+
+        Parses the article, extracts all mathematical claims, formalizes
+        them in Lean 4, verifies with compiler, and optionally cross-verifies
+        with multiple provers.
+
+        Args:
+            article_text: Article text (LaTeX, Markdown, or plain)
+            llm: LLM router
+            title: Article title
+            cross_verify: Whether to use multi-prover cross-verification
+
+        Returns:
+            Dict with verification report.
+        """
+        from autoforge.engine.article_verifier import ArticleVerifier
+
+        verifier = ArticleVerifier()
+        report = await verifier.verify_article(
+            article_text, llm,
+            title=title,
+            cross_verify=cross_verify,
+        )
+
+        return {
+            "report": report.to_dict(),
+            "summary": report.format_summary(),
+            "confidence": report.overall_confidence,
+            "assessment": report.assessment,
+        }
+
+    def _get_extension_state_dir(self) -> Path | None:
+        """Get the directory for reasoning extension state."""
+        try:
+            base = Path(".autoforge") / "reasoning_extension"
+            base.mkdir(parents=True, exist_ok=True)
+            return base
+        except Exception:
+            return None
+
 
 # ══════════════════════════════════════════════════════════════
 # Utilities

@@ -92,6 +92,8 @@ class Orchestrator:
         self._capability_dag: Any = None
         self._dag_bridge: Any = None
         self._theoretical_reasoning: Any = None
+        self._reasoning_extension: Any = None
+        self._article_verifier: Any = None
         self._init_engines()
 
     def _agent(self, role: str, *args: Any, **kwargs: Any) -> Any:
@@ -145,6 +147,10 @@ class Orchestrator:
         if c.theoretical_reasoning_enabled:
             from autoforge.engine.theoretical_reasoning import TheoreticalReasoningEngine
             self._theoretical_reasoning = TheoreticalReasoningEngine()
+            from autoforge.engine.reasoning_extension import ReasoningExtensionEngine
+            self._reasoning_extension = ReasoningExtensionEngine()
+            from autoforge.engine.article_verifier import ArticleVerifier
+            self._article_verifier = ArticleVerifier()
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
@@ -274,6 +280,10 @@ class Orchestrator:
             if self.config.theoretical_reasoning_enabled:
                 await self._run_theoretical_reasoning()
 
+            # Reasoning extension: autonomous kernel growth
+            if self.config.theoretical_reasoning_enabled and self._reasoning_extension is not None:
+                await self._run_reasoning_extension()
+
             self._save_state("verify_complete")
 
             # Checkpoint: review test results
@@ -323,6 +333,11 @@ class Orchestrator:
 
             if self._multi_prover and self.project_dir:
                 self._multi_prover.save_state(self.project_dir / ".autoforge" / "multi_prover.json")
+
+            # Reasoning extension: save state
+            if self._reasoning_extension is not None:
+                ext_dir = Path(".autoforge") / "reasoning_extension"
+                self._reasoning_extension.save(ext_dir)
 
             # Theoretical reasoning: save theory graphs (project-level + global)
             if self.config.theoretical_reasoning_enabled and self.project_dir:
@@ -2442,6 +2457,84 @@ class Orchestrator:
 
         except Exception as e:
             logger.warning(f"Theoretical reasoning failed: {e}")
+
+    async def _run_reasoning_extension(self) -> None:
+        """Run autonomous reasoning extension from minimal kernel.
+
+        Derives publication-worthy conclusions via growth operators,
+        each numbered, in rigorous academic language, non-repetitive.
+        """
+        if self._reasoning_extension is None:
+            return
+
+        try:
+            console.print(
+                "  [cyan]Reasoning extension:[/cyan] "
+                "running autonomous kernel growth..."
+            )
+
+            # Load existing state
+            ext_dir = Path(".autoforge") / "reasoning_extension"
+            self._reasoning_extension.load(ext_dir)
+
+            # Run one round of reasoning
+            round_record = await self._reasoning_extension.run_reasoning_round(
+                self.llm,
+                formalize=self.config.lean_prover_enabled,
+            )
+
+            console.print(
+                f"  [cyan]Reasoning extension:[/cyan] "
+                f"Round {round_record.round_number}: "
+                f"{round_record.accepted} conclusions accepted, "
+                f"{round_record.rejected} rejected"
+            )
+
+            for c in round_record.conclusions:
+                console.print(
+                    f"    [{c.conclusion_type.value.upper()} {c.number}] "
+                    f"({c.worthiness.value}) {c.statement[:80]}..."
+                )
+
+            # Save state
+            self._reasoning_extension.save(ext_dir)
+
+        except Exception as e:
+            logger.warning(f"Reasoning extension failed: {e}")
+
+    async def _run_article_verification(self, article_text: str, title: str = "Untitled") -> dict:
+        """Verify an article's mathematical claims via Lean 4 formalization.
+
+        Extracts claims, auto-formalizes to Lean 4, verifies, and
+        optionally cross-verifies with multiple provers.
+        """
+        if self._article_verifier is None:
+            return {"error": "Article verifier not initialized"}
+
+        try:
+            console.print(
+                f"  [cyan]Article verification:[/cyan] "
+                f"verifying '{title}'..."
+            )
+
+            report = await self._article_verifier.verify_article(
+                article_text, self.llm,
+                title=title,
+                cross_verify=self.config.lean_prover_enabled,
+            )
+
+            console.print(
+                f"  [cyan]Article verification:[/cyan] "
+                f"{report.verified}/{report.total_claims} verified, "
+                f"{report.failed} failed, "
+                f"confidence={report.overall_confidence:.1%}"
+            )
+
+            return report.to_dict()
+
+        except Exception as e:
+            logger.warning(f"Article verification failed: {e}")
+            return {"error": str(e)}
 
     def _ingest_theory_to_dag(self, theory: "TheoryGraph") -> None:
         """Feed theoretical concepts from a TheoryGraph into the CapabilityDAG.
