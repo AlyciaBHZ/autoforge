@@ -1831,6 +1831,7 @@ class Orchestrator:
             return architect.parse_architecture(arch_result.output)
 
         # Step 2: Set up search tree
+        from autoforge.engine.search_tree import SearchTree
         self._search_tree = SearchTree()
         root = self._search_tree.create_root(
             description="Architecture exploration",
@@ -2195,6 +2196,7 @@ class Orchestrator:
         try:
             # Lazy init
             if self._lean_prover is None:
+                from autoforge.engine.lean_prover import LeanProver
                 self._lean_prover = LeanProver(workspace=self.project_dir)
                 # Load prior state if available
                 lean_state = self.project_dir / ".autoforge" / "lean"
@@ -2275,6 +2277,7 @@ class Orchestrator:
             if _any_alt_prover:
                 try:
                     if self._multi_prover is None:
+                        from autoforge.engine.multi_prover import MultiProverEngine
                         self._multi_prover = MultiProverEngine(workspace=self.project_dir)
                     available = await self._multi_prover.detect_available_provers()
                     active = [k.value for k, v in available.items() if v]

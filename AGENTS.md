@@ -80,7 +80,7 @@ tests/smoke_test.py         31-check smoke test (no API key needed)
 
 ## Key Design Decisions
 
-- **LLM SDK**: Native `anthropic.AsyncAnthropic` (not Agent SDK) for full tool-use loop control
+- **LLM SDK**: Multi-provider support (Anthropic, OpenAI, Google) with native async clients for full tool-use loop control
 - **Parallelism**: `asyncio` with `asyncio.wait()` for concurrent builder tasks
 - **Task locks**: `os.symlink()` on POSIX, `os.open(O_CREAT|O_EXCL)` on Windows
 - **Sandbox**: SubprocessSandbox (default) or DockerSandbox (optional, `--network none`)
