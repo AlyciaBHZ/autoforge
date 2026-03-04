@@ -23,6 +23,11 @@ Queue management:
     python forge.py queue "project description"   # Add to queue
     python forge.py projects                      # List all projects
     python forge.py deploy <project_id>           # Show deploy guide
+
+Paper reproduction:
+    python forge.py paper infer "research goal"   # Infer likely ICLR papers
+    python forge.py paper benchmark               # Benchmark inference quality
+    python forge.py paper reproduce "goal"        # Build reproduction brief/prompt
 """
 
 from autoforge.cli.app import main
