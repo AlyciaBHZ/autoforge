@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -359,17 +361,110 @@ def run_setup_wizard() -> None:
         default=False,
     ).execute()
 
+    # Step 7: GitHub environment
+    github_config = _setup_github(inquirer)
+
     # Write config
     _write_config(
         api_keys, model_strong, model_fast,
         float(budget), int(max_agents), docker_enabled,
         auth_configs=auth_configs,
+        github_config=github_config,
     )
 
     console.print()
     console.print(f"[green]Configuration saved to {CONFIG_FILE}[/green]")
     console.print("You can re-run setup anytime with: [bold]autoforge setup[/bold]")
     console.print()
+
+
+def _setup_github(inquirer: Any) -> dict[str, Any]:
+    """Detect and optionally configure GitHub environment.
+
+    Checks for git and gh CLI availability, guides the user through
+    configuration if desired.
+
+    Returns a dict with github config to persist (may be empty).
+    """
+    result: dict[str, Any] = {}
+
+    console.print()
+    console.print("[bold cyan]GitHub Environment[/bold cyan]")
+
+    # Check git
+    git_path = shutil.which("git")
+    if git_path:
+        try:
+            version = subprocess.run(
+                ["git", "--version"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            console.print(f"  [green]Git detected:[/green] {version}")
+        except (subprocess.SubprocessError, OSError):
+            console.print("  [green]Git detected[/green]")
+        result["git_available"] = True
+    else:
+        console.print("  [yellow]Git not found.[/yellow]")
+        console.print("  [dim]Install git for version control: https://git-scm.com/downloads[/dim]")
+        result["git_available"] = False
+
+    # Check gh CLI
+    gh_path = shutil.which("gh")
+    if gh_path:
+        try:
+            auth_status = subprocess.run(
+                ["gh", "auth", "status"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if auth_status.returncode == 0:
+                console.print("  [green]GitHub CLI detected and authenticated[/green]")
+                result["gh_authenticated"] = True
+            else:
+                console.print("  [yellow]GitHub CLI detected but not authenticated[/yellow]")
+                login = inquirer.confirm(
+                    message="Authenticate GitHub CLI now? (opens browser)",
+                    default=True,
+                ).execute()
+                if login:
+                    console.print("  [dim]Running: gh auth login[/dim]")
+                    login_result = subprocess.run(
+                        ["gh", "auth", "login", "--web"],
+                        timeout=120,
+                    )
+                    result["gh_authenticated"] = login_result.returncode == 0
+                    if result["gh_authenticated"]:
+                        console.print("  [green]GitHub authentication successful![/green]")
+                    else:
+                        console.print("  [yellow]Authentication skipped or failed.[/yellow]")
+                else:
+                    result["gh_authenticated"] = False
+                    console.print(
+                        "  [dim]Run 'gh auth login' later to enable GitHub integration.[/dim]"
+                    )
+        except (subprocess.SubprocessError, OSError):
+            console.print("  [yellow]GitHub CLI detected but status check failed[/yellow]")
+            result["gh_authenticated"] = False
+    else:
+        console.print("  [dim]GitHub CLI (gh) not found — optional but enables auto-push.[/dim]")
+        console.print("  [dim]Install: https://cli.github.com[/dim]")
+        result["gh_authenticated"] = False
+
+    # Auto-push preference
+    if result.get("git_available"):
+        auto_push = inquirer.confirm(
+            message="Auto-push generated projects to GitHub?",
+            default=result.get("gh_authenticated", False),
+        ).execute()
+        result["auto_push"] = auto_push
+        if auto_push:
+            default_org = inquirer.text(
+                message="Default GitHub org/user (press Enter to skip):",
+                default="",
+            ).execute()
+            if default_org:
+                result["default_org"] = default_org
+
+    return result
 
 
 def _validate_model_provider(
@@ -417,9 +512,20 @@ def _write_config(
     max_agents: int,
     docker_enabled: bool,
     auth_configs: dict[str, dict[str, str]] | None = None,
+    github_config: dict[str, Any] | None = None,
 ) -> None:
     """Write configuration to ~/.autoforge/config.toml."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Build github section
+    gh_section: dict[str, Any] = {}
+    if github_config:
+        if github_config.get("auto_push"):
+            gh_section["auto_push"] = True
+        if github_config.get("default_org"):
+            gh_section["default_org"] = github_config["default_org"]
+        gh_section["git_available"] = github_config.get("git_available", False)
+        gh_section["gh_authenticated"] = github_config.get("gh_authenticated", False)
 
     try:
         import tomli_w
@@ -449,6 +555,10 @@ def _write_config(
             for provider, auth_data in auth_configs.items():
                 auth_section[provider] = dict(auth_data)
             data["auth"] = auth_section
+
+        # Add github section
+        if gh_section:
+            data["github"] = gh_section
 
         CONFIG_FILE.write_bytes(tomli_w.dumps(data).encode("utf-8"))
     except ImportError:
@@ -480,6 +590,16 @@ def _write_config(
                 for k, v in auth_data.items():
                     if v:
                         lines.append(f'{k} = "{v}"')
+                lines.append("")
+
+        # Write github config
+        if gh_section:
+            lines.append("[github]")
+            for k, v in gh_section.items():
+                if isinstance(v, bool):
+                    lines.append(f'{k} = {"true" if v else "false"}')
+                elif isinstance(v, str):
+                    lines.append(f'{k} = "{v}"')
                 lines.append("")
 
         CONFIG_FILE.write_text("\n".join(lines), encoding="utf-8")
@@ -535,6 +655,14 @@ def load_global_config() -> dict:
         auth_section = auth.get(provider, {})
         if auth_section:
             result[f"auth_{provider}"] = dict(auth_section)
+
+    # Load github config
+    github = data.get("github", {})
+    if github:
+        result["github_auto_push"] = github.get("auto_push", False)
+        result["github_default_org"] = github.get("default_org", "")
+        result["github_git_available"] = github.get("git_available", False)
+        result["github_gh_authenticated"] = github.get("gh_authenticated", False)
 
     return result
 
