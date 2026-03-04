@@ -133,17 +133,35 @@ class ForgeConfig:
     # Daemon mode
     daemon_enabled: bool = False
     daemon_poll_interval: int = 10  # seconds between queue checks
+    daemon_max_concurrent_projects: int = 1
+    daemon_pid_file: Path | None = None
     db_path: Path | None = None  # SQLite database for project registry
+
+    # Intake policy (applies to CLI queue, Telegram, Webhook)
+    queue_max_size: int = 200
+    requester_queue_limit: int = 3
+    requester_daily_limit: int = 20
+    requester_rate_limit: int = 5
+    requester_rate_window_seconds: int = 60
+    request_max_budget_usd: float = 1000.0
+    request_max_description_chars: int = 10000
 
     # Telegram bot
     telegram_token: str = ""
     telegram_allowed_users: list[str] = field(default_factory=list)
+    telegram_allow_public: bool = False
 
     # Webhook API
     webhook_enabled: bool = False
     webhook_host: str = "127.0.0.1"
     webhook_port: int = 8420
     webhook_secret: str = ""  # Bearer token for webhook auth
+    webhook_require_auth: bool = True
+    webhook_allow_unauthenticated_local: bool = False
+    webhook_admin_secret: str = ""
+    webhook_requester_header: str = "X-Autoforge-Requester"
+    webhook_trust_requester_header: bool = False
+    webhook_idempotency_header: str = "Idempotency-Key"
 
     # Web tools (search + fetch)
     web_tools_enabled: bool = True  # Kill switch for all web tools
@@ -257,6 +275,8 @@ class ForgeConfig:
             self.workspace_dir = self.project_root / "workspace"
         if self.constitution_dir is None:
             self.constitution_dir = autoforge.DATA_DIR / "constitution"
+        if self.daemon_pid_file is None:
+            self.daemon_pid_file = self.project_root / ".autoforge" / "daemon.pid"
         if self.db_path is None:
             self.db_path = self.project_root / "autoforge.db"
         if not self.run_id:
@@ -368,6 +388,12 @@ class ForgeConfig:
         allowed_raw = os.getenv("FORGE_TELEGRAM_ALLOWED_USERS", "")
         allowed_users = [u.strip() for u in allowed_raw.split(",") if u.strip()]
 
+        daemon_pid_raw = (
+            os.getenv("FORGE_DAEMON_PID_FILE")
+            or str(global_config.get("daemon_pid_file", "")).strip()
+        )
+        daemon_pid_file = Path(daemon_pid_raw).expanduser() if daemon_pid_raw else None
+
         # Validate log level
         log_level = (
             os.getenv("FORGE_LOG_LEVEL")
@@ -395,6 +421,62 @@ class ForgeConfig:
         elif max_agents > 50:
             max_agents = 50
 
+        daemon_max_concurrent_projects = _safe_int(
+            "FORGE_DAEMON_MAX_CONCURRENT_PROJECTS",
+            _to_int(global_config.get("daemon_max_concurrent_projects", 1), 1),
+        )
+        if daemon_max_concurrent_projects < 1:
+            daemon_max_concurrent_projects = 1
+
+        queue_max_size = _safe_int(
+            "FORGE_QUEUE_MAX_SIZE",
+            _to_int(global_config.get("queue_max_size", 200), 200),
+        )
+        if queue_max_size < 1:
+            queue_max_size = 1
+
+        requester_queue_limit = _safe_int(
+            "FORGE_REQUESTER_QUEUE_LIMIT",
+            _to_int(global_config.get("requester_queue_limit", 3), 3),
+        )
+        if requester_queue_limit < 1:
+            requester_queue_limit = 1
+
+        requester_daily_limit = _safe_int(
+            "FORGE_REQUESTER_DAILY_LIMIT",
+            _to_int(global_config.get("requester_daily_limit", 20), 20),
+        )
+        if requester_daily_limit < 1:
+            requester_daily_limit = 1
+
+        requester_rate_limit = _safe_int(
+            "FORGE_REQUESTER_RATE_LIMIT",
+            _to_int(global_config.get("requester_rate_limit", 5), 5),
+        )
+        if requester_rate_limit < 1:
+            requester_rate_limit = 1
+
+        requester_rate_window_seconds = _safe_int(
+            "FORGE_REQUESTER_RATE_WINDOW_SECONDS",
+            _to_int(global_config.get("requester_rate_window_seconds", 60), 60),
+        )
+        if requester_rate_window_seconds < 1:
+            requester_rate_window_seconds = 1
+
+        request_max_description_chars = _safe_int(
+            "FORGE_REQUEST_MAX_DESCRIPTION_CHARS",
+            _to_int(global_config.get("request_max_description_chars", 10000), 10000),
+        )
+        if request_max_description_chars < 100:
+            request_max_description_chars = 100
+
+        request_max_budget_usd = _safe_float(
+            "FORGE_REQUEST_MAX_BUDGET_USD",
+            float(global_config.get("request_max_budget_usd", 1000.0)),
+        )
+        if request_max_budget_usd <= 0:
+            request_max_budget_usd = 1000.0
+
         config = cls(
             api_keys=api_keys,
             auth_config=auth_config,
@@ -417,14 +499,30 @@ class ForgeConfig:
             mobile_target=global_config.get("mobile_target", "none"),
             # Daemon
             daemon_poll_interval=_safe_int("FORGE_DAEMON_POLL_INTERVAL", 10),
+            daemon_max_concurrent_projects=daemon_max_concurrent_projects,
+            daemon_pid_file=daemon_pid_file,
+            queue_max_size=queue_max_size,
+            requester_queue_limit=requester_queue_limit,
+            requester_daily_limit=requester_daily_limit,
+            requester_rate_limit=requester_rate_limit,
+            requester_rate_window_seconds=requester_rate_window_seconds,
+            request_max_budget_usd=request_max_budget_usd,
+            request_max_description_chars=request_max_description_chars,
             # Telegram
             telegram_token=os.getenv("FORGE_TELEGRAM_TOKEN", ""),
             telegram_allowed_users=allowed_users,
+            telegram_allow_public=os.getenv("FORGE_TELEGRAM_ALLOW_PUBLIC", "").lower() in ("true", "1", "yes"),
             # Webhook
             webhook_enabled=os.getenv("FORGE_WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes"),
             webhook_host=os.getenv("FORGE_WEBHOOK_HOST", "127.0.0.1"),
             webhook_port=_safe_int("FORGE_WEBHOOK_PORT", 8420),
             webhook_secret=os.getenv("FORGE_WEBHOOK_SECRET", ""),
+            webhook_require_auth=os.getenv("FORGE_WEBHOOK_REQUIRE_AUTH", "true").lower() not in ("false", "0", "no"),
+            webhook_allow_unauthenticated_local=os.getenv("FORGE_WEBHOOK_ALLOW_UNAUTH_LOCAL", "").lower() in ("true", "1", "yes"),
+            webhook_admin_secret=os.getenv("FORGE_WEBHOOK_ADMIN_SECRET", ""),
+            webhook_requester_header=os.getenv("FORGE_WEBHOOK_REQUESTER_HEADER", "X-Autoforge-Requester"),
+            webhook_trust_requester_header=os.getenv("FORGE_WEBHOOK_TRUST_REQUESTER_HEADER", "").lower() in ("true", "1", "yes"),
+            webhook_idempotency_header=os.getenv("FORGE_WEBHOOK_IDEMPOTENCY_HEADER", "Idempotency-Key"),
             # Web tools
             web_tools_enabled=os.getenv("FORGE_WEB_TOOLS", "true").lower() not in ("false", "0", "no"),
             search_backend=os.getenv("FORGE_SEARCH_BACKEND", global_config.get("search_backend", "duckduckgo")),

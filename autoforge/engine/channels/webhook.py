@@ -1,16 +1,8 @@
-"""Webhook API channel for AutoForge daemon.
-
-FastAPI server exposing a REST API for project management:
-  POST   /api/build              — Queue a new project
-  GET    /api/projects           — List all projects
-  GET    /api/projects/{id}      — Get project details
-  GET    /api/projects/{id}/deploy — Get deployment guide
-  DELETE /api/projects/{id}      — Cancel a queued project
-  GET    /api/health             — Health check
-"""
+"""Webhook API channel for daemon intake and project management."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hmac
 import logging
 from pathlib import Path
@@ -18,8 +10,23 @@ from typing import Any
 
 from autoforge.engine.config import ForgeConfig
 from autoforge.engine.project_registry import ProjectRegistry, ProjectStatus
+from autoforge.engine.request_intake import IntakePolicyError, RequestIntakeService
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RequestContext:
+    requester: str
+    is_admin: bool = False
+
+
+def _is_limit_error(msg: str) -> bool:
+    lowered = msg.lower()
+    return any(
+        token in lowered
+        for token in ("limit", "quota", "rate", "queue is full", "too many")
+    )
 
 
 async def start_webhook_server(
@@ -28,8 +35,7 @@ async def start_webhook_server(
 ) -> None:
     """Start the FastAPI webhook server."""
     try:
-        from fastapi import FastAPI, HTTPException, Request, Depends
-        from fastapi.responses import JSONResponse
+        from fastapi import Depends, FastAPI, HTTPException, Request
         import uvicorn
     except ImportError:
         raise ImportError(
@@ -37,82 +43,137 @@ async def start_webhook_server(
             "Install them with: pip install autoforge[channels]"
         ) from None
 
-    app = FastAPI(title="AutoForge API", version="0.1.0")
+    if config.webhook_require_auth and not config.webhook_secret:
+        local_host = config.webhook_host in {"127.0.0.1", "localhost"}
+        if not (config.webhook_allow_unauthenticated_local and local_host):
+            raise RuntimeError(
+                "Webhook auth is required but FORGE_WEBHOOK_SECRET is empty. "
+                "Set FORGE_WEBHOOK_SECRET or explicitly allow local unauthenticated mode."
+            )
 
-    # Auth dependency (constant-time comparison to prevent timing attacks)
+    intake = RequestIntakeService(config, registry)
+    app = FastAPI(title="AutoForge API", version="0.2.0")
+
     async def verify_auth(request: Request) -> None:
+        if not config.webhook_require_auth:
+            return
+
         if not config.webhook_secret:
-            return  # No auth configured
+            local_host = config.webhook_host in {"127.0.0.1", "localhost"}
+            if config.webhook_allow_unauthenticated_local and local_host:
+                return
+            raise HTTPException(status_code=503, detail="Webhook authentication misconfigured")
+
         auth = request.headers.get("Authorization", "").encode()
         expected = f"Bearer {config.webhook_secret}".encode()
         if not hmac.compare_digest(auth, expected):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
+    async def get_request_context(request: Request) -> RequestContext:
+        requester_hint = ""
+        if config.webhook_trust_requester_header:
+            requester_hint = request.headers.get(config.webhook_requester_header, "")
+        fallback = request.client.host if request.client else "unknown"
+        requester = intake.normalize_requester(
+            channel="webhook",
+            requester_hint=requester_hint,
+            fallback_hint=fallback,
+        )
+
+        is_admin = False
+        if config.webhook_admin_secret:
+            supplied = request.headers.get("X-Autoforge-Admin-Secret", "").encode()
+            expected = config.webhook_admin_secret.encode()
+            is_admin = hmac.compare_digest(supplied, expected)
+
+        return RequestContext(requester=requester, is_admin=is_admin)
+
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
         queue_size = await registry.queue_size()
+        building = len(await registry.list_by_status(ProjectStatus.BUILDING))
         return {
             "status": "ok",
             "queue_size": queue_size,
+            "building": building,
         }
 
     @app.post("/api/build", dependencies=[Depends(verify_auth)])
-    async def build_project(request: Request) -> dict[str, Any]:
+    async def build_project(
+        request: Request,
+        ctx: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
         try:
             body = await request.json()
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-        description = body.get("description", "").strip()
-        if not description:
-            raise HTTPException(status_code=400, detail="description is required")
-        if len(description) > 10000:
-            raise HTTPException(status_code=400, detail="description too long (max 10,000 chars)")
+        idempotency_key = request.headers.get(config.webhook_idempotency_header, "")
+        description = body.get("description", "")
+        budget = body.get("budget", None)
 
-        budget = body.get("budget", config.budget_limit_usd)
         try:
-            budget = float(budget)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="budget must be a number")
-        if budget <= 0:
-            raise HTTPException(status_code=400, detail="budget must be positive")
-        if budget > 1000:
-            raise HTTPException(status_code=400, detail="budget too high (max $1000)")
-
-        requester = f"webhook:{request.client.host}" if request.client else "webhook:unknown"
-
-        project = await registry.enqueue(
-            description=description,
-            requested_by=requester,
-            budget_usd=budget,
-        )
-        queue_size = await registry.queue_size()
+            result = await intake.enqueue(
+                channel="webhook",
+                requester_hint=ctx.requester.split(":", 1)[1] if ":" in ctx.requester else ctx.requester,
+                fallback_hint=request.client.host if request.client else "unknown",
+                description=description,
+                budget=budget,
+                idempotency_key=idempotency_key,
+            )
+        except IntakePolicyError as exc:
+            status = 429 if _is_limit_error(str(exc)) else 400
+            raise HTTPException(status_code=status, detail=str(exc))
 
         return {
-            "id": project.id,
-            "status": project.status.value,
-            "queue_position": queue_size,
-            "budget_usd": project.budget_usd,
+            "id": result.project.id,
+            "status": result.project.status.value,
+            "queue_position": result.queue_size,
+            "budget_usd": result.project.budget_usd,
+            "requester": result.project.requested_by,
+            "deduplicated": result.deduplicated,
         }
 
     @app.get("/api/projects", dependencies=[Depends(verify_auth)])
-    async def list_projects(limit: int = 50) -> list[dict[str, Any]]:
+    async def list_projects(
+        limit: int = 50,
+        all: bool = False,
+        ctx: RequestContext = Depends(get_request_context),
+    ) -> list[dict[str, Any]]:
         limit = min(max(limit, 1), 500)
-        projects = await registry.list_all(limit=limit)
+        if all and not ctx.is_admin:
+            raise HTTPException(status_code=403, detail="Admin scope required")
+
+        if all:
+            projects = await registry.list_all(limit=limit)
+        else:
+            projects = await registry.list_for_requester(ctx.requester, limit=limit)
         return [p.to_dict() for p in projects]
 
     @app.get("/api/projects/{project_id}", dependencies=[Depends(verify_auth)])
-    async def get_project(project_id: str) -> dict[str, Any]:
+    async def get_project(
+        project_id: str,
+        ctx: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
         try:
-            project = await registry.get(project_id)
+            if ctx.is_admin:
+                project = await registry.get(project_id)
+            else:
+                project = await registry.get_for_requester(project_id, ctx.requester)
         except KeyError:
             raise HTTPException(status_code=404, detail="Project not found")
         return project.to_dict()
 
     @app.get("/api/projects/{project_id}/deploy", dependencies=[Depends(verify_auth)])
-    async def get_deploy_guide(project_id: str) -> dict[str, str]:
+    async def get_deploy_guide(
+        project_id: str,
+        ctx: RequestContext = Depends(get_request_context),
+    ) -> dict[str, str]:
         try:
-            project = await registry.get(project_id)
+            if ctx.is_admin:
+                project = await registry.get(project_id)
+            else:
+                project = await registry.get_for_requester(project_id, ctx.requester)
         except KeyError:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -131,20 +192,25 @@ async def start_webhook_server(
 
         try:
             return {"guide": guide_path.read_text(encoding="utf-8")}
-        except (OSError, UnicodeDecodeError) as e:
-            raise HTTPException(status_code=500, detail=f"Failed to read deploy guide: {e}")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to read deploy guide: {exc}")
 
     @app.delete("/api/projects/{project_id}", dependencies=[Depends(verify_auth)])
-    async def cancel_project(project_id: str) -> dict[str, Any]:
-        ok = await registry.cancel(project_id)
+    async def cancel_project(
+        project_id: str,
+        ctx: RequestContext = Depends(get_request_context),
+    ) -> dict[str, Any]:
+        if ctx.is_admin:
+            ok = await registry.cancel(project_id)
+        else:
+            ok = await registry.cancel_for_requester(project_id, ctx.requester)
         if not ok:
             raise HTTPException(
                 status_code=400,
-                detail="Only queued projects can be cancelled",
+                detail="Only your queued projects can be cancelled",
             )
         return {"id": project_id, "status": "cancelled"}
 
-    # Run the server
     server_config = uvicorn.Config(
         app,
         host=config.webhook_host,

@@ -125,6 +125,27 @@ def test_cli_parse_subcommands():
     args = parser.parse_args(["status"])
     assert args.command == "status"
 
+    # Test daemon
+    args = parser.parse_args(["daemon", "start"])
+    assert args.command == "daemon"
+    assert args.daemon_action == "start"
+
+    # Test queue
+    args = parser.parse_args(["queue", "Build a blog", "--budget", "5", "--idempotency-key", "abc"])
+    assert args.command == "queue"
+    assert args.description == "Build a blog"
+    assert args.idempotency_key == "abc"
+
+    # Test projects
+    args = parser.parse_args(["projects", "--limit", "10"])
+    assert args.command == "projects"
+    assert args.limit == 10
+
+    # Test deploy
+    args = parser.parse_args(["deploy", "abc123"])
+    assert args.command == "deploy"
+    assert args.project_id == "abc123"
+
     # Test global flags
     args = parser.parse_args(["--budget", "5.0", "--mode", "research", "--mobile", "both", "generate", "test"])
     assert args.budget == 5.0
@@ -151,6 +172,8 @@ def test_cli_legacy_compat():
     #  not by argparse, so we test the detection logic here)
     assert "Build a todo app" not in _KNOWN_COMMANDS
     assert "generate" in _KNOWN_COMMANDS
+    assert "daemon" in _KNOWN_COMMANDS
+    assert "queue" in _KNOWN_COMMANDS
 
 
 # ────────────────────────────────────────────
@@ -167,6 +190,9 @@ def test_forge_config():
     assert config.constitution_dir.name == "constitution"
     assert config.mode == "developer"
     assert config.mobile_target == "none"
+    assert config.daemon_max_concurrent_projects >= 1
+    assert config.webhook_require_auth is True
+    assert config.webhook_trust_requester_header is False
 
 
 def test_forge_config_from_env():
@@ -188,6 +214,47 @@ def test_forge_config_budget_tracking():
     # Exhaust budget
     config.record_usage("claude-opus-4-6", 10_000_000, 10_000_000)
     assert config.check_budget() is False
+
+
+def test_request_intake_service_limits_and_idempotency():
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.project_registry import ProjectRegistry
+    from autoforge.engine.request_intake import RequestIntakeService
+
+    async def _test():
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        try:
+            async with ProjectRegistry(db_path) as reg:
+                config = ForgeConfig(
+                    queue_max_size=10,
+                    requester_queue_limit=3,
+                    requester_daily_limit=20,
+                    requester_rate_limit=5,
+                    requester_rate_window_seconds=60,
+                )
+                intake = RequestIntakeService(config, reg)
+                first = await intake.enqueue(
+                    channel="webhook",
+                    requester_hint="user-1",
+                    description="Build a small test app",
+                    budget=5.0,
+                    idempotency_key="idem-1",
+                )
+                assert first.project.requested_by.startswith("webhook:")
+
+                second = await intake.enqueue(
+                    channel="webhook",
+                    requester_hint="user-1",
+                    description="Build a small test app",
+                    budget=5.0,
+                    idempotency_key="idem-1",
+                )
+                assert second.deduplicated is True
+                assert second.project.id == first.project.id
+        finally:
+            db_path.unlink(missing_ok=True)
+
+    asyncio.run(_test())
 
 
 def test_forge_config_mobile():
@@ -884,6 +951,23 @@ def test_project_registry_crud():
 
                 # Cannot cancel non-queued
                 assert await reg.cancel(p.id) is False
+
+                # Requester isolation + idempotency
+                p4 = await reg.enqueue("Owned by A", "telegram:100", idempotency_key="idem-a")
+                p5 = await reg.enqueue("Owned by B", "telegram:200", idempotency_key="idem-b")
+                a_projects = await reg.list_for_requester("telegram:100")
+                b_projects = await reg.list_for_requester("telegram:200")
+                assert any(x.id == p4.id for x in a_projects)
+                assert any(x.id == p5.id for x in b_projects)
+                found = await reg.get_by_idempotency("telegram:100", "idem-a")
+                assert found is not None and found.id == p4.id
+                with_raises = False
+                try:
+                    await reg.get_for_requester(p5.id, "telegram:100")
+                except KeyError:
+                    with_raises = True
+                assert with_raises is True
+                assert await reg.cancel_for_requester(p5.id, "telegram:100") is False
         finally:
             db_path.unlink(missing_ok=True)
 

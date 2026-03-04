@@ -8,15 +8,23 @@ Subcommands:
     import <path>       Import & improve an existing project
     status              Show project status
     resume [path]       Resume an interrupted run
+    daemon <action>     Run daemon lifecycle commands
+    queue <desc>        Queue project for daemon execution
+    projects            List queued/completed projects from registry
+    deploy <id>         Print deploy guide for a completed project
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import logging
+import os
+import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 
@@ -47,7 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  autoforge review ./my-project               # Review existing project\n"
             "  autoforge import ./my-project               # Import & improve\n"
             "  autoforge setup                             # Configure settings\n"
-            "  autoforge status                            # Show projects\n"
+            "  autoforge status                            # Show project status\n"
+            "  autoforge daemon start                      # Start queue daemon\n"
+            '  autoforge queue "Build an API"              # Queue project\n'
+            "  autoforge projects                          # List queued/history\n"
+            "  autoforge deploy <project_id>               # Print deploy guide\n"
         ),
     )
 
@@ -111,6 +123,57 @@ def build_parser() -> argparse.ArgumentParser:
     res_parser = subparsers.add_parser("resume", help="Resume a previous run")
     res_parser.add_argument("path", nargs="?", default=None, help="Workspace path to resume")
 
+    # daemon
+    daemon_parser = subparsers.add_parser("daemon", help="Daemon lifecycle commands")
+    daemon_subparsers = daemon_parser.add_subparsers(dest="daemon_action", required=True)
+    daemon_subparsers.add_parser("start", help="Start daemon in foreground")
+    daemon_subparsers.add_parser("status", help="Show daemon/process status")
+    daemon_subparsers.add_parser("stop", help="Stop daemon using PID file")
+    daemon_subparsers.add_parser("install", help="Print service installation hints")
+
+    # queue
+    queue_parser = subparsers.add_parser("queue", help="Queue a project for daemon build")
+    queue_parser.add_argument("description", help="Natural language project description")
+    queue_parser.add_argument("--budget", type=float, default=None, help="Per-project budget in USD")
+    queue_parser.add_argument(
+        "--requester",
+        default=None,
+        help="Requester id override (default: current user)",
+    )
+    queue_parser.add_argument(
+        "--idempotency-key",
+        default=None,
+        help="Optional idempotency key to de-duplicate retries",
+    )
+
+    # projects
+    projects_parser = subparsers.add_parser("projects", help="List projects from registry")
+    projects_parser.add_argument("--limit", type=int, default=50, help="Max rows to show")
+    projects_parser.add_argument(
+        "--requester",
+        default=None,
+        help="Filter by requester id (default: current user)",
+    )
+    projects_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Show all projects (admin/local use)",
+    )
+
+    # deploy
+    deploy_parser = subparsers.add_parser("deploy", help="Show deployment guide for project id")
+    deploy_parser.add_argument("project_id", help="Project id")
+    deploy_parser.add_argument(
+        "--requester",
+        default=None,
+        help="Requester id for authorization checks (default: current user)",
+    )
+    deploy_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Bypass requester filter and read any project id",
+    )
+
     # Backward compatibility flags
     parser.add_argument(
         "--resume",
@@ -126,13 +189,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # Known subcommands for legacy detection
-_KNOWN_COMMANDS = {"setup", "generate", "review", "import", "status", "resume"}
+_KNOWN_COMMANDS = {
+    "setup",
+    "generate",
+    "review",
+    "import",
+    "status",
+    "resume",
+    "daemon",
+    "queue",
+    "projects",
+    "deploy",
+}
 
 
 def _build_config_overrides(args: argparse.Namespace) -> dict:
     """Build config overrides from CLI args."""
     overrides = {}
-    if args.budget is not None:
+    if args.budget is not None and getattr(args, "command", None) != "queue":
         overrides["budget_limit_usd"] = args.budget
     if args.agents is not None:
         overrides["max_agents"] = args.agents
@@ -250,6 +324,259 @@ async def _run_import(config, project_path: str, enhance: str = "") -> int:
         console.print(f"\n[red]Error:[/red] {e}")
         logging.getLogger(__name__).debug("Full traceback:", exc_info=True)
         return 1
+
+
+def _default_cli_requester() -> str:
+    """Return default requester id for local CLI usage."""
+    try:
+        username = getpass.getuser()
+    except Exception:
+        username = os.getenv("USERNAME") or os.getenv("USER") or "local"
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in username)
+    safe = safe.strip("._-") or "local"
+    return f"cli:{safe}"
+
+
+def _normalize_cli_requester(raw: str | None) -> str:
+    """Normalize requester override into ``channel:identifier`` format."""
+    if not raw:
+        return _default_cli_requester()
+    value = raw.strip()
+    if not value:
+        return _default_cli_requester()
+    if ":" in value:
+        return value
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in value)
+    safe = safe.strip("._-") or "local"
+    return f"cli:{safe}"
+
+
+def _read_daemon_pid_file(pid_path: Path | None) -> int | None:
+    if pid_path is None or not pid_path.exists():
+        return None
+    try:
+        return int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but current user cannot signal it.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+async def _run_daemon_start(config) -> int:
+    """Start daemon in foreground."""
+    from autoforge.engine.daemon import ForgeDaemon
+
+    if not config.has_api_key:
+        console.print("[red]Error:[/red] No API key configured. Run: autoforge setup")
+        return 1
+
+    running_pid = _read_daemon_pid_file(config.daemon_pid_file)
+    if running_pid and _is_pid_running(running_pid):
+        console.print(f"[red]Daemon already running with PID {running_pid}[/red]")
+        return 1
+
+    daemon = ForgeDaemon(config)
+    await daemon.start()
+    return 0
+
+
+async def _run_daemon_status(config) -> int:
+    """Show daemon status and queue counters."""
+    from autoforge.engine.project_registry import ProjectRegistry, ProjectStatus
+
+    pid = _read_daemon_pid_file(config.daemon_pid_file)
+    running = bool(pid and _is_pid_running(pid))
+
+    async with ProjectRegistry(config.db_path) as registry:
+        queued = await registry.queue_size()
+        building = len(await registry.list_by_status(ProjectStatus.BUILDING))
+        completed = len(await registry.list_by_status(ProjectStatus.COMPLETED))
+        failed = len(await registry.list_by_status(ProjectStatus.FAILED))
+
+    state = "running" if running else "stopped"
+    console.print(f"Daemon: [bold]{state}[/bold]")
+    if pid:
+        console.print(f"PID file: {config.daemon_pid_file} (pid={pid})")
+    else:
+        console.print(f"PID file: {config.daemon_pid_file} (not found)")
+    console.print(f"Queue: {queued} queued, {building} building")
+    console.print(f"History: {completed} completed, {failed} failed")
+    return 0
+
+
+async def _run_daemon_stop(config) -> int:
+    """Stop daemon process using PID file."""
+    pid = _read_daemon_pid_file(config.daemon_pid_file)
+    if pid is None:
+        console.print("[yellow]Daemon PID file not found; nothing to stop.[/yellow]")
+        return 0
+
+    if not _is_pid_running(pid):
+        console.print("[yellow]Stale daemon PID file found; cleaning up.[/yellow]")
+        try:
+            config.daemon_pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return 0
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        console.print(f"[red]Failed to stop daemon PID {pid}: {exc}[/red]")
+        return 1
+
+    for _ in range(25):
+        await asyncio.sleep(0.2)
+        if not _is_pid_running(pid):
+            break
+
+    if _is_pid_running(pid):
+        console.print(f"[red]Daemon PID {pid} did not stop after SIGTERM.[/red]")
+        return 1
+
+    try:
+        config.daemon_pid_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+    console.print(f"[green]Daemon stopped (pid {pid}).[/green]")
+    return 0
+
+
+async def _run_daemon_install(config) -> int:
+    """Print service installation instructions for current OS."""
+    project_root = Path(__file__).resolve().parents[2]
+    systemd_service = project_root / "services" / "autoforge.service"
+    launchd_plist = project_root / "services" / "com.autoforge.daemon.plist"
+
+    if sys.platform.startswith("linux"):
+        console.print("Systemd install:")
+        console.print(f"  sudo cp {systemd_service} /etc/systemd/system/autoforge@.service")
+        console.print("  sudo systemctl daemon-reload")
+        console.print("  sudo systemctl enable autoforge@$USER")
+        console.print("  sudo systemctl start autoforge@$USER")
+    elif sys.platform == "darwin":
+        console.print("launchd install:")
+        console.print(f"  cp {launchd_plist} ~/Library/LaunchAgents/")
+        console.print("  launchctl load ~/Library/LaunchAgents/com.autoforge.daemon.plist")
+    else:
+        console.print("Windows service install is not automated yet.")
+        console.print("Run daemon manually: autoforge daemon start")
+    return 0
+
+
+async def _run_queue(config, args: argparse.Namespace) -> int:
+    """Queue a project request in the daemon registry."""
+    from autoforge.engine.project_registry import ProjectRegistry
+    from autoforge.engine.request_intake import IntakePolicyError, RequestIntakeService
+
+    requested_by = _normalize_cli_requester(getattr(args, "requester", None))
+    channel, requester_hint = requested_by.split(":", 1)
+    idempotency_key = getattr(args, "idempotency_key", None)
+    budget = getattr(args, "budget", None)
+
+    async with ProjectRegistry(config.db_path) as registry:
+        intake = RequestIntakeService(config, registry)
+        try:
+            result = await intake.enqueue(
+                channel=channel,
+                requester_hint=requester_hint,
+                fallback_hint="local",
+                description=args.description,
+                budget=budget,
+                idempotency_key=idempotency_key,
+            )
+        except IntakePolicyError as exc:
+            console.print(f"[red]Queue rejected:[/red] {exc}")
+            return 1
+
+    if result.deduplicated:
+        console.print("[yellow]Reused existing queued/completed request (idempotency match).[/yellow]")
+    console.print(
+        f"Queued project [bold]{result.project.id}[/bold] "
+        f"(budget=${result.project.budget_usd:.2f}, queue_position={result.queue_size})"
+    )
+    return 0
+
+
+async def _run_projects(config, args: argparse.Namespace) -> int:
+    """List projects from registry."""
+    from autoforge.engine.project_registry import ProjectRegistry
+
+    limit = max(1, min(int(getattr(args, "limit", 50)), 500))
+    requested_by = _normalize_cli_requester(getattr(args, "requester", None))
+    show_all = bool(getattr(args, "all", False))
+
+    async with ProjectRegistry(config.db_path) as registry:
+        if show_all:
+            projects = await registry.list_all(limit=limit)
+        else:
+            projects = await registry.list_for_requester(requested_by, limit=limit)
+
+    if not projects:
+        console.print("No projects found.")
+        return 0
+
+    for p in projects:
+        phase = f" ({p.phase})" if p.phase else ""
+        console.print(
+            f"[{p.id}] {p.status.value}{phase} "
+            f"cost=${p.cost_usd:.4f} requester={p.requested_by}",
+            markup=False,
+        )
+        console.print(f"  {p.description[:120]}", markup=False)
+    return 0
+
+
+async def _run_deploy(config, args: argparse.Namespace) -> int:
+    """Print deploy guide for a completed project."""
+    from autoforge.engine.project_registry import ProjectRegistry, ProjectStatus
+
+    project_id = args.project_id
+    requested_by = _normalize_cli_requester(getattr(args, "requester", None))
+    allow_all = bool(getattr(args, "all", False))
+
+    async with ProjectRegistry(config.db_path) as registry:
+        try:
+            if allow_all:
+                project = await registry.get(project_id)
+            else:
+                project = await registry.get_for_requester(project_id, requested_by)
+        except KeyError:
+            console.print("[red]Project not found.[/red]")
+            return 1
+
+    if project.status != ProjectStatus.COMPLETED:
+        console.print(f"[red]Project not completed:[/red] {project.status.value}")
+        return 1
+
+    workspace = Path(project.workspace_path).resolve()
+    guide_path = (workspace / "DEPLOY_GUIDE.md").resolve()
+    if not str(guide_path).startswith(str(workspace)):
+        console.print("[red]Invalid deploy guide path.[/red]")
+        return 1
+    if not guide_path.exists():
+        console.print("[red]Deploy guide not found.[/red]")
+        return 1
+
+    try:
+        console.print(guide_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        console.print(f"[red]Failed to read deploy guide:[/red] {exc}")
+        return 1
+    return 0
 
 
 def _resolve_command(argv: list[str]) -> tuple[argparse.Namespace, str | None]:
@@ -379,6 +706,28 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
         except Exception as e:
             console.print(f"[red]Resume failed:[/red] {e}")
             return 1
+
+    elif args.command == "daemon":
+        action = getattr(args, "daemon_action", "")
+        if action == "start":
+            return await _run_daemon_start(config)
+        if action == "status":
+            return await _run_daemon_status(config)
+        if action == "stop":
+            return await _run_daemon_stop(config)
+        if action == "install":
+            return await _run_daemon_install(config)
+        console.print(f"[red]Unknown daemon action:[/red] {action}")
+        return 1
+
+    elif args.command == "queue":
+        return await _run_queue(config, args)
+
+    elif args.command == "projects":
+        return await _run_projects(config, args)
+
+    elif args.command == "deploy":
+        return await _run_deploy(config, args)
 
     return 1
 

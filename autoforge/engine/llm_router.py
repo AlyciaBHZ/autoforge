@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from autoforge.engine.config import ForgeConfig
+from autoforge.engine.config import DEFAULT_PRICING, MODEL_PRICING, ForgeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,9 @@ class TaskComplexity(Enum):
 
     HIGH = "high"  # Uses model_strong (e.g. Opus, GPT-4o, Gemini Pro)
     STANDARD = "standard"  # Uses model_fast (e.g. Sonnet, GPT-4o-mini, Flash)
+    COMPLEX = "complex"  # Alias of HIGH for backward compatibility
+    MODERATE = "moderate"  # Alias of STANDARD for backward compatibility
+    LOW = "low"  # Alias of STANDARD for lightweight tasks
 
 
 class BudgetExceededError(Exception):
@@ -117,6 +120,36 @@ class LLMRouter:
         self._call_count = 0
         self._clients: dict[str, Any] = {}
         self._auth_providers: dict[str, Any] = {}  # Cached AuthProvider per provider
+        self._budget_lock: asyncio.Lock | None = None
+        self._reserved_budget_usd: float = 0.0
+
+    def _get_budget_lock(self) -> asyncio.Lock:
+        """Lazily create lock to avoid cross-event-loop lock reuse."""
+        if self._budget_lock is None:
+            self._budget_lock = asyncio.Lock()
+        return self._budget_lock
+
+    def _estimate_call_cost_usd(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+    ) -> float:
+        """Estimate upper-bound call cost for reservation.
+
+        Uses a conservative chars->tokens approximation to reduce overspend races.
+        """
+        total_chars = len(system)
+        total_chars += sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
+        estimated_input_tokens = max(1, total_chars // 4)
+        estimated_output_tokens = max(1, max_tokens)
+        pricing = MODEL_PRICING.get(model, DEFAULT_PRICING)
+        return (
+            estimated_input_tokens * pricing["input"] / 1_000_000
+            + estimated_output_tokens * pricing["output"] / 1_000_000
+        )
 
     def _get_client(self, provider: str) -> Any:
         """Get or create an async client for the given provider.
@@ -271,7 +304,7 @@ class LLMRouter:
 
     def _select_model(self, complexity: TaskComplexity) -> tuple[str, int]:
         """Return (model_name, max_tokens) for the given complexity."""
-        if complexity == TaskComplexity.HIGH:
+        if complexity in (TaskComplexity.HIGH, TaskComplexity.COMPLEX):
             return self.config.model_strong, self.config.max_tokens_strong
         return self.config.model_fast, self.config.max_tokens_fast
 
@@ -294,13 +327,31 @@ class LLMRouter:
         Returns:
             LLMResponse with normalized content blocks.
         """
-        if not self.config.check_budget():
-            raise BudgetExceededError(
-                f"Budget exhausted: ${self.config.estimated_cost_usd:.2f} "
-                f"of ${self.config.budget_limit_usd:.2f} used"
-            )
-
         model, max_tokens = self._select_model(complexity)
+        reservation = self._estimate_call_cost_usd(
+            model=model,
+            system=system,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+
+        lock = self._get_budget_lock()
+        async with lock:
+            projected = (
+                self.config.estimated_cost_usd
+                + self._reserved_budget_usd
+                + reservation
+            )
+            if projected > self.config.budget_limit_usd:
+                raise BudgetExceededError(
+                    "Budget exhausted before call: "
+                    f"used=${self.config.estimated_cost_usd:.4f}, "
+                    f"reserved=${self._reserved_budget_usd:.4f}, "
+                    f"next_estimate=${reservation:.4f}, "
+                    f"limit=${self.config.budget_limit_usd:.4f}"
+                )
+            self._reserved_budget_usd += reservation
+
         provider = detect_provider(model)
         await self._ensure_fresh_token(provider)
         self._call_count += 1
@@ -311,25 +362,33 @@ class LLMRouter:
             f"messages={len(messages)} budget_remaining=${self.config.budget_remaining:.2f}"
         )
 
-        if provider == "anthropic":
-            response = await self._call_anthropic(model, max_tokens, system, messages, tools)
-        elif provider == "openai":
-            response = await self._call_openai(model, max_tokens, system, messages, tools)
-        elif provider == "google":
-            response = await self._call_google(model, max_tokens, system, messages, tools)
-        else:
-            raise ValueError(f"Unknown provider: {provider}")
+        response: LLMResponse | None = None
+        try:
+            if provider == "anthropic":
+                response = await self._call_anthropic(model, max_tokens, system, messages, tools)
+            elif provider == "openai":
+                response = await self._call_openai(model, max_tokens, system, messages, tools)
+            elif provider == "google":
+                response = await self._call_google(model, max_tokens, system, messages, tools)
+            else:
+                raise ValueError(f"Unknown provider: {provider}")
+            return response
+        finally:
+            async with lock:
+                self._reserved_budget_usd = max(0.0, self._reserved_budget_usd - reservation)
+                if response is not None:
+                    self.config.record_usage(
+                        model,
+                        response.usage.input_tokens,
+                        response.usage.output_tokens,
+                    )
 
-        # Track usage
-        self.config.record_usage(model, response.usage.input_tokens, response.usage.output_tokens)
-
-        logger.info(
-            f"[LLM #{call_id}] stop_reason={response.stop_reason} "
-            f"tokens_in={response.usage.input_tokens} tokens_out={response.usage.output_tokens} "
-            f"cost_total=${self.config.estimated_cost_usd:.4f}"
-        )
-
-        return response
+            if response is not None:
+                logger.info(
+                    f"[LLM #{call_id}] stop_reason={response.stop_reason} "
+                    f"tokens_in={response.usage.input_tokens} tokens_out={response.usage.output_tokens} "
+                    f"cost_total=${self.config.estimated_cost_usd:.4f}"
+                )
 
     # ── Anthropic ──────────────────────────────────────────────────
 
