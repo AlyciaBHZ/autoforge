@@ -5,6 +5,9 @@ Config priority chain (highest -> lowest):
     2. Project .env file (in repo root)
     3. Global ~/.autoforge/config.toml (user-level defaults)
     4. Built-in defaults
+
+ForgeConfig is the central config object. Advanced sub-systems use
+dedicated sub-config dataclasses to keep the top-level clean.
 """
 
 from __future__ import annotations
@@ -85,9 +88,137 @@ def _to_int(value: Any, default: int) -> int:
         return default
 
 
+# ── Sub-config dataclasses ────────────────────────────────────────
+
+
+@dataclass
+class DaemonConfig:
+    """Settings for the 24/7 background daemon and input channels."""
+
+    daemon_enabled: bool = False
+    daemon_poll_interval: int = 10
+    daemon_max_concurrent_projects: int = 1
+    daemon_pid_file: Path | None = None
+    db_path: Path | None = None
+
+    # Intake policy (CLI queue, Telegram, Webhook)
+    queue_max_size: int = 200
+    requester_queue_limit: int = 3
+    requester_daily_limit: int = 20
+    requester_rate_limit: int = 5
+    requester_rate_window_seconds: int = 60
+    request_max_budget_usd: float = 1000.0
+    request_max_description_chars: int = 10000
+
+    # Telegram channel
+    telegram_token: str = ""
+    telegram_allowed_users: list[str] = field(default_factory=list)
+    telegram_allow_public: bool = False
+
+    # Webhook channel
+    webhook_enabled: bool = False
+    webhook_host: str = "127.0.0.1"
+    webhook_port: int = 8420
+    webhook_secret: str = ""
+    webhook_require_auth: bool = True
+    webhook_allow_unauthenticated_local: bool = False
+    webhook_admin_secret: str = ""
+    webhook_requester_header: str = "X-Autoforge-Requester"
+    webhook_trust_requester_header: bool = False
+    webhook_idempotency_header: str = "Idempotency-Key"
+
+
+@dataclass
+class ToolsConfig:
+    """Settings for agent tools (web search, code search, GitHub)."""
+
+    web_tools_enabled: bool = True
+    search_backend: str = "duckduckgo"
+    search_api_key: str = ""
+    github_token: str = ""
+
+
+@dataclass
+class PipelineConfig:
+    """Settings for the core build pipeline behaviour."""
+
+    search_tree_enabled: bool = True
+    search_tree_max_candidates: int = 3
+    checkpoints_enabled: bool = True
+    checkpoint_interval: int = 8
+    confirm_phases: list[str] = field(default_factory=list)
+    build_test_loops: int = 0
+    speculative_enabled: bool = True
+    hierarchical_decomp_enabled: bool = True
+
+
+@dataclass
+class AdvancedConfig:
+    """Feature flags and settings for advanced ML/AI sub-systems.
+
+    All flags default to True (enabled). Set to False to skip the engine.
+    """
+
+    # Core ML engines
+    evolution_enabled: bool = True
+    prompt_optimization_enabled: bool = True
+    process_reward_enabled: bool = True
+    mcts_enabled: bool = True
+    mcts_max_iterations: int = 9
+    evomac_enabled: bool = True
+    sica_enabled: bool = True
+    rag_enabled: bool = True
+    formal_verify_enabled: bool = True
+    debate_enabled: bool = True
+    security_scan_enabled: bool = True
+    reflexion_enabled: bool = True
+    adaptive_compute_enabled: bool = True
+    ldb_debugger_enabled: bool = True
+
+    # Knowledge systems
+    lean_prover_enabled: bool = True
+    capability_dag_enabled: bool = True
+    theoretical_reasoning_enabled: bool = True
+
+    # Context budget
+    context_budget_tokens: int = 4000
+    dag_ingest_confidence_threshold: float = 0.4
+    dag_ingest_relevance_threshold: float = 0.3
+
+    # Lean prover deep settings
+    lean_mcts_iterations: int = 200
+    lean_decomposition_depth: int = 5
+    lean_auto_repair_passes: int = 3
+    lean_mathlib_search_enabled: bool = True
+    lean_pantograph_repl: bool = True
+
+    # Multi-prover formal verification
+    coq_enabled: bool = False
+    isabelle_enabled: bool = False
+    tlaplus_enabled: bool = False
+    z3_smt_enabled: bool = False
+    dafny_enabled: bool = False
+
+
+@dataclass
+class ProjectGoalConfig:
+    """User-declared workspace intent (guides engine resource allocation)."""
+
+    project_goal_type: str = "general"
+    project_goal_description: str = ""
+    project_goal_disciplines: list[str] = field(default_factory=list)
+
+
+# ── Main config ──────────────────────────────────────────────────
+
+
 @dataclass
 class ForgeConfig:
-    """Central configuration for an AutoForge run."""
+    """Central configuration for an AutoForge run.
+
+    Core settings live directly on ForgeConfig. Advanced sub-systems
+    are grouped into dedicated sub-config objects for maintainability.
+    """
 
     # Paths
     project_root: Path = field(default_factory=lambda: Path.cwd())
@@ -96,7 +227,6 @@ class ForgeConfig:
 
     # LLM settings — multi-provider API keys
     api_keys: dict[str, str] = field(default_factory=dict)
-    # Per-provider auth config (OAuth bearer, client_credentials, Google ADC, etc.)
     auth_config: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_strong: str = "claude-opus-4-6"
     model_fast: str = "claude-sonnet-4-5-20250929"
@@ -105,8 +235,6 @@ class ForgeConfig:
 
     # Budget
     budget_limit_usd: float = 10.0
-
-    # Token tracking -- per-model accumulators
     token_usage: dict[str, dict[str, int]] = field(default_factory=dict)
 
     # Execution
@@ -117,150 +245,24 @@ class ForgeConfig:
     log_level: str = "INFO"
 
     # Operating mode
-    mode: str = "developer"  # "developer" or "research"
-
-    # Mobile target
-    mobile_target: str = "none"  # "none", "ios", "android", "both"
-    mobile_framework: str = "react-native"  # "react-native" or "flutter"
+    mode: str = "developer"
+    mobile_target: str = "none"
+    mobile_framework: str = "react-native"
 
     # Run identity
     run_id: str = ""
 
     # Docker
     sandbox_image: str = "autoforge-sandbox:latest"
-    docker_enabled: bool = False  # Default off; setup.sh enables if available
+    docker_enabled: bool = False
 
-    # Daemon mode
-    daemon_enabled: bool = False
-    daemon_poll_interval: int = 10  # seconds between queue checks
-    daemon_max_concurrent_projects: int = 1
-    daemon_pid_file: Path | None = None
-    db_path: Path | None = None  # SQLite database for project registry
+    # ── Sub-configs ──
+    daemon: DaemonConfig = field(default_factory=DaemonConfig)
+    tools: ToolsConfig = field(default_factory=ToolsConfig)
+    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
+    advanced: AdvancedConfig = field(default_factory=AdvancedConfig)
+    goal: ProjectGoalConfig = field(default_factory=ProjectGoalConfig)
 
-    # Intake policy (applies to CLI queue, Telegram, Webhook)
-    queue_max_size: int = 200
-    requester_queue_limit: int = 3
-    requester_daily_limit: int = 20
-    requester_rate_limit: int = 5
-    requester_rate_window_seconds: int = 60
-    request_max_budget_usd: float = 1000.0
-    request_max_description_chars: int = 10000
-
-    # Telegram bot
-    telegram_token: str = ""
-    telegram_allowed_users: list[str] = field(default_factory=list)
-    telegram_allow_public: bool = False
-
-    # Webhook API
-    webhook_enabled: bool = False
-    webhook_host: str = "127.0.0.1"
-    webhook_port: int = 8420
-    webhook_secret: str = ""  # Bearer token for webhook auth
-    webhook_require_auth: bool = True
-    webhook_allow_unauthenticated_local: bool = False
-    webhook_admin_secret: str = ""
-    webhook_requester_header: str = "X-Autoforge-Requester"
-    webhook_trust_requester_header: bool = False
-    webhook_idempotency_header: str = "Idempotency-Key"
-
-    # Web tools (search + fetch)
-    web_tools_enabled: bool = True  # Kill switch for all web tools
-    search_backend: str = "duckduckgo"  # "duckduckgo" | "google" | "bing"
-    search_api_key: str = ""  # API key for Google/Bing search backends
-
-    # GitHub integration
-    github_token: str = ""  # Personal access token for GitHub API (optional, increases rate limit)
-
-    # Search tree (branching/backtracking)
-    search_tree_enabled: bool = True  # Enable tree search for architecture exploration
-    search_tree_max_candidates: int = 3  # Candidates per branch point
-
-    # Mid-task checkpoints
-    checkpoints_enabled: bool = True  # Enable mid-task direction checking
-    checkpoint_interval: int = 8  # Check direction every N turns
-
-    # Human-in-the-loop checkpoints
-    confirm_phases: list[str] = field(default_factory=list)  # e.g. ["spec", "build"] or ["all"]
-
-    # Build-phase TDD loops
-    build_test_loops: int = 0  # 0=disabled, 1-3=test-fix iterations per task
-
-    # Evolution engine
-    evolution_enabled: bool = True  # Enable cross-project workflow evolution
-
-    # Prompt optimization (DSPy/OPRO-style)
-    prompt_optimization_enabled: bool = True  # Enable automatic prompt self-improvement
-
-    # Process reward model (CodePRM)
-    process_reward_enabled: bool = True  # Enable step-level code generation evaluation
-
-    # RethinkMCTS
-    mcts_enabled: bool = True        # Enable MCTS-enhanced search during BUILD
-    mcts_max_iterations: int = 9     # Max MCTS iterations per decision point
-
-    # EvoMAC text backpropagation
-    evomac_enabled: bool = True      # Enable text gradient feedback between agents
-
-    # SICA self-improvement
-    sica_enabled: bool = True        # Enable self-improving constitution edits
-
-    # Library-level RAG retrieval
-    rag_enabled: bool = True         # Enable cross-project code knowledge base
-
-    # Formal verification
-    formal_verify_enabled: bool = True  # Enable static analysis + LLM formal checks
-
-    # Conditional multi-agent debate
-    debate_enabled: bool = True      # Enable reward-guided architecture debates
-
-    # RedCode security scanning
-    security_scan_enabled: bool = True  # Enable security vulnerability scanning
-
-    # Reflexion episodic memory (NeurIPS 2023)
-    reflexion_enabled: bool = True   # Enable verbal RL with failure reflections
-
-    # Adaptive test-time compute (ICLR 2025)
-    adaptive_compute_enabled: bool = True  # Enable difficulty-aware resource allocation
-
-    # LDB block-level debugger (ACL 2024)
-    ldb_debugger_enabled: bool = True  # Enable block-level fault localization
-
-    # Speculative pipeline execution
-    speculative_enabled: bool = True  # Enable parallel speculative pre-execution
-
-    # Hierarchical task decomposition (Parsel / CodePlan)
-    hierarchical_decomp_enabled: bool = True  # Enable function-level decomposition for complex tasks
-    lean_prover_enabled: bool = True           # Enable Lean 4 formal theorem proving engine
-    capability_dag_enabled: bool = True        # Enable universal self-growing knowledge graph
-    theoretical_reasoning_enabled: bool = True # Enable cross-domain scientific reasoning & theory evolution
-
-    # Project goal declaration (v2.8) — users declare workspace intent during setup
-    # so the engine can allocate resources, context, and agent strategies to match.
-    # Valid goal_type values: "general", "formal_verification", "web_app", "api_service",
-    #   "data_pipeline", "mobile_app", "cli_tool", "library", "research"
-    project_goal_type: str = "general"       # Workspace development goal category
-    project_goal_description: str = ""       # Free-text description of what the project aims to achieve
-    project_goal_disciplines: list[str] = field(default_factory=list)
-    # e.g. ["mathematics", "physics", "cs_theory"] — guides which formal tools to load
-
-    # Context budget management (v2.7)
-    context_budget_tokens: int = 4000          # Max total supplementary context injected per agent call
-    dag_ingest_confidence_threshold: float = 0.4  # Min confidence to ingest a concept into CapabilityDAG
-    dag_ingest_relevance_threshold: float = 0.3   # Min relevance score for DAG retrieval results
-
-    # Lean prover deep settings (v2.8)
-    lean_mcts_iterations: int = 200           # Max MCTS iterations for proof search
-    lean_decomposition_depth: int = 5         # Max recursive decomposition depth
-    lean_auto_repair_passes: int = 3          # Max sorry-elimination repair passes
-    lean_mathlib_search_enabled: bool = True   # Enable Mathlib-aware premise selection
-    lean_pantograph_repl: bool = True          # Enable Pantograph interactive REPL mode
-
-    # Multi-prover formal verification (v2.8)
-    coq_enabled: bool = False                  # Coq theorem prover
-    isabelle_enabled: bool = False             # Isabelle/HOL prover
-    tlaplus_enabled: bool = False              # TLA+ model checker (distributed systems)
-    z3_smt_enabled: bool = False               # Z3 SMT solver (program verification)
-    dafny_enabled: bool = False                # Dafny (verified programming)
     # Known model name patterns for validation (prefix-based)
     _KNOWN_MODEL_PATTERNS: tuple[str, ...] = (
         "claude-",
@@ -270,15 +272,579 @@ class ForgeConfig:
         "gemini-",
     )
 
+    # ── Backward-compatible property proxies ──
+    # These let existing code use config.xxx_enabled without changes.
+    # Over time, callers should migrate to config.advanced.xxx_enabled etc.
+
+    @property
+    def daemon_enabled(self) -> bool:
+        return self.daemon.daemon_enabled
+
+    @daemon_enabled.setter
+    def daemon_enabled(self, v: bool) -> None:
+        self.daemon.daemon_enabled = v
+
+    @property
+    def daemon_poll_interval(self) -> int:
+        return self.daemon.daemon_poll_interval
+
+    @daemon_poll_interval.setter
+    def daemon_poll_interval(self, v: int) -> None:
+        self.daemon.daemon_poll_interval = v
+
+    @property
+    def db_path(self) -> Path | None:
+        return self.daemon.db_path
+
+    @db_path.setter
+    def db_path(self, v: Path | None) -> None:
+        self.daemon.db_path = v
+
+    @property
+    def telegram_token(self) -> str:
+        return self.daemon.telegram_token
+
+    @telegram_token.setter
+    def telegram_token(self, v: str) -> None:
+        self.daemon.telegram_token = v
+
+    @property
+    def telegram_allowed_users(self) -> list[str]:
+        return self.daemon.telegram_allowed_users
+
+    @telegram_allowed_users.setter
+    def telegram_allowed_users(self, v: list[str]) -> None:
+        self.daemon.telegram_allowed_users = v
+
+    @property
+    def webhook_enabled(self) -> bool:
+        return self.daemon.webhook_enabled
+
+    @webhook_enabled.setter
+    def webhook_enabled(self, v: bool) -> None:
+        self.daemon.webhook_enabled = v
+
+    @property
+    def webhook_host(self) -> str:
+        return self.daemon.webhook_host
+
+    @webhook_host.setter
+    def webhook_host(self, v: str) -> None:
+        self.daemon.webhook_host = v
+
+    @property
+    def webhook_port(self) -> int:
+        return self.daemon.webhook_port
+
+    @webhook_port.setter
+    def webhook_port(self, v: int) -> None:
+        self.daemon.webhook_port = v
+
+    @property
+    def webhook_secret(self) -> str:
+        return self.daemon.webhook_secret
+
+    @webhook_secret.setter
+    def webhook_secret(self, v: str) -> None:
+        self.daemon.webhook_secret = v
+
+    @property
+    def daemon_max_concurrent_projects(self) -> int:
+        return self.daemon.daemon_max_concurrent_projects
+
+    @daemon_max_concurrent_projects.setter
+    def daemon_max_concurrent_projects(self, v: int) -> None:
+        self.daemon.daemon_max_concurrent_projects = v
+
+    @property
+    def daemon_pid_file(self) -> Path | None:
+        return self.daemon.daemon_pid_file
+
+    @daemon_pid_file.setter
+    def daemon_pid_file(self, v: Path | None) -> None:
+        self.daemon.daemon_pid_file = v
+
+    @property
+    def queue_max_size(self) -> int:
+        return self.daemon.queue_max_size
+
+    @queue_max_size.setter
+    def queue_max_size(self, v: int) -> None:
+        self.daemon.queue_max_size = v
+
+    @property
+    def requester_queue_limit(self) -> int:
+        return self.daemon.requester_queue_limit
+
+    @requester_queue_limit.setter
+    def requester_queue_limit(self, v: int) -> None:
+        self.daemon.requester_queue_limit = v
+
+    @property
+    def requester_daily_limit(self) -> int:
+        return self.daemon.requester_daily_limit
+
+    @requester_daily_limit.setter
+    def requester_daily_limit(self, v: int) -> None:
+        self.daemon.requester_daily_limit = v
+
+    @property
+    def requester_rate_limit(self) -> int:
+        return self.daemon.requester_rate_limit
+
+    @requester_rate_limit.setter
+    def requester_rate_limit(self, v: int) -> None:
+        self.daemon.requester_rate_limit = v
+
+    @property
+    def requester_rate_window_seconds(self) -> int:
+        return self.daemon.requester_rate_window_seconds
+
+    @requester_rate_window_seconds.setter
+    def requester_rate_window_seconds(self, v: int) -> None:
+        self.daemon.requester_rate_window_seconds = v
+
+    @property
+    def request_max_budget_usd(self) -> float:
+        return self.daemon.request_max_budget_usd
+
+    @request_max_budget_usd.setter
+    def request_max_budget_usd(self, v: float) -> None:
+        self.daemon.request_max_budget_usd = v
+
+    @property
+    def request_max_description_chars(self) -> int:
+        return self.daemon.request_max_description_chars
+
+    @request_max_description_chars.setter
+    def request_max_description_chars(self, v: int) -> None:
+        self.daemon.request_max_description_chars = v
+
+    @property
+    def telegram_allow_public(self) -> bool:
+        return self.daemon.telegram_allow_public
+
+    @telegram_allow_public.setter
+    def telegram_allow_public(self, v: bool) -> None:
+        self.daemon.telegram_allow_public = v
+
+    @property
+    def webhook_require_auth(self) -> bool:
+        return self.daemon.webhook_require_auth
+
+    @webhook_require_auth.setter
+    def webhook_require_auth(self, v: bool) -> None:
+        self.daemon.webhook_require_auth = v
+
+    @property
+    def webhook_allow_unauthenticated_local(self) -> bool:
+        return self.daemon.webhook_allow_unauthenticated_local
+
+    @webhook_allow_unauthenticated_local.setter
+    def webhook_allow_unauthenticated_local(self, v: bool) -> None:
+        self.daemon.webhook_allow_unauthenticated_local = v
+
+    @property
+    def webhook_admin_secret(self) -> str:
+        return self.daemon.webhook_admin_secret
+
+    @webhook_admin_secret.setter
+    def webhook_admin_secret(self, v: str) -> None:
+        self.daemon.webhook_admin_secret = v
+
+    @property
+    def webhook_requester_header(self) -> str:
+        return self.daemon.webhook_requester_header
+
+    @webhook_requester_header.setter
+    def webhook_requester_header(self, v: str) -> None:
+        self.daemon.webhook_requester_header = v
+
+    @property
+    def webhook_trust_requester_header(self) -> bool:
+        return self.daemon.webhook_trust_requester_header
+
+    @webhook_trust_requester_header.setter
+    def webhook_trust_requester_header(self, v: bool) -> None:
+        self.daemon.webhook_trust_requester_header = v
+
+    @property
+    def webhook_idempotency_header(self) -> str:
+        return self.daemon.webhook_idempotency_header
+
+    @webhook_idempotency_header.setter
+    def webhook_idempotency_header(self, v: str) -> None:
+        self.daemon.webhook_idempotency_header = v
+
+    @property
+    def web_tools_enabled(self) -> bool:
+        return self.tools.web_tools_enabled
+
+    @web_tools_enabled.setter
+    def web_tools_enabled(self, v: bool) -> None:
+        self.tools.web_tools_enabled = v
+
+    @property
+    def search_backend(self) -> str:
+        return self.tools.search_backend
+
+    @search_backend.setter
+    def search_backend(self, v: str) -> None:
+        self.tools.search_backend = v
+
+    @property
+    def search_api_key(self) -> str:
+        return self.tools.search_api_key
+
+    @search_api_key.setter
+    def search_api_key(self, v: str) -> None:
+        self.tools.search_api_key = v
+
+    @property
+    def github_token(self) -> str:
+        return self.tools.github_token
+
+    @github_token.setter
+    def github_token(self, v: str) -> None:
+        self.tools.github_token = v
+
+    @property
+    def search_tree_enabled(self) -> bool:
+        return self.pipeline.search_tree_enabled
+
+    @search_tree_enabled.setter
+    def search_tree_enabled(self, v: bool) -> None:
+        self.pipeline.search_tree_enabled = v
+
+    @property
+    def search_tree_max_candidates(self) -> int:
+        return self.pipeline.search_tree_max_candidates
+
+    @search_tree_max_candidates.setter
+    def search_tree_max_candidates(self, v: int) -> None:
+        self.pipeline.search_tree_max_candidates = v
+
+    @property
+    def checkpoints_enabled(self) -> bool:
+        return self.pipeline.checkpoints_enabled
+
+    @checkpoints_enabled.setter
+    def checkpoints_enabled(self, v: bool) -> None:
+        self.pipeline.checkpoints_enabled = v
+
+    @property
+    def checkpoint_interval(self) -> int:
+        return self.pipeline.checkpoint_interval
+
+    @checkpoint_interval.setter
+    def checkpoint_interval(self, v: int) -> None:
+        self.pipeline.checkpoint_interval = v
+
+    @property
+    def confirm_phases(self) -> list[str]:
+        return self.pipeline.confirm_phases
+
+    @confirm_phases.setter
+    def confirm_phases(self, v: list[str]) -> None:
+        self.pipeline.confirm_phases = v
+
+    @property
+    def build_test_loops(self) -> int:
+        return self.pipeline.build_test_loops
+
+    @build_test_loops.setter
+    def build_test_loops(self, v: int) -> None:
+        self.pipeline.build_test_loops = v
+
+    @property
+    def speculative_enabled(self) -> bool:
+        return self.pipeline.speculative_enabled
+
+    @speculative_enabled.setter
+    def speculative_enabled(self, v: bool) -> None:
+        self.pipeline.speculative_enabled = v
+
+    @property
+    def hierarchical_decomp_enabled(self) -> bool:
+        return self.pipeline.hierarchical_decomp_enabled
+
+    @hierarchical_decomp_enabled.setter
+    def hierarchical_decomp_enabled(self, v: bool) -> None:
+        self.pipeline.hierarchical_decomp_enabled = v
+
+    @property
+    def evolution_enabled(self) -> bool:
+        return self.advanced.evolution_enabled
+
+    @evolution_enabled.setter
+    def evolution_enabled(self, v: bool) -> None:
+        self.advanced.evolution_enabled = v
+
+    @property
+    def prompt_optimization_enabled(self) -> bool:
+        return self.advanced.prompt_optimization_enabled
+
+    @prompt_optimization_enabled.setter
+    def prompt_optimization_enabled(self, v: bool) -> None:
+        self.advanced.prompt_optimization_enabled = v
+
+    @property
+    def process_reward_enabled(self) -> bool:
+        return self.advanced.process_reward_enabled
+
+    @process_reward_enabled.setter
+    def process_reward_enabled(self, v: bool) -> None:
+        self.advanced.process_reward_enabled = v
+
+    @property
+    def mcts_enabled(self) -> bool:
+        return self.advanced.mcts_enabled
+
+    @mcts_enabled.setter
+    def mcts_enabled(self, v: bool) -> None:
+        self.advanced.mcts_enabled = v
+
+    @property
+    def mcts_max_iterations(self) -> int:
+        return self.advanced.mcts_max_iterations
+
+    @mcts_max_iterations.setter
+    def mcts_max_iterations(self, v: int) -> None:
+        self.advanced.mcts_max_iterations = v
+
+    @property
+    def evomac_enabled(self) -> bool:
+        return self.advanced.evomac_enabled
+
+    @evomac_enabled.setter
+    def evomac_enabled(self, v: bool) -> None:
+        self.advanced.evomac_enabled = v
+
+    @property
+    def sica_enabled(self) -> bool:
+        return self.advanced.sica_enabled
+
+    @sica_enabled.setter
+    def sica_enabled(self, v: bool) -> None:
+        self.advanced.sica_enabled = v
+
+    @property
+    def rag_enabled(self) -> bool:
+        return self.advanced.rag_enabled
+
+    @rag_enabled.setter
+    def rag_enabled(self, v: bool) -> None:
+        self.advanced.rag_enabled = v
+
+    @property
+    def formal_verify_enabled(self) -> bool:
+        return self.advanced.formal_verify_enabled
+
+    @formal_verify_enabled.setter
+    def formal_verify_enabled(self, v: bool) -> None:
+        self.advanced.formal_verify_enabled = v
+
+    @property
+    def debate_enabled(self) -> bool:
+        return self.advanced.debate_enabled
+
+    @debate_enabled.setter
+    def debate_enabled(self, v: bool) -> None:
+        self.advanced.debate_enabled = v
+
+    @property
+    def security_scan_enabled(self) -> bool:
+        return self.advanced.security_scan_enabled
+
+    @security_scan_enabled.setter
+    def security_scan_enabled(self, v: bool) -> None:
+        self.advanced.security_scan_enabled = v
+
+    @property
+    def reflexion_enabled(self) -> bool:
+        return self.advanced.reflexion_enabled
+
+    @reflexion_enabled.setter
+    def reflexion_enabled(self, v: bool) -> None:
+        self.advanced.reflexion_enabled = v
+
+    @property
+    def adaptive_compute_enabled(self) -> bool:
+        return self.advanced.adaptive_compute_enabled
+
+    @adaptive_compute_enabled.setter
+    def adaptive_compute_enabled(self, v: bool) -> None:
+        self.advanced.adaptive_compute_enabled = v
+
+    @property
+    def ldb_debugger_enabled(self) -> bool:
+        return self.advanced.ldb_debugger_enabled
+
+    @ldb_debugger_enabled.setter
+    def ldb_debugger_enabled(self, v: bool) -> None:
+        self.advanced.ldb_debugger_enabled = v
+
+    @property
+    def lean_prover_enabled(self) -> bool:
+        return self.advanced.lean_prover_enabled
+
+    @lean_prover_enabled.setter
+    def lean_prover_enabled(self, v: bool) -> None:
+        self.advanced.lean_prover_enabled = v
+
+    @property
+    def capability_dag_enabled(self) -> bool:
+        return self.advanced.capability_dag_enabled
+
+    @capability_dag_enabled.setter
+    def capability_dag_enabled(self, v: bool) -> None:
+        self.advanced.capability_dag_enabled = v
+
+    @property
+    def theoretical_reasoning_enabled(self) -> bool:
+        return self.advanced.theoretical_reasoning_enabled
+
+    @theoretical_reasoning_enabled.setter
+    def theoretical_reasoning_enabled(self, v: bool) -> None:
+        self.advanced.theoretical_reasoning_enabled = v
+
+    @property
+    def context_budget_tokens(self) -> int:
+        return self.advanced.context_budget_tokens
+
+    @context_budget_tokens.setter
+    def context_budget_tokens(self, v: int) -> None:
+        self.advanced.context_budget_tokens = v
+
+    @property
+    def dag_ingest_confidence_threshold(self) -> float:
+        return self.advanced.dag_ingest_confidence_threshold
+
+    @dag_ingest_confidence_threshold.setter
+    def dag_ingest_confidence_threshold(self, v: float) -> None:
+        self.advanced.dag_ingest_confidence_threshold = v
+
+    @property
+    def dag_ingest_relevance_threshold(self) -> float:
+        return self.advanced.dag_ingest_relevance_threshold
+
+    @dag_ingest_relevance_threshold.setter
+    def dag_ingest_relevance_threshold(self, v: float) -> None:
+        self.advanced.dag_ingest_relevance_threshold = v
+
+    @property
+    def lean_mcts_iterations(self) -> int:
+        return self.advanced.lean_mcts_iterations
+
+    @lean_mcts_iterations.setter
+    def lean_mcts_iterations(self, v: int) -> None:
+        self.advanced.lean_mcts_iterations = v
+
+    @property
+    def lean_decomposition_depth(self) -> int:
+        return self.advanced.lean_decomposition_depth
+
+    @lean_decomposition_depth.setter
+    def lean_decomposition_depth(self, v: int) -> None:
+        self.advanced.lean_decomposition_depth = v
+
+    @property
+    def lean_auto_repair_passes(self) -> int:
+        return self.advanced.lean_auto_repair_passes
+
+    @lean_auto_repair_passes.setter
+    def lean_auto_repair_passes(self, v: int) -> None:
+        self.advanced.lean_auto_repair_passes = v
+
+    @property
+    def lean_mathlib_search_enabled(self) -> bool:
+        return self.advanced.lean_mathlib_search_enabled
+
+    @lean_mathlib_search_enabled.setter
+    def lean_mathlib_search_enabled(self, v: bool) -> None:
+        self.advanced.lean_mathlib_search_enabled = v
+
+    @property
+    def lean_pantograph_repl(self) -> bool:
+        return self.advanced.lean_pantograph_repl
+
+    @lean_pantograph_repl.setter
+    def lean_pantograph_repl(self, v: bool) -> None:
+        self.advanced.lean_pantograph_repl = v
+
+    @property
+    def coq_enabled(self) -> bool:
+        return self.advanced.coq_enabled
+
+    @coq_enabled.setter
+    def coq_enabled(self, v: bool) -> None:
+        self.advanced.coq_enabled = v
+
+    @property
+    def isabelle_enabled(self) -> bool:
+        return self.advanced.isabelle_enabled
+
+    @isabelle_enabled.setter
+    def isabelle_enabled(self, v: bool) -> None:
+        self.advanced.isabelle_enabled = v
+
+    @property
+    def tlaplus_enabled(self) -> bool:
+        return self.advanced.tlaplus_enabled
+
+    @tlaplus_enabled.setter
+    def tlaplus_enabled(self, v: bool) -> None:
+        self.advanced.tlaplus_enabled = v
+
+    @property
+    def z3_smt_enabled(self) -> bool:
+        return self.advanced.z3_smt_enabled
+
+    @z3_smt_enabled.setter
+    def z3_smt_enabled(self, v: bool) -> None:
+        self.advanced.z3_smt_enabled = v
+
+    @property
+    def dafny_enabled(self) -> bool:
+        return self.advanced.dafny_enabled
+
+    @dafny_enabled.setter
+    def dafny_enabled(self, v: bool) -> None:
+        self.advanced.dafny_enabled = v
+
+    @property
+    def project_goal_type(self) -> str:
+        return self.goal.project_goal_type
+
+    @project_goal_type.setter
+    def project_goal_type(self, v: str) -> None:
+        self.goal.project_goal_type = v
+
+    @property
+    def project_goal_description(self) -> str:
+        return self.goal.project_goal_description
+
+    @project_goal_description.setter
+    def project_goal_description(self, v: str) -> None:
+        self.goal.project_goal_description = v
+
+    @property
+    def project_goal_disciplines(self) -> list[str]:
+        return self.goal.project_goal_disciplines
+
+    @project_goal_disciplines.setter
+    def project_goal_disciplines(self, v: list[str]) -> None:
+        self.goal.project_goal_disciplines = v
+
     def __post_init__(self) -> None:
         if self.workspace_dir is None:
             self.workspace_dir = self.project_root / "workspace"
         if self.constitution_dir is None:
             self.constitution_dir = autoforge.DATA_DIR / "constitution"
-        if self.daemon_pid_file is None:
-            self.daemon_pid_file = self.project_root / ".autoforge" / "daemon.pid"
-        if self.db_path is None:
-            self.db_path = self.project_root / "autoforge.db"
+        if self.daemon.daemon_pid_file is None:
+            self.daemon.daemon_pid_file = self.project_root / ".autoforge" / "daemon.pid"
+        if self.daemon.db_path is None:
+            self.daemon.db_path = self.project_root / "autoforge.db"
         if not self.run_id:
             self.run_id = uuid.uuid4().hex[:12]
 
@@ -394,33 +960,6 @@ class ForgeConfig:
         )
         daemon_pid_file = Path(daemon_pid_raw).expanduser() if daemon_pid_raw else None
 
-        # Validate log level
-        log_level = (
-            os.getenv("FORGE_LOG_LEVEL")
-            or global_config.get("log_level", "INFO")
-        ).upper()
-        if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
-            logging.getLogger(__name__).warning(
-                f"Invalid FORGE_LOG_LEVEL={log_level!r}, using INFO"
-            )
-            log_level = "INFO"
-
-        budget = _safe_float(
-            "FORGE_BUDGET_LIMIT",
-            float(global_config.get("budget_limit_usd", 10.0)),
-        )
-        if budget <= 0:
-            budget = 10.0
-
-        max_agents = _safe_int(
-            "FORGE_MAX_AGENTS",
-            _to_int(global_config.get("max_agents", 3), 3),
-        )
-        if max_agents < 1:
-            max_agents = 1
-        elif max_agents > 50:
-            max_agents = 50
-
         daemon_max_concurrent_projects = _safe_int(
             "FORGE_DAEMON_MAX_CONCURRENT_PROJECTS",
             _to_int(global_config.get("daemon_max_concurrent_projects", 1), 1),
@@ -477,6 +1016,33 @@ class ForgeConfig:
         if request_max_budget_usd <= 0:
             request_max_budget_usd = 1000.0
 
+        # Validate log level
+        log_level = (
+            os.getenv("FORGE_LOG_LEVEL")
+            or global_config.get("log_level", "INFO")
+        ).upper()
+        if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            logging.getLogger(__name__).warning(
+                f"Invalid FORGE_LOG_LEVEL={log_level!r}, using INFO"
+            )
+            log_level = "INFO"
+
+        budget = _safe_float(
+            "FORGE_BUDGET_LIMIT",
+            float(global_config.get("budget_limit_usd", 10.0)),
+        )
+        if budget <= 0:
+            budget = 10.0
+
+        max_agents = _safe_int(
+            "FORGE_MAX_AGENTS",
+            _to_int(global_config.get("max_agents", 3), 3),
+        )
+        if max_agents < 1:
+            max_agents = 1
+        elif max_agents > 50:
+            max_agents = 50
+
         config = cls(
             api_keys=api_keys,
             auth_config=auth_config,
@@ -497,46 +1063,45 @@ class ForgeConfig:
             ),
             mode=global_config.get("mode", "developer"),
             mobile_target=global_config.get("mobile_target", "none"),
-            # Daemon
-            daemon_poll_interval=_safe_int("FORGE_DAEMON_POLL_INTERVAL", 10),
-            daemon_max_concurrent_projects=daemon_max_concurrent_projects,
-            daemon_pid_file=daemon_pid_file,
-            queue_max_size=queue_max_size,
-            requester_queue_limit=requester_queue_limit,
-            requester_daily_limit=requester_daily_limit,
-            requester_rate_limit=requester_rate_limit,
-            requester_rate_window_seconds=requester_rate_window_seconds,
-            request_max_budget_usd=request_max_budget_usd,
-            request_max_description_chars=request_max_description_chars,
-            # Telegram
-            telegram_token=os.getenv("FORGE_TELEGRAM_TOKEN", ""),
-            telegram_allowed_users=allowed_users,
-            telegram_allow_public=os.getenv("FORGE_TELEGRAM_ALLOW_PUBLIC", "").lower() in ("true", "1", "yes"),
-            # Webhook
-            webhook_enabled=os.getenv("FORGE_WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes"),
-            webhook_host=os.getenv("FORGE_WEBHOOK_HOST", "127.0.0.1"),
-            webhook_port=_safe_int("FORGE_WEBHOOK_PORT", 8420),
-            webhook_secret=os.getenv("FORGE_WEBHOOK_SECRET", ""),
-            webhook_require_auth=os.getenv("FORGE_WEBHOOK_REQUIRE_AUTH", "true").lower() not in ("false", "0", "no"),
-            webhook_allow_unauthenticated_local=os.getenv("FORGE_WEBHOOK_ALLOW_UNAUTH_LOCAL", "").lower() in ("true", "1", "yes"),
-            webhook_admin_secret=os.getenv("FORGE_WEBHOOK_ADMIN_SECRET", ""),
-            webhook_requester_header=os.getenv("FORGE_WEBHOOK_REQUESTER_HEADER", "X-Autoforge-Requester"),
-            webhook_trust_requester_header=os.getenv("FORGE_WEBHOOK_TRUST_REQUESTER_HEADER", "").lower() in ("true", "1", "yes"),
-            webhook_idempotency_header=os.getenv("FORGE_WEBHOOK_IDEMPOTENCY_HEADER", "Idempotency-Key"),
-            # Web tools
-            web_tools_enabled=os.getenv("FORGE_WEB_TOOLS", "true").lower() not in ("false", "0", "no"),
-            search_backend=os.getenv("FORGE_SEARCH_BACKEND", global_config.get("search_backend", "duckduckgo")),
-            search_api_key=os.getenv("FORGE_SEARCH_API_KEY", global_config.get("search_api_key", "")),
-            # Build TDD
-            build_test_loops=_safe_int("FORGE_BUILD_TEST_LOOPS", _to_int(global_config.get("build_test_loops", 0), 0)),
-            # GitHub
-            github_token=os.getenv("GITHUB_TOKEN", global_config.get("github_token", "")),
-            # Search tree
-            search_tree_enabled=os.getenv("FORGE_SEARCH_TREE", "true").lower() not in ("false", "0", "no"),
-            search_tree_max_candidates=_safe_int("FORGE_SEARCH_CANDIDATES", _to_int(global_config.get("search_tree_max_candidates", 3), 3)),
-            # Checkpoints
-            checkpoints_enabled=os.getenv("FORGE_CHECKPOINTS", "true").lower() not in ("false", "0", "no"),
-            checkpoint_interval=_safe_int("FORGE_CHECKPOINT_INTERVAL", _to_int(global_config.get("checkpoint_interval", 8), 8)),
+            # Sub-configs
+            daemon=DaemonConfig(
+                daemon_poll_interval=_safe_int("FORGE_DAEMON_POLL_INTERVAL", 10),
+                daemon_max_concurrent_projects=daemon_max_concurrent_projects,
+                daemon_pid_file=daemon_pid_file,
+                queue_max_size=queue_max_size,
+                requester_queue_limit=requester_queue_limit,
+                requester_daily_limit=requester_daily_limit,
+                requester_rate_limit=requester_rate_limit,
+                requester_rate_window_seconds=requester_rate_window_seconds,
+                request_max_budget_usd=request_max_budget_usd,
+                request_max_description_chars=request_max_description_chars,
+                telegram_token=os.getenv("FORGE_TELEGRAM_TOKEN", ""),
+                telegram_allowed_users=allowed_users,
+                telegram_allow_public=os.getenv("FORGE_TELEGRAM_ALLOW_PUBLIC", "").lower() in ("true", "1", "yes"),
+                webhook_enabled=os.getenv("FORGE_WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes"),
+                webhook_host=os.getenv("FORGE_WEBHOOK_HOST", "127.0.0.1"),
+                webhook_port=_safe_int("FORGE_WEBHOOK_PORT", 8420),
+                webhook_secret=os.getenv("FORGE_WEBHOOK_SECRET", ""),
+                webhook_require_auth=os.getenv("FORGE_WEBHOOK_REQUIRE_AUTH", "true").lower() not in ("false", "0", "no"),
+                webhook_allow_unauthenticated_local=os.getenv("FORGE_WEBHOOK_ALLOW_UNAUTH_LOCAL", "").lower() in ("true", "1", "yes"),
+                webhook_admin_secret=os.getenv("FORGE_WEBHOOK_ADMIN_SECRET", ""),
+                webhook_requester_header=os.getenv("FORGE_WEBHOOK_REQUESTER_HEADER", "X-Autoforge-Requester"),
+                webhook_trust_requester_header=os.getenv("FORGE_WEBHOOK_TRUST_REQUESTER_HEADER", "").lower() in ("true", "1", "yes"),
+                webhook_idempotency_header=os.getenv("FORGE_WEBHOOK_IDEMPOTENCY_HEADER", "Idempotency-Key"),
+            ),
+            tools=ToolsConfig(
+                web_tools_enabled=os.getenv("FORGE_WEB_TOOLS", "true").lower() not in ("false", "0", "no"),
+                search_backend=os.getenv("FORGE_SEARCH_BACKEND", global_config.get("search_backend", "duckduckgo")),
+                search_api_key=os.getenv("FORGE_SEARCH_API_KEY", global_config.get("search_api_key", "")),
+                github_token=os.getenv("GITHUB_TOKEN", global_config.get("github_token", "")),
+            ),
+            pipeline=PipelineConfig(
+                search_tree_enabled=os.getenv("FORGE_SEARCH_TREE", "true").lower() not in ("false", "0", "no"),
+                search_tree_max_candidates=_safe_int("FORGE_SEARCH_CANDIDATES", _to_int(global_config.get("search_tree_max_candidates", 3), 3)),
+                checkpoints_enabled=os.getenv("FORGE_CHECKPOINTS", "true").lower() not in ("false", "0", "no"),
+                checkpoint_interval=_safe_int("FORGE_CHECKPOINT_INTERVAL", _to_int(global_config.get("checkpoint_interval", 8), 8)),
+                build_test_loops=_safe_int("FORGE_BUILD_TEST_LOOPS", _to_int(global_config.get("build_test_loops", 0), 0)),
+            ),
         )
 
         # Layer 1: CLI overrides (highest priority)
@@ -577,6 +1142,30 @@ class ForgeConfig:
     def check_budget(self) -> bool:
         """Return True if there is budget remaining."""
         return self.estimated_cost_usd < self.budget_limit_usd
+
+
+# ── Backward-compatible constructor ──────────────────────────────
+# Wrap the dataclass-generated __init__ so callers can pass legacy
+# field names (e.g. web_tools_enabled=False) that are now property
+# proxies routed to sub-config objects.
+
+_ForgeConfig_dc_init = ForgeConfig.__init__
+
+
+def _ForgeConfig_compat_init(self: ForgeConfig, **kwargs: Any) -> None:
+    real_fields = {f.name for f in ForgeConfig.__dataclass_fields__.values()}
+    extra = {k: v for k, v in kwargs.items() if k not in real_fields}
+    clean = {k: v for k, v in kwargs.items() if k in real_fields}
+    _ForgeConfig_dc_init(self, **clean)
+    for k, v in extra.items():
+        if v is not None:
+            try:
+                setattr(self, k, v)
+            except AttributeError:
+                pass
+
+
+ForgeConfig.__init__ = _ForgeConfig_compat_init  # type: ignore[assignment]
 
 
 def _load_global_config() -> dict:

@@ -21,39 +21,24 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
-from autoforge.engine.agents.architect import ArchitectAgent
-from autoforge.engine.agents.builder import BuilderAgent
-from autoforge.engine.agents.director import DirectorAgent, DirectorFixAgent
-from autoforge.engine.agents.gardener import GardenerAgent
-from autoforge.engine.agents.reviewer import ReviewerAgent
-from autoforge.engine.agents.scanner import ScannerAgent
-from autoforge.engine.agents.tester import TesterAgent
+# Core imports (always needed)
 from autoforge.engine.config import ForgeConfig
 from autoforge.engine.git_manager import GitManager, is_git_available
 from autoforge.engine.llm_router import BudgetExceededError, LLMRouter
 from autoforge.engine.lock_manager import LockManager
 from autoforge.engine.sandbox import SandboxBase, create_sandbox
+from autoforge.engine.task_dag import Task, TaskDAG, TaskPhase, TaskStatus
+
+# Agents — loaded via registry (no direct class imports needed at module level)
+from autoforge.engine.agents import AGENT_REGISTRY
+
+# Advanced engines — lazy-imported on first use via _lazy_import() to reduce
+# startup time when features are disabled.  Only the types actually needed
+# at runtime are imported; everything else stays behind the config gate.
 from autoforge.engine.dynamic_constitution import DynamicConstitution
-from autoforge.engine.evolution import EvolutionEngine, FitnessScore, WorkflowGenome
+from autoforge.engine.evolution import EvolutionEngine, WorkflowGenome
 from autoforge.engine.process_reward import ProcessRewardModel, StepType
 from autoforge.engine.prompt_optimizer import PromptOptimizer
-from autoforge.engine.search_tree import MCTSSearchTree, SearchTree, evaluate_candidate
-from autoforge.engine.evomac import EvoMACEngine
-from autoforge.engine.sica import SICAEngine
-from autoforge.engine.rag_retrieval import RAGRetrievalEngine
-from autoforge.engine.formal_verify import FormalVerifier
-from autoforge.engine.agent_debate import ConditionalDebateEngine
-from autoforge.engine.security_scan import SecurityScanner
-from autoforge.engine.reflexion import ReflexionEngine
-from autoforge.engine.adaptive_compute import AdaptiveComputeRouter
-from autoforge.engine.ldb_debugger import LDBDebugger
-from autoforge.engine.speculative_pipeline import SpeculativePipeline
-from autoforge.engine.hierarchical_decomp import HierarchicalDecomposer
-from autoforge.engine.lean_prover import LeanProver
-from autoforge.engine.multi_prover import MultiProverEngine
-from autoforge.engine.capability_dag import CapabilityDAG, DAGBridge, Domain
-from autoforge.engine.theoretical_reasoning import TheoreticalReasoningEngine
-from autoforge.engine.task_dag import Task, TaskDAG, TaskPhase, TaskStatus
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -76,33 +61,90 @@ class Orchestrator:
         self._state_file: Path | None = None
         self._start_time: float = 0
         self._dynamic_constitution: DynamicConstitution | None = None
-        self._search_tree: SearchTree | None = None
+        self._search_tree: Any = None
         self._evolution = EvolutionEngine()
         self._genome: WorkflowGenome | None = None
         self._prompt_optimizer = PromptOptimizer()
         self._process_reward: ProcessRewardModel | None = None
-        self._evomac = EvoMACEngine()
-        self._sica = SICAEngine()
-        self._rag = RAGRetrievalEngine()
-        self._formal_verifier = FormalVerifier()
-        self._debate = ConditionalDebateEngine()
-        self._security_scanner = SecurityScanner()
-        self._reflexion = ReflexionEngine()
-        self._adaptive_compute = AdaptiveComputeRouter()
-        self._ldb = LDBDebugger()
-        self._speculative = SpeculativePipeline()
-        self._decomposer = HierarchicalDecomposer()
-        self._lean_prover: LeanProver | None = None
-        self._multi_prover: MultiProverEngine | None = None
-        self._capability_dag = CapabilityDAG()
-        self._dag_bridge = DAGBridge(self._capability_dag)
         self._agent_counter: int = 0
         self._wall_start: float = 0.0
         self._difficulty: float | None = None
-        self._theoretical_reasoning = TheoreticalReasoningEngine()
         # Adaptive context budget tracking
         self._context_budget_multiplier: float = 1.0
         self._context_success_history: list[bool] = []
+
+        # ── Lazy-initialized advanced engines ──
+        # Only created when the corresponding config flag is True.
+        # Reduces startup time and memory when features are disabled.
+        self._evomac: Any = None
+        self._sica: Any = None
+        self._rag: Any = None
+        self._formal_verifier: Any = None
+        self._debate: Any = None
+        self._security_scanner: Any = None
+        self._reflexion: Any = None
+        self._adaptive_compute: Any = None
+        self._ldb: Any = None
+        self._speculative: Any = None
+        self._decomposer: Any = None
+        self._lean_prover: Any = None
+        self._multi_prover: Any = None
+        self._capability_dag: Any = None
+        self._dag_bridge: Any = None
+        self._theoretical_reasoning: Any = None
+        self._init_engines()
+
+    def _agent(self, role: str, *args: Any, **kwargs: Any) -> Any:
+        """Instantiate an agent by role name via AGENT_REGISTRY.
+
+        Usage: self._agent("builder", self.config, self.llm, working_dir=wd)
+        """
+        cls = AGENT_REGISTRY[role]
+        return cls(*args, **kwargs)
+
+    def _init_engines(self) -> None:
+        """Lazily initialize only the engines that are enabled in config."""
+        c = self.config
+        if c.evomac_enabled:
+            from autoforge.engine.evomac import EvoMACEngine
+            self._evomac = EvoMACEngine()
+        if c.sica_enabled:
+            from autoforge.engine.sica import SICAEngine
+            self._sica = SICAEngine()
+        if c.rag_enabled:
+            from autoforge.engine.rag_retrieval import RAGRetrievalEngine
+            self._rag = RAGRetrievalEngine()
+        if c.formal_verify_enabled:
+            from autoforge.engine.formal_verify import FormalVerifier
+            self._formal_verifier = FormalVerifier()
+        if c.debate_enabled:
+            from autoforge.engine.agent_debate import ConditionalDebateEngine
+            self._debate = ConditionalDebateEngine()
+        if c.security_scan_enabled:
+            from autoforge.engine.security_scan import SecurityScanner
+            self._security_scanner = SecurityScanner()
+        if c.reflexion_enabled:
+            from autoforge.engine.reflexion import ReflexionEngine
+            self._reflexion = ReflexionEngine()
+        if c.adaptive_compute_enabled:
+            from autoforge.engine.adaptive_compute import AdaptiveComputeRouter
+            self._adaptive_compute = AdaptiveComputeRouter()
+        if c.ldb_debugger_enabled:
+            from autoforge.engine.ldb_debugger import LDBDebugger
+            self._ldb = LDBDebugger()
+        if c.speculative_enabled:
+            from autoforge.engine.speculative_pipeline import SpeculativePipeline
+            self._speculative = SpeculativePipeline()
+        if c.hierarchical_decomp_enabled:
+            from autoforge.engine.hierarchical_decomp import HierarchicalDecomposer
+            self._decomposer = HierarchicalDecomposer()
+        if c.capability_dag_enabled:
+            from autoforge.engine.capability_dag import CapabilityDAG, DAGBridge
+            self._capability_dag = CapabilityDAG()
+            self._dag_bridge = DAGBridge(self._capability_dag)
+        if c.theoretical_reasoning_enabled:
+            from autoforge.engine.theoretical_reasoning import TheoreticalReasoningEngine
+            self._theoretical_reasoning = TheoreticalReasoningEngine()
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
@@ -112,12 +154,13 @@ class Orchestrator:
 
         # Load capability DAG from global storage
         global_dag_dir = self.config.project_root / ".autoforge" / "capability_dag"
-        self._capability_dag.load(global_dag_dir)
-        if self._capability_dag.size > 0:
-            console.print(f"  [cyan]CapabilityDAG:[/cyan] loaded {self._capability_dag.size} capabilities")
+        if self._capability_dag is not None:
+            self._capability_dag.load(global_dag_dir)
+            if self._capability_dag.size > 0:
+                console.print(f"  [cyan]CapabilityDAG:[/cyan] loaded {self._capability_dag.size} capabilities")
 
         # Load theoretical reasoning state (cross-domain theory graphs)
-        if self.config.theoretical_reasoning_enabled:
+        if self.config.theoretical_reasoning_enabled and self._theoretical_reasoning is not None:
             theory_dir = self.config.project_root / ".autoforge" / "theories"
             self._theoretical_reasoning.load_all(theory_dir)
             n_theories = len(self._theoretical_reasoning._theories)
@@ -300,11 +343,12 @@ class Orchestrator:
                 self._adaptive_compute.save_state(self.project_dir / ".autoforge")
 
             # CapabilityDAG: ingest knowledge from this run + save
-            await self._ingest_run_to_dag(project_name)
-            self._capability_dag.save(global_dag_dir)
-            console.print(
-                f"  [cyan]CapabilityDAG:[/cyan] {self._capability_dag.size} total capabilities"
-            )
+            if self._capability_dag is not None:
+                await self._ingest_run_to_dag(project_name)
+                self._capability_dag.save(global_dag_dir)
+                console.print(
+                    f"  [cyan]CapabilityDAG:[/cyan] {self._capability_dag.size} total capabilities"
+                )
 
             self._print_summary()
             return self.project_dir
@@ -369,7 +413,7 @@ class Orchestrator:
     # ──────────────────────────────────────────────
 
     async def _phase_spec(self, requirement: str) -> dict[str, Any]:
-        director = DirectorAgent(self.config, self.llm)
+        director = self._agent("director", self.config, self.llm)
         result = await director.run({"project_description": requirement})
 
         if not result.success:
@@ -392,7 +436,7 @@ class Orchestrator:
     async def _phase_build(self) -> None:
         # Step 1: Architect designs and creates task DAG
         console.print("  Designing architecture...")
-        architect = ArchitectAgent(self.config, self.llm)
+        architect = self._agent("architect", self.config, self.llm)
 
         # Inject dynamic constitution into architect
         if self._dynamic_constitution:
@@ -680,7 +724,7 @@ class Orchestrator:
                 # No git — work directly in project dir
                 working_dir = self.project_dir
 
-            builder = BuilderAgent(
+            builder = self._agent("builder",
                 self.config,
                 self.llm,
                 working_dir=working_dir,
@@ -793,12 +837,13 @@ class Orchestrator:
                 _add_context("rag", rag_context, max_share=dynamic_shares.get("rag", 0.20))
 
             # P5: CapabilityDAG (universal knowledge graph)
-            dag_budget = min(1500, _budget_remaining() // 4)
-            dag_context = self._dag_bridge.build_context(task.description, max_tokens=dag_budget)
-            _add_context("dag", dag_context, max_share=dynamic_shares.get("dag", 0.20))
+            if self._dag_bridge is not None:
+                dag_budget = min(1500, _budget_remaining() // 4)
+                dag_context = self._dag_bridge.build_context(task.description, max_tokens=dag_budget)
+                _add_context("dag", dag_context, max_share=dynamic_shares.get("dag", 0.20))
 
             # P6: Theoretical reasoning (cross-domain theory knowledge)
-            if self.config.theoretical_reasoning_enabled and self._theoretical_reasoning._theories:
+            if self.config.theoretical_reasoning_enabled and self._theoretical_reasoning is not None and self._theoretical_reasoning._theories:
                 theory_context = self._build_theory_context(
                     task.description, max_tokens=min(1000, _budget_remaining() // 4),
                 )
@@ -871,7 +916,7 @@ class Orchestrator:
                 await self._tdd_loop(task, builder, sandbox, working_dir, agent_id, use_git, git, branch_name)
 
                 # Quick review
-                reviewer = ReviewerAgent(self.config, self.llm, working_dir)
+                reviewer = self._agent("reviewer", self.config, self.llm, working_dir)
                 if self._dynamic_constitution:
                     supplement = self._dynamic_constitution.build_supplementary_prompt("reviewer")
                     if supplement:
@@ -1207,7 +1252,7 @@ class Orchestrator:
     async def _phase_verify(self) -> None:
         sandbox = create_sandbox(self.config, self.project_dir)
         async with sandbox:
-            tester = TesterAgent(self.config, self.llm, self.project_dir, sandbox)
+            tester = self._agent("tester", self.config, self.llm, self.project_dir, sandbox)
             result = await tester.run({"spec": self.spec})
             test_results = tester.parse_results(result.output)
 
@@ -1247,7 +1292,7 @@ class Orchestrator:
             console.print(f"  Fix attempt {attempt + 1}/{self.config.max_retries}")
 
             # Director creates fix tasks
-            fix_director = DirectorFixAgent(self.config, self.llm)
+            fix_director = self._agent("director_fix", self.config, self.llm)
             for failure in failures[:3]:  # Limit fixes per attempt
                 failure_id = f"fix-{hash(str(failure)) % 10000}"
                 failure_msg = failure if isinstance(failure, str) else str(failure)
@@ -1307,7 +1352,7 @@ class Orchestrator:
                     })
 
             # Re-test
-            tester = TesterAgent(self.config, self.llm, self.project_dir, sandbox)
+            tester = self._agent("tester", self.config, self.llm, self.project_dir, sandbox)
             result = await tester.run({"spec": self.spec})
             test_results = tester.parse_results(result.output)
 
@@ -1350,7 +1395,7 @@ class Orchestrator:
 
     async def _phase_refactor(self) -> None:
         # Quick review of overall quality
-        reviewer = ReviewerAgent(self.config, self.llm, self.project_dir)
+        reviewer = self._agent("reviewer", self.config, self.llm, self.project_dir)
         review_result = await reviewer.run({
             "task": {"id": "FINAL", "description": "Final quality review", "files": self._list_project_files()},
             "spec": self.spec,
@@ -1364,7 +1409,7 @@ class Orchestrator:
         console.print(f"  Quality score: {review.score}/10 — refactoring...")
 
         if review.issues:
-            gardener = GardenerAgent(self.config, self.llm, self.project_dir)
+            gardener = self._agent("gardener", self.config, self.llm, self.project_dir)
             await gardener.run({
                 "review": {"issues": review.issues, "summary": review.summary},
                 "spec": self.spec,
@@ -1456,7 +1501,7 @@ class Orchestrator:
 
     async def _phase_scan(self, project_dir: Path):
         """Run Scanner Agent on existing project."""
-        scanner = ScannerAgent(self.config, self.llm, project_dir)
+        scanner = self._agent("scanner", self.config, self.llm, project_dir)
         result = await scanner.run({"project_path": str(project_dir)})
 
         if not result.success:
@@ -1466,7 +1511,7 @@ class Orchestrator:
 
     async def _phase_full_review(self):
         """Run full-project review with Reviewer Agent."""
-        reviewer = ReviewerAgent(self.config, self.llm, self.project_dir)
+        reviewer = self._agent("reviewer", self.config, self.llm, self.project_dir)
         review_result = await reviewer.run({
             "task": {"id": "FULL-REVIEW", "description": "Full project review", "files": self._list_project_files()},
             "spec": self.spec,
@@ -1614,7 +1659,7 @@ class Orchestrator:
         then Architect + Builders to implement new code.
         """
         # Director merges existing spec with enhancement request
-        director = DirectorAgent(self.config, self.llm)
+        director = self._agent("director", self.config, self.llm)
         result = await director.run({
             "project_description": (
                 f"This is an existing project with the following spec:\n"
@@ -1786,6 +1831,7 @@ class Orchestrator:
             return architect.parse_architecture(arch_result.output)
 
         # Step 2: Set up search tree
+        from autoforge.engine.search_tree import SearchTree
         self._search_tree = SearchTree()
         root = self._search_tree.create_root(
             description="Architecture exploration",
@@ -2150,6 +2196,7 @@ class Orchestrator:
         try:
             # Lazy init
             if self._lean_prover is None:
+                from autoforge.engine.lean_prover import LeanProver
                 self._lean_prover = LeanProver(workspace=self.project_dir)
                 # Load prior state if available
                 lean_state = self.project_dir / ".autoforge" / "lean"
@@ -2230,6 +2277,7 @@ class Orchestrator:
             if _any_alt_prover:
                 try:
                     if self._multi_prover is None:
+                        from autoforge.engine.multi_prover import MultiProverEngine
                         self._multi_prover = MultiProverEngine(workspace=self.project_dir)
                     available = await self._multi_prover.detect_available_provers()
                     active = [k.value for k, v in available.items() if v]

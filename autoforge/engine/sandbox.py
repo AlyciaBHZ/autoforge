@@ -19,6 +19,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from autoforge.engine.config import ForgeConfig
 
@@ -58,11 +59,11 @@ class SandboxBase(ABC):
     async def stop(self) -> None:
         """Clean up the sandbox."""
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> SandboxBase:
         await self.start()
         return self
 
-    async def __aexit__(self, *args):
+    async def __aexit__(self, *args: Any) -> None:
         await self.stop()
 
 

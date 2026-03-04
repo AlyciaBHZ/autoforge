@@ -22,6 +22,38 @@ from autoforge.engine.config import DEFAULT_PRICING, MODEL_PRICING, ForgeConfig
 logger = logging.getLogger(__name__)
 
 
+# ── LLM Provider Protocol ──────────────────────────────────────────
+# Implement this protocol to add a new LLM provider (e.g., Mistral, Cohere).
+# Then register it via LLMRouter.register_provider().
+
+
+class LLMProvider:
+    """Protocol for LLM provider implementations.
+
+    To add a new provider:
+        1. Subclass LLMProvider
+        2. Implement get_client(), call(), convert_messages(), convert_tools()
+        3. Register via LLMRouter.register_provider("my_provider", MyProvider())
+        4. Add model patterns to detect_provider() or use explicit provider selection
+    """
+
+    def get_client(self, config: ForgeConfig, auth: Any) -> Any:
+        """Create or return a cached async client."""
+        raise NotImplementedError
+
+    async def call(
+        self,
+        client: Any,
+        model: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        max_tokens: int,
+    ) -> "LLMResponse":
+        """Make an API call and return a normalized LLMResponse."""
+        raise NotImplementedError
+
+
 # ── Normalized response types ──────────────────────────────────────
 
 
@@ -114,6 +146,23 @@ class LLMRouter:
     It handles provider detection, model selection, format conversion,
     budget enforcement, and usage logging.
     """
+
+    # Custom provider registry — populated via register_provider()
+    _custom_providers: dict[str, LLMProvider] = {}
+
+    @classmethod
+    def register_provider(cls, name: str, provider: LLMProvider) -> None:
+        """Register a custom LLM provider.
+
+        Once registered, models that detect_provider() maps to `name`
+        will be routed through this provider's call() method.
+
+        Args:
+            name: Provider identifier (e.g., "mistral", "cohere").
+            provider: An LLMProvider implementation.
+        """
+        cls._custom_providers[name] = provider
+        logger.info(f"Registered custom LLM provider: {name}")
 
     def __init__(self, config: ForgeConfig) -> None:
         self.config = config
