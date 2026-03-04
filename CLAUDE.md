@@ -63,6 +63,11 @@ engine/rag_retrieval.py         Library-level RAG — BM25+TF-IDF hybrid cross-p
 engine/formal_verify.py         Formal verification — multi-level linting, type checking, LLM formal analysis
 engine/agent_debate.py          Conditional debate — reward-guided multi-agent architecture debate
 engine/security_scan.py         RedCode security scanning — pattern matching + LLM deep vulnerability analysis
+engine/reflexion.py             Reflexion — verbal RL with episodic memory for failure-informed retries
+engine/adaptive_compute.py      Adaptive test-time compute — difficulty-aware resource allocation + self-calibration
+engine/ldb_debugger.py          LDB — block-level fault localization via runtime simulation
+engine/speculative_pipeline.py  Speculative pipeline — overlapping phase pre-execution for speed
+engine/hierarchical_decomp.py   Hierarchical decomposition — Parsel-style function-level task planning
 engine/task_dag.py           TaskDAG — dependency graph, scheduling, persistence
 engine/lock_manager.py      Cross-platform atomic task locking (symlink on POSIX, O_CREAT|O_EXCL on Windows)
 engine/git_manager.py       Git worktree isolation for parallel builders

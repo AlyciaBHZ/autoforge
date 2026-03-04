@@ -182,6 +182,21 @@ class ForgeConfig:
     # RedCode security scanning
     security_scan_enabled: bool = True  # Enable security vulnerability scanning
 
+    # Reflexion episodic memory (NeurIPS 2023)
+    reflexion_enabled: bool = True   # Enable verbal RL with failure reflections
+
+    # Adaptive test-time compute (ICLR 2025)
+    adaptive_compute_enabled: bool = True  # Enable difficulty-aware resource allocation
+
+    # LDB block-level debugger (ACL 2024)
+    ldb_debugger_enabled: bool = True  # Enable block-level fault localization
+
+    # Speculative pipeline execution
+    speculative_enabled: bool = True  # Enable parallel speculative pre-execution
+
+    # Hierarchical task decomposition (Parsel / CodePlan)
+    hierarchical_decomp_enabled: bool = True  # Enable function-level decomposition for complex tasks
+
     def __post_init__(self) -> None:
         if self.workspace_dir is None:
             self.workspace_dir = self.project_root / "workspace"

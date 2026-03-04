@@ -44,6 +44,11 @@ from autoforge.engine.rag_retrieval import RAGRetrievalEngine
 from autoforge.engine.formal_verify import FormalVerifier
 from autoforge.engine.agent_debate import ConditionalDebateEngine
 from autoforge.engine.security_scan import SecurityScanner
+from autoforge.engine.reflexion import ReflexionEngine
+from autoforge.engine.adaptive_compute import AdaptiveComputeRouter
+from autoforge.engine.ldb_debugger import LDBDebugger
+from autoforge.engine.speculative_pipeline import SpeculativePipeline
+from autoforge.engine.hierarchical_decomp import HierarchicalDecomposer
 from autoforge.engine.task_dag import Task, TaskDAG, TaskPhase, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -78,6 +83,11 @@ class Orchestrator:
         self._formal_verifier = FormalVerifier()
         self._debate = ConditionalDebateEngine()
         self._security_scanner = SecurityScanner()
+        self._reflexion = ReflexionEngine()
+        self._adaptive_compute = AdaptiveComputeRouter()
+        self._ldb = LDBDebugger()
+        self._speculative = SpeculativePipeline()
+        self._decomposer = HierarchicalDecomposer()
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
@@ -126,12 +136,30 @@ class Orchestrator:
             if self.config.evomac_enabled:
                 self._evomac.start_iteration()
 
+            # Speculative: start build scaffolding while we checkpoint
+            if self.config.speculative_enabled:
+                await self._speculative.speculate_build_scaffold(self.spec, self.project_dir)
+
+            # Adaptive compute: estimate project-level difficulty
+            if self.config.adaptive_compute_enabled:
+                self._difficulty = self._adaptive_compute.estimate_difficulty(
+                    requirement, self.spec,
+                )
+                console.print(
+                    f"  [cyan]Compute router:[/cyan] difficulty={self._difficulty.level.value} "
+                    f"(score={self._difficulty.score:.2f})"
+                )
+
             # Checkpoint: review spec before building
             await self._checkpoint(
                 "spec",
                 f"Generated spec with {n_modules} modules. "
                 f"Review: {self.project_dir / 'spec.json'}",
             )
+
+            # Speculative: validate build scaffold before BUILD
+            if self.config.speculative_enabled:
+                await self._speculative.validate_and_commit("spec-build-scaffold")
 
             # Phase 2: BUILD
             console.print("\n[bold blue]Phase 2: BUILD[/bold blue] — Building project...")
@@ -148,6 +176,10 @@ class Orchestrator:
                     "build",
                     f"Built {done}/{total} tasks. Review generated code in: {self.project_dir}",
                 )
+
+            # Speculative: start test scaffolding while we checkpoint
+            if self.config.speculative_enabled:
+                await self._speculative.speculate_test_scaffold(self.spec, self.project_dir)
 
             # Phase 3: VERIFY
             console.print("\n[bold blue]Phase 3: VERIFY[/bold blue] — Verifying project...")
@@ -198,6 +230,14 @@ class Orchestrator:
             # EvoMAC: save state
             if self.config.evomac_enabled and self.project_dir:
                 self._evomac.save_state(self.project_dir / ".autoforge")
+
+            # Reflexion: save episodic memory for future projects
+            if self.config.reflexion_enabled and self.project_dir:
+                self._reflexion.save_state(self.project_dir / ".autoforge")
+
+            # Adaptive compute: save calibration data
+            if self.config.adaptive_compute_enabled and self.project_dir:
+                self._adaptive_compute.save_state(self.project_dir / ".autoforge")
 
             self._print_summary()
             return self.project_dir
@@ -519,6 +559,39 @@ class Orchestrator:
                 if rag_context:
                     builder.set_dynamic_constitution(
                         (getattr(builder, "_dynamic_supplement", "") or "") + rag_context
+                    )
+
+            # Hierarchical decomposition: for complex tasks, provide structured plan
+            if self.config.hierarchical_decomp_enabled:
+                difficulty = getattr(self, "_difficulty", None)
+                is_complex = (
+                    difficulty and difficulty.level.value in ("complex", "extreme")
+                ) or len(task.files) > 3
+                if is_complex:
+                    try:
+                        mod_name = task.files[0].rsplit("/", 1)[-1].rsplit(".", 1)[0] if task.files else task.id
+                        plan = await self._decomposer.decompose(
+                            task.description, mod_name, self.spec, self.llm,
+                        )
+                        if plan:
+                            decomp_ctx = self._decomposer.build_context_for_agent(plan)
+                            builder.set_dynamic_constitution(
+                                (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + decomp_ctx
+                            )
+                            console.print(
+                                f"    [{agent_id}] [cyan]Decomp:[/cyan] {len(plan.functions)} functions planned"
+                            )
+                    except Exception as e:
+                        logger.debug(f"Hierarchical decomposition skipped: {e}")
+
+            # Reflexion: inject past failure reflections
+            if self.config.reflexion_enabled:
+                reflexion_ctx = self._reflexion.build_retry_context(
+                    task.description, project=self.spec.get("project_name", ""),
+                )
+                if reflexion_ctx:
+                    builder.set_dynamic_constitution(
+                        (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + reflexion_ctx
                     )
 
             # Initialize process reward model for this task
@@ -921,7 +994,17 @@ class Orchestrator:
                 await self._fix_failures(test_results, sandbox)
 
     async def _fix_failures(self, test_results, sandbox: SandboxBase) -> None:
-        """Attempt to fix test failures using Director + Builder."""
+        """Attempt to fix test failures using Director + Builder + Reflexion + LDB.
+
+        Enhanced pipeline:
+          1. LDB: block-level fault localization on each failure
+          2. Director: create fix tasks (enriched with LDB analysis)
+          3. Builder: execute fixes (with Reflexion context)
+          4. Reflexion: reflect on failure if fix didn't work
+          5. Repeat with accumulated reflections
+        """
+        project_name = self.spec.get("project_name", "")
+
         for attempt in range(self.config.max_retries):
             failures = test_results.failures
             if not failures:
@@ -932,6 +1015,34 @@ class Orchestrator:
             # Director creates fix tasks
             fix_director = DirectorFixAgent(self.config, self.llm)
             for failure in failures[:3]:  # Limit fixes per attempt
+                failure_id = f"fix-{hash(str(failure)) % 10000}"
+                failure_msg = failure if isinstance(failure, str) else str(failure)
+
+                # LDB: block-level fault localization
+                ldb_context = ""
+                if self.config.ldb_debugger_enabled:
+                    try:
+                        failure_dict = failure if isinstance(failure, dict) else {"error": failure_msg}
+                        debug_report = await self._ldb.debug_test_failure(
+                            self.project_dir, failure_dict, self.llm, sandbox,
+                        )
+                        if debug_report:
+                            ldb_context = self._ldb.format_for_agent(debug_report)
+                            if debug_report.faulty_block is not None:
+                                console.print(
+                                    f"    [cyan]LDB:[/cyan] fault in {debug_report.function_name} "
+                                    f"block {debug_report.faulty_block}"
+                                )
+                    except Exception as e:
+                        logger.debug(f"LDB debugging skipped: {e}")
+
+                # Reflexion: build context from past reflections
+                reflexion_ctx = ""
+                if self.config.reflexion_enabled:
+                    reflexion_ctx = self._reflexion.build_retry_context(
+                        failure_msg, project=project_name,
+                    )
+
                 fix_result = await fix_director.run({
                     "failure": failure,
                     "spec": self.spec,
@@ -939,12 +1050,22 @@ class Orchestrator:
                 if fix_result.success:
                     fix_task = fix_director.parse_fix_task(fix_result.output)
 
-                    # Builder executes fix
+                    # Builder executes fix (with LDB + Reflexion context)
                     builder = BuilderAgent(
                         self.config, self.llm,
                         working_dir=self.project_dir,
                         sandbox=sandbox,
                     )
+
+                    # Inject LDB + Reflexion context
+                    extra_ctx = ""
+                    if ldb_context:
+                        extra_ctx += "\n" + ldb_context
+                    if reflexion_ctx:
+                        extra_ctx += "\n" + reflexion_ctx
+                    if extra_ctx:
+                        builder.set_dynamic_constitution(extra_ctx)
+
                     await builder.run({
                         "task": fix_task,
                         "spec": self.spec,
@@ -958,7 +1079,34 @@ class Orchestrator:
 
             if test_results.all_passed:
                 console.print("  [green]Fixes successful — all tests pass[/green]")
+                # Reflexion: mark as resolved
+                if self.config.reflexion_enabled:
+                    for failure in failures[:3]:
+                        fid = f"fix-{hash(str(failure)) % 10000}"
+                        self._reflexion.mark_success(fid)
                 return
+
+            # Reflexion: reflect on why fixes didn't work
+            if self.config.reflexion_enabled:
+                for failure in failures[:3]:
+                    failure_msg = failure if isinstance(failure, str) else str(failure)
+                    fid = f"fix-{hash(str(failure)) % 10000}"
+                    try:
+                        await self._reflexion.reflect_on_failure(
+                            task_id=fid,
+                            task_description=f"Fix test failure: {failure_msg[:200]}",
+                            failure_summary=failure_msg[:500],
+                            llm=self.llm,
+                            project=project_name,
+                        )
+                    except Exception as e:
+                        logger.debug(f"Reflexion skipped: {e}")
+
+        # Mark persistent failures
+        if self.config.reflexion_enabled:
+            for failure in (test_results.failures or [])[:3]:
+                fid = f"fix-{hash(str(failure)) % 10000}"
+                self._reflexion.mark_persistent(fid)
 
         console.print("  [yellow]Some issues remain after fix attempts[/yellow]")
 

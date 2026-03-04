@@ -515,6 +515,43 @@ AutoForge 有 **3 条流水线**，由 **8 个 AI Agent** 协作完成。
 - **LLM 深度分析**：对关键文件进行逻辑级安全审查
 - 配置：`security_scan_enabled=True`
 
+**Reflexion 情景记忆 (v2.5 新增)**
+- 灵感来自 Reflexion (NeurIPS 2023, Shinn et al.)：HumanEval +11%
+- **语言强化学习**：Agent 失败后生成自然语言"反思"，而非简单重试
+- **情景记忆**：跨任务、跨项目积累的失败反思库，避免重蹈覆辙
+- **解析标签**：自动从错误信息提取失败类型（import_error、type_error 等）
+- 配置：`reflexion_enabled=True`
+
+**自适应推理计算 (v2.5 新增)**
+- 灵感来自 "Scaling LLM Test-Time Compute" (ICLR 2025)：自适应分配比均匀 best-of-N 高效 4×
+- **难度估计**：关键词信号 + 项目规模 + LLM 评估，混合判断任务复杂度
+- **四级计算配置**：TRIVIAL → STANDARD → COMPLEX → EXTREME，自动调整重试次数、MCTS 深度、模型选择
+- **自校准**：追踪预测 vs 实际难度，用指数移动平均自动修正偏差
+- 配置：`adaptive_compute_enabled=True`
+
+**LDB 块级调试器 (v2.5 新增)**
+- 灵感来自 LDB (ACL 2024, Zhong et al.)：HumanEval +9.8%，GPT-4o 达到 98.2%
+- **控制流分解**：将代码拆分为基本块（条件、循环、赋值、返回）
+- **运行时追踪**：通过沙盒或 LLM 模拟追踪每个块的变量值
+- **精确定位**：LLM 逐块验证，找到第一个输出不符预期的块
+- **靶向修复**：只修改出错的块，而非盲目重写整个函数
+- 配置：`ldb_debugger_enabled=True`
+
+**推测执行流水线 (v2.5 新增)**
+- 灵感来自 Speculative Actions (arXiv 2510.04371) 和 Sherlock (arXiv 2511.00330)
+- **阶段重叠**：SPEC 完成时已提前创建好项目骨架、BUILD 完成时已准备好测试框架
+- **投机验证**：推测性工作完成后验证是否与实际流水线兼容，冲突则丢弃
+- **预计加速 20-40%**：减少阶段间的等待时间
+- 配置：`speculative_enabled=True`
+
+**层级任务分解 (v2.5 新增)**
+- 灵感来自 Parsel (NeurIPS 2023)：竞赛题通过率比直接生成高 75%
+- 灵感来自 CodePlan (ACM 2024)：仓库级依赖感知代码规划
+- **函数级分解**：LLM 将复杂任务拆分为 3-15 个有依赖关系的函数规格
+- **拓扑排序**：Kahn 算法确定实现顺序，叶子函数先实现
+- **自底向上实现**：每个函数实现时已有依赖函数作为上下文
+- 配置：`hierarchical_decomp_enabled=True`
+
 **任务 DAG 调度**
 - 任务之间有依赖关系，形成有向无环图
 - 没有依赖的任务可以并行执行
