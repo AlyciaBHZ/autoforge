@@ -11,8 +11,6 @@ license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.84.0",
-    "openai>=1.0",
-    "google-genai>=1.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0",
     "pyyaml>=6.0",
@@ -20,9 +18,26 @@ dependencies = [
     "tomli-w>=1.0",
     "aiosqlite>=0.20.0",
     "httpx>=0.27",
-    "duckduckgo-search>=7.0",
-    "html2text>=2024.2",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+google = ["google-genai>=1.0", "google-auth>=2.0"]
+search = ["duckduckgo-search>=7.0,<9.0", "html2text>=2024.2"]
+channels = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "python-telegram-bot>=21.0",
+]
+all = [
+    "openai>=1.0",
+    "google-genai>=1.0",
     "google-auth>=2.0",
+    "duckduckgo-search>=7.0,<9.0",
+    "html2text>=2024.2",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "python-telegram-bot>=21.0",
 ]
 
 [project.scripts]

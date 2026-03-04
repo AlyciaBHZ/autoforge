@@ -85,7 +85,10 @@ class ForgeDaemon:
         console.print()
 
         # Install signal handlers
-        if sys.platform != "win32":
+        if sys.platform == "win32":
+            signal.signal(signal.SIGTERM, lambda s, f: self._handle_signal())
+            signal.signal(signal.SIGINT, lambda s, f: self._handle_signal())
+        else:
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, self._handle_signal)

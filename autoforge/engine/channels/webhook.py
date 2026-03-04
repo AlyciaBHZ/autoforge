@@ -27,9 +27,15 @@ async def start_webhook_server(
     registry: ProjectRegistry,
 ) -> None:
     """Start the FastAPI webhook server."""
-    from fastapi import FastAPI, HTTPException, Request, Depends
-    from fastapi.responses import JSONResponse
-    import uvicorn
+    try:
+        from fastapi import FastAPI, HTTPException, Request, Depends
+        from fastapi.responses import JSONResponse
+        import uvicorn
+    except ImportError:
+        raise ImportError(
+            "Webhook server requires 'fastapi' and 'uvicorn'. "
+            "Install them with: pip install autoforge[channels]"
+        ) from None
 
     app = FastAPI(title="AutoForge API", version="0.1.0")
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,14 @@ from pathlib import Path
 from autoforge.engine.config import ForgeConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _shell_quote(s: str) -> str:
+    """Quote a string for shell use, cross-platform."""
+    if sys.platform == "win32":
+        return f'"{s}"'
+    import shlex
+    return shlex.quote(s)
 
 
 @dataclass
@@ -71,8 +80,15 @@ class SubprocessSandbox(SandboxBase):
         """Execute a command as a subprocess."""
         logger.debug(f"[sandbox] exec: {command[:100]}")
         try:
+            # On Windows, wrap Unix-style commands to run via sh if available,
+            # otherwise use cmd.exe (the default for create_subprocess_shell).
+            shell_command = command
+            if sys.platform == "win32" and not command.startswith("cmd"):
+                sh = shutil.which("bash") or shutil.which("sh")
+                if sh:
+                    shell_command = f'"{sh}" -c {_shell_quote(command)}'
             proc = await asyncio.create_subprocess_shell(
-                command,
+                shell_command,
                 cwd=self.working_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

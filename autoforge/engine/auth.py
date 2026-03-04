@@ -188,8 +188,14 @@ class GoogleADCAuth(AuthProvider):
 
     async def get_token(self) -> TokenResult:
         """Get a valid Google access token."""
-        import google.auth
-        import google.auth.transport.requests
+        try:
+            import google.auth
+            import google.auth.transport.requests
+        except ImportError:
+            raise ImportError(
+                "Google ADC/service account auth requires 'google-auth'. "
+                "Install it with: pip install autoforge[google]"
+            ) from None
 
         if self._credentials is None:
             if self._sa_path:

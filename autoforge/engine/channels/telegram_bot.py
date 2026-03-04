@@ -28,14 +28,20 @@ async def start_telegram_bot(
     notify_callback: Callable[..., Coroutine] | None = None,
 ) -> None:
     """Start the Telegram bot (long-polling mode)."""
-    from telegram import Update
-    from telegram.ext import (
-        Application,
-        CommandHandler,
-        ContextTypes,
-        MessageHandler,
-        filters,
-    )
+    try:
+        from telegram import Update
+        from telegram.ext import (
+            Application,
+            CommandHandler,
+            ContextTypes,
+            MessageHandler,
+            filters,
+        )
+    except ImportError:
+        raise ImportError(
+            "Telegram bot requires 'python-telegram-bot'. "
+            "Install it with: pip install autoforge[channels]"
+        ) from None
 
     allowed_users = set(config.telegram_allowed_users) if config.telegram_allowed_users else None
 
