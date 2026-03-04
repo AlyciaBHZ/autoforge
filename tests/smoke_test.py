@@ -1335,6 +1335,207 @@ def test_pyproject_has_new_dependencies():
 
 
 # ────────────────────────────────────────────
+# ────────────────────────────────────────────
+# Auth Module
+# ────────────────────────────────────────────
+
+
+def test_auth_module_imports():
+    """Auth module imports and classes are accessible."""
+    from autoforge.engine.auth import (  # noqa: F401
+        AuthProvider,
+        ApiKeyAuth,
+        OAuthBearerAuth,
+        OAuth2ClientCredentialsAuth,
+        GoogleADCAuth,
+        TokenResult,
+        create_auth_provider,
+    )
+
+
+def test_auth_api_key_provider():
+    """ApiKeyAuth returns key and correct client kwargs."""
+    from autoforge.engine.auth import ApiKeyAuth
+
+    auth = ApiKeyAuth(api_key="sk-test123")
+    kwargs = auth.get_client_kwargs()
+    assert kwargs == {"api_key": "sk-test123"}
+
+    # With base_url
+    auth2 = ApiKeyAuth(api_key="sk-test", base_url="https://proxy.com/v1")
+    kwargs2 = auth2.get_client_kwargs()
+    assert kwargs2["api_key"] == "sk-test"
+    assert kwargs2["base_url"] == "https://proxy.com/v1"
+
+
+def test_auth_bearer_provider():
+    """OAuthBearerAuth returns bearer token as api_key."""
+    from autoforge.engine.auth import OAuthBearerAuth
+
+    auth = OAuthBearerAuth(bearer_token="tok123", base_url="https://proxy.com/v1")
+    kwargs = auth.get_client_kwargs()
+    assert kwargs["api_key"] == "tok123"
+    assert kwargs["base_url"] == "https://proxy.com/v1"
+
+
+def test_auth_token_result_expiry():
+    """TokenResult.is_expired works correctly."""
+    import time
+    from autoforge.engine.auth import TokenResult
+
+    # Never expires
+    t1 = TokenResult(access_token="tok", expires_at=0.0)
+    assert t1.is_expired is False
+
+    # Expired
+    t2 = TokenResult(access_token="tok", expires_at=time.time() - 100)
+    assert t2.is_expired is True
+
+    # Not expired (far future)
+    t3 = TokenResult(access_token="tok", expires_at=time.time() + 3600)
+    assert t3.is_expired is False
+
+
+def test_auth_factory_fallback():
+    """create_auth_provider falls back to ApiKeyAuth."""
+    from autoforge.engine.auth import ApiKeyAuth, create_auth_provider
+
+    auth = create_auth_provider("anthropic", {"anthropic": "sk-test"}, {})
+    assert isinstance(auth, ApiKeyAuth)
+
+
+def test_auth_factory_bearer():
+    """create_auth_provider creates OAuthBearerAuth when configured."""
+    from autoforge.engine.auth import OAuthBearerAuth, create_auth_provider
+
+    auth = create_auth_provider("openai", {}, {
+        "openai": {
+            "auth_method": "oauth_bearer",
+            "base_url": "https://proxy.com/v1",
+            "bearer_token": "tok",
+        }
+    })
+    assert isinstance(auth, OAuthBearerAuth)
+
+
+def test_auth_factory_oauth2():
+    """create_auth_provider creates OAuth2ClientCredentialsAuth."""
+    from autoforge.engine.auth import OAuth2ClientCredentialsAuth, create_auth_provider
+
+    auth = create_auth_provider("openai", {}, {
+        "openai": {
+            "auth_method": "oauth2_client_credentials",
+            "client_id": "cid",
+            "client_secret": "csec",
+            "token_url": "https://token.example.com/token",
+        }
+    })
+    assert isinstance(auth, OAuth2ClientCredentialsAuth)
+
+
+def test_auth_factory_adc():
+    """create_auth_provider creates GoogleADCAuth."""
+    from autoforge.engine.auth import GoogleADCAuth, create_auth_provider
+
+    auth = create_auth_provider("google", {}, {
+        "google": {"auth_method": "adc"}
+    })
+    assert isinstance(auth, GoogleADCAuth)
+
+
+def test_config_auth_config_field():
+    """ForgeConfig has auth_config field with correct default."""
+    from autoforge.engine.config import ForgeConfig
+
+    config = ForgeConfig()
+    assert config.auth_config == {}
+
+    config2 = ForgeConfig(auth_config={
+        "openai": {"auth_method": "oauth_bearer", "base_url": "https://x"}
+    })
+    assert config2.auth_config["openai"]["auth_method"] == "oauth_bearer"
+
+
+def test_config_has_api_key_with_auth_config():
+    """has_api_key returns True when only auth_config is set (no API keys)."""
+    from autoforge.engine.config import ForgeConfig
+
+    # No keys, no auth → False
+    config1 = ForgeConfig()
+    assert config1.has_api_key is False
+
+    # No keys but auth_config → True
+    config2 = ForgeConfig(auth_config={"openai": {"auth_method": "adc"}})
+    assert config2.has_api_key is True
+
+
+def test_setup_wizard_no_precheck():
+    """PROVIDERS dict does not pre-enable any provider."""
+    from autoforge.cli.setup_wizard import PROVIDERS
+
+    assert "anthropic" in PROVIDERS
+    assert "openai" in PROVIDERS
+    assert "google" in PROVIDERS
+    # Verify auth_methods are defined
+    for pid, info in PROVIDERS.items():
+        assert "auth_methods" in info, f"{pid} missing auth_methods"
+
+
+def test_setup_wizard_auth_methods():
+    """Each provider has valid auth method options."""
+    from autoforge.cli.setup_wizard import PROVIDERS
+
+    # Anthropic: only api_key
+    ant_methods = [m["value"] for m in PROVIDERS["anthropic"]["auth_methods"]]
+    assert ant_methods == ["api_key"]
+
+    # OpenAI: api_key + bearer + oauth2
+    oai_methods = [m["value"] for m in PROVIDERS["openai"]["auth_methods"]]
+    assert "api_key" in oai_methods
+    assert "oauth_bearer" in oai_methods
+    assert "oauth2_client_credentials" in oai_methods
+
+    # Google: api_key + adc + service_account
+    ggl_methods = [m["value"] for m in PROVIDERS["google"]["auth_methods"]]
+    assert "api_key" in ggl_methods
+    assert "adc" in ggl_methods
+    assert "service_account" in ggl_methods
+
+
+def test_llm_router_has_auth_providers():
+    """LLMRouter has _auth_providers dict."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    router = LLMRouter(config)
+    assert hasattr(router, "_auth_providers")
+    assert isinstance(router._auth_providers, dict)
+
+
+def test_env_example_no_required_anthropic():
+    """.env.example does not say 'Required: Anthropic'."""
+    env_path = PROJECT_ROOT / ".env.example"
+    assert env_path.exists()
+    content = env_path.read_text(encoding="utf-8")
+    assert "Required: Anthropic" not in content
+    # All three providers should be present
+    assert "ANTHROPIC_API_KEY" in content
+    assert "OPENAI_API_KEY" in content
+    assert "GOOGLE_API_KEY" in content
+    # OAuth env vars should be present
+    assert "OPENAI_BASE_URL" in content
+    assert "GOOGLE_APPLICATION_CREDENTIALS" in content
+
+
+def test_pyproject_has_google_auth():
+    """pyproject.toml includes google-auth dependency."""
+    toml_path = PROJECT_ROOT / "pyproject.toml"
+    content = toml_path.read_text(encoding="utf-8")
+    assert "google-auth" in content
+
+
+# ────────────────────────────────────────────
 # Runner
 # ────────────────────────────────────────────
 
@@ -1465,6 +1666,23 @@ def main():
             ("Constitution: architect has web tools", test_constitution_architect_has_web_tools),
             ("Constitution: quality gates agent capabilities", test_constitution_quality_gates_has_agent_capabilities),
             ("pyproject.toml has new dependencies", test_pyproject_has_new_dependencies),
+        ]),
+        ("Auth Module & OAuth", [
+            ("Auth module imports", test_auth_module_imports),
+            ("ApiKeyAuth provider", test_auth_api_key_provider),
+            ("OAuthBearerAuth provider", test_auth_bearer_provider),
+            ("TokenResult expiry", test_auth_token_result_expiry),
+            ("Auth factory fallback to ApiKeyAuth", test_auth_factory_fallback),
+            ("Auth factory bearer", test_auth_factory_bearer),
+            ("Auth factory OAuth2", test_auth_factory_oauth2),
+            ("Auth factory ADC", test_auth_factory_adc),
+            ("Config auth_config field", test_config_auth_config_field),
+            ("Config has_api_key with auth_config", test_config_has_api_key_with_auth_config),
+            ("Setup wizard no pre-check", test_setup_wizard_no_precheck),
+            ("Setup wizard auth methods", test_setup_wizard_auth_methods),
+            ("LLM router has _auth_providers", test_llm_router_has_auth_providers),
+            (".env.example no required Anthropic", test_env_example_no_required_anthropic),
+            ("pyproject.toml has google-auth", test_pyproject_has_google_auth),
         ]),
     ]
 

@@ -104,34 +104,62 @@ class LLMRouter:
         self.config = config
         self._call_count = 0
         self._clients: dict[str, Any] = {}
+        self._auth_providers: dict[str, Any] = {}  # Cached AuthProvider per provider
 
     def _get_client(self, provider: str) -> Any:
-        """Get or create an async client for the given provider."""
+        """Get or create an async client for the given provider.
+
+        Uses the auth module to determine authentication method (API key,
+        OAuth bearer, OAuth2 client_credentials, Google ADC/service account).
+        """
         if provider in self._clients:
             return self._clients[provider]
 
-        api_keys = self.config.api_keys
+        from autoforge.engine.auth import create_auth_provider
+
+        auth_config = getattr(self.config, "auth_config", {})
+        auth = create_auth_provider(provider, self.config.api_keys, auth_config)
+        self._auth_providers[provider] = auth
+        client_kwargs = auth.get_client_kwargs()
 
         if provider == "anthropic":
             from anthropic import AsyncAnthropic
-            key = api_keys.get("anthropic", "")
-            client = AsyncAnthropic(api_key=key)
+            client = AsyncAnthropic(**client_kwargs)
 
         elif provider == "openai":
             from openai import AsyncOpenAI
-            key = api_keys.get("openai", "")
-            client = AsyncOpenAI(api_key=key)
+            client = AsyncOpenAI(**client_kwargs)
 
         elif provider == "google":
             from google import genai
-            key = api_keys.get("google", "")
-            client = genai.Client(api_key=key)
+            auth_method = auth_config.get("google", {}).get("auth_method", "api_key")
+            if auth_method in ("adc", "service_account"):
+                # ADC: genai.Client() auto-discovers credentials
+                client = genai.Client()
+            else:
+                key = self.config.api_keys.get("google", "")
+                client = genai.Client(api_key=key)
 
         else:
             raise ValueError(f"Unknown provider: {provider}")
 
         self._clients[provider] = client
         return client
+
+    async def _ensure_fresh_token(self, provider: str) -> None:
+        """Refresh OAuth token if needed and update the client."""
+        from autoforge.engine.auth import OAuth2ClientCredentialsAuth
+
+        auth = self._auth_providers.get(provider)
+        if auth is None or not isinstance(auth, OAuth2ClientCredentialsAuth):
+            return
+
+        token = await auth.get_token()
+        # Update the client's API key with the fresh token
+        if provider in self._clients:
+            client = self._clients[provider]
+            if hasattr(client, "api_key"):
+                client.api_key = token.access_token
 
     def _select_model(self, complexity: TaskComplexity) -> tuple[str, int]:
         """Return (model_name, max_tokens) for the given complexity."""
@@ -166,6 +194,7 @@ class LLMRouter:
 
         model, max_tokens = self._select_model(complexity)
         provider = detect_provider(model)
+        await self._ensure_fresh_token(provider)
         self._call_count += 1
         call_id = self._call_count
 
