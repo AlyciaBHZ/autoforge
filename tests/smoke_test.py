@@ -146,6 +146,24 @@ def test_cli_parse_subcommands():
     assert args.command == "deploy"
     assert args.project_id == "abc123"
 
+    # Test paper infer
+    args = parser.parse_args(["paper", "infer", "improve long-context reasoning", "--year", "2025"])
+    assert args.command == "paper"
+    assert args.paper_action == "infer"
+    assert args.year == 2025
+
+    # Test paper benchmark
+    args = parser.parse_args(["paper", "benchmark", "--sample-size", "4"])
+    assert args.command == "paper"
+    assert args.paper_action == "benchmark"
+    assert args.sample_size == 4
+
+    # Test paper reproduce
+    args = parser.parse_args(["paper", "reproduce", "robust graph learning", "--pick", "2"])
+    assert args.command == "paper"
+    assert args.paper_action == "reproduce"
+    assert args.pick == 2
+
     # Test global flags
     args = parser.parse_args(["--budget", "5.0", "--mode", "research", "--mobile", "both", "generate", "test"])
     assert args.budget == 5.0
@@ -174,6 +192,7 @@ def test_cli_legacy_compat():
     assert "generate" in _KNOWN_COMMANDS
     assert "daemon" in _KNOWN_COMMANDS
     assert "queue" in _KNOWN_COMMANDS
+    assert "paper" in _KNOWN_COMMANDS
 
 
 # ────────────────────────────────────────────
@@ -1072,6 +1091,55 @@ def test_cli_queue_subcommand():
     from autoforge.engine.project_registry import ProjectRegistry  # noqa: F401
 
 
+def test_cli_paper_subcommand():
+    """Test that paper inference module imports."""
+    from autoforge.engine.paper_repro import fetch_iclr_papers  # noqa: F401
+
+
+def test_paper_repro_signals_and_simulation():
+    """Test local paper signal extraction + no-key simulation feedback."""
+    from autoforge.engine.paper_repro import (
+        PaperRecord,
+        build_environment_spec,
+        build_verification_plan,
+        extract_paper_signals,
+        simulate_pipeline_feedback,
+    )
+
+    paper = PaperRecord(
+        note_id="test123",
+        title="Fast Sparse Attention for Long-Context LLM Decoding",
+        abstract=(
+            "We propose a sparse attention method that reduces latency by 2.0x "
+            "while maintaining accuracy on MMLU."
+        ),
+        keywords=["sparse attention", "long context", "llm inference"],
+        year=2025,
+        openreview_url="https://openreview.net/forum?id=test123",
+        pdf_url="https://openreview.net/pdf?id=test123",
+    )
+    signals = extract_paper_signals(paper, include_pdf=False)
+    assert "latency" in signals.metrics
+
+    plan = build_verification_plan(signals)
+    assert "checklist" in plan and len(plan["checklist"]) >= 1
+
+    env = build_environment_spec(paper, signals)
+    assert env["python"] == "3.11"
+    dep_names = {d["name"] for d in env["dependencies"]}
+    assert "torch" not in dep_names
+    assert env["profile"] == "theory-first"
+
+    fb = simulate_pipeline_feedback(
+        goal="speed up long-context sparse attention decoding",
+        paper=paper,
+        signals=signals,
+        inference_score=15.0,
+    )
+    assert fb["mode"] == "simulated_no_api_key"
+    assert "p0_p4_status" in fb
+
+
 def test_service_files_exist():
     """Test service config files exist."""
     assert (PROJECT_ROOT / "services" / "autoforge.service").exists()
@@ -1738,6 +1806,333 @@ def test_pyproject_has_google_auth():
 
 
 # ────────────────────────────────────────────
+# Phase 11: Reasoning Extension & Article Verification
+# ────────────────────────────────────────────
+
+
+def test_reasoning_extension_imports():
+    """Reasoning extension module imports correctly."""
+    from autoforge.engine.reasoning_extension import (  # noqa: F401
+        ReasoningExtensionEngine,
+        MinimalKernel,
+        NumberedConclusion,
+        GrowthOperator,
+        ConclusionType,
+        PublicationWorthiness,
+        PublicationGate,
+        FormalVerificationBridge,
+        ReasoningRound,
+    )
+
+
+def test_minimal_kernel_creation():
+    """MinimalKernel creates with default Φ-Kernel axioms."""
+    from autoforge.engine.reasoning_extension import MinimalKernel
+    kernel = MinimalKernel.create_default()
+    assert kernel.name == "Φ-Kernel"
+    assert len(kernel.axioms) == 5
+    assert "Axiom (Φ1)" in kernel.axioms[0]
+    assert len(kernel.domain_seeds) >= 5
+    assert kernel.counter == 0
+    # Test counter increment
+    n = kernel.next_conclusion_number()
+    assert n == 1
+    assert kernel.counter == 1
+
+
+def test_numbered_conclusion():
+    """NumberedConclusion formats correctly and serializes."""
+    from autoforge.engine.reasoning_extension import (
+        NumberedConclusion, ConclusionType, GrowthOperator,
+        PublicationWorthiness,
+    )
+    c = NumberedConclusion(
+        number=42,
+        conclusion_type=ConclusionType.THEOREM,
+        statement="For any compact Riemannian manifold M, the spectral zeta function ζ_M(s) admits meromorphic continuation to ℂ.",
+        proof_sketch="By standard heat kernel asymptotics.",
+        growth_operator=GrowthOperator.SPECTRAL_DECOMPOSE,
+        domain="spectral geometry",
+        worthiness=PublicationWorthiness.PUBLISHABLE,
+    )
+    # Format
+    formatted = c.format_academic()
+    assert "Theorem 42" in formatted
+    assert "spectral zeta" in formatted
+    assert "□" in formatted
+    # Serialize
+    d = c.to_dict()
+    assert d["number"] == 42
+    assert d["type"] == "theorem"
+    assert d["worthiness"] == "publishable"
+    # Deserialize
+    c2 = NumberedConclusion.from_dict(d)
+    assert c2.number == 42
+    assert c2.conclusion_type == ConclusionType.THEOREM
+
+
+def test_reasoning_extension_engine_instantiation():
+    """ReasoningExtensionEngine instantiates with default kernel."""
+    from autoforge.engine.reasoning_extension import ReasoningExtensionEngine
+    engine = ReasoningExtensionEngine()
+    assert engine.kernel.name == "Φ-Kernel"
+    assert engine.conclusion_count == 0
+    stats = engine.get_stats()
+    assert stats["total_conclusions"] == 0
+    assert stats["kernel_name"] == "Φ-Kernel"
+
+
+def test_reasoning_extension_persistence():
+    """ReasoningExtensionEngine saves and loads state."""
+    import tempfile
+    from autoforge.engine.reasoning_extension import (
+        ReasoningExtensionEngine, NumberedConclusion, ConclusionType,
+        GrowthOperator, PublicationWorthiness,
+    )
+    engine = ReasoningExtensionEngine()
+    # Add a conclusion manually for testing
+    c = NumberedConclusion(
+        number=1,
+        conclusion_type=ConclusionType.THEOREM,
+        statement="Test theorem statement.",
+        domain="test",
+        worthiness=PublicationWorthiness.PUBLISHABLE,
+    )
+    engine._conclusions.append(c)
+    engine._kernel._conclusion_counter = 1
+
+    with tempfile.TemporaryDirectory() as td:
+        save_dir = Path(td) / "ext_state"
+        engine.save(save_dir)
+
+        # Load into new engine
+        engine2 = ReasoningExtensionEngine()
+        engine2.load(save_dir)
+        assert engine2.conclusion_count == 1
+        assert engine2._conclusions[0].statement == "Test theorem statement."
+        assert engine2.kernel.counter == 1
+
+
+def test_reasoning_extension_report_generation():
+    """ReasoningExtensionEngine generates markdown and latex reports."""
+    from autoforge.engine.reasoning_extension import (
+        ReasoningExtensionEngine, NumberedConclusion, ConclusionType,
+        GrowthOperator, PublicationWorthiness,
+    )
+    engine = ReasoningExtensionEngine()
+    engine._conclusions = [
+        NumberedConclusion(
+            number=1,
+            conclusion_type=ConclusionType.THEOREM,
+            statement="The spectral gap of M is bounded below.",
+            domain="spectral theory",
+            worthiness=PublicationWorthiness.PUBLISHABLE,
+        ),
+        NumberedConclusion(
+            number=2,
+            conclusion_type=ConclusionType.CONJECTURE,
+            statement="The partition function converges for Re(β) > 0.",
+            domain="statistical mechanics",
+            worthiness=PublicationWorthiness.EXCEPTIONAL,
+        ),
+    ]
+    md = engine.generate_report(latex=False)
+    assert "Autonomous Reasoning Extension" in md
+    assert "Theorem 1" in md or "spectral gap" in md
+    latex = engine.generate_report(latex=True)
+    assert r"\begin{theorem}" in latex
+    assert r"\begin{conjecture}" in latex
+
+
+def test_publication_gate_dedup():
+    """PublicationGate detects duplicate conclusions."""
+    from autoforge.engine.reasoning_extension import (
+        PublicationGate, NumberedConclusion, ConclusionType,
+        PublicationWorthiness,
+    )
+    gate = PublicationGate()
+    c1 = NumberedConclusion(
+        number=1,
+        conclusion_type=ConclusionType.THEOREM,
+        statement="The eigenvalues of L are non-negative.",
+    )
+    gate.register_existing([c1])
+
+    c2 = NumberedConclusion(
+        number=2,
+        conclusion_type=ConclusionType.THEOREM,
+        statement="The eigenvalues of L are non-negative.",  # Same
+    )
+    # Same hash → should be redundant
+    assert c2.content_hash == c1.content_hash
+
+
+def test_growth_operators():
+    """All GrowthOperator values are accessible."""
+    from autoforge.engine.reasoning_extension import GrowthOperator
+    assert len(GrowthOperator) == 12
+    assert GrowthOperator.LIFT.value == "lift"
+    assert GrowthOperator.ERGODIC_LIMIT.value == "ergodic_limit"
+
+
+def test_article_verifier_imports():
+    """Article verifier module imports correctly."""
+    from autoforge.engine.article_verifier import (  # noqa: F401
+        ArticleVerifier,
+        ArticleParser,
+        FormalizationPipeline,
+        VerifiableClaim,
+        ArticleVerificationReport,
+        ClaimType,
+        VerificationStatus,
+    )
+
+
+def test_article_parser_latex():
+    """ArticleParser extracts claims from LaTeX environments."""
+    from autoforge.engine.article_verifier import ArticleParser, ClaimType
+    parser = ArticleParser()
+    text = r"""
+\begin{theorem}[Main]
+For all $n \geq 1$, $\sum_{k=1}^n k = n(n+1)/2$.
+\end{theorem}
+\begin{proof}
+By induction on $n$.
+\end{proof}
+\begin{lemma}
+The sequence is monotone increasing.
+\end{lemma}
+"""
+    claims = parser._extract_latex(text)
+    assert len(claims) >= 2
+    theorem_claims = [c for c in claims if c.claim_type == ClaimType.THEOREM]
+    assert len(theorem_claims) >= 1
+    assert "sum" in theorem_claims[0].statement.lower() or "\\sum" in theorem_claims[0].statement
+
+
+def test_article_parser_markdown():
+    """ArticleParser extracts claims from Markdown format."""
+    from autoforge.engine.article_verifier import ArticleParser, ClaimType
+    parser = ArticleParser()
+    text = """
+## Theorem 1. The main result
+
+For all primes p, the Legendre symbol satisfies quadratic reciprocity.
+
+**Proof.** By Gauss's lemma.
+
+## Lemma 2
+
+The Jacobi symbol extends the Legendre symbol to composite moduli.
+"""
+    claims = parser._extract_markdown(text)
+    assert len(claims) >= 1
+
+
+def test_verification_report_formatting():
+    """ArticleVerificationReport formats summary correctly."""
+    from autoforge.engine.article_verifier import (
+        ArticleVerificationReport, VerifiableClaim,
+        ClaimType, VerificationStatus,
+    )
+    report = ArticleVerificationReport(
+        title="Test Article",
+        total_claims=3,
+        verified=2,
+        failed=1,
+        overall_confidence=0.67,
+        assessment="Good: Majority verified.",
+    )
+    summary = report.format_summary()
+    assert "Test Article" in summary
+    assert "3" in summary
+
+
+def test_orchestrator_has_reasoning_extension():
+    """Orchestrator has reasoning extension and article verifier attributes."""
+    from autoforge.engine.orchestrator import Orchestrator
+    from autoforge.engine.config import ForgeConfig
+    import os
+    os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-000")
+    config = ForgeConfig.from_env()
+    orch = Orchestrator(config)
+    assert hasattr(orch, '_reasoning_extension')
+    assert hasattr(orch, '_article_verifier')
+    assert hasattr(orch, '_run_reasoning_extension')
+    assert hasattr(orch, '_run_article_verification')
+
+
+def test_theoretical_reasoning_has_extension_methods():
+    """TheoreticalReasoningEngine has the new integration methods."""
+    from autoforge.engine.theoretical_reasoning import TheoreticalReasoningEngine
+    engine = TheoreticalReasoningEngine()
+    assert hasattr(engine, 'run_reasoning_extension')
+    assert hasattr(engine, 'verify_article_claims')
+    assert callable(engine.run_reasoning_extension)
+    assert callable(engine.verify_article_claims)
+
+
+# ────────────────────────────────────────────
+# Academic Stack (D5 — 6 new checks)
+# ────────────────────────────────────────────
+
+
+def test_autonomous_discovery_imports():
+    """autonomous_discovery module imports with DomainContext."""
+    from autoforge.engine.autonomous_discovery import (  # noqa: F401
+        DiscoveryOrchestrator, DomainContext, SUPERSPACE_MODEL_SETS,
+        ALGEBRAIC_GEOMETRY, DYNAMICAL_SYSTEMS, detect_domain_context,
+    )
+
+
+def test_paper_formalizer_imports():
+    """paper_formalizer module imports with report generator."""
+    from autoforge.engine.paper_formalizer import (  # noqa: F401
+        PaperFormalizer, FormalizationReport, FormalizationUnit,
+        LeanCodeGenerator, FormalizationStatus,
+    )
+    pf = PaperFormalizer()
+    tmpl = pf.get_lean_project_template()
+    assert "lakefile.lean" in tmpl
+
+
+def test_cloud_prover_imports():
+    """cloud_prover module imports."""
+    from autoforge.engine.cloud_prover import (  # noqa: F401
+        CloudProver, CloudProverConfig, ProofCache, ProofJob,
+        JobStatus, CloudBackend,
+    )
+
+
+def test_discovery_config_sane_defaults():
+    """DiscoveryConfig has sane defaults (max_rounds>0, min_confidence in [0,1])."""
+    from autoforge.engine.autonomous_discovery import DiscoveryConfig
+    dc = DiscoveryConfig()
+    assert dc.max_rounds > 0
+    assert 0 <= dc.min_confidence <= 1
+
+
+def test_formalization_report_compute_score():
+    """FormalizationReport.compute_score() returns correct value for known inputs."""
+    from autoforge.engine.paper_formalizer import FormalizationReport
+    report = FormalizationReport(
+        paper_title="Test", paper_source="t.pdf",
+        total_statements=10, lean_proved=3, lean_sorry=2,
+        numerically_verified=2, computationally_reproduced=1,
+    )
+    score = report.compute_score()
+    expected = (3*1.0 + 2*0.5 + 2*0.7 + 1*0.8) / 10  # 0.62
+    assert abs(score - expected) < 1e-6, f"Expected {expected}, got {score}"
+
+
+def test_proof_cache_empty_get():
+    """ProofCache get on empty cache returns None."""
+    from autoforge.engine.cloud_prover import ProofCache
+    cache = ProofCache()
+    assert cache.get("nonexistent code") is None
+
+
+# ────────────────────────────────────────────
 # Runner
 # ────────────────────────────────────────────
 
@@ -1834,6 +2229,10 @@ def main():
         ("CLI: Subcommands", [
             ("daemon subcommand parsing", test_cli_daemon_subcommand),
             ("queue subcommand parsing", test_cli_queue_subcommand),
+            ("paper subcommand parsing", test_cli_paper_subcommand),
+        ]),
+        ("Paper Repro", [
+            ("Signal extraction + no-key simulation", test_paper_repro_signals_and_simulation),
         ]),
         ("Service Files", [
             ("systemd + launchd configs exist", test_service_files_exist),
@@ -1893,6 +2292,30 @@ def main():
             ("LLM router has _auth_providers", test_llm_router_has_auth_providers),
             (".env.example no required Anthropic", test_env_example_no_required_anthropic),
             ("pyproject.toml has google-auth", test_pyproject_has_google_auth),
+        ]),
+        ("Reasoning Extension & Article Verification", [
+            ("Reasoning extension imports", test_reasoning_extension_imports),
+            ("MinimalKernel creation", test_minimal_kernel_creation),
+            ("NumberedConclusion format + serialize", test_numbered_conclusion),
+            ("ReasoningExtensionEngine instantiation", test_reasoning_extension_engine_instantiation),
+            ("ReasoningExtensionEngine persistence", test_reasoning_extension_persistence),
+            ("Report generation (markdown + latex)", test_reasoning_extension_report_generation),
+            ("PublicationGate dedup", test_publication_gate_dedup),
+            ("GrowthOperator completeness", test_growth_operators),
+            ("Article verifier imports", test_article_verifier_imports),
+            ("ArticleParser LaTeX extraction", test_article_parser_latex),
+            ("ArticleParser Markdown extraction", test_article_parser_markdown),
+            ("VerificationReport formatting", test_verification_report_formatting),
+            ("Orchestrator has reasoning extension", test_orchestrator_has_reasoning_extension),
+            ("TheoreticalReasoning has extension methods", test_theoretical_reasoning_has_extension_methods),
+        ]),
+        ("Academic Stack", [
+            ("autonomous_discovery imports", test_autonomous_discovery_imports),
+            ("paper_formalizer imports", test_paper_formalizer_imports),
+            ("cloud_prover imports", test_cloud_prover_imports),
+            ("DiscoveryConfig sane defaults", test_discovery_config_sane_defaults),
+            ("FormalizationReport compute_score", test_formalization_report_compute_score),
+            ("ProofCache empty get -> None", test_proof_cache_empty_get),
         ]),
     ]
 

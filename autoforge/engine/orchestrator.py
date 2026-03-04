@@ -92,6 +92,11 @@ class Orchestrator:
         self._capability_dag: Any = None
         self._dag_bridge: Any = None
         self._theoretical_reasoning: Any = None
+        self._autonomous_discovery: Any = None
+        self._paper_formalizer: Any = None
+        self._cloud_prover: Any = None
+        self._reasoning_extension: Any = None
+        self._article_verifier: Any = None
         self._init_engines()
 
     def _agent(self, role: str, *args: Any, **kwargs: Any) -> Any:
@@ -145,6 +150,28 @@ class Orchestrator:
         if c.theoretical_reasoning_enabled:
             from autoforge.engine.theoretical_reasoning import TheoreticalReasoningEngine
             self._theoretical_reasoning = TheoreticalReasoningEngine()
+            # Optional extension/verifier modules: keep best-effort imports.
+            try:
+                from autoforge.engine.reasoning_extension import ReasoningExtensionEngine
+
+                self._reasoning_extension = ReasoningExtensionEngine()
+            except Exception:
+                self._reasoning_extension = None
+            try:
+                from autoforge.engine.article_verifier import ArticleVerifier
+
+                self._article_verifier = ArticleVerifier()
+            except Exception:
+                self._article_verifier = None
+        if c.autonomous_discovery_enabled:
+            from autoforge.engine.autonomous_discovery import DiscoveryOrchestrator
+            self._autonomous_discovery = DiscoveryOrchestrator()
+        if c.paper_formalizer_enabled:
+            from autoforge.engine.paper_formalizer import PaperFormalizer
+            self._paper_formalizer = PaperFormalizer()
+        if c.cloud_prover_enabled:
+            from autoforge.engine.cloud_prover import CloudProver
+            self._cloud_prover = CloudProver()
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
@@ -274,6 +301,18 @@ class Orchestrator:
             if self.config.theoretical_reasoning_enabled:
                 await self._run_theoretical_reasoning()
 
+            # Autonomous discovery: extend theory graphs with new results
+            if self.config.autonomous_discovery_enabled and self._autonomous_discovery:
+                await self._run_autonomous_discovery()
+
+            # Paper formalization: Lean 4 formalization + computational reproducibility
+            if self.config.paper_formalizer_enabled and self._paper_formalizer:
+                await self._run_paper_formalization()
+
+            # Reasoning extension: autonomous kernel growth
+            if self.config.theoretical_reasoning_enabled and self._reasoning_extension is not None:
+                await self._run_reasoning_extension()
+
             self._save_state("verify_complete")
 
             # Checkpoint: review test results
@@ -323,6 +362,11 @@ class Orchestrator:
 
             if self._multi_prover and self.project_dir:
                 self._multi_prover.save_state(self.project_dir / ".autoforge" / "multi_prover.json")
+
+            # Reasoning extension: save state
+            if self._reasoning_extension is not None:
+                ext_dir = Path(".autoforge") / "reasoning_extension"
+                self._reasoning_extension.save(ext_dir)
 
             # Theoretical reasoning: save theory graphs (project-level + global)
             if self.config.theoretical_reasoning_enabled and self.project_dir:
@@ -2561,6 +2605,84 @@ class Orchestrator:
         except Exception as e:
             logger.warning(f"Theoretical reasoning failed: {e}")
 
+    async def _run_reasoning_extension(self) -> None:
+        """Run autonomous reasoning extension from minimal kernel.
+
+        Derives publication-worthy conclusions via growth operators,
+        each numbered, in rigorous academic language, non-repetitive.
+        """
+        if self._reasoning_extension is None:
+            return
+
+        try:
+            console.print(
+                "  [cyan]Reasoning extension:[/cyan] "
+                "running autonomous kernel growth..."
+            )
+
+            # Load existing state
+            ext_dir = Path(".autoforge") / "reasoning_extension"
+            self._reasoning_extension.load(ext_dir)
+
+            # Run one round of reasoning
+            round_record = await self._reasoning_extension.run_reasoning_round(
+                self.llm,
+                formalize=self.config.lean_prover_enabled,
+            )
+
+            console.print(
+                f"  [cyan]Reasoning extension:[/cyan] "
+                f"Round {round_record.round_number}: "
+                f"{round_record.accepted} conclusions accepted, "
+                f"{round_record.rejected} rejected"
+            )
+
+            for c in round_record.conclusions:
+                console.print(
+                    f"    [{c.conclusion_type.value.upper()} {c.number}] "
+                    f"({c.worthiness.value}) {c.statement[:80]}..."
+                )
+
+            # Save state
+            self._reasoning_extension.save(ext_dir)
+
+        except Exception as e:
+            logger.warning(f"Reasoning extension failed: {e}")
+
+    async def _run_article_verification(self, article_text: str, title: str = "Untitled") -> dict:
+        """Verify an article's mathematical claims via Lean 4 formalization.
+
+        Extracts claims, auto-formalizes to Lean 4, verifies, and
+        optionally cross-verifies with multiple provers.
+        """
+        if self._article_verifier is None:
+            return {"error": "Article verifier not initialized"}
+
+        try:
+            console.print(
+                f"  [cyan]Article verification:[/cyan] "
+                f"verifying '{title}'..."
+            )
+
+            report = await self._article_verifier.verify_article(
+                article_text, self.llm,
+                title=title,
+                cross_verify=self.config.lean_prover_enabled,
+            )
+
+            console.print(
+                f"  [cyan]Article verification:[/cyan] "
+                f"{report.verified}/{report.total_claims} verified, "
+                f"{report.failed} failed, "
+                f"confidence={report.overall_confidence:.1%}"
+            )
+
+            return report.to_dict()
+
+        except Exception as e:
+            logger.warning(f"Article verification failed: {e}")
+            return {"error": str(e)}
+
     def _ingest_theory_to_dag(self, theory: "TheoryGraph") -> None:
         """Feed theoretical concepts from a TheoryGraph into the CapabilityDAG.
 
@@ -2626,6 +2748,111 @@ class Orchestrator:
 
         except Exception as e:
             logger.debug(f"Theory→DAG ingestion failed: {e}")
+
+    # ──────────────────────────────────────────────
+    # Autonomous Discovery
+    # ──────────────────────────────────────────────
+
+    async def _run_autonomous_discovery(self) -> None:
+        """Run autonomous theorem discovery on theory graphs.
+
+        For each parsed theory graph, attempts to extend the theory
+        by discovering new theorems, conjectures, and cross-domain connections.
+        Results are saved to the project's discovery/ directory.
+        """
+        if not self.project_dir or not self._theoretical_reasoning:
+            return
+
+        try:
+            theories = getattr(self._theoretical_reasoning, '_theories', {})
+            if not theories:
+                return
+
+            from autoforge.engine.autonomous_discovery import DiscoveryOrchestrator
+            discovery = self._autonomous_discovery or DiscoveryOrchestrator()
+            discovery_dir = self.project_dir / ".autoforge" / "discoveries"
+
+            total_discoveries = 0
+            for name, graph in theories.items():
+                if graph.size < 3:  # Skip trivial graphs
+                    continue
+
+                try:
+                    results = await discovery.run(
+                        graph, self.llm,
+                        output_dir=discovery_dir / name,
+                    )
+                    total_discoveries += len(results)
+
+                    if results:
+                        console.print(
+                            f"  [cyan]Autonomous discovery:[/cyan] "
+                            f"'{name}': {len(results)} new results"
+                        )
+                except Exception as e:
+                    logger.debug(f"Autonomous discovery on '{name}' failed: {e}")
+                    continue
+
+            if total_discoveries > 0:
+                console.print(
+                    f"  [cyan]Autonomous discovery:[/cyan] "
+                    f"total {total_discoveries} new discoveries"
+                )
+
+        except Exception as e:
+            logger.warning(f"Autonomous discovery failed: {e}")
+
+    # ──────────────────────────────────────────────
+    # Paper Formalization
+    # ──────────────────────────────────────────────
+
+    async def _run_paper_formalization(self) -> None:
+        """Run Lean 4 formalization on theory graphs.
+
+        For each theory graph, generates Lean 4 code, Python verification
+        scripts, and a structured formalization report.
+        """
+        if not self.project_dir or not self._theoretical_reasoning:
+            return
+
+        try:
+            theories = getattr(self._theoretical_reasoning, '_theories', {})
+            if not theories:
+                return
+
+            from autoforge.engine.paper_formalizer import PaperFormalizer
+            formalizer = self._paper_formalizer or PaperFormalizer()
+            formal_dir = self.project_dir / ".autoforge" / "formalization"
+
+            # Cloud prover for Lean compilation if enabled
+            lean_compile = self.config.cloud_prover_enabled and self._cloud_prover is not None
+            run_python = True  # Always try Python verification
+
+            for name, graph in theories.items():
+                if graph.size < 2:
+                    continue
+
+                try:
+                    report = await formalizer.formalize(
+                        graph, self.llm,
+                        output_dir=formal_dir / name,
+                        lean_compile=lean_compile,
+                        run_python=run_python,
+                    )
+
+                    console.print(
+                        f"  [cyan]Formalization:[/cyan] '{name}': "
+                        f"{report.lean_proved} proved, "
+                        f"{report.lean_sorry} sorry, "
+                        f"{report.numerically_verified} numerically verified "
+                        f"(score={report.overall_score:.2f})"
+                    )
+                except Exception as e:
+                    logger.debug(f"Formalization of '{name}' failed: {e}")
+                    continue
+
+        except Exception as e:
+            logger.warning(f"Paper formalization failed: {e}")
 
     # ──────────────────────────────────────────────
     # EvoMAC Text Backpropagation

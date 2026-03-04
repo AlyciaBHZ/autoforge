@@ -22,6 +22,11 @@ Queue management:
     forgeai queue "project description"          # Add to queue
     forgeai projects                             # List all projects
     forgeai deploy <project_id>                  # Show deploy guide
+
+Paper reproduction:
+    forgeai paper infer "research goal"           # Infer likely ICLR papers
+    forgeai paper benchmark                       # Benchmark inference quality
+    forgeai paper reproduce "goal"                # Build reproduction brief/prompt
 """
 
 from autoforge.cli.app import main

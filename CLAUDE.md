@@ -63,6 +63,8 @@ engine/evomac.py                EvoMAC — text backpropagation, natural-languag
 engine/sica.py                  SICA — self-improving coding agent, constitution self-editing + rollback
 engine/rag_retrieval.py         Library-level RAG — BM25+TF-IDF hybrid cross-project code retrieval
 engine/formal_verify.py         Formal verification — multi-level linting, type checking, LLM formal analysis
+engine/reasoning_extension.py   Autonomous reasoning extension — minimal kernel self-growth, numbered conclusions, publication gate
+engine/article_verifier.py      Article verification pipeline — claim extraction, Lean 4 formalization, cross-prover verification
 engine/agent_debate.py          Conditional debate — reward-guided multi-agent architecture debate
 engine/security_scan.py         RedCode security scanning — pattern matching + LLM deep vulnerability analysis
 engine/reflexion.py             Reflexion — verbal RL with episodic memory for failure-informed retries
@@ -72,6 +74,9 @@ engine/speculative_pipeline.py  Speculative pipeline — overlapping phase pre-e
 engine/hierarchical_decomp.py   Hierarchical decomposition — Parsel-style function-level task planning
 engine/lean_prover.py           Lean 4 theorem proving — Hilbert+COPRA+MCTS+STP+Pantograph+PaperReview+ProofRepair
 engine/multi_prover.py          Multi-prover formal verification — Coq, Isabelle, TLA+, Z3/SMT, Dafny cross-verification
+engine/autonomous_discovery.py  Autonomous theorem discovery — minimal kernel → conjecture generation → novelty filter → depth evaluation
+engine/paper_formalizer.py      Paper-specific Lean 4 formalization — theorem extraction, Lean codegen, Python reproducibility
+engine/cloud_prover.py          Cloud Lean 4 compilation — Docker, SSH, GitHub Codespaces backends with caching
 engine/capability_dag.py        CapabilityDAG — self-growing universal knowledge graph, community-mergeable
 engine/theoretical_reasoning.py Cross-domain scientific reasoning — TheoryGraph, multi-modal verification, theory evolution & article generation
 engine/task_dag.py           TaskDAG — dependency graph, scheduling, persistence
