@@ -198,6 +198,7 @@ class ForgeConfig:
     hierarchical_decomp_enabled: bool = True  # Enable function-level decomposition for complex tasks
     lean_prover_enabled: bool = True           # Enable Lean 4 formal theorem proving engine
     capability_dag_enabled: bool = True        # Enable universal self-growing knowledge graph
+    theoretical_reasoning_enabled: bool = True # Enable cross-domain scientific reasoning & theory evolution
 
     def __post_init__(self) -> None:
         if self.workspace_dir is None:

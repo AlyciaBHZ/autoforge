@@ -51,6 +51,7 @@ from autoforge.engine.speculative_pipeline import SpeculativePipeline
 from autoforge.engine.hierarchical_decomp import HierarchicalDecomposer
 from autoforge.engine.lean_prover import LeanProver
 from autoforge.engine.capability_dag import CapabilityDAG, DAGBridge, Domain
+from autoforge.engine.theoretical_reasoning import TheoreticalReasoningEngine
 from autoforge.engine.task_dag import Task, TaskDAG, TaskPhase, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,7 @@ class Orchestrator:
         self._lean_prover: LeanProver | None = None
         self._capability_dag = CapabilityDAG()
         self._dag_bridge = DAGBridge(self._capability_dag)
+        self._theoretical_reasoning = TheoreticalReasoningEngine()
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
@@ -104,6 +106,14 @@ class Orchestrator:
         self._capability_dag.load(global_dag_dir)
         if self._capability_dag.size > 0:
             console.print(f"  [cyan]CapabilityDAG:[/cyan] loaded {self._capability_dag.size} capabilities")
+
+        # Load theoretical reasoning state (cross-domain theory graphs)
+        if self.config.theoretical_reasoning_enabled:
+            theory_dir = self.config.project_root / ".autoforge" / "theories"
+            self._theoretical_reasoning.load_all(theory_dir)
+            n_theories = len(self._theoretical_reasoning._theories)
+            if n_theories > 0:
+                console.print(f"  [cyan]Theoretical reasoning:[/cyan] loaded {n_theories} theory graphs")
 
         try:
             # Phase 1: SPEC
@@ -208,6 +218,10 @@ class Orchestrator:
             if self.config.lean_prover_enabled:
                 await self._run_lean_proving()
 
+            # Theoretical reasoning: parse, evolve, and verify theories
+            if self.config.theoretical_reasoning_enabled:
+                await self._run_theoretical_reasoning()
+
             self._save_state("verify_complete")
 
             # Checkpoint: review test results
@@ -254,6 +268,20 @@ class Orchestrator:
             if self.config.lean_prover_enabled and self._lean_prover and self.project_dir:
                 self._lean_prover.save_state(self.project_dir / ".autoforge" / "lean")
                 console.print(f"  [cyan]Lean:[/cyan] proof state saved")
+
+            # Theoretical reasoning: save theory graphs (project-level + global)
+            if self.config.theoretical_reasoning_enabled and self.project_dir:
+                self._theoretical_reasoning.save_all(
+                    self.project_dir / ".autoforge" / "theories"
+                )
+                # Also save to global storage for cross-project reuse
+                global_theory_dir = self.config.project_root / ".autoforge" / "theories"
+                self._theoretical_reasoning.save_all(global_theory_dir)
+                n_theories = len(self._theoretical_reasoning._theories)
+                if n_theories > 0:
+                    console.print(
+                        f"  [cyan]Theoretical reasoning:[/cyan] {n_theories} theory graphs saved"
+                    )
 
             # Adaptive compute: save calibration data
             if self.config.adaptive_compute_enabled and self.project_dir:
@@ -594,6 +622,14 @@ class Orchestrator:
                 builder.set_dynamic_constitution(
                     (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + dag_context
                 )
+
+            # Theoretical reasoning: inject relevant theory context for science-related tasks
+            if self.config.theoretical_reasoning_enabled and self._theoretical_reasoning._theories:
+                theory_context = self._build_theory_context(task.description)
+                if theory_context:
+                    builder.set_dynamic_constitution(
+                        (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + theory_context
+                    )
 
             # Hierarchical decomposition: for complex tasks, provide structured plan
             if self.config.hierarchical_decomp_enabled:
@@ -1930,6 +1966,11 @@ class Orchestrator:
                         source_project=project_name,
                     )
 
+            # 4. Theoretical reasoning: ingest theory graph concepts
+            if self.config.theoretical_reasoning_enabled:
+                for title, theory in self._theoretical_reasoning._theories.items():
+                    self._ingest_theory_to_dag(theory)
+
             logger.info(f"[CapDAG] Ingested knowledge from project {project_name}")
 
         except Exception as e:
@@ -2006,6 +2047,202 @@ class Orchestrator:
 
         except Exception as e:
             logger.warning(f"Lean proving failed: {e}")
+
+    def _build_theory_context(self, task_description: str, max_tokens: int = 1500) -> str:
+        """Build context from stored theories relevant to a build task.
+
+        Scans loaded TheoryGraphs for concepts/relations that match the
+        task description, returning a compact summary for agent injection.
+        """
+        if not self._theoretical_reasoning._theories:
+            return ""
+
+        keywords = set(task_description.lower().split())
+        relevant_snippets: list[str] = []
+        char_budget = max_tokens * 4  # ~4 chars per token
+
+        for title, theory in self._theoretical_reasoning._theories.items():
+            # Check if theory title matches task
+            title_words = set(title.lower().split("_"))
+            if not keywords & title_words and len(relevant_snippets) > 3:
+                continue
+
+            stats = theory.get_stats()
+            header = (
+                f"Theory: {title} ({stats.get('total_concepts', 0)} concepts, "
+                f"{stats.get('total_relations', 0)} relations)"
+            )
+
+            # Include high-confidence theorems and conjectures
+            useful = []
+            for node in theory._nodes.values():
+                if node.overall_confidence >= 0.5 and node.concept_type.value in (
+                    "theorem", "lemma", "conjecture", "definition",
+                ):
+                    snippet = f"  [{node.concept_type.value}] {node.id}: {node.informal_statement[:150] or node.formal_statement[:150]}"
+                    useful.append(snippet)
+                    if len("\n".join(useful)) > char_budget // max(len(self._theoretical_reasoning._theories), 1):
+                        break
+
+            if useful:
+                relevant_snippets.append(header + "\n" + "\n".join(useful[:8]))
+
+        if not relevant_snippets:
+            return ""
+
+        result = (
+            "\n\n# Theoretical Knowledge Base\n"
+            "The following cross-domain theoretical insights are available:\n\n"
+            + "\n\n".join(relevant_snippets[:5])
+        )
+        return result[:char_budget]
+
+    # ──────────────────────────────────────────────
+    # Theoretical Reasoning — Cross-Domain Scientific Discovery
+    # ──────────────────────────────────────────────
+
+    async def _run_theoretical_reasoning(self) -> None:
+        """Run cross-domain theoretical reasoning on the generated project.
+
+        This integrates the TheoreticalReasoningEngine into the pipeline:
+          1. Detects theory-relevant files (.md, .tex, .theory.json) in the project
+          2. Parses them into TheoryGraphs
+          3. Attempts multi-strategy reasoning to generate new insights
+          4. Verifies generated concepts via multi-modal verification
+          5. Evolves theories by branching into related domains
+          6. Feeds discovered concepts into the CapabilityDAG
+        """
+        if not self.project_dir:
+            return
+
+        try:
+            from autoforge.engine.theoretical_reasoning import (
+                ReasoningStrategy,
+                ScientificDomain,
+            )
+
+            # 1. Find theory-relevant files
+            theory_files: list[Path] = []
+            for pattern in ("*.theory.json", "*.theory.md", "*.tex"):
+                theory_files.extend(self.project_dir.rglob(pattern))
+
+            # Also scan markdown files for theoretical content
+            for md_file in self.project_dir.rglob("*.md"):
+                try:
+                    text = md_file.read_text(encoding="utf-8")[:2000]
+                    theory_keywords = [
+                        "theorem", "lemma", "proof", "conjecture",
+                        "definition", "corollary", "proposition",
+                    ]
+                    if any(kw in text.lower() for kw in theory_keywords):
+                        theory_files.append(md_file)
+                except Exception:
+                    continue
+
+            if not theory_files:
+                return
+
+            console.print(
+                f"  [cyan]Theoretical reasoning:[/cyan] "
+                f"found {len(theory_files)} theory-relevant file(s)"
+            )
+
+            parsed_count = 0
+            new_insights = 0
+
+            for tf in theory_files[:10]:  # Limit to 10 files per run
+                try:
+                    text = tf.read_text(encoding="utf-8")
+
+                    # 2. Parse into TheoryGraph
+                    if tf.suffix == ".json":
+                        # Pre-structured theory graph
+                        from autoforge.engine.theoretical_reasoning import TheoryGraph
+                        graph = TheoryGraph()
+                        graph.load(tf.parent)
+                    else:
+                        # Parse from text (markdown, LaTeX)
+                        graph = await self._theoretical_reasoning.parse_article(
+                            text, self.llm, title=tf.stem,
+                        )
+                    parsed_count += 1
+
+                    # 3. Verify low-confidence concepts
+                    results = await self._theoretical_reasoning.verify_theory(
+                        graph, self.llm,
+                    )
+                    verified_count = sum(1 for c in results.values() if c >= 0.5)
+
+                    # 4. Evolve: attempt one round of reasoning from frontier
+                    if graph.size > 0:
+                        branch = await self._theoretical_reasoning.evolve_theory(
+                            graph, self.llm,
+                            strategy=ReasoningStrategy.ANALOGY_TRANSFER,
+                        )
+                        new_insights += branch.size - graph.size
+
+                    console.print(
+                        f"    {tf.name}: {graph.size} concepts, "
+                        f"{verified_count} verified, "
+                        f"+{max(0, new_insights)} new insights"
+                    )
+
+                    # 5. Feed into CapabilityDAG
+                    if self.config.capability_dag_enabled:
+                        self._ingest_theory_to_dag(graph)
+
+                except Exception as e:
+                    logger.debug(f"Theoretical reasoning on {tf.name}: {e}")
+                    continue
+
+            if parsed_count > 0:
+                console.print(
+                    f"  [cyan]Theoretical reasoning:[/cyan] "
+                    f"parsed {parsed_count} theories, "
+                    f"generated {new_insights} new insights"
+                )
+
+        except Exception as e:
+            logger.warning(f"Theoretical reasoning failed: {e}")
+
+    def _ingest_theory_to_dag(self, theory: "TheoryGraph") -> None:
+        """Feed theoretical concepts from a TheoryGraph into the CapabilityDAG.
+
+        Maps:
+          ConceptNode → DAG capability node
+          ConceptRelation → DAG edges
+          Cross-domain bridges → DAG cross-domain links
+        """
+        try:
+            for node in theory._nodes.values():
+                self._dag_bridge.ingest_architecture_decision(
+                    decision=(
+                        f"[{node.concept_type.value}] {node.id}: "
+                        f"{(node.informal_statement or node.formal_statement)[:300]}"
+                    ),
+                    context=(
+                        f"Domain: {node.domain.value}. "
+                        f"Confidence: {node.overall_confidence:.2f}"
+                    ),
+                    outcome_success=node.overall_confidence >= 0.5,
+                    source_project=theory.title or "theoretical_reasoning",
+                )
+
+            # Ingest cross-domain bridges as high-value workflow knowledge
+            for src, dst, rel in theory.get_cross_domain_bridges():
+                self._dag_bridge.ingest_workflow(
+                    strategy_description=(
+                        f"Cross-domain bridge ({rel.relation_type.value}): "
+                        f"{src.id} ({src.domain.value}) → "
+                        f"{dst.id} ({dst.domain.value}). "
+                        f"Insight: {rel.bridging_insight[:200]}"
+                    ),
+                    tech_fingerprint=f"{src.domain.value}→{dst.domain.value}",
+                    source_project=theory.title or "theoretical_reasoning",
+                )
+
+        except Exception as e:
+            logger.debug(f"Theory→DAG ingestion failed: {e}")
 
     # ──────────────────────────────────────────────
     # EvoMAC Text Backpropagation
