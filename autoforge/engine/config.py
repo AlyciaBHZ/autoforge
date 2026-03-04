@@ -202,6 +202,43 @@ class AdvancedConfig:
     z3_smt_enabled: bool = False
     dafny_enabled: bool = False
 
+    def __post_init__(self) -> None:
+        """Validate bounds on critical settings (D6)."""
+        import warnings
+
+        if self.lean_mcts_iterations <= 0:
+            raise ValueError(
+                f"lean_mcts_iterations must be > 0 (got {self.lean_mcts_iterations})"
+            )
+        if not (1 <= self.lean_decomposition_depth <= 20):
+            raise ValueError(
+                f"lean_decomposition_depth must be in [1, 20] "
+                f"(got {self.lean_decomposition_depth})"
+            )
+        if not (0 <= self.lean_auto_repair_passes <= 10):
+            raise ValueError(
+                f"lean_auto_repair_passes must be in [0, 10] "
+                f"(got {self.lean_auto_repair_passes})"
+            )
+        if not (0.0 <= self.dag_ingest_confidence_threshold <= 1.0):
+            raise ValueError(
+                f"dag_ingest_confidence_threshold must be in [0, 1] "
+                f"(got {self.dag_ingest_confidence_threshold})"
+            )
+
+        # Warn if cloud prover enabled but no backend configured
+        if self.cloud_prover_enabled:
+            import os
+            has_docker = bool(os.environ.get("DOCKER_HOST"))
+            has_ssh = False  # Would need SSH config, but we can't check here
+            if not has_docker:
+                warnings.warn(
+                    "cloud_prover_enabled=True but no Docker host detected "
+                    "(set DOCKER_HOST or configure SSH in ForgeConfig)",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
 
 @dataclass
 class ProjectGoalConfig:
