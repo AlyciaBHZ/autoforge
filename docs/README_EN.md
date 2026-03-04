@@ -11,7 +11,7 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](../LICENSE)
-[![Tests](https://img.shields.io/badge/tests-105%20checks-brightgreen.svg)](../tests/smoke_test.py)
+[![Tests](https://img.shields.io/badge/tests-217%20checks-brightgreen.svg)](../tests/)
 
 [中文](../README.md) | [Developer Docs](../CLAUDE.md)
 
@@ -20,11 +20,35 @@
 ## Quick Start
 
 ```bash
-./setup.sh                                    # Install dependencies
-python forge.py "Todo app with user auth"     # Generate a project
+pip install autoforge                         # Install
+autoforge "Todo app with user auth"           # Generate a project
 ```
 
-On first run, the setup wizard guides you through API key configuration (Anthropic / OpenAI / Google — any one will do). You can skip and configure later. Output lands in `workspace/`, ready to run.
+On first run, the setup wizard guides you through API key configuration (Anthropic / OpenAI / Google — any one will do). Output lands in `workspace/`, ready to run.
+
+<details>
+<summary>Optional dependencies</summary>
+
+```bash
+pip install autoforge[openai]     # OpenAI support
+pip install autoforge[google]     # Google Gemini support
+pip install autoforge[search]     # Web search capabilities
+pip install autoforge[channels]   # Telegram / Webhook channels
+pip install autoforge[all]        # Install everything
+```
+
+</details>
+
+<details>
+<summary>Install from source (developers)</summary>
+
+```bash
+git clone https://github.com/AlyciaBHZ/autoforge.git
+cd autoforge
+pip install -e ".[all]"
+```
+
+</details>
 
 ---
 
@@ -79,8 +103,6 @@ AutoForge orchestrates 6 specialized AI agents through a 5-phase pipeline to tur
 
 ## Supported LLM Providers
 
-AutoForge supports multiple LLM providers. Mix and match freely:
-
 | Provider | Environment Variable | Recommended Models |
 |----------|---------------------|--------------------|
 | **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4 (strong), Claude Sonnet 4 (fast) |
@@ -100,18 +122,18 @@ export FORGE_MODEL_FAST=gemini-2.5-flash  # Fast model from Google
 
 ```bash
 # Generate projects
-python forge.py "REST API for a bookstore with JWT auth"
-python forge.py "Landing page for a SaaS product" --budget 3.00
+autoforge "REST API for a bookstore with JWT auth"
+autoforge "Landing page for a SaaS product" --budget 3.00
 
 # Manage runs
-python forge.py --status          # Show all projects
-python forge.py --resume          # Resume interrupted run
+autoforge --status                # Show all projects
+autoforge --resume                # Resume interrupted run
 
 # Daemon mode (24/7 background service)
-python forge.py daemon start
-python forge.py queue "Blog with markdown support"
-python forge.py projects
-python forge.py deploy <project_id>
+autoforge daemon start
+autoforge queue "Blog with markdown support"
+autoforge projects
+autoforge deploy <project_id>
 ```
 
 <details>
@@ -119,9 +141,9 @@ python forge.py deploy <project_id>
 
 | Complexity | Example | Estimated Cost |
 |------------|---------|:--------------:|
-| Simple | Todo app, landing page | $2--3 |
-| Medium | Blog system, booking platform | $4--6 |
-| Complex | E-commerce MVP, multi-role platform | $7--10 |
+| Simple | Todo app, landing page | $2–3 |
+| Medium | Blog system, booking platform | $4–6 |
+| Complex | E-commerce MVP, multi-role platform | $7–10 |
 
 Default budget cap: $10. Override with `--budget`.
 
@@ -129,34 +151,31 @@ Default budget cap: $10. Override with `--budget`.
 
 ---
 
-## Academic Foundations
+## Intelligent Engines
 
-AutoForge integrates techniques from recent AI and software engineering research:
+AutoForge includes multiple intelligent engines that work together across the code generation pipeline:
 
-| Engine | Source | Paper / Reference |
-|--------|--------|-------------------|
-| **RethinkMCTS** | `search_tree.py` | RethinkMCTS (2024) — thought refinement via execution feedback in MCTS |
-| **EvoMAC** | `evomac.py` | EvoMAC (ICLR 2025) — text backpropagation with natural-language gradients |
-| **SICA** | `sica.py` | SICA (ICLR 2025 Workshop) + STO (NeurIPS 2025) — self-improving coding agents |
-| **Reflexion** | `reflexion.py` | Reflexion (NeurIPS 2023) — verbal reinforcement learning |
-| **CodePRM** | `process_reward.py` | CodePRM (ACL 2025) — step-level process reward model for code |
-| **LDB** | `ldb_debugger.py` | LDB (ACL 2024) — block-level fault localisation |
-| **Adaptive Compute** | `adaptive_compute.py` | Scaling LLM Test-Time Compute (ICLR 2025) — difficulty-aware resource allocation |
-| **Speculative Pipeline** | `speculative_pipeline.py` | Speculative Actions — overlapping phase pre-execution |
-| **Parsel** | `hierarchical_decomp.py` | Parsel (NeurIPS 2023) + CodePlan (ACM 2024) — function-level decomposition |
-| **Lean Prover** | `lean_prover.py` | Hilbert (NeurIPS 2025) + COPRA (COLM 2024) + DeepSeek-Prover (ICLR 2025) |
-| **CapabilityDAG** | `capability_dag.py` | Voyager (NeurIPS 2023) + FunSearch (Nature 2024) — self-growing knowledge graph |
-| **TheoryGraph** | `theoretical_reasoning.py` | Cross-domain scientific reasoning with multi-modal verification |
+- **MCTS Search Tree** — Architecture exploration with execution-feedback-driven thought refinement
+- **Natural-Language Gradient Feedback** — Agents improve each other's output via text "backpropagation"
+- **Process Reward Model** — Step-level code quality evaluation, not just final results
+- **Adaptive Compute Allocation** — Dynamically adjusts reasoning depth based on task difficulty
+- **Verbal Reinforcement Learning** — Extracts lessons from failures to avoid known mistakes on retry
+- **Block-Level Fault Localisation** — Pinpoints code defects to the block level
+- **Function-Level Task Decomposition** — Breaks complex requirements into independently verifiable subtasks
+- **Speculative Pipeline** — Overlapping phase execution for faster builds
 
 <details>
-<summary>Additional techniques</summary>
+<summary>Advanced reasoning capabilities</summary>
 
-- **DSPy/OPRO prompt optimisation** (`prompt_optimizer.py`) — automatic prompt self-improvement
-- **Cross-project RAG** (`rag_retrieval.py`) — BM25+TF-IDF hybrid code retrieval
-- **Formal verification** (`formal_verify.py`) — multi-level linting and type checking
-- **Conditional debate** (`agent_debate.py`) — reward-guided multi-agent architecture debate (ICLR 2025)
-- **RedCode security scanning** (`security_scan.py`) — pattern matching + LLM vulnerability analysis (NeurIPS 2024)
-- **Evolution engine** (`evolution.py`) — MAP-Elites cross-project workflow self-improvement
+- **Theorem Proving** — Lean 4 formal proofs with MCTS tactic search and auto-repair
+- **Multi-Prover Verification** — Cross-verification via Coq, Isabelle, TLA+, Z3/SMT, Dafny
+- **Cross-Domain Scientific Reasoning** — Theory graph construction, multi-modal verification, theory evolution
+- **Self-Growing Knowledge Graph** — Cross-project capability accumulation, community-mergeable
+- **Prompt Self-Optimisation** — Automatic A/B testing and evolutionary prompt improvement
+- **Cross-Project RAG Retrieval** — BM25+TF-IDF hybrid code retrieval from past projects
+- **Multi-Agent Debate** — Reward-guided architecture debate from multiple perspectives
+- **Security Vulnerability Scanning** — Pattern matching + LLM deep analysis
+- **Workflow Self-Evolution** — Cross-project strategy evolution based on historical fitness
 
 </details>
 
