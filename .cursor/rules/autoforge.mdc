@@ -1,0 +1,65 @@
+---
+description: "AutoForge project conventions, commands, and architecture"
+globs: "**/*"
+alwaysApply: true
+---
+
+# AutoForge
+
+AI multi-agent project generation framework. 6 agents build complete projects from natural language descriptions.
+
+## Commands
+
+```bash
+./setup.sh                              # Setup (macOS/Linux)
+setup.bat                               # Setup (Windows)
+source .venv/bin/activate               # Activate venv
+python forge.py "project description"   # Generate project
+python forge.py --budget 5.00 "desc"    # With budget limit
+python forge.py --status                # Show projects
+python forge.py --resume                # Resume interrupted run
+python tests/smoke_test.py              # Run 31-check smoke test
+python forge.py daemon start            # Start 24/7 daemon
+python forge.py queue "description"     # Add to build queue
+python forge.py projects                # List all projects
+python forge.py deploy <project_id>     # Show deploy guide
+```
+
+## Architecture
+
+**Pipeline:** SPEC → BUILD → VERIFY → REFACTOR → DELIVER
+
+**Agents:** Director (Opus), Architect (Opus), Builder (Sonnet, parallel), Reviewer (Sonnet), Tester (Sonnet), Gardener (Sonnet)
+
+## Key Files
+
+- `forge.py` — CLI entry point
+- `engine/orchestrator.py` — 5-phase pipeline controller
+- `engine/config.py` — ForgeConfig dataclass (models, budget, paths)
+- `engine/llm_router.py` — LLM routing (Opus/Sonnet) + budget enforcement
+- `engine/agent_base.py` — Agentic tool-use loop base class
+- `engine/task_dag.py` — Task dependency graph + scheduler
+- `engine/lock_manager.py` — Cross-platform atomic task locking
+- `engine/git_manager.py` — Git worktree isolation for parallel builders
+- `engine/sandbox.py` — Subprocess + Docker sandbox
+- `engine/project_registry.py` — SQLite multi-project management (daemon mode)
+- `engine/daemon.py` — 24/7 daemon controller
+- `engine/deploy_guide.py` — Vercel deployment guide generator
+- `engine/channels/` — Input channels (Telegram bot, webhook API)
+- `engine/agents/` — 6 agent implementations
+- `constitution/` — Agent behavior rules (editable markdown)
+- `constitution/agents/*.md` — Per-agent system prompts
+- `constitution/workflows/*.md` — Phase definitions
+- `services/` — systemd + launchd service configs
+
+## Coding Standards
+
+- Python 3.11+ with `from __future__ import annotations`
+- Fully async (`async/await`, `asyncio`)
+- Type hints on all function signatures
+- `pathlib.Path` for file paths (never string concatenation)
+- `rich` library for terminal output
+- Cross-platform (`sys.platform` checks, `tempfile` for temp dirs)
+- Path traversal prevention in agent file operations
+- Budget tracking on every LLM call via `config.record_usage()`
+- Test changes with `python tests/smoke_test.py` before committing

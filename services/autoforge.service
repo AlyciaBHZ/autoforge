@@ -1,0 +1,28 @@
+# AutoForge systemd service
+# Install: sudo cp services/autoforge.service /etc/systemd/system/
+# Enable:  sudo systemctl enable autoforge
+# Start:   sudo systemctl start autoforge
+# Logs:    journalctl -u autoforge -f
+
+[Unit]
+Description=AutoForge Daemon — AI multi-agent project generator
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/autoforge
+Environment=PATH=/home/%i/autoforge/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/%i/autoforge/.venv/bin/python forge.py daemon start
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/%i/autoforge
+
+[Install]
+WantedBy=multi-user.target

@@ -163,20 +163,30 @@ class TesterAgent(AgentBase):
 
     def parse_results(self, output: str) -> TestResults:
         """Extract structured test results from output."""
+        _fail = TestResults(all_passed=False, summary="Could not parse test results — treating as failure")
+
+        raw: str | None = None
         match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
         if match:
-            data = json.loads(match.group(1).strip())
+            raw = match.group(1).strip()
         else:
             start = output.find("{")
             end = output.rfind("}")
             if start != -1 and end != -1:
-                data = json.loads(output[start : end + 1])
-            else:
-                logger.warning("Could not parse test results, defaulting to passed")
-                return TestResults(all_passed=True, summary="Could not parse results")
+                raw = output[start : end + 1]
+
+        if raw is None:
+            logger.warning("Could not find JSON in test output, treating as failure")
+            return _fail
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON in test results: {e}")
+            return _fail
 
         return TestResults(
-            all_passed=data.get("all_passed", True),
+            all_passed=data.get("all_passed", False),
             results=data.get("results", []),
             summary=data.get("summary", ""),
         )

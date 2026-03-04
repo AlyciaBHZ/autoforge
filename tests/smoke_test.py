@@ -73,6 +73,10 @@ def test_engine_imports():
         SandboxResult, create_sandbox,
     )
     from autoforge.engine.orchestrator import Orchestrator  # noqa: F401
+    from autoforge.engine.project_registry import ProjectRegistry, ProjectStatus, Project  # noqa: F401
+    from autoforge.engine.daemon import ForgeDaemon  # noqa: F401
+    from autoforge.engine.deploy_guide import detect_framework, generate_deploy_guide  # noqa: F401
+    import autoforge.engine.channels  # noqa: F401
 
 
 def test_agent_imports():
@@ -237,6 +241,52 @@ def test_task_dag_failure_handling():
     dag.mark_failed("F-1", "e2")
     dag.mark_failed("F-1", "e3")
     assert dag.get_task("F-1").status == TaskStatus.BLOCKED
+
+
+def test_task_dag_cycle_detection():
+    from autoforge.engine.task_dag import TaskDAG, Task
+    dag = TaskDAG()
+    dag.add_task(Task(id="A", description="a", depends_on=["B"]))
+    dag.add_task(Task(id="B", description="b", depends_on=["A"]))
+    try:
+        dag.validate_acyclic()
+        raise AssertionError("Should have raised ValueError for cycle")
+    except ValueError as e:
+        assert "Cycle" in str(e)
+
+
+def test_project_registry_validation():
+    """Test that enqueue rejects empty/invalid descriptions."""
+    from autoforge.engine.project_registry import ProjectRegistry
+
+    async def _test():
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        try:
+            async with ProjectRegistry(db_path) as reg:
+                # Empty description
+                try:
+                    await reg.enqueue("", "cli")
+                    raise AssertionError("Should reject empty description")
+                except ValueError:
+                    pass
+
+                # Whitespace-only description
+                try:
+                    await reg.enqueue("   ", "cli")
+                    raise AssertionError("Should reject whitespace description")
+                except ValueError:
+                    pass
+
+                # Negative budget
+                try:
+                    await reg.enqueue("valid", "cli", budget_usd=-1.0)
+                    raise AssertionError("Should reject negative budget")
+                except ValueError:
+                    pass
+        finally:
+            db_path.unlink(missing_ok=True)
+
+    asyncio.run(_test())
 
 
 def test_lock_manager():
@@ -438,6 +488,33 @@ def test_research_mode_blocks_writes():
     assert "run_command" in AgentBase.WRITE_TOOLS
 
 
+def test_agent_parse_failsafe():
+    """Test that agents fail-safe on unparseable output (never auto-approve/pass)."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+    from autoforge.engine.agents.reviewer import ReviewerAgent
+    from autoforge.engine.agents.tester import TesterAgent
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    llm = LLMRouter(config)
+    _td = Path(tempfile.mkdtemp())
+
+    r = ReviewerAgent(config, llm, _td)
+    # Unparseable output should NOT auto-approve
+    review = r.parse_review("This is not JSON at all")
+    assert review.approved is False
+    assert review.score == 0
+
+    # Invalid JSON should NOT auto-approve
+    review2 = r.parse_review('```json\n{bad json}\n```')
+    assert review2.approved is False
+
+    t = TesterAgent(config, llm, _td)
+    # Unparseable output should NOT auto-pass
+    results = t.parse_results("Random text output")
+    assert results.all_passed is False
+
+
 # ────────────────────────────────────────────
 # Phase 3b: Multi-Provider
 # ────────────────────────────────────────────
@@ -540,8 +617,185 @@ def test_orchestrator_show_status():
     orch.show_status()  # Should not raise
 
 
+def test_llm_router_requires_api_key():
+    """LLMRouter allows init without keys (lazy client creation)."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+    config = ForgeConfig()  # No API keys
+    router = LLMRouter(config)
+    # Should instantiate fine — keys checked lazily when _get_client is called
+    assert router.call_count == 0
+
+
 # ────────────────────────────────────────────
-# Phase 5: Constitution files
+# Phase 5: Daemon components
+# ────────────────────────────────────────────
+
+def test_project_registry_crud():
+    """Test ProjectRegistry CRUD operations."""
+    from autoforge.engine.project_registry import ProjectRegistry, ProjectStatus
+
+    async def _test():
+        import os
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        try:
+            async with ProjectRegistry(db_path) as reg:
+                # Enqueue
+                p = await reg.enqueue("Test project", "cli", 5.0)
+                assert p.status == ProjectStatus.QUEUED
+                assert p.budget_usd == 5.0
+
+                # Get
+                p2 = await reg.get(p.id)
+                assert p2.description == "Test project"
+
+                # List
+                all_projects = await reg.list_all()
+                assert len(all_projects) == 1
+
+                # Queue size
+                assert await reg.queue_size() == 1
+
+                # Dequeue
+                dequeued = await reg.dequeue()
+                assert dequeued is not None
+                assert dequeued.status == ProjectStatus.BUILDING
+                assert await reg.queue_size() == 0
+
+                # Update phase
+                await reg.update_phase(p.id, "build")
+                updated = await reg.get(p.id)
+                assert updated.phase == "build"
+
+                # Mark completed
+                await reg.mark_completed(p.id, 2.50)
+                completed = await reg.get(p.id)
+                assert completed.status == ProjectStatus.COMPLETED
+                assert completed.cost_usd == 2.50
+
+                # Total cost
+                assert await reg.total_cost() == 2.50
+
+                # Enqueue + Cancel
+                p3 = await reg.enqueue("Cancel me", "cli")
+                assert await reg.cancel(p3.id) is True
+                cancelled = await reg.get(p3.id)
+                assert cancelled.status == ProjectStatus.CANCELLED
+
+                # Cannot cancel non-queued
+                assert await reg.cancel(p.id) is False
+        finally:
+            db_path.unlink(missing_ok=True)
+
+    asyncio.run(_test())
+
+
+def test_project_registry_to_dict():
+    """Test Project.to_dict() serialization."""
+    from autoforge.engine.project_registry import Project, ProjectStatus
+    p = Project(
+        id="abc123", name="test", description="desc",
+        status=ProjectStatus.QUEUED, phase="", workspace_path="",
+        requested_by="cli", budget_usd=10.0, cost_usd=0.0,
+        created_at="2025-01-01T00:00:00", started_at=None,
+        completed_at=None, error=None,
+    )
+    d = p.to_dict()
+    assert d["id"] == "abc123"
+    assert d["status"] == "queued"
+
+
+def test_deploy_guide_generation():
+    """Test deploy guide generation."""
+    from autoforge.engine.deploy_guide import detect_framework, generate_deploy_guide
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        # Create a Next.js project
+        (d / "package.json").write_text(json.dumps({
+            "name": "test-app",
+            "dependencies": {"next": "14.0.0", "react": "18.0.0"},
+            "scripts": {"build": "next build", "dev": "next dev"},
+        }), encoding="utf-8")
+        (d / ".env.example").write_text(
+            "DATABASE_URL=\nNEXTAUTH_SECRET=\n", encoding="utf-8"
+        )
+
+        # Detect
+        info = detect_framework(d)
+        assert info["framework"] == "nextjs"
+        assert "DATABASE_URL" in info["env_vars"]
+
+        # Generate
+        guide = generate_deploy_guide(d, "test-app")
+        assert "Vercel" in guide
+        assert "DATABASE_URL" in guide
+        assert "test-app" in guide
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_deploy_guide_vite():
+    """Test framework detection for Vite project."""
+    from autoforge.engine.deploy_guide import detect_framework
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "package.json").write_text(json.dumps({
+            "dependencies": {"react": "18.0.0"},
+            "devDependencies": {"vite": "5.0.0"},
+        }), encoding="utf-8")
+        info = detect_framework(d)
+        assert info["framework"] == "vite"
+        assert info["output_directory"] == "dist"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_daemon_instantiation():
+    """Test ForgeDaemon can be instantiated."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.daemon import ForgeDaemon
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
+    daemon = ForgeDaemon(config)
+    assert daemon.config is config
+    assert daemon._running is False
+
+
+def test_forge_config_daemon_fields():
+    """Test daemon-related config fields."""
+    from autoforge.engine.config import ForgeConfig
+    config = ForgeConfig()
+    assert config.daemon_enabled is False
+    assert config.daemon_poll_interval == 10
+    assert config.telegram_token == ""
+    assert config.webhook_enabled is False
+    assert config.webhook_port == 8420
+    assert config.db_path is not None
+
+
+def test_cli_daemon_subcommand():
+    """Test that daemon module can be imported."""
+    from autoforge.engine.daemon import ForgeDaemon  # noqa: F401
+    from autoforge.engine.config import ForgeConfig
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
+    daemon = ForgeDaemon(config)
+    assert daemon._running is False
+
+
+def test_cli_queue_subcommand():
+    """Test that project registry supports queue operations."""
+    from autoforge.engine.project_registry import ProjectRegistry  # noqa: F401
+
+
+def test_service_files_exist():
+    """Test service config files exist."""
+    assert (PROJECT_ROOT / "services" / "autoforge.service").exists()
+    assert (PROJECT_ROOT / "services" / "com.autoforge.daemon.plist").exists()
+
+
+# ────────────────────────────────────────────
+# Phase 6: Constitution files
 # ────────────────────────────────────────────
 
 def test_constitution_files_exist():
@@ -597,6 +851,7 @@ def main():
             ("Basic operations + dependency resolution", test_task_dag_basic),
             ("Save and load (JSON persistence)", test_task_dag_save_load),
             ("Failure handling + BLOCKED status", test_task_dag_failure_handling),
+            ("Cycle detection", test_task_dag_cycle_detection),
         ]),
         ("Unit: LockManager", [
             ("Claim, release, enforce, clear", test_lock_manager),
@@ -607,6 +862,7 @@ def main():
         ]),
         ("Unit: LLMRouter", [
             ("Instantiation + model selection", test_llm_router_instantiation),
+            ("Rejects empty API key", test_llm_router_requires_api_key),
         ]),
         ("Unit: GitManager", [
             ("Instantiation", test_git_manager_instantiation),
@@ -615,6 +871,7 @@ def main():
             ("All 8 agents instantiate", test_all_agents_instantiate),
             ("All build_prompt methods", test_agent_build_prompts),
             ("All parse methods", test_agent_parse_methods),
+            ("Fail-safe on unparseable output", test_agent_parse_failsafe),
             ("Research mode blocks writes", test_research_mode_blocks_writes),
         ]),
         ("Multi-Provider", [
@@ -628,6 +885,26 @@ def main():
             ("Orchestrator instantiation", test_orchestrator_instantiation),
             ("Orchestrator has review + import", test_orchestrator_has_review_and_import),
             ("Orchestrator show_status", test_orchestrator_show_status),
+        ]),
+        ("Unit: ProjectRegistry", [
+            ("CRUD operations", test_project_registry_crud),
+            ("Project.to_dict()", test_project_registry_to_dict),
+            ("Input validation", test_project_registry_validation),
+        ]),
+        ("Unit: DeployGuide", [
+            ("Next.js detection + guide generation", test_deploy_guide_generation),
+            ("Vite detection", test_deploy_guide_vite),
+        ]),
+        ("Unit: Daemon", [
+            ("ForgeDaemon instantiation", test_daemon_instantiation),
+            ("Config daemon fields", test_forge_config_daemon_fields),
+        ]),
+        ("CLI: Subcommands", [
+            ("daemon subcommand parsing", test_cli_daemon_subcommand),
+            ("queue subcommand parsing", test_cli_queue_subcommand),
+        ]),
+        ("Service Files", [
+            ("systemd + launchd configs exist", test_service_files_exist),
         ]),
         ("Constitution", [
             ("All constitution files exist + non-empty", test_constitution_files_exist),

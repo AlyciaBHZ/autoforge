@@ -18,6 +18,7 @@ dependencies = [
     "pyyaml>=6.0",
     "InquirerPy>=0.3.4",
     "tomli-w>=1.0",
+    "aiosqlite>=0.20.0",
 ]
 
 [project.scripts]
