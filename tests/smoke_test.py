@@ -146,6 +146,24 @@ def test_cli_parse_subcommands():
     assert args.command == "deploy"
     assert args.project_id == "abc123"
 
+    # Test paper infer
+    args = parser.parse_args(["paper", "infer", "improve long-context reasoning", "--year", "2025"])
+    assert args.command == "paper"
+    assert args.paper_action == "infer"
+    assert args.year == 2025
+
+    # Test paper benchmark
+    args = parser.parse_args(["paper", "benchmark", "--sample-size", "4"])
+    assert args.command == "paper"
+    assert args.paper_action == "benchmark"
+    assert args.sample_size == 4
+
+    # Test paper reproduce
+    args = parser.parse_args(["paper", "reproduce", "robust graph learning", "--pick", "2"])
+    assert args.command == "paper"
+    assert args.paper_action == "reproduce"
+    assert args.pick == 2
+
     # Test global flags
     args = parser.parse_args(["--budget", "5.0", "--mode", "research", "--mobile", "both", "generate", "test"])
     assert args.budget == 5.0
@@ -174,6 +192,7 @@ def test_cli_legacy_compat():
     assert "generate" in _KNOWN_COMMANDS
     assert "daemon" in _KNOWN_COMMANDS
     assert "queue" in _KNOWN_COMMANDS
+    assert "paper" in _KNOWN_COMMANDS
 
 
 # ────────────────────────────────────────────
@@ -1072,6 +1091,11 @@ def test_cli_queue_subcommand():
     from autoforge.engine.project_registry import ProjectRegistry  # noqa: F401
 
 
+def test_cli_paper_subcommand():
+    """Test that paper inference module imports."""
+    from autoforge.engine.paper_repro import fetch_iclr_papers  # noqa: F401
+
+
 def test_service_files_exist():
     """Test service config files exist."""
     assert (PROJECT_ROOT / "services" / "autoforge.service").exists()
@@ -1834,6 +1858,7 @@ def main():
         ("CLI: Subcommands", [
             ("daemon subcommand parsing", test_cli_daemon_subcommand),
             ("queue subcommand parsing", test_cli_queue_subcommand),
+            ("paper subcommand parsing", test_cli_paper_subcommand),
         ]),
         ("Service Files", [
             ("systemd + launchd configs exist", test_service_files_exist),

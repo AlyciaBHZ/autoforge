@@ -12,6 +12,7 @@ Subcommands:
     queue <desc>        Queue project for daemon execution
     projects            List queued/completed projects from registry
     deploy <id>         Print deploy guide for a completed project
+    paper <action>      Infer/reproduce ICLR papers from high-level goals
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import json
 import logging
 import os
 import signal
@@ -60,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
             '  autoforge queue "Build an API"              # Queue project\n'
             "  autoforge projects                          # List queued/history\n"
             "  autoforge deploy <project_id>               # Print deploy guide\n"
+            "  autoforge paper infer \"goal text\"          # Infer likely ICLR papers\n"
+            "  autoforge paper benchmark                   # Evaluate paper inference quality\n"
         ),
     )
 
@@ -174,6 +178,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass requester filter and read any project id",
     )
 
+    # paper
+    from datetime import datetime
+
+    default_year = datetime.now().year - 1
+    paper_parser = subparsers.add_parser(
+        "paper",
+        help="Infer/reproduce ICLR papers from high-level goals",
+    )
+    paper_subparsers = paper_parser.add_subparsers(dest="paper_action", required=True)
+
+    paper_infer = paper_subparsers.add_parser("infer", help="Infer likely ICLR papers from a goal")
+    paper_infer.add_argument("goal", help="High-level research goal (no paper title)")
+    paper_infer.add_argument("--year", type=int, default=default_year, help="ICLR year (default: previous year)")
+    paper_infer.add_argument("--top-k", type=int, default=5, help="Show top-k paper candidates")
+    paper_infer.add_argument("--corpus-size", type=int, default=1200, help="Number of papers to fetch from OpenReview")
+
+    paper_bench = paper_subparsers.add_parser(
+        "benchmark",
+        help="Benchmark goal->paper inference on real ICLR papers",
+    )
+    paper_bench.add_argument("--year", type=int, default=default_year, help="ICLR year")
+    paper_bench.add_argument("--sample-size", type=int, default=5, help="How many benchmark cases to evaluate")
+    paper_bench.add_argument("--top-k", type=int, default=5, help="Hit@k threshold")
+    paper_bench.add_argument("--corpus-size", type=int, default=1200, help="Number of papers to fetch")
+    paper_bench.add_argument("--seed", type=int, default=42, help="Random seed for case sampling")
+    paper_bench.add_argument(
+        "--output",
+        default=None,
+        help="Optional path to write JSON benchmark report",
+    )
+
+    paper_repro = paper_subparsers.add_parser(
+        "reproduce",
+        help="Infer a paper and build reproduction brief/prompt",
+    )
+    paper_repro.add_argument("goal", help="High-level research goal")
+    paper_repro.add_argument("--year", type=int, default=default_year, help="ICLR year")
+    paper_repro.add_argument("--top-k", type=int, default=5, help="Candidate pool size")
+    paper_repro.add_argument("--pick", type=int, default=1, help="1-based candidate index to reproduce")
+    paper_repro.add_argument("--corpus-size", type=int, default=1200, help="Number of papers to fetch")
+    paper_repro.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory to write reproduction artifacts",
+    )
+    paper_repro.add_argument(
+        "--run-generate",
+        action="store_true",
+        help="Run full AutoForge generation using the built reproduction prompt",
+    )
+
     # Backward compatibility flags
     parser.add_argument(
         "--resume",
@@ -200,6 +255,7 @@ _KNOWN_COMMANDS = {
     "queue",
     "projects",
     "deploy",
+    "paper",
 }
 
 
@@ -579,6 +635,203 @@ async def _run_deploy(config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _default_paper_report_path(config, year: int) -> Path:
+    return config.project_root / ".autoforge" / "reports" / f"paper_benchmark_iclr{year}.json"
+
+
+def _safe_slug(text: str, max_len: int = 64) -> str:
+    cleaned = "".join(c.lower() if c.isalnum() else "-" for c in text)
+    cleaned = "-".join(part for part in cleaned.split("-") if part).strip("-")
+    return (cleaned[:max_len].strip("-") or "paper")
+
+
+async def _run_paper_infer(config, args: argparse.Namespace) -> int:
+    """Infer likely ICLR papers from a short goal description."""
+    from autoforge.engine.paper_repro import fetch_iclr_papers, infer_papers_from_goal
+
+    goal = (args.goal or "").strip()
+    if not goal:
+        console.print("[red]Goal is required.[/red]")
+        return 1
+
+    year = int(getattr(args, "year", 0) or 0)
+    top_k = max(1, min(int(getattr(args, "top_k", 5)), 20))
+    corpus_size = max(50, min(int(getattr(args, "corpus_size", 1200)), 5000))
+
+    try:
+        papers = await asyncio.to_thread(fetch_iclr_papers, year=year, limit=corpus_size)
+    except Exception as exc:
+        console.print(f"[red]Failed to fetch ICLR papers:[/red] {exc}")
+        return 1
+
+    if not papers:
+        console.print("[red]No papers fetched from OpenReview.[/red]")
+        return 1
+
+    ranked = infer_papers_from_goal(goal, papers, top_k=top_k)
+    if not ranked:
+        console.print("[yellow]No strong paper match found for this goal.[/yellow]")
+        return 0
+
+    console.print(f"[bold]Goal:[/bold] {goal}")
+    console.print(f"[bold]ICLR {year} candidates:[/bold]")
+    for idx, r in enumerate(ranked, start=1):
+        matched = ", ".join(r.matched_terms[:8]) if r.matched_terms else "-"
+        console.print(f"{idx}. score={r.score:.2f}  {r.paper.title}")
+        console.print(f"   matched: {matched}")
+        console.print(f"   {r.paper.openreview_url}")
+    return 0
+
+
+async def _run_paper_benchmark(config, args: argparse.Namespace) -> int:
+    """Benchmark goal->paper inference on real ICLR papers."""
+    from autoforge.engine.paper_repro import run_goal_inference_benchmark
+
+    year = int(getattr(args, "year", 0) or 0)
+    sample_size = max(3, min(int(getattr(args, "sample_size", 5)), 20))
+    top_k = max(1, min(int(getattr(args, "top_k", 5)), 20))
+    corpus_size = max(200, min(int(getattr(args, "corpus_size", 1200)), 5000))
+    seed = int(getattr(args, "seed", 42))
+
+    try:
+        report = await asyncio.to_thread(
+            run_goal_inference_benchmark,
+            year=year,
+            sample_size=sample_size,
+            corpus_size=corpus_size,
+            top_k=top_k,
+            seed=seed,
+        )
+    except Exception as exc:
+        console.print(f"[red]Benchmark failed:[/red] {exc}")
+        return 1
+
+    out_arg = getattr(args, "output", None)
+    out_path = Path(out_arg) if out_arg else _default_paper_report_path(config, year)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(report.to_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        console.print(f"[red]Failed to write benchmark report:[/red] {exc}")
+        return 1
+
+    console.print(f"[bold]ICLR {year} Goal-Inference Benchmark[/bold]")
+    console.print(
+        f"sample={report.sample_size} top_k={report.top_k} "
+        f"hit@1={report.hit_at_1:.2%} hit@{report.top_k}={report.hit_at_k:.2%} "
+        f"mrr={report.mrr:.3f}"
+    )
+    console.print(f"report: {out_path}")
+
+    console.print("\nTop shortcomings:")
+    for i, gap in enumerate(report.gaps, start=1):
+        console.print(f"{i}. {gap}")
+    return 0
+
+
+async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
+    """Infer one paper and generate reproduction artifacts/prompt."""
+    from autoforge.engine.paper_repro import (
+        build_generation_prompt,
+        build_reproduction_brief,
+        fetch_iclr_papers,
+        infer_papers_from_goal,
+    )
+
+    goal = (args.goal or "").strip()
+    if not goal:
+        console.print("[red]Goal is required.[/red]")
+        return 1
+
+    year = int(getattr(args, "year", 0) or 0)
+    top_k = max(1, min(int(getattr(args, "top_k", 5)), 20))
+    pick = max(1, int(getattr(args, "pick", 1)))
+    corpus_size = max(200, min(int(getattr(args, "corpus_size", 1200)), 5000))
+
+    try:
+        papers = await asyncio.to_thread(fetch_iclr_papers, year=year, limit=corpus_size)
+    except Exception as exc:
+        console.print(f"[red]Failed to fetch ICLR papers:[/red] {exc}")
+        return 1
+
+    ranked = infer_papers_from_goal(goal, papers, top_k=top_k)
+    if not ranked:
+        console.print("[red]No candidate paper inferred. Try a richer goal description.[/red]")
+        return 1
+    if pick > len(ranked):
+        console.print(f"[red]--pick {pick} exceeds candidate count {len(ranked)}.[/red]")
+        return 1
+
+    chosen = ranked[pick - 1]
+    paper = chosen.paper
+
+    brief = build_reproduction_brief(goal, paper)
+    prompt = build_generation_prompt(goal, paper)
+
+    out_arg = getattr(args, "output_dir", None)
+    if out_arg:
+        out_dir = Path(out_arg)
+    else:
+        slug = _safe_slug(paper.title, max_len=48)
+        out_dir = config.project_root / ".autoforge" / "paper_runs" / f"iclr{year}_{slug}_{paper.note_id}"
+
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "candidate.json").write_text(
+            json.dumps(
+                {
+                    "goal": goal,
+                    "score": chosen.score,
+                    "matched_terms": chosen.matched_terms,
+                    "paper": {
+                        "title": paper.title,
+                        "year": paper.year,
+                        "openreview_url": paper.openreview_url,
+                        "pdf_url": paper.pdf_url,
+                        "note_id": paper.note_id,
+                        "keywords": paper.keywords,
+                    },
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (out_dir / "reproduction_brief.md").write_text(brief, encoding="utf-8")
+        (out_dir / "generation_prompt.txt").write_text(prompt, encoding="utf-8")
+    except OSError as exc:
+        console.print(f"[red]Failed to write reproduction artifacts:[/red] {exc}")
+        return 1
+
+    console.print(f"[bold]Selected paper:[/bold] {paper.title}")
+    console.print(f"score={chosen.score:.2f}  matched={', '.join(chosen.matched_terms[:10]) or '-'}")
+    console.print(f"openreview: {paper.openreview_url}")
+    console.print(f"artifacts: {out_dir}")
+
+    if not getattr(args, "run_generate", False):
+        return 0
+
+    if not config.has_api_key:
+        console.print("[red]--run-generate requires API key/auth config (run `autoforge setup`).[/red]")
+        return 1
+
+    from autoforge.engine.orchestrator import Orchestrator
+
+    console.print("[cyan]Running full AutoForge generation from inferred paper prompt...[/cyan]")
+    orchestrator = Orchestrator(config)
+    try:
+        project_dir = await orchestrator.run(prompt)
+    except Exception as exc:
+        console.print(f"[red]Generation failed:[/red] {exc}")
+        return 1
+
+    console.print(f"[green]Generation completed:[/green] {project_dir}")
+    return 0
+
+
 def _resolve_command(argv: list[str]) -> tuple[argparse.Namespace, str | None]:
     """Parse CLI args, handling legacy bare-description mode.
 
@@ -728,6 +981,17 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
 
     elif args.command == "deploy":
         return await _run_deploy(config, args)
+
+    elif args.command == "paper":
+        action = getattr(args, "paper_action", "")
+        if action == "infer":
+            return await _run_paper_infer(config, args)
+        if action == "benchmark":
+            return await _run_paper_benchmark(config, args)
+        if action == "reproduce":
+            return await _run_paper_reproduce(config, args)
+        console.print(f"[red]Unknown paper action:[/red] {action}")
+        return 1
 
     return 1
 

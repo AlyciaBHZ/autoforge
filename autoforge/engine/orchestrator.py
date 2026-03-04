@@ -92,6 +92,9 @@ class Orchestrator:
         self._capability_dag: Any = None
         self._dag_bridge: Any = None
         self._theoretical_reasoning: Any = None
+        self._autonomous_discovery: Any = None
+        self._paper_formalizer: Any = None
+        self._cloud_prover: Any = None
         self._init_engines()
 
     def _agent(self, role: str, *args: Any, **kwargs: Any) -> Any:
@@ -145,6 +148,15 @@ class Orchestrator:
         if c.theoretical_reasoning_enabled:
             from autoforge.engine.theoretical_reasoning import TheoreticalReasoningEngine
             self._theoretical_reasoning = TheoreticalReasoningEngine()
+        if c.autonomous_discovery_enabled:
+            from autoforge.engine.autonomous_discovery import DiscoveryOrchestrator
+            self._autonomous_discovery = DiscoveryOrchestrator()
+        if c.paper_formalizer_enabled:
+            from autoforge.engine.paper_formalizer import PaperFormalizer
+            self._paper_formalizer = PaperFormalizer()
+        if c.cloud_prover_enabled:
+            from autoforge.engine.cloud_prover import CloudProver
+            self._cloud_prover = CloudProver()
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
@@ -273,6 +285,14 @@ class Orchestrator:
             # Theoretical reasoning: parse, evolve, and verify theories
             if self.config.theoretical_reasoning_enabled:
                 await self._run_theoretical_reasoning()
+
+            # Autonomous discovery: extend theory graphs with new results
+            if self.config.autonomous_discovery_enabled and self._autonomous_discovery:
+                await self._run_autonomous_discovery()
+
+            # Paper formalization: Lean 4 formalization + computational reproducibility
+            if self.config.paper_formalizer_enabled and self._paper_formalizer:
+                await self._run_paper_formalization()
 
             self._save_state("verify_complete")
 
@@ -2511,6 +2531,111 @@ class Orchestrator:
 
         except Exception as e:
             logger.debug(f"Theory→DAG ingestion failed: {e}")
+
+    # ──────────────────────────────────────────────
+    # Autonomous Discovery
+    # ──────────────────────────────────────────────
+
+    async def _run_autonomous_discovery(self) -> None:
+        """Run autonomous theorem discovery on theory graphs.
+
+        For each parsed theory graph, attempts to extend the theory
+        by discovering new theorems, conjectures, and cross-domain connections.
+        Results are saved to the project's discovery/ directory.
+        """
+        if not self.project_dir or not self._theoretical_reasoning:
+            return
+
+        try:
+            theories = getattr(self._theoretical_reasoning, '_theories', {})
+            if not theories:
+                return
+
+            from autoforge.engine.autonomous_discovery import DiscoveryOrchestrator
+            discovery = self._autonomous_discovery or DiscoveryOrchestrator()
+            discovery_dir = self.project_dir / ".autoforge" / "discoveries"
+
+            total_discoveries = 0
+            for name, graph in theories.items():
+                if graph.size < 3:  # Skip trivial graphs
+                    continue
+
+                try:
+                    results = await discovery.run(
+                        graph, self.llm,
+                        output_dir=discovery_dir / name,
+                    )
+                    total_discoveries += len(results)
+
+                    if results:
+                        console.print(
+                            f"  [cyan]Autonomous discovery:[/cyan] "
+                            f"'{name}': {len(results)} new results"
+                        )
+                except Exception as e:
+                    logger.debug(f"Autonomous discovery on '{name}' failed: {e}")
+                    continue
+
+            if total_discoveries > 0:
+                console.print(
+                    f"  [cyan]Autonomous discovery:[/cyan] "
+                    f"total {total_discoveries} new discoveries"
+                )
+
+        except Exception as e:
+            logger.warning(f"Autonomous discovery failed: {e}")
+
+    # ──────────────────────────────────────────────
+    # Paper Formalization
+    # ──────────────────────────────────────────────
+
+    async def _run_paper_formalization(self) -> None:
+        """Run Lean 4 formalization on theory graphs.
+
+        For each theory graph, generates Lean 4 code, Python verification
+        scripts, and a structured formalization report.
+        """
+        if not self.project_dir or not self._theoretical_reasoning:
+            return
+
+        try:
+            theories = getattr(self._theoretical_reasoning, '_theories', {})
+            if not theories:
+                return
+
+            from autoforge.engine.paper_formalizer import PaperFormalizer
+            formalizer = self._paper_formalizer or PaperFormalizer()
+            formal_dir = self.project_dir / ".autoforge" / "formalization"
+
+            # Cloud prover for Lean compilation if enabled
+            lean_compile = self.config.cloud_prover_enabled and self._cloud_prover is not None
+            run_python = True  # Always try Python verification
+
+            for name, graph in theories.items():
+                if graph.size < 2:
+                    continue
+
+                try:
+                    report = await formalizer.formalize(
+                        graph, self.llm,
+                        output_dir=formal_dir / name,
+                        lean_compile=lean_compile,
+                        run_python=run_python,
+                    )
+
+                    console.print(
+                        f"  [cyan]Formalization:[/cyan] '{name}': "
+                        f"{report.lean_proved} proved, "
+                        f"{report.lean_sorry} sorry, "
+                        f"{report.numerically_verified} numerically verified "
+                        f"(score={report.overall_score:.2f})"
+                    )
+                except Exception as e:
+                    logger.debug(f"Formalization of '{name}' failed: {e}")
+                    continue
+
+        except Exception as e:
+            logger.warning(f"Paper formalization failed: {e}")
 
     # ──────────────────────────────────────────────
     # EvoMAC Text Backpropagation

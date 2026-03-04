@@ -179,6 +179,9 @@ class AdvancedConfig:
     lean_prover_enabled: bool = True
     capability_dag_enabled: bool = True
     theoretical_reasoning_enabled: bool = True
+    autonomous_discovery_enabled: bool = True
+    paper_formalizer_enabled: bool = True
+    cloud_prover_enabled: bool = False
 
     # Context budget
     context_budget_tokens: int = 4000
@@ -835,6 +838,30 @@ class ForgeConfig:
     @project_goal_disciplines.setter
     def project_goal_disciplines(self, v: list[str]) -> None:
         self.goal.project_goal_disciplines = v
+
+    @property
+    def autonomous_discovery_enabled(self) -> bool:
+        return self.advanced.autonomous_discovery_enabled
+
+    @autonomous_discovery_enabled.setter
+    def autonomous_discovery_enabled(self, v: bool) -> None:
+        self.advanced.autonomous_discovery_enabled = v
+
+    @property
+    def paper_formalizer_enabled(self) -> bool:
+        return self.advanced.paper_formalizer_enabled
+
+    @paper_formalizer_enabled.setter
+    def paper_formalizer_enabled(self, v: bool) -> None:
+        self.advanced.paper_formalizer_enabled = v
+
+    @property
+    def cloud_prover_enabled(self) -> bool:
+        return self.advanced.cloud_prover_enabled
+
+    @cloud_prover_enabled.setter
+    def cloud_prover_enabled(self, v: bool) -> None:
+        self.advanced.cloud_prover_enabled = v
 
     def __post_init__(self) -> None:
         if self.workspace_dir is None:
