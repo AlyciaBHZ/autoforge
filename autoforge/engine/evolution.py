@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -76,6 +77,8 @@ class WorkflowGenome:
     generation: int = 0
     mutations: list[str] = field(default_factory=list)  # What was changed
     created_at: float = field(default_factory=time.time)
+    # Model routing strategy (ShinkaEvolve)
+    model_preference: str = "balanced"  # "fast", "balanced", or "strong"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -94,6 +97,7 @@ class WorkflowGenome:
             "generation": self.generation,
             "mutations": self.mutations,
             "created_at": self.created_at,
+            "model_preference": self.model_preference,
         }
 
     @classmethod
@@ -114,6 +118,7 @@ class WorkflowGenome:
             generation=data.get("generation", 0),
             mutations=data.get("mutations", []),
             created_at=data.get("created_at", time.time()),
+            model_preference=data.get("model_preference", "balanced"),
         )
 
 
@@ -335,6 +340,69 @@ class EvolutionEngine:
 
     # ──────── Phase 1: Recall + Mutate ────────
 
+    def _get_niche_candidates(self, project_type: str, tech_fingerprint: str) -> list[EvolutionRecord]:
+        """Get all candidate genomes from the niche (ShinkaEvolve fitness-proportional sampling).
+
+        Returns candidates that could be used for parent selection, ordered by fitness.
+        """
+        candidates = []
+
+        # Exact niche match first
+        for key in [tech_fingerprint, project_type, "general"]:
+            if key and key in self.memory.niches and self.memory.niches[key]:
+                candidates.extend(self.memory.niches[key])
+                if candidates:
+                    break
+
+        # Fuzzy match if no exact match
+        if not candidates and tech_fingerprint:
+            target_techs = set(tech_fingerprint.split("-"))
+            for niche_key, records in self.memory.niches.items():
+                niche_techs = set(niche_key.split("-"))
+                if len(target_techs & niche_techs) > 0 and records:
+                    candidates.extend(records)
+
+        # Fall back to hall of fame
+        if not candidates:
+            candidates = list(self.memory.hall_of_fame)
+
+        return candidates
+
+    def _fitness_proportional_sample(self, candidates: list[EvolutionRecord]) -> EvolutionRecord | None:
+        """Fitness-proportional (softmax) parent selection from candidates (ShinkaEvolve trick 1).
+
+        Instead of just picking the single best, use softmax-weighted probability distribution
+        to promote diversity while still favoring better-performing genomes.
+        """
+        import random
+
+        if not candidates:
+            return None
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Extract fitness scores and normalize
+        scores = [max(0.1, r.fitness.composite_score) for r in candidates]
+        max_score = max(scores)
+        min_score = min(scores)
+
+        # Normalize to [0, 1] range
+        if max_score > min_score:
+            normalized = [(s - min_score) / (max_score - min_score) for s in scores]
+        else:
+            normalized = [1.0] * len(scores)
+
+        # Apply softmax (temperature-scaled exponential)
+        temperature = 0.5  # Lower = more concentrated on best; higher = more diverse
+        exp_scores = [math.exp(x / temperature) for x in normalized]
+        total = sum(exp_scores)
+        probabilities = [e / total for e in exp_scores]
+
+        # Sample according to probabilities
+        selected = random.choices(candidates, weights=probabilities, k=1)[0]
+        return selected
+
     def prepare_genome(
         self,
         project_type: str = "",
@@ -345,9 +413,12 @@ class EvolutionEngine:
 
         If evolution memory has a good match, start from that and mutate.
         Otherwise, create a fresh genome from the current config.
+
+        Uses fitness-proportional sampling (ShinkaEvolve trick 1) to select ancestors.
         """
-        # Try to recall a successful strategy
-        ancestor = self.memory.get_best_for_type(project_type, tech_fingerprint)
+        # Try to recall successful strategies (ShinkaEvolve: fitness-proportional sampling)
+        candidates = self._get_niche_candidates(project_type, tech_fingerprint)
+        ancestor = self._fitness_proportional_sample(candidates)
 
         if ancestor and ancestor.fitness.composite_score > 0.5:
             # Found a good ancestor — inherit and mutate
@@ -396,49 +467,142 @@ class EvolutionEngine:
             project_type=project_type or parent.project_type,
             parent_id=parent.id,
             generation=parent.generation + 1,
+            model_preference=parent.model_preference,
         )
+
+    def _genome_fingerprint(self, genome: WorkflowGenome) -> frozenset[str]:
+        """Create a fingerprint for a genome (ShinkaEvolve trick 2: novelty rejection).
+
+        Returns a frozenset of genome characteristics for Jaccard distance comparison.
+        """
+        fingerprint = {
+            f"search_tree:{genome.search_tree_enabled}",
+            f"checkpoints:{genome.checkpoints_enabled}",
+            f"candidates:{genome.arch_candidates_tried}",
+            f"tdd_loops:{genome.tdd_loops}",
+            f"parallel:{genome.parallel_builders}",
+            f"model:{genome.model_preference}",
+        }
+        if genome.arch_strategy:
+            fingerprint.add(f"arch:{genome.arch_strategy}")
+        return frozenset(fingerprint)
+
+    def _novelty_check(
+        self,
+        candidate: WorkflowGenome,
+        recent_genomes: list[WorkflowGenome],
+        jaccard_threshold: float = 0.7,
+    ) -> bool:
+        """Check if a candidate genome is sufficiently novel (ShinkaEvolve trick 2).
+
+        Uses Jaccard distance between fingerprints to ensure diversity.
+        Returns True if the genome is novel (sufficiently different from recent ones).
+        """
+        if not recent_genomes:
+            return True
+
+        candidate_fp = self._genome_fingerprint(candidate)
+
+        for recent in recent_genomes:
+            recent_fp = self._genome_fingerprint(recent)
+
+            # Compute Jaccard similarity: intersection / union
+            intersection = len(candidate_fp & recent_fp)
+            union = len(candidate_fp | recent_fp)
+
+            if union > 0:
+                jaccard_similarity = intersection / union
+                if jaccard_similarity > jaccard_threshold:
+                    # Too similar to a recent genome — not novel
+                    return False
+
+        return True
 
     def _mutate(self, genome: WorkflowGenome) -> WorkflowGenome:
         """Apply small random mutations to a genome.
 
         Mutations are conservative — only change 1-2 parameters at a time.
         The idea is to explore the neighborhood of known-good solutions.
+
+        Includes novelty rejection sampling (ShinkaEvolve trick 2) to avoid
+        re-exploring similar genomes.
         """
         import random
-        mutations = []
 
-        # Mutation 1: Toggle search tree (10% chance)
-        if random.random() < 0.10:
-            genome.search_tree_enabled = not genome.search_tree_enabled
-            mutations.append(f"search_tree={'on' if genome.search_tree_enabled else 'off'}")
+        # Collect recent genomes from memory for novelty check
+        recent_genomes = []
+        for records in self.memory.niches.values():
+            recent_genomes.extend([r.genome for r in records[:3]])  # Top 3 from each niche
+        recent_genomes.extend([r.genome for r in self.memory.hall_of_fame[:5]])
 
-        # Mutation 2: Adjust candidate count (15% chance)
-        if random.random() < 0.15 and genome.search_tree_enabled:
-            delta = random.choice([-1, 1])
-            genome.arch_candidates_tried = max(2, min(5, genome.arch_candidates_tried + delta))
-            mutations.append(f"candidates={genome.arch_candidates_tried}")
+        # Novelty rejection: up to 3 attempts to generate a novel genome
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            mutations = []
+            candidate = WorkflowGenome(
+                arch_strategy=genome.arch_strategy,
+                arch_candidates_tried=genome.arch_candidates_tried,
+                active_patches=list(genome.active_patches),
+                active_rules=list(genome.active_rules),
+                parallel_builders=genome.parallel_builders,
+                tdd_loops=genome.tdd_loops,
+                checkpoints_enabled=genome.checkpoints_enabled,
+                search_tree_enabled=genome.search_tree_enabled,
+                tech_fingerprint=genome.tech_fingerprint,
+                project_type=genome.project_type,
+                parent_id=genome.parent_id,
+                generation=genome.generation,
+                model_preference=genome.model_preference,
+            )
 
-        # Mutation 3: Toggle checkpoints (10% chance)
-        if random.random() < 0.10:
-            genome.checkpoints_enabled = not genome.checkpoints_enabled
-            mutations.append(f"checkpoints={'on' if genome.checkpoints_enabled else 'off'}")
+            # Mutation 1: Toggle search tree (10% chance)
+            if random.random() < 0.10:
+                candidate.search_tree_enabled = not candidate.search_tree_enabled
+                mutations.append(f"search_tree={'on' if candidate.search_tree_enabled else 'off'}")
 
-        # Mutation 4: Adjust TDD loops (15% chance)
-        if random.random() < 0.15:
-            delta = random.choice([-1, 1])
-            genome.tdd_loops = max(0, min(3, genome.tdd_loops + delta))
-            mutations.append(f"tdd_loops={genome.tdd_loops}")
+            # Mutation 2: Adjust candidate count (15% chance)
+            if random.random() < 0.15 and candidate.search_tree_enabled:
+                delta = random.choice([-1, 1])
+                candidate.arch_candidates_tried = max(2, min(5, candidate.arch_candidates_tried + delta))
+                mutations.append(f"candidates={candidate.arch_candidates_tried}")
 
-        # Mutation 5: Adjust parallelism (10% chance)
-        if random.random() < 0.10:
-            delta = random.choice([-1, 1])
-            genome.parallel_builders = max(1, min(4, genome.parallel_builders + delta))
-            mutations.append(f"parallel={genome.parallel_builders}")
+            # Mutation 3: Toggle checkpoints (10% chance)
+            if random.random() < 0.10:
+                candidate.checkpoints_enabled = not candidate.checkpoints_enabled
+                mutations.append(f"checkpoints={'on' if candidate.checkpoints_enabled else 'off'}")
 
-        genome.mutations = mutations
+            # Mutation 4: Adjust TDD loops (15% chance)
+            if random.random() < 0.15:
+                delta = random.choice([-1, 1])
+                candidate.tdd_loops = max(0, min(3, candidate.tdd_loops + delta))
+                mutations.append(f"tdd_loops={candidate.tdd_loops}")
+
+            # Mutation 5: Adjust parallelism (10% chance)
+            if random.random() < 0.10:
+                delta = random.choice([-1, 1])
+                candidate.parallel_builders = max(1, min(4, candidate.parallel_builders + delta))
+                mutations.append(f"parallel={candidate.parallel_builders}")
+
+            # Mutation 6: Adaptive model ensemble selection (15% chance) (ShinkaEvolve trick 3)
+            if random.random() < 0.15:
+                candidate.model_preference = random.choice(["fast", "balanced", "strong"])
+                mutations.append(f"model_preference={candidate.model_preference}")
+
+            # Check novelty (ShinkaEvolve trick 2: novelty rejection sampling)
+            if self._novelty_check(candidate, recent_genomes):
+                candidate.mutations = mutations
+                if mutations:
+                    logger.info(f"[Evolution] Mutations (attempt {attempt + 1}): {', '.join(mutations)}")
+                return candidate
+            else:
+                if attempt < max_attempts - 1:
+                    logger.debug(f"[Evolution] Mutation not novel enough (attempt {attempt + 1}/{max_attempts}), re-rolling...")
+
+        # If all attempts failed novelty check, return the last candidate anyway
+        candidate.mutations = mutations
         if mutations:
-            logger.info(f"[Evolution] Mutations: {', '.join(mutations)}")
-        return genome
+            logger.info(f"[Evolution] Mutations (final, novelty check exhausted): {', '.join(mutations)}")
+        return candidate
 
     # ──────── Phase 2: Record + Evaluate ────────
 
@@ -587,6 +751,7 @@ class EvolutionEngine:
             parent_id=genome_a.id,
             generation=max(genome_a.generation, genome_b.generation) + 1,
             mutations=[f"crossover({genome_a.id}x{genome_b.id})"],
+            model_preference=random.choice([genome_a.model_preference, genome_b.model_preference]),
         )
         logger.info(
             f"[Evolution] Crossover: {genome_a.id} x {genome_b.id} -> {child.id}"
@@ -612,10 +777,23 @@ class EvolutionEngine:
         if hasattr(config, "search_tree_max_candidates"):
             config.search_tree_max_candidates = genome.arch_candidates_tried
 
+        # Apply model routing strategy (ShinkaEvolve trick 3: adaptive model ensemble selection)
+        if hasattr(config, "model_strong") and hasattr(config, "model_fast"):
+            if genome.model_preference == "strong":
+                config.model_strong = True
+                config.model_fast = False
+            elif genome.model_preference == "fast":
+                config.model_strong = False
+                config.model_fast = True
+            else:  # balanced
+                config.model_strong = False
+                config.model_fast = False
+
         logger.info(
             f"[Evolution] Applied genome {genome.id} to config: "
             f"parallel={genome.parallel_builders} tdd={genome.tdd_loops} "
-            f"search_tree={genome.search_tree_enabled} checkpoints={genome.checkpoints_enabled}"
+            f"search_tree={genome.search_tree_enabled} checkpoints={genome.checkpoints_enabled} "
+            f"model_preference={genome.model_preference}"
         )
 
     # ──────── Tech Fingerprint Extraction ────────

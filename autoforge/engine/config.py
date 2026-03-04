@@ -200,6 +200,11 @@ class ForgeConfig:
     capability_dag_enabled: bool = True        # Enable universal self-growing knowledge graph
     theoretical_reasoning_enabled: bool = True # Enable cross-domain scientific reasoning & theory evolution
 
+    # Context budget management (v2.7)
+    context_budget_tokens: int = 4000          # Max total supplementary context injected per agent call
+    dag_ingest_confidence_threshold: float = 0.4  # Min confidence to ingest a concept into CapabilityDAG
+    dag_ingest_relevance_threshold: float = 0.3   # Min relevance score for DAG retrieval results
+
     def __post_init__(self) -> None:
         if self.workspace_dir is None:
             self.workspace_dir = self.project_root / "workspace"

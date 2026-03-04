@@ -138,6 +138,7 @@ class VerificationMode(str, Enum):
     STATISTICAL = "statistical"         # Statistical test / Monte Carlo
     PEER_REVIEW = "peer_review"         # Human expert evaluation
     LLM_EVALUATION = "llm_evaluation"   # AI evaluation (lowest confidence)
+    VLM_VISUAL = "vlm_visual"           # Visual/diagram verification via VLM (AI Scientist v2)
 
 
 class ReasoningStrategy(str, Enum):
@@ -219,7 +220,7 @@ class ConceptNode:
             "formal_proof": 1.0, "numerical": 0.85, "symbolic_cas": 0.80,
             "limiting_case": 0.75, "consistency": 0.70, "dimensional": 0.65,
             "symmetry": 0.65, "statistical": 0.60, "peer_review": 0.50,
-            "llm_evaluation": 0.35,
+            "vlm_visual": 0.45, "llm_evaluation": 0.35,
         }
         if not self.verification_status:
             self.overall_confidence = 0.0
@@ -570,6 +571,14 @@ class VerificationSuite:
         else:
             modes.extend([VerificationMode.CONSISTENCY, VerificationMode.NUMERICAL])
 
+        # VLM visual verification: available for any concept with formal statements
+        # containing equations, diagrams, or formulas (AI Scientist v2 idea)
+        if any(kw in concept.formal_statement.lower() for kw in [
+            "\\frac", "\\sum", "\\int", "\\lim", "equation", "diagram",
+            "figure", "graph", "plot", "matrix", "\\begin{",
+        ]):
+            modes.append(VerificationMode.VLM_VISUAL)
+
         return modes
 
     async def _verify_one(
@@ -589,6 +598,7 @@ class VerificationSuite:
             VerificationMode.SYMMETRY: self._prompt_symmetry,
             VerificationMode.LIMITING_CASE: self._prompt_limiting_case,
             VerificationMode.STATISTICAL: self._prompt_statistical,
+            VerificationMode.VLM_VISUAL: self._prompt_vlm_visual,
         }
 
         prompt_fn = prompts.get(mode)
@@ -725,6 +735,34 @@ Design a Monte Carlo or statistical test:
 4. What p-value threshold would support or reject it?
 
 Return JSON: {{"confidence": 0.0-1.0, "reasoning": "your analysis"}}"""
+
+    @staticmethod
+    def _prompt_vlm_visual(concept: ConceptNode) -> str:
+        """VLM visual verification prompt (AI Scientist v2, Sakana ICLR 2025).
+
+        Asks the LLM to "render" the mathematical structure mentally and
+        check for visual/structural correctness. When used with a multimodal
+        model, this can check LaTeX rendering, graph structures, and diagram
+        consistency without needing an actual renderer.
+        """
+        return f"""Visually verify this {concept.concept_type.value} from {concept.domain.value}.
+
+## Formal Statement
+{concept.formal_statement[:3000]}
+
+## Informal Description
+{concept.informal_statement[:1000]}
+
+Perform a "visual inspection" of the mathematical/scientific structure:
+1. **Notation consistency**: Are symbols used consistently? Any overloaded notation?
+2. **Structural correctness**: If this involves a diagram, graph, or commutative diagram,
+   does the structure make sense? Do arrows compose correctly?
+3. **Dimensional/type correctness**: Do the types on both sides of equations match?
+4. **Boundary visualization**: At extreme values (0, ∞, ε→0), does the expression
+   behave as expected visually?
+5. **Pattern recognition**: Does this look similar to known results? If so, which?
+
+Return JSON: {{"confidence": 0.0-1.0, "reasoning": "your visual analysis"}}"""
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1292,6 +1330,98 @@ class TheoryEvolver:
         self._parser = ArticleParser()
         self._verification = VerificationSuite()
         self._evolution_history: list[dict[str, Any]] = []
+        # Bayesian Surprise tracking (AutoDiscovery, Ai2 2026)
+        # Prior belief: uniform distribution over strategy-domain success
+        self._strategy_stats: dict[str, dict[str, float]] = {}  # strategy → {attempts, successes, surprise_sum}
+
+    def _bayesian_surprise(self, branch: "TheoryGraph", source: "TheoryGraph") -> float:
+        """Compute Bayesian Surprise — how much a branch updates our beliefs.
+
+        Surprise = KL divergence between posterior and prior, approximated as:
+          - Novel concepts (new types/domains vs source)
+          - Unexpected cross-domain bridges
+          - Confidence above prior expectation
+
+        Inspired by AutoDiscovery (Ai2, 2026.02): use surprise as MCTS reward
+        to guide hypothesis generation toward genuinely novel directions.
+        """
+        if branch.size <= 0:
+            return 0.0
+
+        source_domains = {n.domain for n in source._nodes.values()}
+        source_types = {n.concept_type for n in source._nodes.values()}
+
+        surprise = 0.0
+        new_count = 0
+
+        for node in branch._nodes.values():
+            if node.id not in source._nodes:
+                new_count += 1
+                # Domain novelty: higher surprise for concepts in new domains
+                if node.domain not in source_domains:
+                    surprise += 2.0
+                # Type novelty: conjectures and analogies are more surprising
+                if node.concept_type not in source_types:
+                    surprise += 1.0
+                if node.concept_type in (ConceptType.CONJECTURE, ConceptType.ANALOGY):
+                    surprise += 1.5
+                # Confidence surprise: high confidence on new concepts is unexpected
+                if node.overall_confidence > 0.6:
+                    surprise += node.overall_confidence
+
+        # Cross-domain bridges are high surprise
+        bridges = branch.get_cross_domain_bridges()
+        source_bridges = source.get_cross_domain_bridges()
+        new_bridges = len(bridges) - len(source_bridges)
+        surprise += new_bridges * 3.0
+
+        # Normalize by new concept count (avoid division by zero)
+        return surprise / max(new_count, 1)
+
+    def _select_strategy_by_surprise(
+        self,
+        strategies: list["ReasoningStrategy"],
+        target_domains: list["ScientificDomain"],
+    ) -> tuple["ReasoningStrategy", "ScientificDomain"]:
+        """Select strategy and domain using Thompson Sampling on surprise scores.
+
+        Strategies that have historically produced high-surprise branches
+        are sampled more often, with exploration via Beta distribution.
+        """
+        import random
+
+        best_score = -1.0
+        best_strategy = strategies[0]
+        best_domain = target_domains[0]
+
+        for s in strategies:
+            for d in target_domains:
+                key = f"{s.value}:{d.value}"
+                stats = self._strategy_stats.get(key, {"attempts": 0, "successes": 0, "surprise_sum": 0.0})
+                alpha = max(1.0, stats.get("successes", 0) + 1)
+                beta_val = max(1.0, stats.get("attempts", 0) - stats.get("successes", 0) + 1)
+                # Thompson sample: higher surprise history → higher sample
+                sample = random.betavariate(alpha, beta_val)
+                # Boost by average surprise
+                avg_surprise = stats.get("surprise_sum", 0) / max(stats.get("attempts", 0), 1)
+                score = sample * (1.0 + avg_surprise)
+
+                if score > best_score:
+                    best_score = score
+                    best_strategy = s
+                    best_domain = d
+
+        return best_strategy, best_domain
+
+    def _record_surprise(self, strategy: "ReasoningStrategy", domain: "ScientificDomain", surprise: float) -> None:
+        """Update Bayesian surprise statistics for a strategy-domain pair."""
+        key = f"{strategy.value}:{domain.value}"
+        if key not in self._strategy_stats:
+            self._strategy_stats[key] = {"attempts": 0, "successes": 0, "surprise_sum": 0.0}
+        self._strategy_stats[key]["attempts"] += 1
+        self._strategy_stats[key]["surprise_sum"] += surprise
+        if surprise > 1.0:  # Threshold for "successful" surprise
+            self._strategy_stats[key]["successes"] += 1
 
     async def evolve(
         self,
@@ -1404,11 +1534,16 @@ class TheoryEvolver:
         strategies: list[ReasoningStrategy] | None = None,
         target_domains: list[ScientificDomain] | None = None,
     ) -> list[TheoryGraph]:
-        """Run multiple evolution rounds autonomously.
+        """Run multiple evolution rounds autonomously with surprise-guided selection.
 
-        This is the "self-emergent discovery" mode: the system
-        explores the theory space by trying different strategies
-        and domains, keeping the most promising branches.
+        Instead of cycling through strategies uniformly, uses Bayesian Surprise
+        (AutoDiscovery, Ai2 2026) to guide exploration toward the most novel
+        and informative research directions. Strategies that historically produce
+        high-surprise branches are selected more often via Thompson Sampling.
+
+        This is the "self-emergent discovery" mode: the system explores the
+        theory space by trying different strategies and domains, keeping the
+        most promising branches measured by surprise score.
         """
         if strategies is None:
             strategies = [
@@ -1417,6 +1552,8 @@ class TheoryEvolver:
                 ReasoningStrategy.COMPOSITION,
                 ReasoningStrategy.BOUNDARY_ANALYSIS,
                 ReasoningStrategy.UNIFICATION,
+                ReasoningStrategy.NUMERICAL_EXPLORATION,
+                ReasoningStrategy.DUALITY,
             ]
         if target_domains is None:
             target_domains = [
@@ -1424,17 +1561,19 @@ class TheoryEvolver:
                 ScientificDomain.STATISTICAL_MECHANICS,
                 ScientificDomain.INFORMATION_THEORY,
                 ScientificDomain.PURE_MATHEMATICS,
+                ScientificDomain.MATHEMATICAL_PHYSICS,
             ]
 
         branches: list[TheoryGraph] = []
+        branch_scores: list[tuple[TheoryGraph, float]] = []  # (branch, surprise)
         current_theory = source_theory
 
         for round_num in range(max_rounds):
-            strategy = strategies[round_num % len(strategies)]
-            target = target_domains[round_num % len(target_domains)]
+            # Surprise-guided selection (replaces uniform cycling)
+            strategy, target = self._select_strategy_by_surprise(strategies, target_domains)
 
             logger.info(f"[Evolver] Autonomous round {round_num + 1}/{max_rounds}: "
-                        f"{strategy.value} → {target.value}")
+                        f"{strategy.value} → {target.value} (surprise-guided)")
 
             branch = await self.evolve(
                 current_theory,
@@ -1444,17 +1583,38 @@ class TheoryEvolver:
                 num_new_concepts=3,
             )
 
+            # Compute Bayesian surprise for this branch
+            surprise = self._bayesian_surprise(branch, current_theory)
+            self._record_surprise(strategy, target, surprise)
+
             if branch.size > len(list(current_theory._nodes.values())):
                 branches.append(branch)
-                # Use this branch as seed for next round (if it produced good results)
-                conjectures = branch.get_conjectures()
-                if conjectures:
-                    current_theory = branch
-                    logger.info(f"[Evolver] Branch has {len(conjectures)} conjectures, "
-                                f"continuing from here")
+                branch_scores.append((branch, surprise))
 
-        logger.info(f"[Evolver] Autonomous exploration complete: {len(branches)} branches")
-        return branches
+                # Follow high-surprise branches (not just any branch with conjectures)
+                if surprise > 1.5:
+                    current_theory = branch
+                    logger.info(
+                        f"[Evolver] High surprise ({surprise:.2f}), following this branch"
+                    )
+                elif branch.get_conjectures():
+                    current_theory = branch
+
+            logger.info(
+                f"[Evolver] Round {round_num + 1}: surprise={surprise:.2f}, "
+                f"branch_size={branch.size}"
+            )
+
+        # Sort branches by surprise for downstream consumers
+        branch_scores.sort(key=lambda x: x[1], reverse=True)
+        sorted_branches = [b for b, _ in branch_scores]
+
+        logger.info(
+            f"[Evolver] Autonomous exploration complete: {len(branches)} branches, "
+            f"top surprise={branch_scores[0][1]:.2f}" if branch_scores else
+            f"[Evolver] Autonomous exploration complete: 0 branches"
+        )
+        return sorted_branches if sorted_branches else branches
 
 
 # ══════════════════════════════════════════════════════════════

@@ -95,6 +95,9 @@ class Orchestrator:
         self._capability_dag = CapabilityDAG()
         self._dag_bridge = DAGBridge(self._capability_dag)
         self._theoretical_reasoning = TheoreticalReasoningEngine()
+        # Adaptive context budget tracking
+        self._context_budget_multiplier: float = 1.0
+        self._context_success_history: list[bool] = []
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
@@ -464,6 +467,78 @@ class Orchestrator:
             })
         return tasks
 
+    def _compute_context_shares(self, task_description: str) -> dict[str, float]:
+        """Compute dynamic context source shares based on task characteristics.
+
+        Returns a dict mapping source labels to their max_share values.
+        Adjusts allocation based on whether the task is testing-focused or file-creation-focused.
+        """
+        # Check if task mentions testing/verification keywords
+        testing_keywords = ["test", "verify", "check", "assert", "validation", "debug"]
+        is_testing = any(kw in task_description.lower() for kw in testing_keywords)
+
+        # Check if task is creating new files
+        creation_keywords = ["create", "implement", "new", "file", "module", "component"]
+        is_creation = any(kw in task_description.lower() for kw in creation_keywords)
+
+        # Default shares
+        shares = {
+            "constitution": 0.35,
+            "prompt_opt": 0.20,
+            "decomp": 0.25,
+            "reflexion": 0.20,
+            "rag": 0.20,
+            "dag": 0.20,
+            "theory": 0.15,
+        }
+
+        # Adjust based on task type
+        if is_testing:
+            # Boost reflexion (past failure patterns help with testing)
+            # Reduce decomp (less structured planning needed for test fixes)
+            shares["reflexion"] = 0.30
+            shares["decomp"] = 0.15
+            logger.debug(f"[ContextShares] Testing task detected — boosted reflexion, reduced decomp")
+        elif is_creation:
+            # Boost decomp (structured planning helps new implementations)
+            # Reduce reflexion (fewer failure patterns for brand new code)
+            shares["decomp"] = 0.35
+            shares["reflexion"] = 0.12
+            logger.debug(f"[ContextShares] Creation task detected — boosted decomp, reduced reflexion")
+
+        return shares
+
+    def _adjust_context_budget(self, success_first_try: bool) -> None:
+        """Learn from task outcome and adjust context budget multiplier.
+
+        First-try success suggests budget was sufficient or generous.
+        Retries suggest budget might have been too tight.
+        Uses a rolling average to smooth out variance.
+        """
+        self._context_success_history.append(success_first_try)
+
+        # Keep only last 10 tasks for rolling average
+        if len(self._context_success_history) > 10:
+            self._context_success_history.pop(0)
+
+        # Calculate success rate
+        success_rate = sum(self._context_success_history) / len(self._context_success_history)
+
+        # Adjust multiplier: if success rate is low, budget was too tight
+        # if success rate is high, budget might be too generous
+        # Target: ~80% first-try success
+        target_success = 0.80
+        adjustment = (success_rate - target_success) * 0.10  # ±10% per cycle
+
+        old_multiplier = self._context_budget_multiplier
+        self._context_budget_multiplier = max(0.5, min(2.0, self._context_budget_multiplier + adjustment))
+
+        if abs(self._context_budget_multiplier - old_multiplier) > 0.01:
+            logger.info(
+                f"[ContextBudget] Adjusted multiplier: {old_multiplier:.2f} → {self._context_budget_multiplier:.2f} "
+                f"(success_rate={success_rate:.1%}, adjustment={adjustment:+.2f})"
+            )
+
     async def _execute_build_tasks(
         self,
         git: GitManager | None,
@@ -593,45 +668,69 @@ class Orchestrator:
                 agent_id=agent_id,
             )
 
-            # Inject dynamic constitution into builder
+            # ── Adaptive Context Budget Manager ──────────────────────────
+            # All supplementary context competes for a shared token budget.
+            # Adaptive system:
+            #  1. Starts with base budget from config.context_budget_tokens
+            #  2. Adjusts based on task difficulty: TRIVIAL×0.5, STANDARD×1.0, COMPLEX×1.5, EXTREME×2.0
+            #  3. Dynamic shares per source based on task characteristics
+            #  4. Learning signal: adjusts multiplier based on first-try success rate
+            # Priority order (P0-P6): constitution → prompt_opt → decomp → reflexion → rag → dag → theory
+            # ────────────────────────────────────────────────────────────────────────
+
+            # Estimate task difficulty if adaptive_compute is available
+            difficulty_level = "standard"  # fallback
+            difficulty_multiplier = 1.0
+            if hasattr(self, "_adaptive_compute"):
+                try:
+                    difficulty = await self._adaptive_compute.estimate_difficulty(task.description)
+                    difficulty_level = difficulty.level.value if hasattr(difficulty.level, "value") else str(difficulty.level)
+                    # Map difficulty to budget multiplier
+                    difficulty_map = {
+                        "trivial": 0.5,
+                        "simple": 0.7,
+                        "standard": 1.0,
+                        "complex": 1.5,
+                        "extreme": 2.0,
+                    }
+                    difficulty_multiplier = difficulty_map.get(difficulty_level, 1.0)
+                    logger.debug(f"[ContextBudget] Task difficulty: {difficulty_level} (multiplier={difficulty_multiplier})")
+                except Exception as e:
+                    logger.debug(f"[ContextBudget] Difficulty estimation failed: {e}")
+
+            # Compute adaptive base budget
+            base_budget_chars = self.config.context_budget_tokens * 4  # ~4 chars/token
+            budget_chars = int(base_budget_chars * difficulty_multiplier * self._context_budget_multiplier)
+            used_chars = 0
+            context_parts: list[tuple[str, str]] = []  # (label, text)
+
+            def _budget_remaining() -> int:
+                return max(0, budget_chars - used_chars)
+
+            def _add_context(label: str, text: str | None, max_share: float = 0.3) -> None:
+                nonlocal used_chars
+                if not text:
+                    return
+                cap = min(len(text), int(budget_chars * max_share), _budget_remaining())
+                if cap <= 0:
+                    return
+                trimmed = text[:cap]
+                context_parts.append((label, trimmed))
+                used_chars += len(trimmed)
+
+            # Get dynamic source shares based on task type
+            dynamic_shares = self._compute_context_shares(task.description)
+
+            # P0: Dynamic constitution (project-specific rules — always included)
             if self._dynamic_constitution:
                 supplement = self._dynamic_constitution.build_supplementary_prompt("builder")
-                if supplement:
-                    builder.set_dynamic_constitution(supplement)
+                _add_context("constitution", supplement, max_share=dynamic_shares.get("constitution", 0.35))
 
-            # Inject optimized prompt if available
+            # P1: Optimized prompt (DSPy/OPRO tuned variant)
             _, opt_prompt = self._prompt_optimizer.get_active_prompt("builder")
-            if opt_prompt:
-                builder.set_dynamic_constitution(
-                    (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + opt_prompt
-                )
+            _add_context("prompt_opt", opt_prompt, max_share=dynamic_shares.get("prompt_opt", 0.20))
 
-            # RAG: inject relevant code from past projects
-            if self.config.rag_enabled:
-                rag_context = self._rag.build_context(
-                    task.description, top_k=3,
-                )
-                if rag_context:
-                    builder.set_dynamic_constitution(
-                        (getattr(builder, "_dynamic_supplement", "") or "") + rag_context
-                    )
-
-            # CapabilityDAG: inject relevant capabilities from universal knowledge graph
-            dag_context = self._dag_bridge.build_context(task.description, max_tokens=2000)
-            if dag_context:
-                builder.set_dynamic_constitution(
-                    (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + dag_context
-                )
-
-            # Theoretical reasoning: inject relevant theory context for science-related tasks
-            if self.config.theoretical_reasoning_enabled and self._theoretical_reasoning._theories:
-                theory_context = self._build_theory_context(task.description)
-                if theory_context:
-                    builder.set_dynamic_constitution(
-                        (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + theory_context
-                    )
-
-            # Hierarchical decomposition: for complex tasks, provide structured plan
+            # P2: Hierarchical decomposition (structured plan for complex tasks)
             if self.config.hierarchical_decomp_enabled:
                 difficulty = getattr(self, "_difficulty", None)
                 is_complex = (
@@ -645,24 +744,48 @@ class Orchestrator:
                         )
                         if plan:
                             decomp_ctx = self._decomposer.build_context_for_agent(plan)
-                            builder.set_dynamic_constitution(
-                                (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + decomp_ctx
-                            )
+                            _add_context("decomp", decomp_ctx, max_share=dynamic_shares.get("decomp", 0.25))
                             console.print(
                                 f"    [{agent_id}] [cyan]Decomp:[/cyan] {len(plan.functions)} functions planned"
                             )
                     except Exception as e:
                         logger.debug(f"Hierarchical decomposition skipped: {e}")
 
-            # Reflexion: inject past failure reflections
+            # P3: Reflexion (past failure memories — high value for retry scenarios)
             if self.config.reflexion_enabled:
                 reflexion_ctx = self._reflexion.build_retry_context(
                     task.description, project=self.spec.get("project_name", ""),
                 )
-                if reflexion_ctx:
-                    builder.set_dynamic_constitution(
-                        (getattr(builder, "_dynamic_supplement", "") or "") + "\n" + reflexion_ctx
-                    )
+                _add_context("reflexion", reflexion_ctx, max_share=dynamic_shares.get("reflexion", 0.20))
+
+            # P4: RAG (relevant code from past projects)
+            if self.config.rag_enabled:
+                rag_context = self._rag.build_context(task.description, top_k=3)
+                _add_context("rag", rag_context, max_share=dynamic_shares.get("rag", 0.20))
+
+            # P5: CapabilityDAG (universal knowledge graph)
+            dag_budget = min(1500, _budget_remaining() // 4)
+            dag_context = self._dag_bridge.build_context(task.description, max_tokens=dag_budget)
+            _add_context("dag", dag_context, max_share=dynamic_shares.get("dag", 0.20))
+
+            # P6: Theoretical reasoning (cross-domain theory knowledge)
+            if self.config.theoretical_reasoning_enabled and self._theoretical_reasoning._theories:
+                theory_context = self._build_theory_context(
+                    task.description, max_tokens=min(1000, _budget_remaining() // 4),
+                )
+                _add_context("theory", theory_context, max_share=dynamic_shares.get("theory", 0.15))
+
+            # Apply all context in one shot
+            if context_parts:
+                combined = "\n".join(text for _, text in context_parts)
+                builder.set_dynamic_constitution(combined)
+                logger.debug(
+                    f"[ContextBudget] {agent_id}: {used_chars}/{budget_chars} chars "
+                    f"(difficulty={difficulty_level}×{difficulty_multiplier}, "
+                    f"learn_mult={self._context_budget_multiplier:.2f}, "
+                    f"{len(context_parts)} sources: "
+                    f"{', '.join(f'{l}={len(t)}' for l, t in context_parts)})"
+                )
 
             # Initialize process reward model for this task
             prm = ProcessRewardModel(
@@ -737,6 +860,11 @@ class Orchestrator:
                     self.dag.mark_done(task.id, f"score={review.score}")
                     console.print(f"  [green][{agent_id}] Done:[/green] {task.id} (score: {review.score})")
 
+                    # Learning signal: task succeeded on first try (before smoke check fix, before any retries)
+                    # Check if we had to loop back for smoke check or revision
+                    success_first_try = (smoke_ok)  # True if smoke check passed on first run
+                    self._adjust_context_budget(success_first_try)
+
                     # PRM: evaluate trajectory and save
                     traj_result = await prm.evaluate_trajectory(task.id, "success")
                     if traj_result.get("final_score", 0) > 0:
@@ -747,7 +875,7 @@ class Orchestrator:
                     if self.project_dir:
                         prm.save_trajectory(task.id, self.project_dir / ".autoforge")
                 else:
-                    # Revision needed — retry with feedback
+                    # Revision needed — retry with feedback (not first-try success)
                     logger.info(f"Task {task.id} needs revision: {review.summary}")
                     revision_result = await builder.run({
                         "task": {
@@ -763,12 +891,19 @@ class Orchestrator:
                             await git.merge_branch(branch_name)
                         self.dag.mark_done(task.id, "revised and approved")
                         console.print(f"  [green][{agent_id}] Done (revised):[/green] {task.id}")
+                        # Learning signal: task needed revision (not first-try success)
+                        self._adjust_context_budget(False)
                     else:
                         self.dag.mark_failed(task.id, revision_result.error)
                         console.print(f"  [red][{agent_id}] Failed:[/red] {task.id}")
+                        # Learning signal: task failed completely (not first-try success)
+                        self._adjust_context_budget(False)
             else:
                 self.dag.mark_failed(task.id, result.error)
                 console.print(f"  [red][{agent_id}] Failed:[/red] {task.id} — {result.error[:80]}")
+
+                # Learning signal: initial builder run failed (not first-try success)
+                self._adjust_context_budget(False)
 
                 # PRM: record failure and evaluate trajectory
                 prm.record_step(
@@ -2208,13 +2343,27 @@ class Orchestrator:
     def _ingest_theory_to_dag(self, theory: "TheoryGraph") -> None:
         """Feed theoretical concepts from a TheoryGraph into the CapabilityDAG.
 
+        Quality gating:
+          - Only concepts above config.dag_ingest_confidence_threshold are ingested
+          - Cross-domain bridges require both endpoints above threshold
+          - This prevents low-quality noise from polluting the shared DAG
+
         Maps:
           ConceptNode → DAG capability node
           ConceptRelation → DAG edges
           Cross-domain bridges → DAG cross-domain links
         """
+        threshold = self.config.dag_ingest_confidence_threshold
+        ingested = 0
+        skipped = 0
+
         try:
             for node in theory._nodes.values():
+                # Quality gate: skip low-confidence concepts
+                if node.overall_confidence < threshold:
+                    skipped += 1
+                    continue
+
                 self._dag_bridge.ingest_architecture_decision(
                     decision=(
                         f"[{node.concept_type.value}] {node.id}: "
@@ -2227,9 +2376,15 @@ class Orchestrator:
                     outcome_success=node.overall_confidence >= 0.5,
                     source_project=theory.title or "theoretical_reasoning",
                 )
+                ingested += 1
 
             # Ingest cross-domain bridges as high-value workflow knowledge
+            # Both endpoints must meet confidence threshold
             for src, dst, rel in theory.get_cross_domain_bridges():
+                if src.overall_confidence < threshold or dst.overall_confidence < threshold:
+                    skipped += 1
+                    continue
+
                 self._dag_bridge.ingest_workflow(
                     strategy_description=(
                         f"Cross-domain bridge ({rel.relation_type.value}): "
@@ -2239,6 +2394,13 @@ class Orchestrator:
                     ),
                     tech_fingerprint=f"{src.domain.value}→{dst.domain.value}",
                     source_project=theory.title or "theoretical_reasoning",
+                )
+                ingested += 1
+
+            if ingested > 0 or skipped > 0:
+                logger.info(
+                    f"[Theory→DAG] {theory.title}: ingested {ingested}, "
+                    f"skipped {skipped} (threshold={threshold})"
                 )
 
         except Exception as e:

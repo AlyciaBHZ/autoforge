@@ -629,6 +629,7 @@ AutoForge 的 AI 智能层从 v2.1 到 v2.7 逐步构建，形成了完整的自
 - **AI 原生检索**：没有 CLI 入口。AI 描述需要什么，DAG 返回相关能力。`DAGBridge.build_context()` 自动注入到 agent 提示词中
 - **向后兼容**：不替代 RAG/Evolution/SICA/LeanProver，而是作为底层统一持久化 + 检索 + 增长层。现有模块通过 `DAGBridge` 适配器读写
 - **自动积累**：每次 pipeline 结束自动将本次运行的架构决策、调试经验、工作流策略写入图
+- **质量门控**（v2.7 新增）：DAG 入口有置信度阈值过滤（`dag_ingest_confidence_threshold=0.4`），低质量概念不会污染共享知识库
 - 灵感来自：Voyager (NeurIPS 2023) 技能库 + FunSearch (Nature 2024) LLM 引导搜索 + EUREKA (ICLR 2024) 进化搜索
 - 配置：`capability_dag_enabled=True`
 
@@ -662,6 +663,15 @@ AutoForge 的 AI 智能层从 v2.1 到 v2.7 逐步构建，形成了完整的自
   - 结束时：理论状态保存到项目级 + 全局级存储，支持跨项目复用
 - 灵感来自：FunSearch (Nature 2024) + AlphaEvolve/AlphaProof (DeepMind 2025) + HERMES (2025) + SciAgent (2025) + Graph of Thought (2024) + LacMaterial (2024) + Ramanujan Machine (Nature 2021)
 - 配置：`theoretical_reasoning_enabled=True`
+
+**上下文预算管理器 (v2.7 新增)**
+- 解决真实的性能问题：20+ 个智能模块各自向 agent 注入上下文，叠加后轻松超过 6000 tokens，拖慢响应且浪费成本
+- **统一预算**：所有补充上下文共享 `context_budget_tokens=4000` 的总预算（约 16KB），每次 agent 调用严格不超
+- **优先级竞争**：7 个上下文源按优先级排序——动态 Constitution > 优化提示 > 任务分解 > Reflexion > RAG > DAG > 理论知识。高优先级先分配，余量流向低优先级
+- **弹性份额**：每个源有 max_share 上限（15%-35%），防止单一源占满预算
+- **DAG 质量门控**：低于 `dag_ingest_confidence_threshold` 的概念不入库，检索时也按相关度过滤
+- 灵感来自：Token-Budget-Aware LLM Reasoning (ACL 2025) + BudgetThinker (2025)
+- 配置：`context_budget_tokens=4000`，`dag_ingest_confidence_threshold=0.4`
 
 **任务 DAG 调度**
 - 任务之间有依赖关系，形成有向无环图
