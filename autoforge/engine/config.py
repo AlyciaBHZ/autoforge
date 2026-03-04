@@ -14,6 +14,7 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -22,9 +23,20 @@ import autoforge
 
 # Approximate pricing per million tokens (USD)
 MODEL_PRICING = {
+    # Anthropic
     "claude-opus-4-6": {"input": 15.0, "output": 75.0},
     "claude-sonnet-4-5-20250929": {"input": 3.0, "output": 15.0},
     "claude-haiku-4-5-20251001": {"input": 1.0, "output": 5.0},
+    # OpenAI
+    "gpt-4o": {"input": 2.5, "output": 10.0},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.6},
+    "o3": {"input": 10.0, "output": 40.0},
+    "o3-mini": {"input": 1.1, "output": 4.4},
+    "o4-mini": {"input": 1.1, "output": 4.4},
+    # Google Gemini
+    "gemini-2.5-pro": {"input": 1.25, "output": 10.0},
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.6},
+    "gemini-2.0-flash": {"input": 0.1, "output": 0.4},
 }
 
 # Default fallback pricing
@@ -66,8 +78,10 @@ class ForgeConfig:
     workspace_dir: Path | None = None
     constitution_dir: Path | None = None
 
-    # LLM settings
-    anthropic_api_key: str = ""
+    # LLM settings — multi-provider API keys
+    api_keys: dict[str, str] = field(default_factory=dict)
+    # Per-provider auth config (OAuth bearer, client_credentials, Google ADC, etc.)
+    auth_config: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_strong: str = "claude-opus-4-6"
     model_fast: str = "claude-sonnet-4-5-20250929"
     max_tokens_strong: int = 16384
@@ -115,6 +129,76 @@ class ForgeConfig:
     webhook_port: int = 8420
     webhook_secret: str = ""  # Bearer token for webhook auth
 
+    # Web tools (search + fetch)
+    web_tools_enabled: bool = True  # Kill switch for all web tools
+    search_backend: str = "duckduckgo"  # "duckduckgo" | "google" | "bing"
+    search_api_key: str = ""  # API key for Google/Bing search backends
+
+    # GitHub integration
+    github_token: str = ""  # Personal access token for GitHub API (optional, increases rate limit)
+
+    # Search tree (branching/backtracking)
+    search_tree_enabled: bool = True  # Enable tree search for architecture exploration
+    search_tree_max_candidates: int = 3  # Candidates per branch point
+
+    # Mid-task checkpoints
+    checkpoints_enabled: bool = True  # Enable mid-task direction checking
+    checkpoint_interval: int = 8  # Check direction every N turns
+
+    # Human-in-the-loop checkpoints
+    confirm_phases: list[str] = field(default_factory=list)  # e.g. ["spec", "build"] or ["all"]
+
+    # Build-phase TDD loops
+    build_test_loops: int = 0  # 0=disabled, 1-3=test-fix iterations per task
+
+    # Evolution engine
+    evolution_enabled: bool = True  # Enable cross-project workflow evolution
+
+    # Prompt optimization (DSPy/OPRO-style)
+    prompt_optimization_enabled: bool = True  # Enable automatic prompt self-improvement
+
+    # Process reward model (CodePRM)
+    process_reward_enabled: bool = True  # Enable step-level code generation evaluation
+
+    # RethinkMCTS
+    mcts_enabled: bool = True        # Enable MCTS-enhanced search during BUILD
+    mcts_max_iterations: int = 9     # Max MCTS iterations per decision point
+
+    # EvoMAC text backpropagation
+    evomac_enabled: bool = True      # Enable text gradient feedback between agents
+
+    # SICA self-improvement
+    sica_enabled: bool = True        # Enable self-improving constitution edits
+
+    # Library-level RAG retrieval
+    rag_enabled: bool = True         # Enable cross-project code knowledge base
+
+    # Formal verification
+    formal_verify_enabled: bool = True  # Enable static analysis + LLM formal checks
+
+    # Conditional multi-agent debate
+    debate_enabled: bool = True      # Enable reward-guided architecture debates
+
+    # RedCode security scanning
+    security_scan_enabled: bool = True  # Enable security vulnerability scanning
+
+    # Reflexion episodic memory (NeurIPS 2023)
+    reflexion_enabled: bool = True   # Enable verbal RL with failure reflections
+
+    # Adaptive test-time compute (ICLR 2025)
+    adaptive_compute_enabled: bool = True  # Enable difficulty-aware resource allocation
+
+    # LDB block-level debugger (ACL 2024)
+    ldb_debugger_enabled: bool = True  # Enable block-level fault localization
+
+    # Speculative pipeline execution
+    speculative_enabled: bool = True  # Enable parallel speculative pre-execution
+
+    # Hierarchical task decomposition (Parsel / CodePlan)
+    hierarchical_decomp_enabled: bool = True  # Enable function-level decomposition for complex tasks
+    lean_prover_enabled: bool = True           # Enable Lean 4 formal theorem proving engine
+    capability_dag_enabled: bool = True        # Enable universal self-growing knowledge graph
+
     def __post_init__(self) -> None:
         if self.workspace_dir is None:
             self.workspace_dir = self.project_root / "workspace"
@@ -124,6 +208,22 @@ class ForgeConfig:
             self.db_path = self.project_root / "autoforge.db"
         if not self.run_id:
             self.run_id = uuid.uuid4().hex[:12]
+
+    @property
+    def has_api_key(self) -> bool:
+        """Check if at least one LLM provider is configured (API key or OAuth)."""
+        return any(v for v in self.api_keys.values()) or bool(self.auth_config)
+
+    @property
+    def anthropic_api_key(self) -> str:
+        """Backward-compatible access to Anthropic API key."""
+        return self.api_keys.get("anthropic", "")
+
+    @anthropic_api_key.setter
+    def anthropic_api_key(self, value: str) -> None:
+        """Backward-compatible setter for Anthropic API key."""
+        if value:
+            self.api_keys["anthropic"] = value
 
     @classmethod
     def from_env(cls, **overrides) -> ForgeConfig:
@@ -140,6 +240,61 @@ class ForgeConfig:
 
         # Layer 2: Load .env (overrides global)
         load_dotenv()
+
+        # Build API keys dict from all sources
+        api_keys: dict[str, str] = {}
+
+        # From global config
+        if global_config.get("anthropic_api_key"):
+            api_keys["anthropic"] = global_config["anthropic_api_key"]
+        if global_config.get("openai_api_key"):
+            api_keys["openai"] = global_config["openai_api_key"]
+        if global_config.get("google_api_key"):
+            api_keys["google"] = global_config["google_api_key"]
+
+        # From env vars (override global)
+        if os.getenv("ANTHROPIC_API_KEY"):
+            api_keys["anthropic"] = os.getenv("ANTHROPIC_API_KEY", "")
+        if os.getenv("OPENAI_API_KEY"):
+            api_keys["openai"] = os.getenv("OPENAI_API_KEY", "")
+        if os.getenv("GOOGLE_API_KEY"):
+            api_keys["google"] = os.getenv("GOOGLE_API_KEY", "")
+
+        # Load per-provider auth config (OAuth bearer, client_credentials, ADC)
+        auth_config: dict[str, dict[str, Any]] = {}
+        for provider in ("anthropic", "openai", "google"):
+            provider_auth = global_config.get(f"auth_{provider}", {})
+            if provider_auth:
+                auth_config[provider] = dict(provider_auth)
+
+        # Env var overrides for auth
+        if os.getenv("OPENAI_BASE_URL"):
+            auth_config.setdefault("openai", {})
+            auth_config["openai"]["base_url"] = os.getenv("OPENAI_BASE_URL", "")
+            if "auth_method" not in auth_config["openai"]:
+                auth_config["openai"]["auth_method"] = "oauth_bearer"
+        if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+            auth_config.setdefault("google", {})
+            if "auth_method" not in auth_config["google"]:
+                auth_config["google"]["auth_method"] = "adc"
+
+        # AWS Bedrock env overrides
+        if os.getenv("CLAUDE_CODE_USE_BEDROCK", "").lower() in ("1", "true", "yes"):
+            auth_config.setdefault("anthropic", {})
+            if "auth_method" not in auth_config["anthropic"]:
+                auth_config["anthropic"]["auth_method"] = "bedrock"
+            if os.getenv("AWS_REGION"):
+                auth_config["anthropic"]["aws_region"] = os.getenv("AWS_REGION", "")
+
+        # Google Vertex AI env overrides
+        if os.getenv("CLAUDE_CODE_USE_VERTEX", "").lower() in ("1", "true", "yes"):
+            auth_config.setdefault("anthropic", {})
+            if "auth_method" not in auth_config["anthropic"]:
+                auth_config["anthropic"]["auth_method"] = "vertex_ai"
+            if os.getenv("ANTHROPIC_VERTEX_PROJECT_ID"):
+                auth_config["anthropic"]["project_id"] = os.getenv("ANTHROPIC_VERTEX_PROJECT_ID", "")
+            if os.getenv("CLOUD_ML_REGION"):
+                auth_config["anthropic"]["region"] = os.getenv("CLOUD_ML_REGION", "")
 
         # Parse allowed Telegram users (comma-separated)
         allowed_raw = os.getenv("FORGE_TELEGRAM_ALLOWED_USERS", "")
@@ -172,12 +327,9 @@ class ForgeConfig:
         elif max_agents > 50:
             max_agents = 50
 
-        # Start with global config values, then override with .env, then CLI
         config = cls(
-            anthropic_api_key=(
-                os.getenv("ANTHROPIC_API_KEY")
-                or global_config.get("anthropic_api_key", "")
-            ),
+            api_keys=api_keys,
+            auth_config=auth_config,
             model_strong=(
                 os.getenv("FORGE_MODEL_STRONG")
                 or global_config.get("model_strong", "claude-opus-4-6")
@@ -205,6 +357,20 @@ class ForgeConfig:
             webhook_host=os.getenv("FORGE_WEBHOOK_HOST", "127.0.0.1"),
             webhook_port=_safe_int("FORGE_WEBHOOK_PORT", 8420),
             webhook_secret=os.getenv("FORGE_WEBHOOK_SECRET", ""),
+            # Web tools
+            web_tools_enabled=os.getenv("FORGE_WEB_TOOLS", "true").lower() not in ("false", "0", "no"),
+            search_backend=os.getenv("FORGE_SEARCH_BACKEND", global_config.get("search_backend", "duckduckgo")),
+            search_api_key=os.getenv("FORGE_SEARCH_API_KEY", global_config.get("search_api_key", "")),
+            # Build TDD
+            build_test_loops=_safe_int("FORGE_BUILD_TEST_LOOPS", int(global_config.get("build_test_loops", 0))),
+            # GitHub
+            github_token=os.getenv("GITHUB_TOKEN", global_config.get("github_token", "")),
+            # Search tree
+            search_tree_enabled=os.getenv("FORGE_SEARCH_TREE", "true").lower() not in ("false", "0", "no"),
+            search_tree_max_candidates=_safe_int("FORGE_SEARCH_CANDIDATES", int(global_config.get("search_tree_max_candidates", 3))),
+            # Checkpoints
+            checkpoints_enabled=os.getenv("FORGE_CHECKPOINTS", "true").lower() not in ("false", "0", "no"),
+            checkpoint_interval=_safe_int("FORGE_CHECKPOINT_INTERVAL", int(global_config.get("checkpoint_interval", 8))),
         )
 
         # Layer 1: CLI overrides (highest priority)

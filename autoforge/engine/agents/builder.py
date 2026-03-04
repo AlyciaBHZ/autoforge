@@ -111,6 +111,61 @@ class BuilderAgent(AgentBase):
             ),
         ]
 
+        # Add grep_search for finding code patterns
+        from functools import partial
+
+        from autoforge.engine.tools.search import (
+            GREP_SEARCH_TOOL_SCHEMA,
+            handle_grep_search,
+        )
+
+        self._tools.append(ToolDefinition(
+            name="grep_search",
+            description=(
+                "Search project files for a pattern (regex). "
+                "Use to find imports, function definitions, existing patterns, "
+                "and integration points before writing code."
+            ),
+            input_schema=GREP_SEARCH_TOOL_SCHEMA,
+            handler=partial(handle_grep_search, working_dir=self.working_dir),
+        ))
+
+        # Add fetch_url and GitHub tools if web tools enabled
+        if getattr(self.config, "web_tools_enabled", True):
+            from autoforge.engine.tools.web import (
+                FETCH_URL_TOOL_SCHEMA,
+                handle_fetch_url,
+            )
+
+            self._tools.append(ToolDefinition(
+                name="fetch_url",
+                description=(
+                    "Fetch a web page and return its text content. "
+                    "Use to read API documentation or code examples while implementing."
+                ),
+                input_schema=FETCH_URL_TOOL_SCHEMA,
+                handler=handle_fetch_url,
+            ))
+
+            # GitHub search for discovering libraries during implementation
+            import os
+            from autoforge.engine.tools.github_search import (
+                SEARCH_GITHUB_TOOL_SCHEMA,
+                handle_search_github,
+            )
+
+            github_token = os.environ.get("GITHUB_TOKEN", "")
+
+            self._tools.append(ToolDefinition(
+                name="search_github",
+                description=(
+                    "Search GitHub for libraries when you need a specific package. "
+                    "Use to find the right npm/pip package for a sub-task."
+                ),
+                input_schema=SEARCH_GITHUB_TOOL_SCHEMA,
+                handler=partial(handle_search_github, github_token=github_token),
+            ))
+
     def _validate_path(self, rel_path: str) -> Path:
         """Validate and resolve a relative path, preventing path traversal."""
         full_path = (self.working_dir / rel_path).resolve()

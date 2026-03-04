@@ -58,7 +58,11 @@
       "Bash(/c/Users/Administrator/AppData/Local/Programs/Python/Python312/python.exe -m pytest /c/Users/Administrator/Desktop/lexa/autoforge/.claude/worktrees/beautiful-gauss/tests/smoke_test.py -v)",
       "Bash(/c/Users/Administrator/AppData/Local/Programs/Python/Python312/Scripts/autoforge.exe --help)",
       "Bash(git add autoforge/__init__.py pyproject.toml README.md forge.py requirements.txt setup.bat setup.sh tests/smoke_test.py autoforge/cli/ autoforge/engine/ autoforge/data/ cli/ engine/ constitution/ templates/)",
-      "Bash(git add -A)"
+      "Bash(git add -A)",
+      "Bash(git push origin claude/beautiful-gauss)",
+      "Bash(git pull origin claude/beautiful-gauss)",
+      "Bash(git add autoforge/cli/setup_wizard.py autoforge/engine/agent_base.py autoforge/engine/config.py autoforge/engine/llm_router.py pyproject.toml tests/smoke_test.py)",
+      "Bash(git fetch origin claude/beautiful-gauss)"
     ]
   }
 }

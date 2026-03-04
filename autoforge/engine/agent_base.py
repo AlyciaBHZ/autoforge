@@ -1,4 +1,10 @@
-"""Agent base class — the core agentic tool-use loop."""
+"""Agent base class — the core agentic tool-use loop.
+
+Enhanced with:
+  - Mid-task checkpoints (process reward model style)
+  - Search tree integration for branching decisions
+  - Dynamic constitution support
+"""
 
 from __future__ import annotations
 
@@ -37,6 +43,8 @@ class AgentResult:
     error: str = ""
     total_turns: int = 0
     duration_seconds: float = 0.0
+    files_written: int = 0
+    tool_calls: dict[str, int] = field(default_factory=dict)
 
 
 class AgentBase(ABC):
@@ -61,16 +69,27 @@ class AgentBase(ABC):
     # Tools that modify state — blocked in research mode
     WRITE_TOOLS: set[str] = {"write_file", "run_command", "delete_file"}
 
+    # Anti-spin detection: turns without write_file before warning/failure
+    SPIN_WARN_TURNS: int = 10
+    SPIN_FAIL_TURNS: int = 20
+
     def __init__(self, config: ForgeConfig, llm: LLMRouter) -> None:
         self.config = config
         self.llm = llm
         self.mode: str = getattr(config, "mode", "developer")
         self._system_prompt: str = ""
+        self._dynamic_supplement: str = ""  # Dynamic constitution patches
         self._tools: list[ToolDefinition] = []
         self._output_parts: list[str] = []
         self._artifacts: dict[str, Any] = {}
+        self._checkpoint_mgr: Any = None  # Lazy-initialized CheckpointManager
         self._load_system_prompt()
         self._register_tools()
+
+    def set_dynamic_constitution(self, supplement: str) -> None:
+        """Set dynamic constitution supplement (project-specific instructions)."""
+        self._dynamic_supplement = supplement
+        logger.debug(f"[{self.ROLE}] Dynamic constitution set ({len(supplement)} chars)")
 
     def _load_system_prompt(self) -> None:
         """Load system prompt from constitution/agents/{role}.md."""
@@ -91,7 +110,7 @@ class AgentBase(ABC):
         """Build the user message for this agent's task."""
 
     def _get_tool_definitions(self) -> list[dict[str, Any]]:
-        """Convert ToolDefinitions to Anthropic API format."""
+        """Convert ToolDefinitions to internal format (provider conversion in LLMRouter)."""
         return [
             {
                 "name": t.name,
@@ -134,22 +153,60 @@ class AgentBase(ABC):
     async def run(self, context: dict[str, Any]) -> AgentResult:
         """Execute the agentic tool-use loop.
 
+        Enhanced with mid-task checkpoints and dynamic constitution support.
+
         Args:
             context: Dictionary with task-specific data for build_prompt().
 
         Returns:
-            AgentResult with success status, output text, and artifacts.
+            AgentResult with success status, output text, artifacts, and metrics.
         """
         self._output_parts = []
         self._artifacts = {}
         start_time = time.monotonic()
+
+        # Build effective system prompt (static + dynamic)
+        effective_system = self._system_prompt
+        if self._dynamic_supplement:
+            effective_system += self._dynamic_supplement
 
         user_prompt = self.build_prompt(context)
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
         tool_defs = self._get_tool_definitions()
         turns = 0
 
+        # --- Metrics tracking (Section D) ---
+        tool_counts: dict[str, int] = {}
+        files_written = 0
+        files_written_list: list[str] = []
+        # --- Anti-spin tracking (Section B) ---
+        last_write_turn = 0  # last turn that called write_file
+        is_write_agent = bool(self.WRITE_TOOLS)  # spin detection only for write-capable agents
+
+        # --- Checkpoint setup (Section E) ---
+        checkpoint_enabled = is_write_agent and self.MAX_TURNS >= 15
+        if checkpoint_enabled:
+            from autoforge.engine.checkpoints import CheckpointManager
+            self._checkpoint_mgr = CheckpointManager(
+                config=self.config, llm=self.llm,
+                checkpoint_interval=8,
+            )
+
         self._log_action("started", f"prompt length={len(user_prompt)}")
+
+        def _build_result(success: bool, error: str = "") -> AgentResult:
+            elapsed = time.monotonic() - start_time
+            return AgentResult(
+                agent_name=self.ROLE,
+                success=success,
+                output="\n".join(self._output_parts),
+                artifacts=self._artifacts,
+                error=error,
+                total_turns=turns,
+                duration_seconds=elapsed,
+                files_written=files_written,
+                tool_calls=dict(tool_counts),
+            )
 
         try:
             while turns < self.MAX_TURNS:
@@ -157,7 +214,7 @@ class AgentBase(ABC):
 
                 response = await self.llm.call(
                     complexity=self.COMPLEXITY,
-                    system=self._system_prompt,
+                    system=effective_system,
                     messages=messages,
                     tools=tool_defs if tool_defs else None,
                 )
@@ -175,15 +232,96 @@ class AgentBase(ABC):
                 # Process tool calls
                 if response.stop_reason == "tool_use":
                     tool_results = []
+                    wrote_this_turn = False
+
                     for block in response.content:
                         if block.type == "tool_use":
                             self._log_action("tool_call", f"{block.name}")
                             result = await self._execute_tool(block.name, block.input)
+
+                            # Track metrics (Section D)
+                            tool_counts[block.name] = tool_counts.get(block.name, 0) + 1
+                            if block.name == "write_file":
+                                files_written += 1
+                                wrote_this_turn = True
+                                # Track file paths for checkpoint system
+                                if block.input.get("path"):
+                                    files_written_list.append(block.input["path"])
+
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": result,
                             })
+
+                    # Update last write turn for spin detection
+                    if wrote_this_turn:
+                        last_write_turn = turns
+
+                    # --- Anti-spin detection (Section B) ---
+                    if is_write_agent and self.mode != "research":
+                        idle_turns = turns - last_write_turn
+
+                        # Hard fail: too many turns without writing
+                        if idle_turns >= self.SPIN_FAIL_TURNS:
+                            spin_msg = (
+                                f"Agent spinning: no file output in {idle_turns} turns"
+                            )
+                            self._log_action("spin_detected", spin_msg)
+                            return _build_result(False, error=spin_msg)
+
+                        # Warning nudge: inject reminder into last tool result
+                        if idle_turns >= self.SPIN_WARN_TURNS and tool_results:
+                            nudge = (
+                                f"\n\nWARNING: You have not written any files in "
+                                f"{idle_turns} turns. Focus on writing code now. "
+                                f"If blocked, report the issue explicitly."
+                            )
+                            tool_results[-1]["content"] += nudge
+                            self._log_action(
+                                "spin_warning",
+                                f"nudge injected at turn {turns} ({idle_turns} idle)",
+                            )
+
+                    # --- Mid-task checkpoint (Section E) ---
+                    if (checkpoint_enabled and self._checkpoint_mgr
+                            and self._checkpoint_mgr.should_check(turns)):
+                        task_desc = context.get("task", {}).get("description", user_prompt[:500])
+                        verdict = await self._checkpoint_mgr.check_direction(
+                            task_description=task_desc,
+                            messages_so_far=messages,
+                            files_written=files_written_list,
+                            turn=turns,
+                        )
+                        if verdict.suggested_action == "adjust" and verdict.feedback:
+                            # Inject course-correction guidance into tool results
+                            correction = (
+                                f"\n\n[CHECKPOINT REVIEW — Turn {turns}]\n"
+                                f"Direction score: {verdict.score:.1f}/1.0\n"
+                                f"Feedback: {verdict.feedback}\n"
+                                f"Action: Adjust your approach based on this feedback."
+                            )
+                            tool_results[-1]["content"] += correction
+                            self._log_action("checkpoint_adjust", verdict.feedback[:100])
+                        elif verdict.should_reset:
+                            # Rollback to last good checkpoint
+                            good_cp = self._checkpoint_mgr.get_last_good_checkpoint()
+                            if good_cp:
+                                messages = good_cp.messages_snapshot
+                                reset_msg = (
+                                    f"\n\n[CHECKPOINT RESET — Turn {turns}]\n"
+                                    f"Your previous approach scored {verdict.score:.1f}/1.0.\n"
+                                    f"Feedback: {verdict.feedback}\n"
+                                    f"You have been reset to turn {good_cp.turn}. "
+                                    f"Try a DIFFERENT approach this time."
+                                )
+                                messages.append({
+                                    "role": "user",
+                                    "content": reset_msg,
+                                })
+                                self._log_action("checkpoint_reset",
+                                    f"Reset to turn {good_cp.turn}, score={verdict.score:.2f}")
+                                continue  # Skip appending, restart loop with reset messages
 
                     # Append assistant response + tool results to conversation
                     messages.append({"role": "assistant", "content": response.content})
@@ -191,35 +329,20 @@ class AgentBase(ABC):
             else:
                 # MAX_TURNS exceeded — this is a failure
                 self._log_action("max_turns_reached", f"turns={turns}")
-                elapsed = time.monotonic() - start_time
-                return AgentResult(
-                    agent_name=self.ROLE,
-                    success=False,
-                    output="\n".join(self._output_parts),
-                    artifacts=self._artifacts,
+                return _build_result(
+                    False,
                     error=f"Agent exceeded maximum turns ({self.MAX_TURNS})",
-                    total_turns=turns,
-                    duration_seconds=elapsed,
                 )
 
-            elapsed = time.monotonic() - start_time
-            return AgentResult(
-                agent_name=self.ROLE,
-                success=True,
-                output="\n".join(self._output_parts),
-                artifacts=self._artifacts,
-                total_turns=turns,
-                duration_seconds=elapsed,
+            # Log metrics summary (Section D)
+            total_calls = sum(tool_counts.values())
+            self._log_action(
+                "metrics",
+                f"{files_written} files written, {total_calls} tool calls in {turns} turns",
             )
 
+            return _build_result(True)
+
         except Exception as e:
-            elapsed = time.monotonic() - start_time
             self._log_action("failed", str(e))
-            return AgentResult(
-                agent_name=self.ROLE,
-                success=False,
-                output="\n".join(self._output_parts),
-                error=str(e),
-                total_turns=turns,
-                duration_seconds=elapsed,
-            )
+            return _build_result(False, error=str(e))

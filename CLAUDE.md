@@ -48,9 +48,28 @@ python scripts/git_sync.py pick-range 0,2-4 # Cherry-pick by index from main
 ```
 forge.py                    Entry point — CLI argument parsing, orchestrator launch
 engine/orchestrator.py      Pipeline controller — 5 phases, state persistence, resume
-engine/config.py            ForgeConfig dataclass — models, budget, paths
+engine/config.py            ForgeConfig dataclass — models, budget, paths, search tree & checkpoint settings
 engine/llm_router.py        LLM routing — Opus for complex, Sonnet for routine tasks
-engine/agent_base.py        AgentBase — agentic tool-use loop (send → tool_use → execute → repeat)
+engine/agent_base.py        AgentBase — agentic tool-use loop + checkpoints + dynamic constitution
+engine/search_tree.py       Search tree + RethinkMCTS — branching, evaluation, backtracking, thought refinement
+engine/checkpoints.py       Mid-task checkpoints — Process Reward Model style direction checking
+engine/dynamic_constitution.py  Dynamic constitution + meta-learning knowledge base
+engine/evolution.py             Evolution engine — cross-project workflow self-improvement
+engine/prompt_optimizer.py      DSPy/OPRO-style automatic prompt self-optimization
+engine/process_reward.py        CodePRM — step-level process reward model for code generation
+engine/evomac.py                EvoMAC — text backpropagation, natural-language gradient feedback between agents
+engine/sica.py                  SICA — self-improving coding agent, constitution self-editing + rollback
+engine/rag_retrieval.py         Library-level RAG — BM25+TF-IDF hybrid cross-project code retrieval
+engine/formal_verify.py         Formal verification — multi-level linting, type checking, LLM formal analysis
+engine/agent_debate.py          Conditional debate — reward-guided multi-agent architecture debate
+engine/security_scan.py         RedCode security scanning — pattern matching + LLM deep vulnerability analysis
+engine/reflexion.py             Reflexion — verbal RL with episodic memory for failure-informed retries
+engine/adaptive_compute.py      Adaptive test-time compute — difficulty-aware resource allocation + self-calibration
+engine/ldb_debugger.py          LDB — block-level fault localization via runtime simulation
+engine/speculative_pipeline.py  Speculative pipeline — overlapping phase pre-execution for speed
+engine/hierarchical_decomp.py   Hierarchical decomposition — Parsel-style function-level task planning
+engine/lean_prover.py           Lean 4 theorem proving — Hilbert+COPRA+MCTS+STP multi-strategy formal prover
+engine/capability_dag.py        CapabilityDAG — self-growing universal knowledge graph, community-mergeable
 engine/task_dag.py           TaskDAG — dependency graph, scheduling, persistence
 engine/lock_manager.py      Cross-platform atomic task locking (symlink on POSIX, O_CREAT|O_EXCL on Windows)
 engine/git_manager.py       Git worktree isolation for parallel builders
@@ -59,6 +78,9 @@ engine/project_registry.py  SQLite-backed multi-project management (daemon mode)
 engine/daemon.py            24/7 daemon controller — queue → build → notify → repeat
 engine/deploy_guide.py      Vercel deployment guide generator
 engine/channels/            Input channels (Telegram bot, webhook API)
+engine/tools/web.py         Web search (DuckDuckGo/Google) + URL fetching
+engine/tools/search.py      Project code search (grep)
+engine/tools/github_search.py  GitHub repository & code search API integration
 engine/agents/              6 agent implementations (director, architect, builder, reviewer, tester, gardener)
 constitution/               Agent behavior rules, workflow definitions, quality gates
 constitution/agents/*.md    Per-agent system prompts (loaded by agent_base.py)

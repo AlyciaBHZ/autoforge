@@ -60,7 +60,10 @@ def test_dependency_imports():
 
 def test_engine_imports():
     from autoforge.engine.config import ForgeConfig  # noqa: F401
-    from autoforge.engine.llm_router import LLMRouter, TaskComplexity, BudgetExceededError  # noqa: F401
+    from autoforge.engine.llm_router import (  # noqa: F401
+        LLMRouter, TaskComplexity, BudgetExceededError,
+        ContentBlock, Usage, LLMResponse, detect_provider,
+    )
     from autoforge.engine.agent_base import AgentBase, AgentResult, ToolDefinition  # noqa: F401
     from autoforge.engine.task_dag import TaskDAG, Task, TaskPhase, TaskStatus  # noqa: F401
     from autoforge.engine.lock_manager import LockManager  # noqa: F401
@@ -89,7 +92,7 @@ def test_agent_imports():
 
 
 def test_cli_imports():
-    from autoforge.cli.app import build_parser, async_main  # noqa: F401
+    from autoforge.cli.app import build_parser, main  # noqa: F401
     from autoforge.cli.display import show_banner, show_startup_info, show_review_report  # noqa: F401
     from autoforge.cli.setup_wizard import needs_setup, load_global_config  # noqa: F401
 
@@ -144,7 +147,7 @@ def test_cli_legacy_compat():
     assert args.legacy_resume == "auto"
 
     # Verify legacy pre-scan detects bare descriptions
-    # (bare descriptions are handled by argv pre-scanning in async_main,
+    # (bare descriptions are handled by argv pre-scanning in _resolve_command,
     #  not by argparse, so we test the detection logic here)
     assert "Build a todo app" not in _KNOWN_COMMANDS
     assert "generate" in _KNOWN_COMMANDS
@@ -341,7 +344,7 @@ def test_sandbox_factory():
 def test_llm_router_instantiation():
     from autoforge.engine.llm_router import LLMRouter, TaskComplexity
     from autoforge.engine.config import ForgeConfig
-    config = ForgeConfig(anthropic_api_key="fake-key")
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
     router = LLMRouter(config)
     m, t = router._select_model(TaskComplexity.HIGH)
     assert m == "claude-opus-4-6"
@@ -363,6 +366,206 @@ def test_git_manager_instantiation():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_agent_result_metrics_fields():
+    """Test AgentResult has files_written and tool_calls fields."""
+    from autoforge.engine.agent_base import AgentResult
+    r = AgentResult(agent_name="builder", success=True)
+    assert r.files_written == 0
+    assert r.tool_calls == {}
+    r2 = AgentResult(
+        agent_name="builder", success=True,
+        files_written=3, tool_calls={"write_file": 3, "read_file": 5},
+    )
+    assert r2.files_written == 3
+    assert r2.tool_calls["write_file"] == 3
+
+
+def test_anti_spin_constants():
+    """Test anti-spin detection constants on AgentBase."""
+    from autoforge.engine.agent_base import AgentBase
+    assert hasattr(AgentBase, "SPIN_WARN_TURNS")
+    assert hasattr(AgentBase, "SPIN_FAIL_TURNS")
+    assert AgentBase.SPIN_WARN_TURNS == 10
+    assert AgentBase.SPIN_FAIL_TURNS == 20
+    assert AgentBase.SPIN_FAIL_TURNS > AgentBase.SPIN_WARN_TURNS
+
+
+def test_build_gate_enforcement():
+    """Test _enforce_build_gate catches missing/failed tasks."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
+    from autoforge.engine.task_dag import TaskDAG, Task, TaskPhase, TaskStatus
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    orch = Orchestrator(config)
+
+    # All done → no error
+    dag = TaskDAG()
+    dag.add_task(Task(id="T1", description="test", phase=TaskPhase.BUILD, status=TaskStatus.DONE, files=[]))
+    try:
+        asyncio.run(orch._enforce_build_gate(dag, Path(tempfile.mkdtemp())))
+    except RuntimeError:
+        raise AssertionError("Should not raise for completed tasks")
+
+    # Zero completed → RuntimeError
+    dag2 = TaskDAG()
+    dag2.add_task(Task(id="T2", description="fail", phase=TaskPhase.BUILD, status=TaskStatus.FAILED))
+    dag2.add_task(Task(id="T3", description="fail2", phase=TaskPhase.BUILD, status=TaskStatus.FAILED))
+    try:
+        asyncio.run(orch._enforce_build_gate(dag2, Path(tempfile.mkdtemp())))
+        raise AssertionError("Should raise for all-failed tasks")
+    except RuntimeError as e:
+        assert "failed" in str(e).lower()
+
+
+def test_file_overlap_detection():
+    """Test _detect_file_overlaps finds overlapping files."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
+    from autoforge.engine.task_dag import TaskDAG, Task, TaskPhase
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    orch = Orchestrator(config)
+
+    dag = TaskDAG()
+    dag.add_task(Task(id="A", description="task A", phase=TaskPhase.BUILD, files=["shared.py", "a.py"]))
+    dag.add_task(Task(id="B", description="task B", phase=TaskPhase.BUILD, files=["shared.py", "b.py"]))
+    dag.add_task(Task(id="C", description="task C", phase=TaskPhase.BUILD, files=["c.py"]))
+
+    overlaps = orch._detect_file_overlaps(dag)
+    assert "shared.py" in overlaps
+    assert set(overlaps["shared.py"]) == {"A", "B"}
+    assert "a.py" not in overlaps
+    assert "c.py" not in overlaps
+
+
+def test_smoke_check_missing_files():
+    """Test _smoke_check catches missing files."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
+    from autoforge.engine.task_dag import Task, TaskPhase
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    orch = Orchestrator(config)
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        task = Task(id="T1", description="test", phase=TaskPhase.BUILD, files=["missing.py"])
+        ok, msg = asyncio.run(orch._smoke_check(task, d))
+        assert ok is False
+        assert "Missing files" in msg
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_smoke_check_syntax_error():
+    """Test _smoke_check catches Python syntax errors."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
+    from autoforge.engine.task_dag import Task, TaskPhase
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    orch = Orchestrator(config)
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        # Write a file with a syntax error
+        (d / "bad.py").write_text("def f(\n  pass", encoding="utf-8")
+        task = Task(id="T1", description="test", phase=TaskPhase.BUILD, files=["bad.py"])
+        ok, msg = asyncio.run(orch._smoke_check(task, d))
+        assert ok is False
+        assert "Syntax errors" in msg
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_smoke_check_valid_file():
+    """Test _smoke_check passes for valid Python files."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.orchestrator import Orchestrator
+    from autoforge.engine.task_dag import Task, TaskPhase
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    orch = Orchestrator(config)
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "good.py").write_text("def hello():\n    return 'world'\n", encoding="utf-8")
+        task = Task(id="T1", description="test", phase=TaskPhase.BUILD, files=["good.py"])
+        ok, msg = asyncio.run(orch._smoke_check(task, d))
+        assert ok is True
+        assert msg == "OK"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_constitution_builder_mandatory_rules():
+    """Test builder.md contains mandatory rules section."""
+    builder_path = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "agents" / "builder.md"
+    content = builder_path.read_text(encoding="utf-8")
+    assert "MANDATORY" in content
+    assert "write_file" in content
+    assert "read_file" in content
+    assert "py_compile" in content
+
+
+def test_constitution_architect_composition():
+    """Test architect.md contains composition principle."""
+    arch_path = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "agents" / "architect.md"
+    content = arch_path.read_text(encoding="utf-8")
+    assert "Composition" in content
+    assert "library" in content.lower() or "libraries" in content.lower()
+
+
+def test_constitution_quality_gates_enforcement():
+    """Test quality_gates.md documents enforcement status."""
+    qg_path = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "quality_gates.md"
+    content = qg_path.read_text(encoding="utf-8")
+    assert "Enforcement" in content
+    assert "_enforce_build_gate" in content
+    assert "Anti-Spin" in content or "anti-spin" in content.lower()
+
+
+def test_git_available_detection():
+    from autoforge.engine.git_manager import is_git_available, _git_available
+    import autoforge.engine.git_manager as gm_mod
+    # Reset cache so we test fresh
+    old = gm_mod._git_available
+    gm_mod._git_available = None
+    try:
+        result = is_git_available()
+        assert isinstance(result, bool)
+        # On most CI/dev systems git is installed; just verify it returns bool
+        # Also verify caching works
+        assert gm_mod._git_available is result
+        assert is_git_available() is result  # cached
+    finally:
+        gm_mod._git_available = old
+
+
+def test_git_version_async():
+    from autoforge.engine.git_manager import get_git_version, is_git_available
+    version = asyncio.run(get_git_version())
+    if is_git_available():
+        assert version is not None
+        assert "git version" in version.lower()
+    else:
+        assert version is None
+
+
+def test_config_has_api_key():
+    from autoforge.engine.config import ForgeConfig
+    # No keys → has_api_key is False
+    config = ForgeConfig(api_keys={})
+    assert config.has_api_key is False
+    # With a key → has_api_key is True
+    config2 = ForgeConfig(api_keys={"openai": "sk-test123"})
+    assert config2.has_api_key is True
+    # Empty string key → has_api_key is False
+    config3 = ForgeConfig(api_keys={"anthropic": ""})
+    assert config3.has_api_key is False
+
+
 def test_all_agents_instantiate():
     from autoforge.engine.config import ForgeConfig
     from autoforge.engine.llm_router import LLMRouter
@@ -375,28 +578,28 @@ def test_all_agents_instantiate():
     from autoforge.engine.agents.scanner import ScannerAgent
     from autoforge.engine.sandbox import SubprocessSandbox
 
-    config = ForgeConfig(anthropic_api_key="fake")
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
     llm = LLMRouter(config)
     wd = Path(tempfile.mkdtemp())
 
     try:
         d = DirectorAgent(config, llm)
-        assert d.ROLE == "director" and len(d._tools) == 0
+        assert d.ROLE == "director" and len(d._tools) == 4  # search_web + fetch_url + search_github + inspect_repo
         df = DirectorFixAgent(config, llm)
         assert df.ROLE == "director"
         a = ArchitectAgent(config, llm)
-        assert a.ROLE == "architect" and len(a._tools) == 1
+        assert a.ROLE == "architect" and len(a._tools) == 5  # read_template + search_web + fetch_url + search_github + inspect_repo
         sb = SubprocessSandbox(wd)
         b = BuilderAgent(config, llm, working_dir=wd, sandbox=sb)
-        assert b.ROLE == "builder" and len(b._tools) == 4
+        assert b.ROLE == "builder" and len(b._tools) == 7  # write/read/list/run + grep_search + fetch_url + search_github
         r = ReviewerAgent(config, llm, working_dir=wd)
         assert r.ROLE == "reviewer" and len(r._tools) == 2
         t = TesterAgent(config, llm, working_dir=wd, sandbox=sb)
         assert t.ROLE == "tester" and len(t._tools) == 2
         g = GardenerAgent(config, llm, working_dir=wd)
-        assert g.ROLE == "gardener" and len(g._tools) == 3
+        assert g.ROLE == "gardener" and len(g._tools) == 5  # write/read/list + grep_search + fetch_url
         s = ScannerAgent(config, llm, working_dir=wd)
-        assert s.ROLE == "scanner" and len(s._tools) == 3
+        assert s.ROLE == "scanner" and len(s._tools) == 4  # read/list/run + grep_search
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 
@@ -413,7 +616,7 @@ def test_agent_build_prompts():
     from autoforge.engine.agents.scanner import ScannerAgent
     from autoforge.engine.sandbox import SubprocessSandbox
 
-    config = ForgeConfig(anthropic_api_key="fake")
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
     llm = LLMRouter(config)
     wd = Path(tempfile.mkdtemp())
     sb = SubprocessSandbox(wd)
@@ -446,7 +649,7 @@ def test_agent_parse_methods():
     from autoforge.engine.agents.tester import TesterAgent
     from autoforge.engine.agents.scanner import ScannerAgent
 
-    config = ForgeConfig(anthropic_api_key="fake")
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
     llm = LLMRouter(config)
 
     d = DirectorAgent(config, llm)
@@ -477,7 +680,7 @@ def test_research_mode_blocks_writes():
     from autoforge.engine.agent_base import AgentBase
     from autoforge.engine.config import ForgeConfig
 
-    config = ForgeConfig(anthropic_api_key="fake", mode="research")
+    config = ForgeConfig(api_keys={"anthropic": "fake"}, mode="research")
     assert config.mode == "research"
 
     # Verify WRITE_TOOLS is defined
@@ -492,7 +695,7 @@ def test_agent_parse_failsafe():
     from autoforge.engine.agents.reviewer import ReviewerAgent
     from autoforge.engine.agents.tester import TesterAgent
 
-    config = ForgeConfig(anthropic_api_key="fake")
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
     llm = LLMRouter(config)
     _td = Path(tempfile.mkdtemp())
 
@@ -513,13 +716,84 @@ def test_agent_parse_failsafe():
 
 
 # ────────────────────────────────────────────
+# Phase 3b: Multi-Provider
+# ────────────────────────────────────────────
+
+def test_provider_detection():
+    from autoforge.engine.llm_router import detect_provider
+    assert detect_provider("claude-opus-4-6") == "anthropic"
+    assert detect_provider("claude-sonnet-4-5-20250929") == "anthropic"
+    assert detect_provider("claude-haiku-4-5-20251001") == "anthropic"
+    assert detect_provider("gpt-4o") == "openai"
+    assert detect_provider("gpt-4o-mini") == "openai"
+    assert detect_provider("o3") == "openai"
+    assert detect_provider("o4-mini") == "openai"
+    assert detect_provider("gemini-2.5-pro") == "google"
+    assert detect_provider("gemini-2.5-flash") == "google"
+    assert detect_provider("gemini-2.0-flash") == "google"
+    # Unknown model defaults to anthropic
+    assert detect_provider("some-unknown-model") == "anthropic"
+
+
+def test_normalized_response_types():
+    from autoforge.engine.llm_router import ContentBlock, Usage, LLMResponse
+    # Text block
+    tb = ContentBlock(type="text", text="hello")
+    assert tb.type == "text" and tb.text == "hello"
+    # Tool use block
+    tu = ContentBlock(type="tool_use", id="abc", name="write_file", input={"path": "x"})
+    assert tu.type == "tool_use" and tu.name == "write_file"
+    # Response
+    resp = LLMResponse(
+        content=[tb, tu],
+        stop_reason="tool_use",
+        usage=Usage(input_tokens=100, output_tokens=50),
+    )
+    assert resp.stop_reason == "tool_use"
+    assert len(resp.content) == 2
+    assert resp.usage.input_tokens == 100
+
+
+def test_multi_key_config():
+    from autoforge.engine.config import ForgeConfig
+    config = ForgeConfig(api_keys={
+        "anthropic": "sk-ant-fake",
+        "openai": "sk-fake",
+        "google": "AI-fake",
+    })
+    # Backward compat property
+    assert config.anthropic_api_key == "sk-ant-fake"
+    assert config.api_keys["openai"] == "sk-fake"
+    assert config.api_keys["google"] == "AI-fake"
+
+
+def test_multi_key_config_setter():
+    from autoforge.engine.config import ForgeConfig
+    config = ForgeConfig()
+    config.anthropic_api_key = "sk-ant-test"
+    assert config.api_keys["anthropic"] == "sk-ant-test"
+
+
+def test_extended_model_pricing():
+    from autoforge.engine.config import MODEL_PRICING
+    # Anthropic
+    assert "claude-opus-4-6" in MODEL_PRICING
+    # OpenAI
+    assert "gpt-4o" in MODEL_PRICING
+    assert "o3" in MODEL_PRICING
+    # Google
+    assert "gemini-2.5-pro" in MODEL_PRICING
+    assert "gemini-2.0-flash" in MODEL_PRICING
+
+
+# ────────────────────────────────────────────
 # Phase 4: Integration
 # ────────────────────────────────────────────
 
 def test_orchestrator_instantiation():
     from autoforge.engine.config import ForgeConfig
     from autoforge.engine.orchestrator import Orchestrator
-    config = ForgeConfig(anthropic_api_key="fake-key")
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
     orch = Orchestrator(config)
     assert orch.llm is not None
     assert orch.config is config
@@ -544,15 +818,13 @@ def test_orchestrator_show_status():
 
 
 def test_llm_router_requires_api_key():
-    """LLMRouter must reject empty API key."""
+    """LLMRouter allows init without keys (lazy client creation)."""
     from autoforge.engine.config import ForgeConfig
     from autoforge.engine.llm_router import LLMRouter
-    config = ForgeConfig(anthropic_api_key="")
-    try:
-        LLMRouter(config)
-        raise AssertionError("Should have raised ValueError")
-    except ValueError as e:
-        assert "ANTHROPIC_API_KEY" in str(e)
+    config = ForgeConfig()  # No API keys
+    router = LLMRouter(config)
+    # Should instantiate fine — keys checked lazily when _get_client is called
+    assert router.call_count == 0
 
 
 # ────────────────────────────────────────────
@@ -684,7 +956,7 @@ def test_daemon_instantiation():
     """Test ForgeDaemon can be instantiated."""
     from autoforge.engine.config import ForgeConfig
     from autoforge.engine.daemon import ForgeDaemon
-    config = ForgeConfig(anthropic_api_key="fake-key")
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
     daemon = ForgeDaemon(config)
     assert daemon.config is config
     assert daemon._running is False
@@ -706,7 +978,7 @@ def test_cli_daemon_subcommand():
     """Test that daemon module can be imported."""
     from autoforge.engine.daemon import ForgeDaemon  # noqa: F401
     from autoforge.engine.config import ForgeConfig
-    config = ForgeConfig(anthropic_api_key="fake-key")
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
     daemon = ForgeDaemon(config)
     assert daemon._running is False
 
@@ -749,6 +1021,639 @@ def test_display_module():
 
 
 # ────────────────────────────────────────────
+# Phase 7: Web Tools, Code Search, Checkpoints, TDD
+# ────────────────────────────────────────────
+
+def test_tools_package_imports():
+    """Test that the tools package can be imported."""
+    from autoforge.engine.tools import web  # noqa: F401
+    from autoforge.engine.tools import search  # noqa: F401
+    from autoforge.engine.tools.web import (
+        handle_fetch_url,  # noqa: F401
+        handle_search_web,  # noqa: F401
+        FETCH_URL_TOOL_SCHEMA,
+        SEARCH_WEB_TOOL_SCHEMA,
+    )
+    from autoforge.engine.tools.search import (
+        handle_grep_search,  # noqa: F401
+        GREP_SEARCH_TOOL_SCHEMA,
+    )
+    # Validate schemas have required fields
+    assert "properties" in FETCH_URL_TOOL_SCHEMA
+    assert "url" in FETCH_URL_TOOL_SCHEMA["properties"]
+    assert "properties" in SEARCH_WEB_TOOL_SCHEMA
+    assert "query" in SEARCH_WEB_TOOL_SCHEMA["properties"]
+    assert "properties" in GREP_SEARCH_TOOL_SCHEMA
+    assert "pattern" in GREP_SEARCH_TOOL_SCHEMA["properties"]
+
+
+def test_config_new_fields():
+    """Test new config fields for web tools, checkpoints, TDD."""
+    from autoforge.engine.config import ForgeConfig
+    config = ForgeConfig()
+    # Web tools
+    assert config.web_tools_enabled is True
+    assert config.search_backend == "duckduckgo"
+    assert config.search_api_key == ""
+    # Checkpoints
+    assert config.confirm_phases == []
+    # TDD
+    assert config.build_test_loops == 0
+
+
+def test_config_with_overrides():
+    """Test new config fields can be overridden."""
+    from autoforge.engine.config import ForgeConfig
+    config = ForgeConfig(
+        web_tools_enabled=False,
+        search_backend="google",
+        search_api_key="test-key:cx123",
+        confirm_phases=["spec", "build"],
+        build_test_loops=2,
+    )
+    assert config.web_tools_enabled is False
+    assert config.search_backend == "google"
+    assert config.search_api_key == "test-key:cx123"
+    assert config.confirm_phases == ["spec", "build"]
+    assert config.build_test_loops == 2
+
+
+def test_cli_confirm_flag():
+    """Test --confirm flag parsing."""
+    from autoforge.cli.app import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["--confirm", "spec,build", "generate", "test"])
+    assert args.confirm == "spec,build"
+
+
+def test_cli_tdd_flag():
+    """Test --tdd flag parsing."""
+    from autoforge.cli.app import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["--tdd", "2", "generate", "test"])
+    assert args.tdd == 2
+
+
+def test_cli_config_overrides_confirm():
+    """Test --confirm wiring to config overrides."""
+    from autoforge.cli.app import build_parser, _build_config_overrides
+    parser = build_parser()
+    args = parser.parse_args(["--confirm", "spec,build,verify", "generate", "test"])
+    overrides = _build_config_overrides(args)
+    assert overrides["confirm_phases"] == ["spec", "build", "verify"]
+
+
+def test_cli_config_overrides_tdd():
+    """Test --tdd wiring to config overrides."""
+    from autoforge.cli.app import build_parser, _build_config_overrides
+    parser = build_parser()
+    args = parser.parse_args(["--tdd", "3", "generate", "test"])
+    overrides = _build_config_overrides(args)
+    assert overrides["build_test_loops"] == 3
+
+
+def test_grep_search_basic():
+    """Test grep_search on a temporary directory."""
+    from autoforge.engine.tools.search import handle_grep_search
+    d = Path(tempfile.mkdtemp())
+    try:
+        # Create test files
+        (d / "hello.py").write_text("def hello_world():\n    print('hello')\n", encoding="utf-8")
+        (d / "utils.py").write_text("def helper_func():\n    pass\n", encoding="utf-8")
+
+        result = asyncio.run(handle_grep_search({"pattern": "def.*hello"}, d))
+        data = json.loads(result)
+        assert data["total_matches"] >= 1
+        assert any("hello.py" in m["file"] for m in data["matches"])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_grep_search_file_glob():
+    """Test grep_search with file_glob filter."""
+    from autoforge.engine.tools.search import handle_grep_search
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "app.py").write_text("import flask\n", encoding="utf-8")
+        (d / "style.css").write_text("/* import reset */\n", encoding="utf-8")
+
+        result = asyncio.run(handle_grep_search({"pattern": "import", "file_glob": "*.py"}, d))
+        data = json.loads(result)
+        # Should only find .py files
+        for m in data["matches"]:
+            assert m["file"].endswith(".py"), f"Expected .py file but got {m['file']}"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_grep_search_empty_pattern():
+    """Test grep_search rejects empty pattern."""
+    from autoforge.engine.tools.search import handle_grep_search
+    d = Path(tempfile.mkdtemp())
+    try:
+        result = asyncio.run(handle_grep_search({"pattern": ""}, d))
+        data = json.loads(result)
+        assert "error" in data
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_web_tool_schemas():
+    """Test web tool schema structures are valid."""
+    from autoforge.engine.tools.web import FETCH_URL_TOOL_SCHEMA, SEARCH_WEB_TOOL_SCHEMA
+    # fetch_url schema
+    assert FETCH_URL_TOOL_SCHEMA["type"] == "object"
+    assert "url" in FETCH_URL_TOOL_SCHEMA["properties"]
+    assert FETCH_URL_TOOL_SCHEMA["required"] == ["url"]
+    # search_web schema
+    assert SEARCH_WEB_TOOL_SCHEMA["type"] == "object"
+    assert "query" in SEARCH_WEB_TOOL_SCHEMA["properties"]
+    assert SEARCH_WEB_TOOL_SCHEMA["required"] == ["query"]
+
+
+def test_html_strip_fallback():
+    """Test the HTML stripping fallback (no html2text dependency needed)."""
+    from autoforge.engine.tools.web import _strip_html_tags
+    html = "<html><body><h1>Title</h1><p>Hello <b>world</b></p><script>evil()</script></body></html>"
+    text = _strip_html_tags(html)
+    assert "Title" in text
+    assert "Hello" in text
+    assert "world" in text
+    assert "evil()" not in text
+    assert "<script>" not in text
+
+
+def test_orchestrator_checkpoint_method():
+    """Test that orchestrator has _checkpoint method."""
+    from autoforge.engine.orchestrator import Orchestrator, UserPausedError
+    assert hasattr(Orchestrator, "_checkpoint")
+    assert callable(getattr(Orchestrator, "_checkpoint"))
+    # UserPausedError should be an Exception subclass
+    assert issubclass(UserPausedError, Exception)
+
+
+def test_orchestrator_tdd_loop_method():
+    """Test that orchestrator has _tdd_loop and _detect_test_command methods."""
+    from autoforge.engine.orchestrator import Orchestrator
+    assert hasattr(Orchestrator, "_tdd_loop")
+    assert hasattr(Orchestrator, "_detect_test_command")
+
+
+def test_detect_test_command_npm():
+    """Test _detect_test_command detects npm test."""
+    from autoforge.engine.orchestrator import Orchestrator
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "package.json").write_text(json.dumps({
+            "scripts": {"test": "jest"}
+        }), encoding="utf-8")
+        cmd = Orchestrator._detect_test_command(d)
+        assert cmd is not None
+        assert "npm test" in cmd
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_detect_test_command_pytest():
+    """Test _detect_test_command detects pytest."""
+    from autoforge.engine.orchestrator import Orchestrator
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        cmd = Orchestrator._detect_test_command(d)
+        assert cmd is not None
+        assert "pytest" in cmd
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_detect_test_command_none():
+    """Test _detect_test_command returns None for unknown project type."""
+    from autoforge.engine.orchestrator import Orchestrator
+    d = Path(tempfile.mkdtemp())
+    try:
+        cmd = Orchestrator._detect_test_command(d)
+        assert cmd is None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_agents_have_new_tools():
+    """Test that agents have the new tools registered."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
+    llm = LLMRouter(config)
+    _td = Path(tempfile.mkdtemp())
+
+    try:
+        # Builder should have grep_search and fetch_url
+        from autoforge.engine.agents.builder import BuilderAgent
+        builder = BuilderAgent(config, llm, _td)
+        builder_tool_names = {t.name for t in builder._tools}
+        assert "grep_search" in builder_tool_names, f"Builder tools: {builder_tool_names}"
+        assert "fetch_url" in builder_tool_names, f"Builder tools: {builder_tool_names}"
+
+        # Scanner should have grep_search
+        from autoforge.engine.agents.scanner import ScannerAgent
+        scanner = ScannerAgent(config, llm, _td)
+        scanner_tool_names = {t.name for t in scanner._tools}
+        assert "grep_search" in scanner_tool_names, f"Scanner tools: {scanner_tool_names}"
+
+        # Gardener should have grep_search and fetch_url
+        from autoforge.engine.agents.gardener import GardenerAgent
+        gardener = GardenerAgent(config, llm, _td)
+        gardener_tool_names = {t.name for t in gardener._tools}
+        assert "grep_search" in gardener_tool_names, f"Gardener tools: {gardener_tool_names}"
+        assert "fetch_url" in gardener_tool_names, f"Gardener tools: {gardener_tool_names}"
+
+        # Director should have search_web and fetch_url
+        from autoforge.engine.agents.director import DirectorAgent
+        director = DirectorAgent(config, llm)
+        director_tool_names = {t.name for t in director._tools}
+        assert "search_web" in director_tool_names, f"Director tools: {director_tool_names}"
+        assert "fetch_url" in director_tool_names, f"Director tools: {director_tool_names}"
+
+        # Architect should have search_web and fetch_url
+        from autoforge.engine.agents.architect import ArchitectAgent
+        architect = ArchitectAgent(config, llm)
+        architect_tool_names = {t.name for t in architect._tools}
+        assert "search_web" in architect_tool_names, f"Architect tools: {architect_tool_names}"
+        assert "fetch_url" in architect_tool_names, f"Architect tools: {architect_tool_names}"
+    finally:
+        shutil.rmtree(_td, ignore_errors=True)
+
+
+def test_agents_web_tools_disabled():
+    """Test that web tools are not registered when disabled."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"}, web_tools_enabled=False)
+    llm = LLMRouter(config)
+
+    # Director should NOT have search_web or fetch_url when disabled
+    from autoforge.engine.agents.director import DirectorAgent
+    director = DirectorAgent(config, llm)
+    director_tool_names = {t.name for t in director._tools}
+    assert "search_web" not in director_tool_names
+    assert "fetch_url" not in director_tool_names
+
+
+def test_constitution_builder_has_new_tools():
+    """Test that builder constitution documents grep_search and fetch_url."""
+    builder_md = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "agents" / "builder.md"
+    content = builder_md.read_text(encoding="utf-8")
+    assert "grep_search" in content
+    assert "fetch_url" in content
+
+
+def test_constitution_architect_has_web_tools():
+    """Test that architect constitution documents search_web and fetch_url."""
+    architect_md = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "agents" / "architect.md"
+    content = architect_md.read_text(encoding="utf-8")
+    assert "search_web" in content
+    assert "fetch_url" in content
+
+
+def test_constitution_quality_gates_has_agent_capabilities():
+    """Test that quality_gates documents agent capabilities table."""
+    qg_md = PROJECT_ROOT / "autoforge" / "data" / "constitution" / "quality_gates.md"
+    content = qg_md.read_text(encoding="utf-8")
+    assert "Agent Capabilities" in content
+    assert "grep_search" in content
+    assert "TDD Loop" in content
+    assert "Human Checkpoints" in content
+
+
+def test_pyproject_has_new_dependencies():
+    """Test that pyproject.toml includes httpx, duckduckgo-search, html2text."""
+    toml_path = PROJECT_ROOT / "pyproject.toml"
+    content = toml_path.read_text(encoding="utf-8")
+    assert "httpx" in content
+    assert "duckduckgo-search" in content
+    assert "html2text" in content
+
+
+# ────────────────────────────────────────────
+# ────────────────────────────────────────────
+# Auth Module
+# ────────────────────────────────────────────
+
+
+def test_auth_module_imports():
+    """Auth module imports and classes are accessible."""
+    from autoforge.engine.auth import (  # noqa: F401
+        AuthProvider,
+        ApiKeyAuth,
+        OAuthBearerAuth,
+        OAuth2ClientCredentialsAuth,
+        GoogleADCAuth,
+        AWSBedrockAuth,
+        VertexAIAuth,
+        CodexOAuthAuth,
+        DeviceCodeAuth,
+        TokenResult,
+        create_auth_provider,
+    )
+
+
+def test_auth_api_key_provider():
+    """ApiKeyAuth returns key and correct client kwargs."""
+    from autoforge.engine.auth import ApiKeyAuth
+
+    auth = ApiKeyAuth(api_key="sk-test123")
+    kwargs = auth.get_client_kwargs()
+    assert kwargs == {"api_key": "sk-test123"}
+
+    # With base_url
+    auth2 = ApiKeyAuth(api_key="sk-test", base_url="https://proxy.com/v1")
+    kwargs2 = auth2.get_client_kwargs()
+    assert kwargs2["api_key"] == "sk-test"
+    assert kwargs2["base_url"] == "https://proxy.com/v1"
+
+
+def test_auth_bearer_provider():
+    """OAuthBearerAuth returns bearer token as api_key."""
+    from autoforge.engine.auth import OAuthBearerAuth
+
+    auth = OAuthBearerAuth(bearer_token="tok123", base_url="https://proxy.com/v1")
+    kwargs = auth.get_client_kwargs()
+    assert kwargs["api_key"] == "tok123"
+    assert kwargs["base_url"] == "https://proxy.com/v1"
+
+
+def test_auth_token_result_expiry():
+    """TokenResult.is_expired works correctly."""
+    import time
+    from autoforge.engine.auth import TokenResult
+
+    # Never expires
+    t1 = TokenResult(access_token="tok", expires_at=0.0)
+    assert t1.is_expired is False
+
+    # Expired
+    t2 = TokenResult(access_token="tok", expires_at=time.time() - 100)
+    assert t2.is_expired is True
+
+    # Not expired (far future)
+    t3 = TokenResult(access_token="tok", expires_at=time.time() + 3600)
+    assert t3.is_expired is False
+
+
+def test_auth_factory_fallback():
+    """create_auth_provider falls back to ApiKeyAuth."""
+    from autoforge.engine.auth import ApiKeyAuth, create_auth_provider
+
+    auth = create_auth_provider("anthropic", {"anthropic": "sk-test"}, {})
+    assert isinstance(auth, ApiKeyAuth)
+
+
+def test_auth_factory_bearer():
+    """create_auth_provider creates OAuthBearerAuth when configured."""
+    from autoforge.engine.auth import OAuthBearerAuth, create_auth_provider
+
+    auth = create_auth_provider("openai", {}, {
+        "openai": {
+            "auth_method": "oauth_bearer",
+            "base_url": "https://proxy.com/v1",
+            "bearer_token": "tok",
+        }
+    })
+    assert isinstance(auth, OAuthBearerAuth)
+
+
+def test_auth_factory_oauth2():
+    """create_auth_provider creates OAuth2ClientCredentialsAuth."""
+    from autoforge.engine.auth import OAuth2ClientCredentialsAuth, create_auth_provider
+
+    auth = create_auth_provider("openai", {}, {
+        "openai": {
+            "auth_method": "oauth2_client_credentials",
+            "client_id": "cid",
+            "client_secret": "csec",
+            "token_url": "https://token.example.com/token",
+        }
+    })
+    assert isinstance(auth, OAuth2ClientCredentialsAuth)
+
+
+def test_auth_factory_adc():
+    """create_auth_provider creates GoogleADCAuth."""
+    from autoforge.engine.auth import GoogleADCAuth, create_auth_provider
+
+    auth = create_auth_provider("google", {}, {
+        "google": {"auth_method": "adc"}
+    })
+    assert isinstance(auth, GoogleADCAuth)
+
+
+def test_config_auth_config_field():
+    """ForgeConfig has auth_config field with correct default."""
+    from autoforge.engine.config import ForgeConfig
+
+    config = ForgeConfig()
+    assert config.auth_config == {}
+
+    config2 = ForgeConfig(auth_config={
+        "openai": {"auth_method": "oauth_bearer", "base_url": "https://x"}
+    })
+    assert config2.auth_config["openai"]["auth_method"] == "oauth_bearer"
+
+
+def test_config_has_api_key_with_auth_config():
+    """has_api_key returns True when only auth_config is set (no API keys)."""
+    from autoforge.engine.config import ForgeConfig
+
+    # No keys, no auth → False
+    config1 = ForgeConfig()
+    assert config1.has_api_key is False
+
+    # No keys but auth_config → True
+    config2 = ForgeConfig(auth_config={"openai": {"auth_method": "adc"}})
+    assert config2.has_api_key is True
+
+
+def test_auth_bedrock_provider():
+    """AWSBedrockAuth stores region and returns correct kwargs."""
+    from autoforge.engine.auth import AWSBedrockAuth
+
+    auth = AWSBedrockAuth(aws_region="us-west-2", aws_profile="myprofile")
+    kwargs = auth.get_client_kwargs()
+    assert kwargs["aws_region"] == "us-west-2"
+    assert kwargs["aws_profile"] == "myprofile"
+
+    # With static keys
+    auth2 = AWSBedrockAuth(
+        aws_region="eu-west-1",
+        aws_access_key_id="AKID",
+        aws_secret_access_key="SECRET",
+    )
+    kwargs2 = auth2.get_client_kwargs()
+    assert kwargs2["aws_access_key"] == "AKID"
+    assert kwargs2["aws_secret_key"] == "SECRET"
+
+
+def test_auth_vertex_provider():
+    """VertexAIAuth stores project_id and region."""
+    from autoforge.engine.auth import VertexAIAuth
+
+    auth = VertexAIAuth(project_id="my-project", region="us-east5")
+    kwargs = auth.get_client_kwargs()
+    assert kwargs["region"] == "us-east5"
+    assert kwargs["project_id"] == "my-project"
+
+
+def test_auth_codex_oauth_provider():
+    """CodexOAuthAuth initializes correctly."""
+    from autoforge.engine.auth import CodexOAuthAuth
+
+    auth = CodexOAuthAuth()
+    # No token yet — get_client_kwargs returns empty (token injected dynamically)
+    kwargs = auth.get_client_kwargs()
+    assert kwargs == {}
+    # Has correct endpoints
+    assert "openai.com" in auth.AUTH_URL
+    assert "openai.com" in auth.TOKEN_URL
+
+
+def test_auth_device_code_provider():
+    """DeviceCodeAuth initializes correctly."""
+    from autoforge.engine.auth import DeviceCodeAuth
+
+    auth = DeviceCodeAuth()
+    kwargs = auth.get_client_kwargs()
+    assert kwargs == {}
+    assert "openai.com" in auth.DEVICE_URL
+    assert "openai.com" in auth.TOKEN_URL
+
+
+def test_auth_factory_bedrock():
+    """create_auth_provider creates AWSBedrockAuth."""
+    from autoforge.engine.auth import AWSBedrockAuth, create_auth_provider
+
+    auth = create_auth_provider("anthropic", {}, {
+        "anthropic": {
+            "auth_method": "bedrock",
+            "aws_region": "us-west-2",
+        }
+    })
+    assert isinstance(auth, AWSBedrockAuth)
+
+
+def test_auth_factory_vertex():
+    """create_auth_provider creates VertexAIAuth."""
+    from autoforge.engine.auth import VertexAIAuth, create_auth_provider
+
+    auth = create_auth_provider("anthropic", {}, {
+        "anthropic": {
+            "auth_method": "vertex_ai",
+            "project_id": "proj-123",
+            "region": "us-east5",
+        }
+    })
+    assert isinstance(auth, VertexAIAuth)
+
+
+def test_auth_factory_codex_oauth():
+    """create_auth_provider creates CodexOAuthAuth."""
+    from autoforge.engine.auth import CodexOAuthAuth, create_auth_provider
+
+    auth = create_auth_provider("openai", {}, {
+        "openai": {"auth_method": "codex_oauth"}
+    })
+    assert isinstance(auth, CodexOAuthAuth)
+
+
+def test_auth_factory_device_code():
+    """create_auth_provider creates DeviceCodeAuth."""
+    from autoforge.engine.auth import DeviceCodeAuth, create_auth_provider
+
+    auth = create_auth_provider("openai", {}, {
+        "openai": {"auth_method": "device_code"}
+    })
+    assert isinstance(auth, DeviceCodeAuth)
+
+
+def test_setup_wizard_no_precheck():
+    """PROVIDERS dict does not pre-enable any provider."""
+    from autoforge.cli.setup_wizard import PROVIDERS
+
+    assert "anthropic" in PROVIDERS
+    assert "openai" in PROVIDERS
+    assert "google" in PROVIDERS
+    # Verify auth_methods are defined
+    for pid, info in PROVIDERS.items():
+        assert "auth_methods" in info, f"{pid} missing auth_methods"
+
+
+def test_setup_wizard_auth_methods():
+    """Each provider has valid auth method options."""
+    from autoforge.cli.setup_wizard import PROVIDERS
+
+    # Anthropic: api_key + bearer + oauth2 + bedrock + vertex_ai
+    ant_methods = [m["value"] for m in PROVIDERS["anthropic"]["auth_methods"]]
+    assert "api_key" in ant_methods
+    assert "oauth_bearer" in ant_methods
+    assert "oauth2_client_credentials" in ant_methods
+    assert "bedrock" in ant_methods
+    assert "vertex_ai" in ant_methods
+
+    # OpenAI: api_key + bearer + codex_oauth + device_code + oauth2
+    oai_methods = [m["value"] for m in PROVIDERS["openai"]["auth_methods"]]
+    assert "api_key" in oai_methods
+    assert "oauth_bearer" in oai_methods
+    assert "codex_oauth" in oai_methods
+    assert "device_code" in oai_methods
+    assert "oauth2_client_credentials" in oai_methods
+
+    # Google: api_key + adc + service_account (no OAuth)
+    ggl_methods = [m["value"] for m in PROVIDERS["google"]["auth_methods"]]
+    assert "api_key" in ggl_methods
+    assert "adc" in ggl_methods
+    assert "service_account" in ggl_methods
+
+
+def test_llm_router_has_auth_providers():
+    """LLMRouter has _auth_providers dict."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
+    router = LLMRouter(config)
+    assert hasattr(router, "_auth_providers")
+    assert isinstance(router._auth_providers, dict)
+
+
+def test_env_example_no_required_anthropic():
+    """.env.example does not say 'Required: Anthropic'."""
+    env_path = PROJECT_ROOT / ".env.example"
+    assert env_path.exists()
+    content = env_path.read_text(encoding="utf-8")
+    assert "Required: Anthropic" not in content
+    # All three providers should be present
+    assert "ANTHROPIC_API_KEY" in content
+    assert "OPENAI_API_KEY" in content
+    assert "GOOGLE_API_KEY" in content
+    # OAuth/proxy env vars
+    assert "OPENAI_BASE_URL" in content
+    assert "GOOGLE_APPLICATION_CREDENTIALS" in content
+    # Bedrock env vars
+    assert "CLAUDE_CODE_USE_BEDROCK" in content
+    assert "AWS_REGION" in content
+    # Vertex AI env vars
+    assert "CLAUDE_CODE_USE_VERTEX" in content
+    assert "ANTHROPIC_VERTEX_PROJECT_ID" in content
+    assert "CLOUD_ML_REGION" in content
+
+
+def test_pyproject_has_google_auth():
+    """pyproject.toml includes google-auth dependency."""
+    toml_path = PROJECT_ROOT / "pyproject.toml"
+    content = toml_path.read_text(encoding="utf-8")
+    assert "google-auth" in content
+
+
+# ────────────────────────────────────────────
 # Runner
 # ────────────────────────────────────────────
 
@@ -774,6 +1679,7 @@ def main():
             ("from_env with overrides", test_forge_config_from_env),
             ("Budget tracking + exhaustion", test_forge_config_budget_tracking),
             ("Mobile config fields", test_forge_config_mobile),
+            ("has_api_key property", test_config_has_api_key),
         ]),
         ("Unit: TaskDAG", [
             ("Basic operations + dependency resolution", test_task_dag_basic),
@@ -794,6 +1700,20 @@ def main():
         ]),
         ("Unit: GitManager", [
             ("Instantiation", test_git_manager_instantiation),
+            ("Git available detection", test_git_available_detection),
+            ("Git version async", test_git_version_async),
+        ]),
+        ("Pipeline Hardening", [
+            ("AgentResult metrics fields", test_agent_result_metrics_fields),
+            ("Anti-spin detection constants", test_anti_spin_constants),
+            ("Build gate enforcement", test_build_gate_enforcement),
+            ("File overlap detection", test_file_overlap_detection),
+            ("Smoke check: missing files", test_smoke_check_missing_files),
+            ("Smoke check: syntax error", test_smoke_check_syntax_error),
+            ("Smoke check: valid file", test_smoke_check_valid_file),
+            ("Constitution: builder mandatory rules", test_constitution_builder_mandatory_rules),
+            ("Constitution: architect composition", test_constitution_architect_composition),
+            ("Constitution: quality gates enforcement", test_constitution_quality_gates_enforcement),
         ]),
         ("Unit: Agents", [
             ("All 8 agents instantiate", test_all_agents_instantiate),
@@ -801,6 +1721,13 @@ def main():
             ("All parse methods", test_agent_parse_methods),
             ("Fail-safe on unparseable output", test_agent_parse_failsafe),
             ("Research mode blocks writes", test_research_mode_blocks_writes),
+        ]),
+        ("Multi-Provider", [
+            ("Provider detection from model names", test_provider_detection),
+            ("Normalized response types", test_normalized_response_types),
+            ("Multi-key config", test_multi_key_config),
+            ("Multi-key config setter (backward compat)", test_multi_key_config_setter),
+            ("Extended model pricing", test_extended_model_pricing),
         ]),
         ("Integration", [
             ("Orchestrator instantiation", test_orchestrator_instantiation),
@@ -832,6 +1759,56 @@ def main():
         ]),
         ("Display", [
             ("Display module functions", test_display_module),
+        ]),
+        ("Web Tools & Code Search", [
+            ("Tools package imports", test_tools_package_imports),
+            ("Config new fields (web, checkpoints, TDD)", test_config_new_fields),
+            ("Config with overrides", test_config_with_overrides),
+            ("CLI --confirm flag parsing", test_cli_confirm_flag),
+            ("CLI --tdd flag parsing", test_cli_tdd_flag),
+            ("CLI config overrides: confirm", test_cli_config_overrides_confirm),
+            ("CLI config overrides: tdd", test_cli_config_overrides_tdd),
+            ("grep_search: basic pattern match", test_grep_search_basic),
+            ("grep_search: file_glob filter", test_grep_search_file_glob),
+            ("grep_search: empty pattern rejected", test_grep_search_empty_pattern),
+            ("Web tool schemas valid", test_web_tool_schemas),
+            ("HTML strip fallback", test_html_strip_fallback),
+            ("Orchestrator _checkpoint method", test_orchestrator_checkpoint_method),
+            ("Orchestrator _tdd_loop method", test_orchestrator_tdd_loop_method),
+            ("Test command detection: npm", test_detect_test_command_npm),
+            ("Test command detection: pytest", test_detect_test_command_pytest),
+            ("Test command detection: none", test_detect_test_command_none),
+            ("Agents have new tools", test_agents_have_new_tools),
+            ("Agents web tools disabled", test_agents_web_tools_disabled),
+            ("Constitution: builder has new tools", test_constitution_builder_has_new_tools),
+            ("Constitution: architect has web tools", test_constitution_architect_has_web_tools),
+            ("Constitution: quality gates agent capabilities", test_constitution_quality_gates_has_agent_capabilities),
+            ("pyproject.toml has new dependencies", test_pyproject_has_new_dependencies),
+        ]),
+        ("Auth Module & OAuth", [
+            ("Auth module imports", test_auth_module_imports),
+            ("ApiKeyAuth provider", test_auth_api_key_provider),
+            ("OAuthBearerAuth provider", test_auth_bearer_provider),
+            ("TokenResult expiry", test_auth_token_result_expiry),
+            ("Auth factory fallback to ApiKeyAuth", test_auth_factory_fallback),
+            ("Auth factory bearer", test_auth_factory_bearer),
+            ("Auth factory OAuth2", test_auth_factory_oauth2),
+            ("Auth factory ADC", test_auth_factory_adc),
+            ("AWSBedrockAuth provider", test_auth_bedrock_provider),
+            ("VertexAIAuth provider", test_auth_vertex_provider),
+            ("CodexOAuthAuth provider", test_auth_codex_oauth_provider),
+            ("DeviceCodeAuth provider", test_auth_device_code_provider),
+            ("Auth factory Bedrock", test_auth_factory_bedrock),
+            ("Auth factory Vertex AI", test_auth_factory_vertex),
+            ("Auth factory Codex OAuth", test_auth_factory_codex_oauth),
+            ("Auth factory Device Code", test_auth_factory_device_code),
+            ("Config auth_config field", test_config_auth_config_field),
+            ("Config has_api_key with auth_config", test_config_has_api_key_with_auth_config),
+            ("Setup wizard no pre-check", test_setup_wizard_no_precheck),
+            ("Setup wizard auth methods", test_setup_wizard_auth_methods),
+            ("LLM router has _auth_providers", test_llm_router_has_auth_providers),
+            (".env.example no required Anthropic", test_env_example_no_required_anthropic),
+            ("pyproject.toml has google-auth", test_pyproject_has_google_auth),
         ]),
     ]
 

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+from functools import partial
 from typing import Any
 
-from autoforge.engine.agent_base import AgentBase
+from autoforge.engine.agent_base import AgentBase, ToolDefinition
 from autoforge.engine.llm_router import TaskComplexity
 
 logger = logging.getLogger(__name__)
@@ -24,8 +26,70 @@ class DirectorAgent(AgentBase):
     COMPLEXITY = TaskComplexity.HIGH  # Uses Opus for deep understanding
 
     def _register_tools(self) -> None:
-        """Director has no tools — it produces output through text only."""
+        """Director has web tools and GitHub tools for researching frameworks."""
         self._tools = []
+
+        # Add web tools if enabled
+        if getattr(self.config, "web_tools_enabled", True):
+            from autoforge.engine.tools.web import (
+                FETCH_URL_TOOL_SCHEMA,
+                SEARCH_WEB_TOOL_SCHEMA,
+                handle_fetch_url,
+                handle_search_web,
+            )
+
+            self._tools.append(ToolDefinition(
+                name="search_web",
+                description=(
+                    "Search the web for information about frameworks, libraries, "
+                    "and best practices. Use to research the latest tech options."
+                ),
+                input_schema=SEARCH_WEB_TOOL_SCHEMA,
+                handler=partial(
+                    handle_search_web,
+                    backend=self.config.search_backend,
+                    api_key=self.config.search_api_key,
+                ),
+            ))
+            self._tools.append(ToolDefinition(
+                name="fetch_url",
+                description=(
+                    "Fetch a web page and return its text content. "
+                    "Use to read documentation, API references, or framework guides."
+                ),
+                input_schema=FETCH_URL_TOOL_SCHEMA,
+                handler=handle_fetch_url,
+            ))
+
+            # GitHub search tools for discovering open-source solutions
+            from autoforge.engine.tools.github_search import (
+                SEARCH_GITHUB_TOOL_SCHEMA,
+                INSPECT_REPO_TOOL_SCHEMA,
+                handle_search_github,
+                handle_inspect_repo,
+            )
+
+            github_token = os.environ.get("GITHUB_TOKEN", "")
+
+            self._tools.append(ToolDefinition(
+                name="search_github",
+                description=(
+                    "Search GitHub for open-source repositories. Use to discover "
+                    "existing libraries and frameworks that solve sub-problems. "
+                    "Prefer well-maintained repos (high stars, recent updates)."
+                ),
+                input_schema=SEARCH_GITHUB_TOOL_SCHEMA,
+                handler=partial(handle_search_github, github_token=github_token),
+            ))
+            self._tools.append(ToolDefinition(
+                name="inspect_repo",
+                description=(
+                    "Inspect a GitHub repository's README, file structure, and "
+                    "dependencies. Use after search_github to evaluate candidates."
+                ),
+                input_schema=INSPECT_REPO_TOOL_SCHEMA,
+                handler=partial(handle_inspect_repo, github_token=github_token),
+            ))
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         description = context.get("project_description", "")

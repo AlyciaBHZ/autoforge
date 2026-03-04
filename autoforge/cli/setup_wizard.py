@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 
@@ -13,13 +14,84 @@ console = Console()
 CONFIG_DIR = Path.home() / ".autoforge"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 
+# Provider metadata
+PROVIDERS = {
+    "anthropic": {
+        "name": "Anthropic (Claude)",
+        "key_hint": "Get your key at https://console.anthropic.com/settings/keys",
+        "validate": lambda x: x.startswith("sk-ant-") and len(x) > 20,
+        "invalid_msg": "Must start with 'sk-ant-' and be at least 20 characters",
+        "models_strong": [
+            {"name": "Claude Opus 4.6 (best quality, higher cost)", "value": "claude-opus-4-6"},
+            {"name": "Claude Sonnet 4.5 (good balance)", "value": "claude-sonnet-4-5-20250929"},
+        ],
+        "models_fast": [
+            {"name": "Claude Sonnet 4.5 (recommended)", "value": "claude-sonnet-4-5-20250929"},
+            {"name": "Claude Haiku 4.5 (faster, cheaper)", "value": "claude-haiku-4-5-20251001"},
+        ],
+        "auth_methods": [
+            {"name": "API Key", "value": "api_key"},
+            {"name": "Bearer Token + Custom URL (proxy)", "value": "oauth_bearer"},
+            {"name": "OAuth2 Client Credentials", "value": "oauth2_client_credentials"},
+            {"name": "Amazon Bedrock (AWS credentials)", "value": "bedrock"},
+            {"name": "Google Vertex AI (ADC)", "value": "vertex_ai"},
+        ],
+    },
+    "openai": {
+        "name": "OpenAI (GPT / o-series)",
+        "key_hint": "Get your key at https://platform.openai.com/api-keys",
+        "validate": lambda x: x.startswith("sk-") and len(x) > 20,
+        "invalid_msg": "Must start with 'sk-' and be at least 20 characters",
+        "models_strong": [
+            {"name": "o3 (strongest reasoning)", "value": "o3"},
+            {"name": "GPT-4o (fast + capable)", "value": "gpt-4o"},
+        ],
+        "models_fast": [
+            {"name": "GPT-4o-mini (recommended)", "value": "gpt-4o-mini"},
+            {"name": "o4-mini (reasoning, cheaper)", "value": "o4-mini"},
+        ],
+        "auth_methods": [
+            {"name": "API Key", "value": "api_key"},
+            {"name": "Bearer Token + Custom URL (Azure, LiteLLM)", "value": "oauth_bearer"},
+            {"name": "Codex OAuth (browser login, uses subscription)", "value": "codex_oauth"},
+            {"name": "Device Code (headless/SSH)", "value": "device_code"},
+            {"name": "OAuth2 Client Credentials", "value": "oauth2_client_credentials"},
+        ],
+    },
+    "google": {
+        "name": "Google (Gemini)",
+        "key_hint": "Get your key at https://aistudio.google.com/apikey",
+        "validate": lambda x: len(x) > 10,
+        "invalid_msg": "API key seems too short",
+        "models_strong": [
+            {"name": "Gemini 2.5 Pro (best quality)", "value": "gemini-2.5-pro"},
+            {"name": "Gemini 2.5 Flash (good balance)", "value": "gemini-2.5-flash"},
+        ],
+        "models_fast": [
+            {"name": "Gemini 2.5 Flash (recommended)", "value": "gemini-2.5-flash"},
+            {"name": "Gemini 2.0 Flash (fastest, cheapest)", "value": "gemini-2.0-flash"},
+        ],
+        "auth_methods": [
+            {"name": "API Key (recommended)", "value": "api_key"},
+            {"name": "Application Default Credentials (ADC)", "value": "adc"},
+            {"name": "Service Account JSON", "value": "service_account"},
+        ],
+    },
+}
+
 
 def needs_setup() -> bool:
     """Check if first-run setup is needed."""
     if not CONFIG_FILE.exists():
         return True
     content = CONFIG_FILE.read_text(encoding="utf-8")
-    return "anthropic_key" not in content or 'anthropic_key = ""' in content
+    # Need at least one API key or auth config
+    has_key = any(
+        key_name in content and f'{key_name} = ""' not in content
+        for key_name in ("anthropic_key", "openai_key", "google_key")
+    )
+    has_auth = "[auth." in content
+    return not (has_key or has_auth)
 
 
 def run_setup_wizard() -> None:
@@ -30,38 +102,241 @@ def run_setup_wizard() -> None:
     console.print("[bold cyan]AutoForge Setup Wizard[/bold cyan]")
     console.print("Let's configure your environment.\n")
 
-    # Step 1: API Key
-    api_key = inquirer.secret(
-        message="Anthropic API key (sk-ant-...):",
-        validate=lambda x: x.startswith("sk-ant-") and len(x) > 20,
-        invalid_message="Must start with 'sk-ant-' and be at least 20 characters",
-        long_instruction="Get your key at https://console.anthropic.com/settings/keys",
+    # Step 1: Select providers
+    selected_providers = inquirer.checkbox(
+        message="Which LLM providers do you want to use?",
+        choices=[
+            {"name": info["name"], "value": pid, "enabled": False}
+            for pid, info in PROVIDERS.items()
+        ],
+        validate=lambda x: len(x) > 0,
+        invalid_message="Select at least one provider",
     ).execute()
 
-    if not api_key:
+    if not selected_providers:
         console.print("[red]Setup cancelled.[/red]")
         return
 
-    # Step 2: Model selection
+    # Step 2: Auth method + credentials per provider
+    api_keys: dict[str, str] = {}
+    auth_configs: dict[str, dict[str, str]] = {}
+
+    for pid in selected_providers:
+        info = PROVIDERS[pid]
+        auth_methods = info["auth_methods"]
+
+        # Ask auth method (skip if only one option)
+        if len(auth_methods) > 1:
+            auth_method = inquirer.select(
+                message=f"{info['name']} — authentication method:",
+                choices=auth_methods,
+                default="api_key",
+            ).execute()
+        else:
+            auth_method = "api_key"
+
+        if auth_method == "api_key":
+            key = inquirer.secret(
+                message=f"{info['name']} API key:",
+                validate=info["validate"],
+                invalid_message=info["invalid_msg"],
+                long_instruction=info["key_hint"],
+            ).execute()
+            if key:
+                api_keys[pid] = key
+
+        elif auth_method == "oauth_bearer":
+            base_url = inquirer.text(
+                message="Base URL (e.g. https://your-proxy.com/v1):",
+                validate=lambda x: x.startswith("http"),
+                invalid_message="Must be a valid URL starting with http",
+            ).execute()
+            bearer = inquirer.secret(
+                message="Bearer token:",
+                validate=lambda x: len(x) > 5,
+                invalid_message="Token seems too short",
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "oauth_bearer",
+                "base_url": base_url,
+                "bearer_token": bearer,
+            }
+            # Also set as api_key so has_api_key returns True
+            api_keys[pid] = bearer
+
+        elif auth_method == "oauth2_client_credentials":
+            token_url = inquirer.text(
+                message="Token URL:",
+                validate=lambda x: x.startswith("http"),
+                invalid_message="Must be a valid URL",
+            ).execute()
+            client_id = inquirer.text(message="Client ID:").execute()
+            client_secret = inquirer.secret(
+                message="Client Secret:",
+                validate=lambda x: len(x) > 5,
+                invalid_message="Secret seems too short",
+            ).execute()
+            scope = inquirer.text(
+                message="Scope (optional, press Enter to skip):",
+                default="",
+            ).execute()
+            base_url = inquirer.text(
+                message="Base URL (optional, for proxy — press Enter to skip):",
+                default="",
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "oauth2_client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "token_url": token_url,
+            }
+            if scope:
+                auth_configs[pid]["scope"] = scope
+            if base_url:
+                auth_configs[pid]["base_url"] = base_url
+
+        elif auth_method == "adc":
+            auth_configs[pid] = {"auth_method": "adc"}
+            console.print(
+                "[dim]Ensure GOOGLE_APPLICATION_CREDENTIALS is set or "
+                "run 'gcloud auth application-default login'.[/dim]"
+            )
+
+        elif auth_method == "service_account":
+            sa_path = inquirer.filepath(
+                message="Path to service account JSON:",
+                validate=lambda x: Path(x).is_file() and x.endswith(".json"),
+                invalid_message="Must be a valid .json file",
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "service_account",
+                "service_account_path": sa_path,
+            }
+
+        elif auth_method == "bedrock":
+            console.print("[dim]Amazon Bedrock — Claude via AWS[/dim]")
+            aws_region = inquirer.text(
+                message="AWS Region:",
+                default="us-east-1",
+            ).execute()
+            auth_type = inquirer.select(
+                message="AWS authentication:",
+                choices=[
+                    {"name": "AWS Profile (SSO/IAM Identity Center)", "value": "profile"},
+                    {"name": "Access Keys (static)", "value": "keys"},
+                    {"name": "Instance Role (automatic on EC2/ECS/Lambda)", "value": "instance"},
+                ],
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "bedrock",
+                "aws_region": aws_region,
+            }
+            if auth_type == "profile":
+                profile = inquirer.text(
+                    message="AWS Profile name:",
+                    default="default",
+                ).execute()
+                auth_configs[pid]["aws_profile"] = profile
+                console.print(
+                    f"[dim]Run 'aws sso login --profile {profile}' if using SSO.[/dim]"
+                )
+            elif auth_type == "keys":
+                access_key = inquirer.secret(
+                    message="AWS Access Key ID:",
+                    validate=lambda x: len(x) >= 16,
+                    invalid_message="Access key too short",
+                ).execute()
+                secret_key = inquirer.secret(
+                    message="AWS Secret Access Key:",
+                    validate=lambda x: len(x) >= 20,
+                    invalid_message="Secret key too short",
+                ).execute()
+                session_token = inquirer.secret(
+                    message="AWS Session Token (optional, press Enter to skip):",
+                    default="",
+                ).execute()
+                auth_configs[pid]["aws_access_key_id"] = access_key
+                auth_configs[pid]["aws_secret_access_key"] = secret_key
+                if session_token:
+                    auth_configs[pid]["aws_session_token"] = session_token
+            else:
+                console.print(
+                    "[dim]Instance role will be auto-detected on AWS compute.[/dim]"
+                )
+
+        elif auth_method == "vertex_ai":
+            console.print("[dim]Google Vertex AI — Claude via Google Cloud[/dim]")
+            project_id = inquirer.text(
+                message="GCP Project ID:",
+                validate=lambda x: len(x) > 0,
+                invalid_message="Project ID is required",
+            ).execute()
+            region = inquirer.text(
+                message="GCP Region:",
+                default="us-east5",
+            ).execute()
+            auth_configs[pid] = {
+                "auth_method": "vertex_ai",
+                "project_id": project_id,
+                "region": region,
+            }
+            console.print(
+                "[dim]Ensure you've run 'gcloud auth application-default login' "
+                "or set GOOGLE_APPLICATION_CREDENTIALS.[/dim]"
+            )
+
+        elif auth_method == "codex_oauth":
+            console.print(
+                "[dim]Codex OAuth — will open browser for ChatGPT login.\n"
+                "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.\n"
+                "Uses subscription quota (not API billing).[/dim]"
+            )
+            auth_configs[pid] = {"auth_method": "codex_oauth"}
+            # Interactive login happens at runtime when first API call is made
+
+        elif auth_method == "device_code":
+            console.print(
+                "[dim]Device Code Flow — for headless/SSH environments.\n"
+                "Will display a URL and code to enter on another device.\n"
+                "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.[/dim]"
+            )
+            auth_configs[pid] = {"auth_method": "device_code"}
+            # Device flow happens at runtime when first API call is made
+
+    if not api_keys and not auth_configs:
+        console.print("[red]No credentials provided. Setup cancelled.[/red]")
+        return
+
+    # Step 3: Model selection — choices from selected providers only
+    strong_choices = []
+    fast_choices = []
+    for pid in selected_providers:
+        if pid in api_keys or pid in auth_configs:
+            info = PROVIDERS[pid]
+            strong_choices.extend(info["models_strong"])
+            fast_choices.extend(info["models_fast"])
+
+    if not strong_choices:
+        console.print("[red]No models available. Setup cancelled.[/red]")
+        return
+
     model_strong = inquirer.select(
         message="Model for complex tasks (Director, Architect):",
-        choices=[
-            {"name": "Claude Opus 4.6 (best quality, higher cost)", "value": "claude-opus-4-6"},
-            {"name": "Claude Sonnet 4.5 (good balance)", "value": "claude-sonnet-4-5-20250929"},
-        ],
-        default="claude-opus-4-6",
+        choices=strong_choices,
+        default=strong_choices[0]["value"] if strong_choices else None,
     ).execute()
 
     model_fast = inquirer.select(
         message="Model for routine tasks (Builder, Reviewer, Tester):",
-        choices=[
-            {"name": "Claude Sonnet 4.5 (recommended)", "value": "claude-sonnet-4-5-20250929"},
-            {"name": "Claude Haiku 4.5 (faster, cheaper)", "value": "claude-haiku-4-5-20251001"},
-        ],
-        default="claude-sonnet-4-5-20250929",
+        choices=fast_choices,
+        default=fast_choices[0]["value"] if fast_choices else None,
     ).execute()
 
-    # Step 3: Budget
+    # Step 3b: Validate model → provider mapping
+    _validate_model_provider(inquirer, api_keys, auth_configs, model_strong, "strong")
+    _validate_model_provider(inquirer, api_keys, auth_configs, model_fast, "fast")
+
+    # Step 4: Budget
     budget = inquirer.number(
         message="Default budget limit (USD):",
         default=10.0,
@@ -70,7 +345,7 @@ def run_setup_wizard() -> None:
         max_allowed=100.0,
     ).execute()
 
-    # Step 4: Max agents
+    # Step 5: Max agents
     max_agents = inquirer.number(
         message="Max parallel builder agents:",
         default=3,
@@ -78,14 +353,18 @@ def run_setup_wizard() -> None:
         max_allowed=8,
     ).execute()
 
-    # Step 5: Docker
+    # Step 6: Docker
     docker_enabled = inquirer.confirm(
         message="Enable Docker sandbox for isolated builds?",
         default=False,
     ).execute()
 
     # Write config
-    _write_config(api_key, model_strong, model_fast, float(budget), int(max_agents), docker_enabled)
+    _write_config(
+        api_keys, model_strong, model_fast,
+        float(budget), int(max_agents), docker_enabled,
+        auth_configs=auth_configs,
+    )
 
     console.print()
     console.print(f"[green]Configuration saved to {CONFIG_FILE}[/green]")
@@ -93,13 +372,51 @@ def run_setup_wizard() -> None:
     console.print()
 
 
+def _validate_model_provider(
+    inquirer: Any,
+    api_keys: dict[str, str],
+    auth_configs: dict[str, dict[str, str]],
+    model: str,
+    label: str,
+) -> None:
+    """Validate that a selected model has a configured provider."""
+    from autoforge.engine.llm_router import detect_provider
+
+    required_provider = detect_provider(model)
+    if required_provider in api_keys or required_provider in auth_configs:
+        return
+
+    info = PROVIDERS.get(required_provider)
+    if not info:
+        return
+
+    console.print(
+        f"[yellow]Warning:[/yellow] {label} model '{model}' requires "
+        f"{info['name']} but no credentials were provided."
+    )
+    fix = inquirer.confirm(
+        message=f"Add credentials for {info['name']}?",
+        default=True,
+    ).execute()
+    if fix:
+        key = inquirer.secret(
+            message=f"{info['name']} API key:",
+            validate=info["validate"],
+            invalid_message=info["invalid_msg"],
+            long_instruction=info["key_hint"],
+        ).execute()
+        if key:
+            api_keys[required_provider] = key
+
+
 def _write_config(
-    api_key: str,
+    api_keys: dict[str, str],
     model_strong: str,
     model_fast: str,
     budget: float,
     max_agents: int,
     docker_enabled: bool,
+    auth_configs: dict[str, dict[str, str]] | None = None,
 ) -> None:
     """Write configuration to ~/.autoforge/config.toml."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -107,8 +424,16 @@ def _write_config(
     try:
         import tomli_w
 
-        data = {
-            "api": {"anthropic_key": api_key},
+        api_section: dict[str, str] = {}
+        if "anthropic" in api_keys:
+            api_section["anthropic_key"] = api_keys["anthropic"]
+        if "openai" in api_keys:
+            api_section["openai_key"] = api_keys["openai"]
+        if "google" in api_keys:
+            api_section["google_key"] = api_keys["google"]
+
+        data: dict[str, Any] = {
+            "api": api_section,
             "models": {"strong": model_strong, "fast": model_fast},
             "defaults": {
                 "budget": budget,
@@ -117,23 +442,47 @@ def _write_config(
                 "mode": "developer",
             },
         }
+
+        # Add auth config sections
+        if auth_configs:
+            auth_section: dict[str, Any] = {}
+            for provider, auth_data in auth_configs.items():
+                auth_section[provider] = dict(auth_data)
+            data["auth"] = auth_section
+
         CONFIG_FILE.write_bytes(tomli_w.dumps(data).encode("utf-8"))
     except ImportError:
         # Fallback: write TOML manually
-        content = f"""[api]
-anthropic_key = "{api_key}"
+        lines = ["[api]"]
+        if "anthropic" in api_keys:
+            lines.append(f'anthropic_key = "{api_keys["anthropic"]}"')
+        if "openai" in api_keys:
+            lines.append(f'openai_key = "{api_keys["openai"]}"')
+        if "google" in api_keys:
+            lines.append(f'google_key = "{api_keys["google"]}"')
 
-[models]
-strong = "{model_strong}"
-fast = "{model_fast}"
+        lines.append("")
+        lines.append("[models]")
+        lines.append(f'strong = "{model_strong}"')
+        lines.append(f'fast = "{model_fast}"')
+        lines.append("")
+        lines.append("[defaults]")
+        lines.append(f"budget = {budget}")
+        lines.append(f"max_agents = {max_agents}")
+        lines.append(f'docker = {"true" if docker_enabled else "false"}')
+        lines.append('mode = "developer"')
+        lines.append("")
 
-[defaults]
-budget = {budget}
-max_agents = {max_agents}
-docker = {"true" if docker_enabled else "false"}
-mode = "developer"
-"""
-        CONFIG_FILE.write_text(content, encoding="utf-8")
+        # Write auth configs
+        if auth_configs:
+            for provider, auth_data in auth_configs.items():
+                lines.append(f"[auth.{provider}]")
+                for k, v in auth_data.items():
+                    if v:
+                        lines.append(f'{k} = "{v}"')
+                lines.append("")
+
+        CONFIG_FILE.write_text("\n".join(lines), encoding="utf-8")
 
 
 def load_global_config() -> dict:
@@ -155,10 +504,14 @@ def load_global_config() -> dict:
         # Manual parse fallback for simple TOML
         return _parse_toml_simple(CONFIG_FILE)
 
-    result = {}
+    result: dict[str, Any] = {}
     api = data.get("api", {})
     if api.get("anthropic_key"):
         result["anthropic_api_key"] = api["anthropic_key"]
+    if api.get("openai_key"):
+        result["openai_api_key"] = api["openai_key"]
+    if api.get("google_key"):
+        result["google_api_key"] = api["google_key"]
 
     models = data.get("models", {})
     if models.get("strong"):
@@ -176,38 +529,71 @@ def load_global_config() -> dict:
     if "mode" in defaults:
         result["mode"] = defaults["mode"]
 
+    # Load per-provider auth config
+    auth = data.get("auth", {})
+    for provider in ("anthropic", "openai", "google"):
+        auth_section = auth.get(provider, {})
+        if auth_section:
+            result[f"auth_{provider}"] = dict(auth_section)
+
     return result
 
 
 def _parse_toml_simple(path: Path) -> dict:
-    """Simple TOML parser fallback for basic key=value pairs."""
-    result = {}
+    """Simple TOML parser fallback for basic key=value pairs.
+
+    Handles nested sections like [auth.openai] by tracking the current
+    section path and mapping dotted keys to auth_{provider} config keys.
+    """
+    result: dict[str, Any] = {}
+    current_section = ""
+
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if not line or line.startswith("#") or line.startswith("["):
+        if not line or line.startswith("#"):
             continue
-        if "=" in line:
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"')
-            # Map TOML keys to config fields
-            key_map = {
-                "anthropic_key": "anthropic_api_key",
-                "strong": "model_strong",
-                "fast": "model_fast",
-                "budget": "budget_limit_usd",
-                "max_agents": "max_agents",
-                "docker": "docker_enabled",
-                "mode": "mode",
-            }
-            config_key = key_map.get(key)
-            if config_key:
-                if config_key in ("budget_limit_usd",):
-                    result[config_key] = float(value)
-                elif config_key in ("max_agents",):
-                    result[config_key] = int(value)
-                elif config_key in ("docker_enabled",):
-                    result[config_key] = value.lower() in ("true", "1", "yes")
-                else:
-                    result[config_key] = value
+
+        # Section header
+        if line.startswith("[") and line.endswith("]"):
+            current_section = line[1:-1].strip()
+            continue
+
+        if "=" not in line:
+            continue
+
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"')
+
+        # Auth sections: [auth.openai], [auth.google], etc.
+        if current_section.startswith("auth."):
+            provider = current_section.split(".", 1)[1]
+            auth_key = f"auth_{provider}"
+            if auth_key not in result:
+                result[auth_key] = {}
+            result[auth_key][key] = value
+            continue
+
+        # Standard key mapping
+        key_map = {
+            "anthropic_key": "anthropic_api_key",
+            "openai_key": "openai_api_key",
+            "google_key": "google_api_key",
+            "strong": "model_strong",
+            "fast": "model_fast",
+            "budget": "budget_limit_usd",
+            "max_agents": "max_agents",
+            "docker": "docker_enabled",
+            "mode": "mode",
+        }
+        config_key = key_map.get(key)
+        if config_key:
+            if config_key in ("budget_limit_usd",):
+                result[config_key] = float(value)
+            elif config_key in ("max_agents",):
+                result[config_key] = int(value)
+            elif config_key in ("docker_enabled",):
+                result[config_key] = value.lower() in ("true", "1", "yes")
+            else:
+                result[config_key] = value
     return result
