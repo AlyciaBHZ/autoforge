@@ -60,7 +60,10 @@ def test_dependency_imports():
 
 def test_engine_imports():
     from autoforge.engine.config import ForgeConfig  # noqa: F401
-    from autoforge.engine.llm_router import LLMRouter, TaskComplexity, BudgetExceededError  # noqa: F401
+    from autoforge.engine.llm_router import (  # noqa: F401
+        LLMRouter, TaskComplexity, BudgetExceededError,
+        ContentBlock, Usage, LLMResponse, detect_provider,
+    )
     from autoforge.engine.agent_base import AgentBase, AgentResult, ToolDefinition  # noqa: F401
     from autoforge.engine.task_dag import TaskDAG, Task, TaskPhase, TaskStatus  # noqa: F401
     from autoforge.engine.lock_manager import LockManager  # noqa: F401
@@ -341,7 +344,7 @@ def test_sandbox_factory():
 def test_llm_router_instantiation():
     from autoforge.engine.llm_router import LLMRouter, TaskComplexity
     from autoforge.engine.config import ForgeConfig
-    config = ForgeConfig(anthropic_api_key="fake-key")
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
     router = LLMRouter(config)
     m, t = router._select_model(TaskComplexity.HIGH)
     assert m == "claude-opus-4-6"
@@ -375,7 +378,7 @@ def test_all_agents_instantiate():
     from autoforge.engine.agents.scanner import ScannerAgent
     from autoforge.engine.sandbox import SubprocessSandbox
 
-    config = ForgeConfig(anthropic_api_key="fake")
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
     llm = LLMRouter(config)
     wd = Path(tempfile.mkdtemp())
 
@@ -413,7 +416,7 @@ def test_agent_build_prompts():
     from autoforge.engine.agents.scanner import ScannerAgent
     from autoforge.engine.sandbox import SubprocessSandbox
 
-    config = ForgeConfig(anthropic_api_key="fake")
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
     llm = LLMRouter(config)
     wd = Path(tempfile.mkdtemp())
     sb = SubprocessSandbox(wd)
@@ -446,7 +449,7 @@ def test_agent_parse_methods():
     from autoforge.engine.agents.tester import TesterAgent
     from autoforge.engine.agents.scanner import ScannerAgent
 
-    config = ForgeConfig(anthropic_api_key="fake")
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
     llm = LLMRouter(config)
 
     d = DirectorAgent(config, llm)
@@ -477,7 +480,7 @@ def test_research_mode_blocks_writes():
     from autoforge.engine.agent_base import AgentBase
     from autoforge.engine.config import ForgeConfig
 
-    config = ForgeConfig(anthropic_api_key="fake", mode="research")
+    config = ForgeConfig(api_keys={"anthropic": "fake"}, mode="research")
     assert config.mode == "research"
 
     # Verify WRITE_TOOLS is defined
@@ -492,7 +495,7 @@ def test_agent_parse_failsafe():
     from autoforge.engine.agents.reviewer import ReviewerAgent
     from autoforge.engine.agents.tester import TesterAgent
 
-    config = ForgeConfig(anthropic_api_key="fake")
+    config = ForgeConfig(api_keys={"anthropic": "fake"})
     llm = LLMRouter(config)
     _td = Path(tempfile.mkdtemp())
 
@@ -513,13 +516,84 @@ def test_agent_parse_failsafe():
 
 
 # ────────────────────────────────────────────
+# Phase 3b: Multi-Provider
+# ────────────────────────────────────────────
+
+def test_provider_detection():
+    from autoforge.engine.llm_router import detect_provider
+    assert detect_provider("claude-opus-4-6") == "anthropic"
+    assert detect_provider("claude-sonnet-4-5-20250929") == "anthropic"
+    assert detect_provider("claude-haiku-4-5-20251001") == "anthropic"
+    assert detect_provider("gpt-4o") == "openai"
+    assert detect_provider("gpt-4o-mini") == "openai"
+    assert detect_provider("o3") == "openai"
+    assert detect_provider("o4-mini") == "openai"
+    assert detect_provider("gemini-2.5-pro") == "google"
+    assert detect_provider("gemini-2.5-flash") == "google"
+    assert detect_provider("gemini-2.0-flash") == "google"
+    # Unknown model defaults to anthropic
+    assert detect_provider("some-unknown-model") == "anthropic"
+
+
+def test_normalized_response_types():
+    from autoforge.engine.llm_router import ContentBlock, Usage, LLMResponse
+    # Text block
+    tb = ContentBlock(type="text", text="hello")
+    assert tb.type == "text" and tb.text == "hello"
+    # Tool use block
+    tu = ContentBlock(type="tool_use", id="abc", name="write_file", input={"path": "x"})
+    assert tu.type == "tool_use" and tu.name == "write_file"
+    # Response
+    resp = LLMResponse(
+        content=[tb, tu],
+        stop_reason="tool_use",
+        usage=Usage(input_tokens=100, output_tokens=50),
+    )
+    assert resp.stop_reason == "tool_use"
+    assert len(resp.content) == 2
+    assert resp.usage.input_tokens == 100
+
+
+def test_multi_key_config():
+    from autoforge.engine.config import ForgeConfig
+    config = ForgeConfig(api_keys={
+        "anthropic": "sk-ant-fake",
+        "openai": "sk-fake",
+        "google": "AI-fake",
+    })
+    # Backward compat property
+    assert config.anthropic_api_key == "sk-ant-fake"
+    assert config.api_keys["openai"] == "sk-fake"
+    assert config.api_keys["google"] == "AI-fake"
+
+
+def test_multi_key_config_setter():
+    from autoforge.engine.config import ForgeConfig
+    config = ForgeConfig()
+    config.anthropic_api_key = "sk-ant-test"
+    assert config.api_keys["anthropic"] == "sk-ant-test"
+
+
+def test_extended_model_pricing():
+    from autoforge.engine.config import MODEL_PRICING
+    # Anthropic
+    assert "claude-opus-4-6" in MODEL_PRICING
+    # OpenAI
+    assert "gpt-4o" in MODEL_PRICING
+    assert "o3" in MODEL_PRICING
+    # Google
+    assert "gemini-2.5-pro" in MODEL_PRICING
+    assert "gemini-2.0-flash" in MODEL_PRICING
+
+
+# ────────────────────────────────────────────
 # Phase 4: Integration
 # ────────────────────────────────────────────
 
 def test_orchestrator_instantiation():
     from autoforge.engine.config import ForgeConfig
     from autoforge.engine.orchestrator import Orchestrator
-    config = ForgeConfig(anthropic_api_key="fake-key")
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
     orch = Orchestrator(config)
     assert orch.llm is not None
     assert orch.config is config
@@ -544,15 +618,13 @@ def test_orchestrator_show_status():
 
 
 def test_llm_router_requires_api_key():
-    """LLMRouter must reject empty API key."""
+    """LLMRouter allows init without keys (lazy client creation)."""
     from autoforge.engine.config import ForgeConfig
     from autoforge.engine.llm_router import LLMRouter
-    config = ForgeConfig(anthropic_api_key="")
-    try:
-        LLMRouter(config)
-        raise AssertionError("Should have raised ValueError")
-    except ValueError as e:
-        assert "ANTHROPIC_API_KEY" in str(e)
+    config = ForgeConfig()  # No API keys
+    router = LLMRouter(config)
+    # Should instantiate fine — keys checked lazily when _get_client is called
+    assert router.call_count == 0
 
 
 # ────────────────────────────────────────────
@@ -684,7 +756,7 @@ def test_daemon_instantiation():
     """Test ForgeDaemon can be instantiated."""
     from autoforge.engine.config import ForgeConfig
     from autoforge.engine.daemon import ForgeDaemon
-    config = ForgeConfig(anthropic_api_key="fake-key")
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
     daemon = ForgeDaemon(config)
     assert daemon.config is config
     assert daemon._running is False
@@ -706,7 +778,7 @@ def test_cli_daemon_subcommand():
     """Test that daemon module can be imported."""
     from autoforge.engine.daemon import ForgeDaemon  # noqa: F401
     from autoforge.engine.config import ForgeConfig
-    config = ForgeConfig(anthropic_api_key="fake-key")
+    config = ForgeConfig(api_keys={"anthropic": "fake-key"})
     daemon = ForgeDaemon(config)
     assert daemon._running is False
 
@@ -801,6 +873,13 @@ def main():
             ("All parse methods", test_agent_parse_methods),
             ("Fail-safe on unparseable output", test_agent_parse_failsafe),
             ("Research mode blocks writes", test_research_mode_blocks_writes),
+        ]),
+        ("Multi-Provider", [
+            ("Provider detection from model names", test_provider_detection),
+            ("Normalized response types", test_normalized_response_types),
+            ("Multi-key config", test_multi_key_config),
+            ("Multi-key config setter (backward compat)", test_multi_key_config_setter),
+            ("Extended model pricing", test_extended_model_pricing),
         ]),
         ("Integration", [
             ("Orchestrator instantiation", test_orchestrator_instantiation),

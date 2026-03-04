@@ -91,7 +91,7 @@ class AgentBase(ABC):
         """Build the user message for this agent's task."""
 
     def _get_tool_definitions(self) -> list[dict[str, Any]]:
-        """Convert ToolDefinitions to Anthropic API format."""
+        """Convert ToolDefinitions to internal format (provider conversion in LLMRouter)."""
         return [
             {
                 "name": t.name,

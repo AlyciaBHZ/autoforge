@@ -22,9 +22,20 @@ import autoforge
 
 # Approximate pricing per million tokens (USD)
 MODEL_PRICING = {
+    # Anthropic
     "claude-opus-4-6": {"input": 15.0, "output": 75.0},
     "claude-sonnet-4-5-20250929": {"input": 3.0, "output": 15.0},
     "claude-haiku-4-5-20251001": {"input": 1.0, "output": 5.0},
+    # OpenAI
+    "gpt-4o": {"input": 2.5, "output": 10.0},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.6},
+    "o3": {"input": 10.0, "output": 40.0},
+    "o3-mini": {"input": 1.1, "output": 4.4},
+    "o4-mini": {"input": 1.1, "output": 4.4},
+    # Google Gemini
+    "gemini-2.5-pro": {"input": 1.25, "output": 10.0},
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.6},
+    "gemini-2.0-flash": {"input": 0.1, "output": 0.4},
 }
 
 # Default fallback pricing
@@ -66,8 +77,8 @@ class ForgeConfig:
     workspace_dir: Path | None = None
     constitution_dir: Path | None = None
 
-    # LLM settings
-    anthropic_api_key: str = ""
+    # LLM settings — multi-provider API keys
+    api_keys: dict[str, str] = field(default_factory=dict)
     model_strong: str = "claude-opus-4-6"
     model_fast: str = "claude-sonnet-4-5-20250929"
     max_tokens_strong: int = 16384
@@ -125,6 +136,17 @@ class ForgeConfig:
         if not self.run_id:
             self.run_id = uuid.uuid4().hex[:12]
 
+    @property
+    def anthropic_api_key(self) -> str:
+        """Backward-compatible access to Anthropic API key."""
+        return self.api_keys.get("anthropic", "")
+
+    @anthropic_api_key.setter
+    def anthropic_api_key(self, value: str) -> None:
+        """Backward-compatible setter for Anthropic API key."""
+        if value:
+            self.api_keys["anthropic"] = value
+
     @classmethod
     def from_env(cls, **overrides) -> ForgeConfig:
         """Create config from environment variables and optional overrides.
@@ -140,6 +162,25 @@ class ForgeConfig:
 
         # Layer 2: Load .env (overrides global)
         load_dotenv()
+
+        # Build API keys dict from all sources
+        api_keys: dict[str, str] = {}
+
+        # From global config
+        if global_config.get("anthropic_api_key"):
+            api_keys["anthropic"] = global_config["anthropic_api_key"]
+        if global_config.get("openai_api_key"):
+            api_keys["openai"] = global_config["openai_api_key"]
+        if global_config.get("google_api_key"):
+            api_keys["google"] = global_config["google_api_key"]
+
+        # From env vars (override global)
+        if os.getenv("ANTHROPIC_API_KEY"):
+            api_keys["anthropic"] = os.getenv("ANTHROPIC_API_KEY", "")
+        if os.getenv("OPENAI_API_KEY"):
+            api_keys["openai"] = os.getenv("OPENAI_API_KEY", "")
+        if os.getenv("GOOGLE_API_KEY"):
+            api_keys["google"] = os.getenv("GOOGLE_API_KEY", "")
 
         # Parse allowed Telegram users (comma-separated)
         allowed_raw = os.getenv("FORGE_TELEGRAM_ALLOWED_USERS", "")
@@ -172,12 +213,8 @@ class ForgeConfig:
         elif max_agents > 50:
             max_agents = 50
 
-        # Start with global config values, then override with .env, then CLI
         config = cls(
-            anthropic_api_key=(
-                os.getenv("ANTHROPIC_API_KEY")
-                or global_config.get("anthropic_api_key", "")
-            ),
+            api_keys=api_keys,
             model_strong=(
                 os.getenv("FORGE_MODEL_STRONG")
                 or global_config.get("model_strong", "claude-opus-4-6")
