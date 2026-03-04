@@ -19,7 +19,8 @@ python forge.py --status                    # Show all projects
 python forge.py --resume                    # Resume interrupted run
 
 # Test
-python tests/smoke_test.py                  # 31-check smoke test suite
+python tests/smoke_test.py                  # 105-check smoke test suite
+python -m pytest tests/test_engines.py      # 112 behavioral/unit tests
 
 # Daemon mode (24/7 background service)
 python forge.py daemon start                # Start daemon
@@ -88,7 +89,8 @@ constitution/               Agent behavior rules, workflow definitions, quality 
 constitution/agents/*.md    Per-agent system prompts (loaded by agent_base.py)
 constitution/workflows/*.md Phase definitions (spec, build, verify, refactor, deliver)
 services/                   systemd + launchd service configs for daemon mode
-tests/smoke_test.py         31-check validation suite (no API key needed)
+tests/smoke_test.py         105-check validation suite (no API key needed)
+tests/test_engines.py       112 behavioral tests (SearchTree, MCTS, Evolution, etc.)
 scripts/git_sync.py         Automated git merge/cherry-pick workflow tool
 ```
 

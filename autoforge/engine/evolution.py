@@ -775,17 +775,11 @@ class EvolutionEngine:
         if hasattr(config, "search_tree_max_candidates"):
             config.search_tree_max_candidates = genome.arch_candidates_tried
 
-        # Apply model routing strategy (ShinkaEvolve trick 3: adaptive model ensemble selection)
-        if hasattr(config, "model_strong") and hasattr(config, "model_fast"):
-            if genome.model_preference == "strong":
-                config.model_strong = True
-                config.model_fast = False
-            elif genome.model_preference == "fast":
-                config.model_strong = False
-                config.model_fast = True
-            else:  # balanced
-                config.model_strong = False
-                config.model_fast = False
+        # Note: genome.model_preference ("strong"/"fast"/"balanced") is an
+        # advisory signal logged for analysis.  We do NOT override
+        # config.model_strong / config.model_fast here because those are
+        # model-name strings, not booleans.  The LLM router already picks
+        # the right tier per-agent based on task complexity.
 
         logger.info(
             f"[Evolution] Applied genome {genome.id} to config: "

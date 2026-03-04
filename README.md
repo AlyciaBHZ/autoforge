@@ -7,169 +7,185 @@
                                        |___/
 ```
 
-**One command. Six agents. A complete, runnable software project.**
+**一行命令，六个智能体，生成完整可运行的软件项目。**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Smoke Tests](https://img.shields.io/badge/tests-31%20checks-brightgreen.svg)](tests/smoke_test.py)
+[![Tests](https://img.shields.io/badge/tests-105%20checks-brightgreen.svg)](tests/smoke_test.py)
 
-[中文文档](docs/README_CN.md) | [Developer Docs](CLAUDE.md)
+[English](docs/README_EN.md) | [开发者文档](CLAUDE.md)
 
 ---
 
-## Quick Start
+## 快速开始
 
 ```bash
-./setup.sh                                    # Install dependencies
-export ANTHROPIC_API_KEY="sk-..."             # Set any supported LLM key
-python forge.py "Todo app with user auth"     # Generate a project
+./setup.sh                                    # 安装依赖
+python forge.py "带用户登录的待办事项应用"       # 生成项目
 ```
 
-Your project lands in `workspace/` -- ready to run.
+首次运行会引导配置 API Key（支持 Anthropic / OpenAI / Google 任意一家），也可以跳过稍后配置。项目输出到 `workspace/` 目录，开箱即用。
 
 ---
 
-## What It Does
+## 它能做什么
 
-AutoForge orchestrates 6 specialized AI agents through a 5-phase pipeline to turn a natural-language idea into a working codebase. Requirements analysis, architecture design, parallel code generation, testing, code review, refactoring, and deployment packaging -- fully automated.
+AutoForge 通过 6 个专业化 AI 智能体协作，经过 5 阶段流水线，将一句自然语言描述转化为完整的代码项目。需求分析、架构设计、并行代码生成、自动化测试、代码审查、重构优化、部署打包，全程自动完成。
 
-**Highlights:**
-- Full-stack web apps, APIs, CLI tools, and mobile apps from a single prompt
-- Multi-provider LLM support with cross-provider mixing (Opus for planning, Flash for coding)
-- Budget controls with real-time cost tracking (`--budget 5.00`)
-- Sandbox execution (Docker or subprocess) for safe testing
-- Interrupt-safe -- resume any run without losing progress
-- 24/7 daemon mode with build queue, Telegram bot, and REST API
+**核心特性：**
+- 全栈 Web 应用、API 服务、CLI 工具、移动端应用，一行命令搞定
+- 多模型多厂商支持，可跨厂商混搭（强模型做规划，快模型写代码）
+- 预算控制与实时成本追踪（`--budget 5.00`）
+- 沙盒执行（Docker 或子进程），安全运行生成的代码
+- 断点恢复，中断后继续不丢失进度
+- 24/7 守护进程模式，支持构建队列、Telegram 机器人和 REST API
 
 ---
 
-## Architecture
+## 架构
 
 ```
- "Build a todo app with auth"
+ "做一个带登录的 Todo App"
           |
           v
  ┌─────────────────────────────────────────────┐
- │  SPEC      Director analyses requirements    │
+ │  SPEC      Director 分析需求、拆解模块       │
  ├─────────────────────────────────────────────┤
- │  BUILD     Architect designs, Builders code  │
- │            Reviewer checks each task         │
+ │  BUILD     Architect 设计架构                │
+ │            Builder 并行写代码，Reviewer 审查  │
  ├─────────────────────────────────────────────┤
- │  VERIFY    Tester runs build + tests         │
- │            Failures auto-generate fix tasks   │
+ │  VERIFY    Tester 安装依赖、构建、运行测试    │
+ │            失败自动生成修复任务               │
  ├─────────────────────────────────────────────┤
- │  REFACTOR  Gardener optimises code quality   │
+ │  REFACTOR  Gardener 优化代码质量             │
  ├─────────────────────────────────────────────┤
- │  DELIVER   README, structure, cost report    │
+ │  DELIVER   生成 README、整理结构、成本报告    │
  └─────────────────────────────────────────────┘
           |
           v
     workspace/my-todo-app/
 ```
 
-| Agent | Role | Model Tier |
-|-------|------|------------|
-| **Director** | Requirements & scoping | Strong (Opus) |
-| **Architect** | System design & task DAG | Strong (Opus) |
-| **Builder** | Code generation (parallelised) | Fast (Sonnet) |
-| **Reviewer** | Code review & scoring | Fast (Sonnet) |
-| **Tester** | Build, test, auto-fix loop | Fast (Sonnet) |
-| **Gardener** | Refactoring & security fixes | Fast (Sonnet) |
+| 智能体 | 角色 | 模型层级 |
+|--------|------|----------|
+| **Director** | 需求分析与范围界定 | Strong（强模型） |
+| **Architect** | 系统设计与任务依赖图 | Strong（强模型） |
+| **Builder** | 代码生成（可并行） | Fast（快模型） |
+| **Reviewer** | 代码审查与评分 | Fast（快模型） |
+| **Tester** | 构建、测试、自动修复循环 | Fast（快模型） |
+| **Gardener** | 重构与安全修复 | Fast（快模型） |
 
 ---
 
-## Academic Foundations
+## 支持的 LLM 提供商
 
-AutoForge integrates techniques from recent AI and software engineering research:
+AutoForge 支持多家主流 LLM 提供商，可自由切换或混搭使用：
 
-| Engine | Source | Paper / Reference |
-|--------|--------|-------------------|
-| **RethinkMCTS** | `search_tree.py` | RethinkMCTS (2024) -- thought refinement via execution feedback in MCTS |
-| **EvoMAC** | `evomac.py` | EvoMAC (ICLR 2025) -- text backpropagation with natural-language gradients |
-| **SICA** | `sica.py` | SICA (ICLR 2025 Workshop) + STO (NeurIPS 2025) -- self-improving coding agents |
-| **Reflexion** | `reflexion.py` | Reflexion (NeurIPS 2023, Shinn et al.) -- verbal reinforcement learning |
-| **CodePRM** | `process_reward.py` | CodePRM (ACL 2025) -- step-level process reward model for code |
-| **LDB** | `ldb_debugger.py` | LDB (ACL 2024, Zhong et al.) -- block-level fault localisation |
-| **Adaptive Compute** | `adaptive_compute.py` | Scaling LLM Test-Time Compute (ICLR 2025) -- difficulty-aware resource allocation |
-| **Speculative Pipeline** | `speculative_pipeline.py` | Speculative Actions + Sherlock -- overlapping phase pre-execution |
-| **Parsel** | `hierarchical_decomp.py` | Parsel (NeurIPS 2023) + CodePlan (ACM 2024) -- function-level decomposition |
-| **Lean Prover** | `lean_prover.py` | Hilbert (NeurIPS 2025) + COPRA (COLM 2024) + DeepSeek-Prover (ICLR 2025) + STP (ICML 2025) |
-| **CapabilityDAG** | `capability_dag.py` | Voyager (NeurIPS 2023) + FunSearch (Nature 2024) -- self-growing knowledge graph |
-| **TheoryGraph** | `theoretical_reasoning.py` | Cross-domain scientific reasoning with multi-modal verification |
+| 提供商 | 环境变量 | 推荐模型 |
+|--------|----------|----------|
+| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4（强）、Claude Sonnet 4（快） |
+| **OpenAI** | `OPENAI_API_KEY` | GPT-4o / o3（强）、GPT-4o-mini（快） |
+| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro（强）、Gemini 2.5 Flash（快） |
 
-<details>
-<summary>Additional techniques</summary>
-
-- **DSPy/OPRO prompt optimisation** (`prompt_optimizer.py`) -- automatic prompt self-improvement
-- **Cross-project RAG** (`rag_retrieval.py`) -- BM25+TF-IDF hybrid code retrieval
-- **Formal verification** (`formal_verify.py`) -- multi-level linting, type checking, LLM analysis
-- **Conditional debate** (`agent_debate.py`) -- reward-guided multi-agent architecture debate (ICLR 2025)
-- **RedCode security scanning** (`security_scan.py`) -- pattern matching + LLM vulnerability analysis (NeurIPS 2024)
-- **Evolution engine** (`evolution.py`) -- MAP-Elites cross-project workflow self-improvement
-
-</details>
-
----
-
-## Supported LLM Providers
-
-| Provider | Auth | Recommended Models |
-|----------|------|--------------------|
-| **Anthropic** | `ANTHROPIC_API_KEY` or `~/.autoforge/config.toml` | Claude Opus 4 (strong), Sonnet 4.5 (fast) |
-| **OpenAI** | `OPENAI_API_KEY` or `~/.autoforge/config.toml` | GPT-4o, o3 (strong), GPT-4o-mini (fast) |
-| **Google** | `GOOGLE_API_KEY` or `~/.autoforge/config.toml` | Gemini 2.5 Pro (strong), Gemini 2.5 Flash (fast) |
-
-Mix and match across providers:
+也可以通过 `~/.autoforge/config.toml` 统一管理密钥。支持跨厂商混搭：
 
 ```bash
-export FORGE_MODEL_STRONG=claude-opus-4-6
-export FORGE_MODEL_FAST=gemini-2.5-flash
+export FORGE_MODEL_STRONG=gpt-4o          # 强模型用 OpenAI
+export FORGE_MODEL_FAST=gemini-2.5-flash  # 快模型用 Google
 ```
 
 ---
 
-## Usage
+## 使用方法
 
 ```bash
-# Generate projects
-python forge.py "REST API for a bookstore with JWT auth"
-python forge.py "Landing page for a SaaS product" --budget 3.00
+# 生成项目
+python forge.py "用 Flask + Vue 做一个书店管理系统，带 JWT 认证"
+python forge.py "SaaS 产品落地页" --budget 3.00
 
-# Manage runs
-python forge.py --status          # Show all projects
-python forge.py --resume          # Resume interrupted run
+# 管理运行
+python forge.py --status          # 查看所有项目
+python forge.py --resume          # 恢复中断的任务
 
-# Daemon mode (24/7 background service)
+# 守护进程模式（24/7 后台服务）
 python forge.py daemon start
-python forge.py queue "Blog with markdown support"
+python forge.py queue "支持 Markdown 的博客系统"
 python forge.py projects
 python forge.py deploy <project_id>
 ```
 
 <details>
-<summary>Cost estimates</summary>
+<summary>成本估算</summary>
 
-| Complexity | Example | Estimated Cost |
-|------------|---------|:--------------:|
-| Simple | Todo app, landing page | $2--3 |
-| Medium | Blog system, booking platform | $4--6 |
-| Complex | E-commerce MVP, multi-role platform | $7--10 |
+| 复杂度 | 示例 | 预估成本 |
+|--------|------|:--------:|
+| 简单 | Todo App、落地页 | $2--3 |
+| 中等 | 博客系统、预约平台 | $4--6 |
+| 复杂 | 电商 MVP、多角色平台 | $7--10 |
 
-Default budget cap: $10. Override with `--budget`.
+默认预算上限 $10，可通过 `--budget` 覆盖。
 
 </details>
 
 ---
 
-## Requirements
+## 学术基础
 
-- **Python 3.11+** -- [python.org](https://python.org)
-- **At least one LLM API key** -- [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/api-keys) / [Google](https://aistudio.google.com/apikey)
-- **Git** (recommended) -- for worktree isolation
-- **Docker** (optional) -- for sandbox execution
+AutoForge 集成了近年 AI 与软件工程领域的前沿研究成果：
+
+| 引擎 | 源文件 | 论文 / 参考 |
+|------|--------|-------------|
+| **RethinkMCTS** | `search_tree.py` | RethinkMCTS (2024) — 基于执行反馈的 MCTS 思维链修正 |
+| **EvoMAC** | `evomac.py` | EvoMAC (ICLR 2025) — 自然语言梯度的文本反向传播 |
+| **SICA** | `sica.py` | SICA (ICLR 2025 Workshop) + STO (NeurIPS 2025) — 自改进编码智能体 |
+| **Reflexion** | `reflexion.py` | Reflexion (NeurIPS 2023) — 语言强化学习 |
+| **CodePRM** | `process_reward.py` | CodePRM (ACL 2025) — 代码生成步骤级过程奖励模型 |
+| **LDB** | `ldb_debugger.py` | LDB (ACL 2024) — 块级故障定位 |
+| **Adaptive Compute** | `adaptive_compute.py` | Scaling LLM Test-Time Compute (ICLR 2025) — 难度自适应资源分配 |
+| **Speculative Pipeline** | `speculative_pipeline.py` | Speculative Actions — 阶段重叠预执行加速 |
+| **Parsel** | `hierarchical_decomp.py` | Parsel (NeurIPS 2023) + CodePlan (ACM 2024) — 函数级任务分解 |
+| **Lean Prover** | `lean_prover.py` | Hilbert (NeurIPS 2025) + COPRA (COLM 2024) + DeepSeek-Prover (ICLR 2025) |
+| **CapabilityDAG** | `capability_dag.py` | Voyager (NeurIPS 2023) + FunSearch (Nature 2024) — 自增长知识图谱 |
+| **TheoryGraph** | `theoretical_reasoning.py` | 跨领域科研推理与多模态验证 |
+
+<details>
+<summary>更多集成技术</summary>
+
+- **DSPy/OPRO 提示词优化** (`prompt_optimizer.py`) — 自动提示词自改进
+- **跨项目 RAG 检索** (`rag_retrieval.py`) — BM25+TF-IDF 混合代码检索
+- **形式化验证** (`formal_verify.py`) — 多层次静态分析与类型检查
+- **条件辩论** (`agent_debate.py`) — 奖励引导的多智能体架构辩论 (ICLR 2025)
+- **RedCode 安全扫描** (`security_scan.py`) — 模式匹配 + LLM 漏洞分析 (NeurIPS 2024)
+- **进化引擎** (`evolution.py`) — MAP-Elites 跨项目工作流自我进化
+
+</details>
 
 ---
 
-## License
+## 系统要求
+
+- **Python 3.11+** — [python.org](https://python.org)
+- **至少一个 LLM API Key** — [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/api-keys) / [Google](https://aistudio.google.com/apikey)
+- **Git**（推荐）— 用于 Worktree 隔离并行开发
+- **Docker**（可选）— 用于沙盒执行
+
+---
+
+## AI 编码工具兼容
+
+本项目提供主流 AI 编码工具的配置文件，clone 即可自动识别：
+
+| 工具 | 配置文件 |
+|------|---------|
+| Claude Code | `CLAUDE.md` |
+| Codex / OpenCode | `AGENTS.md` |
+| Cursor | `.cursor/rules/autoforge.mdc` |
+| GitHub Copilot | `.github/copilot-instructions.md` |
+| Windsurf | `.windsurfrules` |
+| Aider | `.aider.conf.yml` |
+
+---
+
+## 许可证
 
 MIT
