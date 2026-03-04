@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -369,7 +370,7 @@ async def _check_python_deps(project_dir: Path) -> list[SecurityFinding]:
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "python", "-m", "pip_audit",
+            sys.executable, "-m", "pip_audit",
             "-r", str(req_files[0]),
             "--format", "json",
             stdout=asyncio.subprocess.PIPE,

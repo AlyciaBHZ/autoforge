@@ -79,7 +79,8 @@ def generate_deploy_guide(project_dir: Path, project_name: str = "") -> str:
     framework = info["framework"]
     name = project_name or project_dir.name
     # Quote the path for safe use in shell commands
-    safe_dir = str(project_dir).replace(" ", "\\ ")
+    import shlex
+    safe_dir = shlex.quote(str(project_dir))
 
     lines = [
         f"# {name} — Vercel Deployment Guide / 部署指南",

@@ -25,6 +25,14 @@ from autoforge.engine.config import ForgeConfig
 logger = logging.getLogger(__name__)
 
 
+def _shell_quote(s: str) -> str:
+    """Quote a string for shell use, cross-platform."""
+    if sys.platform == "win32":
+        return f'"{s}"'
+    import shlex
+    return shlex.quote(s)
+
+
 @dataclass
 class SandboxResult:
     """Result of a command execution in the sandbox."""
@@ -66,7 +74,6 @@ class SubprocessSandbox(SandboxBase):
     """
 
     # Dangerous command patterns that must never be executed.
-    # Each entry is a regex pattern matched case-insensitively against the command.
     BLOCKED_PATTERNS: list[str] = [
         r"\brm\s+-rf\s+/",              # rm -rf /
         r"\brm\s+-fr\s+/",              # rm -fr /
@@ -78,12 +85,12 @@ class SubprocessSandbox(SandboxBase):
         r"\bwget\b.*\|\s*\bsh\b",       # wget | sh
         r"\bwget\b.*\|\s*\bbash\b",     # wget | bash
         r">\s*/dev/sd[a-z]",            # > /dev/sda (overwrite disk)
-        r":\(\)\s*\{\s*:\|\s*:&\s*\}\s*;", # fork bomb :(){ :|:& };:
+        r":\(\)\s*\{\s*:\|\s*:&\s*\}\s*;", # fork bomb
         r"\bshutdown\b",                # shutdown
         r"\breboot\b",                  # reboot
         r"\binit\s+0\b",               # init 0
         r"\bhalt\b",                    # halt
-        r"\bsystemctl\s+(start|stop|restart|disable|enable)\b",  # systemctl service control
+        r"\bsystemctl\s+(start|stop|restart|disable|enable)\b",
         r"\biptables\b",               # firewall manipulation
         r">\s*/etc/passwd",             # overwrite passwd
         r">\s*/etc/shadow",             # overwrite shadow
@@ -96,11 +103,7 @@ class SubprocessSandbox(SandboxBase):
 
     @classmethod
     def _sanitize_command(cls, command: str) -> None:
-        """Check command against blocked patterns and raise ValueError if matched.
-
-        Raises:
-            ValueError: If the command matches any blocked pattern.
-        """
+        """Check command against blocked patterns and raise ValueError if matched."""
         for pattern in cls.BLOCKED_PATTERNS:
             if re.search(pattern, command, re.IGNORECASE):
                 raise ValueError(
@@ -126,6 +129,13 @@ class SubprocessSandbox(SandboxBase):
                 stderr=f"Command blocked by security filter: {e}",
             )
 
+        # On Windows, wrap Unix-style commands to run via bash/sh if available
+        shell_command = command
+        if sys.platform == "win32" and not command.startswith("cmd"):
+            sh = shutil.which("bash") or shutil.which("sh")
+            if sh:
+                shell_command = f'"{sh}" -c {_shell_quote(command)}'
+
         proc: asyncio.subprocess.Process | None = None
         try:
             # On POSIX, start a new process group so we can kill the entire
@@ -135,7 +145,7 @@ class SubprocessSandbox(SandboxBase):
                 kwargs["preexec_fn"] = os.setsid
 
             proc = await asyncio.create_subprocess_shell(
-                command,
+                shell_command,
                 cwd=self.working_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -152,8 +162,6 @@ class SubprocessSandbox(SandboxBase):
             )
         except asyncio.TimeoutError:
             if proc is not None:
-                # Kill the entire process group on POSIX to reap children;
-                # on Windows fall back to proc.kill().
                 try:
                     if sys.platform != "win32" and proc.pid is not None:
                         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -161,7 +169,6 @@ class SubprocessSandbox(SandboxBase):
                         proc.kill()
                 except (ProcessLookupError, OSError):
                     pass
-                # Always reap the zombie process to avoid resource leaks
                 try:
                     await proc.communicate()
                 except Exception:
@@ -252,19 +259,15 @@ class DockerSandbox(SandboxBase):
                 stderr=stderr.decode(errors="replace"),
             )
         except asyncio.TimeoutError:
-            # Kill the local docker exec process
             if proc is not None:
                 try:
                     proc.kill()
                 except (ProcessLookupError, OSError):
                     pass
-                # Reap the killed process to avoid zombie
                 try:
                     await proc.communicate()
                 except Exception:
                     pass
-            # Also kill any running processes inside the container to prevent
-            # the timed-out command from continuing in the background.
             try:
                 kill_cmd = [
                     "docker", "exec", self._container_id,

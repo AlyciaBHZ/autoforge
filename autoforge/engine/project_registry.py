@@ -98,10 +98,15 @@ class ProjectRegistry:
     async def open(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(self.db_path))
-        self._db.row_factory = aiosqlite.Row
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._db.executescript(_SCHEMA)
-        await self._db.commit()
+        try:
+            self._db.row_factory = aiosqlite.Row
+            await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._db.executescript(_SCHEMA)
+            await self._db.commit()
+        except Exception:
+            await self._db.close()
+            self._db = None
+            raise
 
     async def close(self) -> None:
         if self._db:
@@ -189,26 +194,26 @@ class ProjectRegistry:
         return [self._row_to_project(r) for r in rows]
 
     async def dequeue(self) -> Project | None:
-        """Get the oldest queued project and mark it as building."""
+        """Get the oldest queued project and atomically mark it as building."""
         db = self._ensure_db()
+        now = datetime.now(timezone.utc).isoformat()
         cursor = await db.execute(
-            "SELECT * FROM projects WHERE status = ? ORDER BY created_at ASC LIMIT 1",
-            (ProjectStatus.QUEUED.value,),
+            """UPDATE projects
+               SET status = ?, started_at = ?
+               WHERE id = (
+                   SELECT id FROM projects
+                   WHERE status = ?
+                   ORDER BY created_at ASC
+                   LIMIT 1
+               )
+               RETURNING *""",
+            (ProjectStatus.BUILDING.value, now, ProjectStatus.QUEUED.value),
         )
         row = await cursor.fetchone()
         if row is None:
             return None
-
-        project = self._row_to_project(row)
-        now = datetime.now(timezone.utc).isoformat()
-        await db.execute(
-            "UPDATE projects SET status = ?, started_at = ? WHERE id = ?",
-            (ProjectStatus.BUILDING.value, now, project.id),
-        )
         await db.commit()
-        project.status = ProjectStatus.BUILDING
-        project.started_at = now
-        return project
+        return self._row_to_project(row)
 
     async def update_phase(self, project_id: str, phase: str) -> None:
         """Update the current build phase."""

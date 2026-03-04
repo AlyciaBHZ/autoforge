@@ -28,14 +28,20 @@ async def start_telegram_bot(
     notify_callback: Callable[..., Coroutine] | None = None,
 ) -> None:
     """Start the Telegram bot (long-polling mode)."""
-    from telegram import Update
-    from telegram.ext import (
-        Application,
-        CommandHandler,
-        ContextTypes,
-        MessageHandler,
-        filters,
-    )
+    try:
+        from telegram import Update
+        from telegram.ext import (
+            Application,
+            CommandHandler,
+            ContextTypes,
+            MessageHandler,
+            filters,
+        )
+    except ImportError:
+        raise ImportError(
+            "Telegram bot requires 'python-telegram-bot'. "
+            "Install it with: pip install autoforge[channels]"
+        ) from None
 
     allowed_users = set(config.telegram_allowed_users) if config.telegram_allowed_users else None
 
@@ -225,9 +231,17 @@ async def start_telegram_bot(
             return
 
         from pathlib import Path
-        guide_path = Path(project.workspace_path) / "DEPLOY_GUIDE.md"
+        workspace = Path(project.workspace_path).resolve()
+        guide_path = (workspace / "DEPLOY_GUIDE.md").resolve()
+        if not str(guide_path).startswith(str(workspace)):
+            await update.message.reply_text("Invalid workspace path.")
+            return
         if guide_path.exists():
-            guide = guide_path.read_text(encoding="utf-8")
+            try:
+                guide = guide_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                await update.message.reply_text(f"Error reading deploy guide: {e}")
+                return
             # Telegram has 4096 char limit per message
             if len(guide) > 4000:
                 guide = guide[:3990] + "\n\n[...truncated]"

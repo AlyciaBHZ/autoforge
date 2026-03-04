@@ -220,7 +220,7 @@ class SpeculativePipeline:
                     deps = ["pytest"]
                     for dep in deps:
                         cmd_result = await sandbox.exec(
-                            f"pip install {dep} -q 2>/dev/null || true",
+                            f"pip install {dep} -q",
                             timeout=30,
                         )
                         result.commands_run.append(f"pip install {dep}")

@@ -151,7 +151,13 @@ class LLMRouter:
                 client = AsyncAnthropic(**client_kwargs)
 
         elif provider == "openai":
-            from openai import AsyncOpenAI
+            try:
+                from openai import AsyncOpenAI
+            except ImportError:
+                raise ImportError(
+                    "OpenAI provider requires the 'openai' package. "
+                    "Install it with: pip install autoforge[openai]"
+                ) from None
             if isinstance(auth, (CodexOAuthAuth, DeviceCodeAuth)):
                 # Token-based auth: client gets a dummy key, real token
                 # injected via _ensure_fresh_token before each call
@@ -160,7 +166,13 @@ class LLMRouter:
                 client = AsyncOpenAI(**client_kwargs)
 
         elif provider == "google":
-            from google import genai
+            try:
+                from google import genai
+            except ImportError:
+                raise ImportError(
+                    "Google provider requires the 'google-genai' package. "
+                    "Install it with: pip install autoforge[google]"
+                ) from None
             auth_method = auth_config.get("google", {}).get("auth_method", "api_key")
             if auth_method in ("adc", "service_account"):
                 # ADC: genai.Client() auto-discovers credentials
