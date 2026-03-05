@@ -14,13 +14,36 @@ import asyncio
 import json
 import shutil
 import sys
-import tempfile
 import traceback
+import uuid
 from pathlib import Path
 
 # Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+def _tmp_root() -> Path:
+    """Return a writable temp root inside the repo.
+
+    Some sandboxes allow writing inside the workspace but restrict OS temp
+    directories, and may also restrict directories created by tempfile.mkdtemp().
+    Using explicit mkdir keeps permissions consistent.
+    """
+    root = PROJECT_ROOT / ".tmp_smoke"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _mkdtemp() -> Path:
+    """Create a writable temp directory inside the repo."""
+    d = _tmp_root() / f"tmp{uuid.uuid4().hex}"
+    d.mkdir(parents=True, exist_ok=False)
+    return d
+
+
+def _mktemp(*, suffix: str = "") -> Path:
+    """Return a temp file path inside the repo (file not created)."""
+    return _tmp_root() / f"tmp{uuid.uuid4().hex}{suffix}"
 
 PASSED = 0
 FAILED = 0
@@ -244,7 +267,7 @@ def test_request_intake_service_limits_and_idempotency():
     from autoforge.engine.request_intake import RequestIntakeService
 
     async def _test():
-        db_path = Path(tempfile.mktemp(suffix=".db"))
+        db_path = _mktemp(suffix=".db")
         try:
             async with ProjectRegistry(db_path) as reg:
                 config = ForgeConfig(
@@ -307,7 +330,7 @@ def test_task_dag_save_load():
     from autoforge.engine.task_dag import TaskDAG, Task
     dag = TaskDAG()
     dag.add_task(Task(id="X-1", description="test"))
-    tmp = Path(tempfile.mktemp(suffix=".json"))
+    tmp = _mktemp(suffix=".json")
     try:
         dag.save(tmp)
         loaded = TaskDAG.load(tmp)
@@ -349,7 +372,7 @@ def test_project_registry_validation():
     from autoforge.engine.project_registry import ProjectRegistry
 
     async def _test():
-        db_path = Path(tempfile.mktemp(suffix=".db"))
+        db_path = _mktemp(suffix=".db")
         try:
             async with ProjectRegistry(db_path) as reg:
                 # Empty description
@@ -380,7 +403,7 @@ def test_project_registry_validation():
 
 def test_lock_manager():
     from autoforge.engine.lock_manager import LockManager
-    d = Path(tempfile.mkdtemp()) / "locks"
+    d = _mkdtemp() / "locks"
     try:
         lm = LockManager(d)
         assert lm.try_claim("t-1", "a-0") is True
@@ -404,7 +427,7 @@ def test_sandbox_subprocess():
     from autoforge.engine.sandbox import SubprocessSandbox
 
     async def _test():
-        d = Path(tempfile.mkdtemp())
+        d = _mkdtemp()
         try:
             async with SubprocessSandbox(d) as sb:
                 result = await sb.exec("echo hello")
@@ -422,7 +445,7 @@ def test_sandbox_factory():
     from autoforge.engine.sandbox import create_sandbox, SubprocessSandbox
     from autoforge.engine.config import ForgeConfig
     config = ForgeConfig(docker_enabled=False)
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         sb = create_sandbox(config, d)
         assert isinstance(sb, SubprocessSandbox)
@@ -445,7 +468,7 @@ def test_llm_router_instantiation():
 
 def test_git_manager_instantiation():
     from autoforge.engine.git_manager import GitManager
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         project_dir = d / "test-project"
         gm = GitManager(project_dir)
@@ -492,7 +515,7 @@ def test_build_gate_enforcement():
     dag = TaskDAG()
     dag.add_task(Task(id="T1", description="test", phase=TaskPhase.BUILD, status=TaskStatus.DONE, files=[]))
     try:
-        asyncio.run(orch._enforce_build_gate(dag, Path(tempfile.mkdtemp())))
+        asyncio.run(orch._enforce_build_gate(dag, _mkdtemp()))
     except RuntimeError:
         raise AssertionError("Should not raise for completed tasks")
 
@@ -501,7 +524,7 @@ def test_build_gate_enforcement():
     dag2.add_task(Task(id="T2", description="fail", phase=TaskPhase.BUILD, status=TaskStatus.FAILED))
     dag2.add_task(Task(id="T3", description="fail2", phase=TaskPhase.BUILD, status=TaskStatus.FAILED))
     try:
-        asyncio.run(orch._enforce_build_gate(dag2, Path(tempfile.mkdtemp())))
+        asyncio.run(orch._enforce_build_gate(dag2, _mkdtemp()))
         raise AssertionError("Should raise for all-failed tasks")
     except RuntimeError as e:
         assert "failed" in str(e).lower()
@@ -537,7 +560,7 @@ def test_smoke_check_missing_files():
     config = ForgeConfig(api_keys={"anthropic": "fake"})
     orch = Orchestrator(config)
 
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         task = Task(id="T1", description="test", phase=TaskPhase.BUILD, files=["missing.py"])
         ok, msg = asyncio.run(orch._smoke_check(task, d))
@@ -556,7 +579,7 @@ def test_smoke_check_syntax_error():
     config = ForgeConfig(api_keys={"anthropic": "fake"})
     orch = Orchestrator(config)
 
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         # Write a file with a syntax error
         (d / "bad.py").write_text("def f(\n  pass", encoding="utf-8")
@@ -577,7 +600,7 @@ def test_smoke_check_valid_file():
     config = ForgeConfig(api_keys={"anthropic": "fake"})
     orch = Orchestrator(config)
 
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         (d / "good.py").write_text("def hello():\n    return 'world'\n", encoding="utf-8")
         task = Task(id="T1", description="test", phase=TaskPhase.BUILD, files=["good.py"])
@@ -669,7 +692,7 @@ def test_all_agents_instantiate():
 
     config = ForgeConfig(api_keys={"anthropic": "fake"})
     llm = LLMRouter(config)
-    wd = Path(tempfile.mkdtemp())
+    wd = _mkdtemp()
 
     try:
         d = DirectorAgent(config, llm)
@@ -707,7 +730,7 @@ def test_agent_build_prompts():
 
     config = ForgeConfig(api_keys={"anthropic": "fake"})
     llm = LLMRouter(config)
-    wd = Path(tempfile.mkdtemp())
+    wd = _mkdtemp()
     sb = SubprocessSandbox(wd)
     spec = {"project_name": "test", "modules": []}
 
@@ -749,7 +772,7 @@ def test_agent_parse_methods():
     fix = df.parse_fix_task('{"id": "FIX-1", "description": "fix"}')
     assert fix["id"] == "FIX-1"
 
-    _td = Path(tempfile.mkdtemp())
+    _td = _mkdtemp()
     r = ReviewerAgent(config, llm, _td)
     review = r.parse_review('{"approved": true, "score": 8, "issues": [], "summary": "ok"}')
     assert review.approved is True and review.score == 8
@@ -786,7 +809,7 @@ def test_agent_parse_failsafe():
 
     config = ForgeConfig(api_keys={"anthropic": "fake"})
     llm = LLMRouter(config)
-    _td = Path(tempfile.mkdtemp())
+    _td = _mkdtemp()
 
     r = ReviewerAgent(config, llm, _td)
     # Unparseable output should NOT auto-approve
@@ -931,7 +954,7 @@ def test_project_registry_crud():
 
     async def _test():
         import os
-        db_path = Path(tempfile.mktemp(suffix=".db"))
+        db_path = _mktemp(suffix=".db")
         try:
             async with ProjectRegistry(db_path) as reg:
                 # Enqueue
@@ -1020,7 +1043,7 @@ def test_deploy_guide_generation():
     """Test deploy guide generation."""
     from autoforge.engine.deploy_guide import detect_framework, generate_deploy_guide
 
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         # Create a Next.js project
         (d / "package.json").write_text(json.dumps({
@@ -1050,7 +1073,7 @@ def test_deploy_guide_vite():
     """Test framework detection for Vite project."""
     from autoforge.engine.deploy_guide import detect_framework
 
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         (d / "package.json").write_text(json.dumps({
             "dependencies": {"react": "18.0.0"},
@@ -1290,7 +1313,7 @@ def test_cli_config_overrides_tdd():
 def test_grep_search_basic():
     """Test grep_search on a temporary directory."""
     from autoforge.engine.tools.search import handle_grep_search
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         # Create test files
         (d / "hello.py").write_text("def hello_world():\n    print('hello')\n", encoding="utf-8")
@@ -1307,7 +1330,7 @@ def test_grep_search_basic():
 def test_grep_search_file_glob():
     """Test grep_search with file_glob filter."""
     from autoforge.engine.tools.search import handle_grep_search
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         (d / "app.py").write_text("import flask\n", encoding="utf-8")
         (d / "style.css").write_text("/* import reset */\n", encoding="utf-8")
@@ -1324,7 +1347,7 @@ def test_grep_search_file_glob():
 def test_grep_search_empty_pattern():
     """Test grep_search rejects empty pattern."""
     from autoforge.engine.tools.search import handle_grep_search
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         result = asyncio.run(handle_grep_search({"pattern": ""}, d))
         data = json.loads(result)
@@ -1377,7 +1400,7 @@ def test_orchestrator_tdd_loop_method():
 def test_detect_test_command_npm():
     """Test _detect_test_command detects npm test."""
     from autoforge.engine.orchestrator import Orchestrator
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         (d / "package.json").write_text(json.dumps({
             "scripts": {"test": "jest"}
@@ -1392,7 +1415,7 @@ def test_detect_test_command_npm():
 def test_detect_test_command_pytest():
     """Test _detect_test_command detects pytest."""
     from autoforge.engine.orchestrator import Orchestrator
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         (d / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
         cmd = Orchestrator._detect_test_command(d)
@@ -1405,7 +1428,7 @@ def test_detect_test_command_pytest():
 def test_detect_test_command_none():
     """Test _detect_test_command returns None for unknown project type."""
     from autoforge.engine.orchestrator import Orchestrator
-    d = Path(tempfile.mkdtemp())
+    d = _mkdtemp()
     try:
         cmd = Orchestrator._detect_test_command(d)
         assert cmd is None
@@ -1419,7 +1442,7 @@ def test_agents_have_new_tools():
     from autoforge.engine.llm_router import LLMRouter
     config = ForgeConfig(api_keys={"anthropic": "fake-key"})
     llm = LLMRouter(config)
-    _td = Path(tempfile.mkdtemp())
+    _td = _mkdtemp()
 
     try:
         # Builder should have grep_search and fetch_url
@@ -1907,7 +1930,6 @@ def test_reasoning_extension_engine_instantiation():
 
 def test_reasoning_extension_persistence():
     """ReasoningExtensionEngine saves and loads state."""
-    import tempfile
     from autoforge.engine.reasoning_extension import (
         ReasoningExtensionEngine, NumberedConclusion, ConclusionType,
         GrowthOperator, PublicationWorthiness,
@@ -1924,8 +1946,9 @@ def test_reasoning_extension_persistence():
     engine._conclusions.append(c)
     engine._kernel._conclusion_counter = 1
 
-    with tempfile.TemporaryDirectory() as td:
-        save_dir = Path(td) / "ext_state"
+    td = _mkdtemp()
+    try:
+        save_dir = td / "ext_state"
         engine.save(save_dir)
 
         # Load into new engine
@@ -1934,6 +1957,8 @@ def test_reasoning_extension_persistence():
         assert engine2.conclusion_count == 1
         assert engine2._conclusions[0].statement == "Test theorem statement."
         assert engine2.kernel.counter == 1
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
 
 def test_reasoning_extension_report_generation():
@@ -2144,7 +2169,8 @@ def test_formalization_report_compute_score():
         numerically_verified=2, computationally_reproduced=1,
     )
     score = report.compute_score()
-    expected = (3*1.0 + 2*0.5 + 2*0.7 + 1*0.8) / 10  # 0.62
+    # sorry should not contribute positively to score
+    expected = (3*1.0 + 2*0.0 + 2*0.7 + 1*0.8) / 10  # 0.52
     assert abs(score - expected) < 1e-6, f"Expected {expected}, got {score}"
 
 

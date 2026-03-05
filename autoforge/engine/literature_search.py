@@ -382,7 +382,7 @@ class CitationGraph:
         try:
             response_text = await self._http_get(url)
             if not response_text:
-                return []
+                raise RuntimeError("Semantic Scholar request returned empty payload")
 
             data = json.loads(response_text)
             papers: list[PaperReference] = []
@@ -426,7 +426,7 @@ class CitationGraph:
         try:
             response_text = await self._http_get(url)
             if not response_text:
-                return []
+                raise RuntimeError("Semantic Scholar request returned empty payload")
 
             data = json.loads(response_text)
             papers: list[PaperReference] = []
@@ -1219,6 +1219,7 @@ class LiteratureSearchEngine:
         self._max_cache_entries: int = 500
         self._citation_graph: CitationGraph | None = None
         self._semantic_search: SemanticSearchEngine | None = None
+        self._backend_errors: dict[str, str] = {}
 
     @property
     def citation_graph(self) -> CitationGraph:
@@ -1263,27 +1264,46 @@ class LiteratureSearchEngine:
             return cached
 
         all_results: list[PaperReference] = []
+        self._backend_errors = {}
 
         # Search enabled backends in parallel
-        tasks = []
+        tasks: list[asyncio.Task[list[PaperReference]]] = []
+        task_names: list[str] = []
         if self.config.semantic_scholar_enabled:
             tasks.append(
-                self._search_semantic_scholar(query, limit=self.config.max_results_per_query)
+                asyncio.create_task(
+                    self._search_semantic_scholar(
+                        query, limit=self.config.max_results_per_query
+                    )
+                )
             )
+            task_names.append("semantic_scholar")
         if self.config.arxiv_enabled:
             tasks.append(
-                self._search_arxiv(query, limit=self.config.max_results_per_query)
+                asyncio.create_task(
+                    self._search_arxiv(query, limit=self.config.max_results_per_query)
+                )
             )
+            task_names.append("arxiv")
 
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for result in results:
+            for backend, result in zip(task_names, results):
                 if isinstance(result, Exception):
-                    logger.warning(f"Search backend error: {result}")
+                    error_msg = str(result)
+                    self._backend_errors[backend] = error_msg
+                    logger.warning(f"Search backend '{backend}' failed: {error_msg}")
                 else:
                     all_results.extend(result)
 
         # Deduplicate by title similarity
+        if not all_results and self._backend_errors:
+            logger.warning(
+                "No literature backend produced successful results; returning empty list "
+                f"for distinction: {list(self._backend_errors.keys())}"
+            )
+            return []
+
         unique_results = list(dict.fromkeys(all_results))
 
         # Filter by relevance threshold
@@ -1297,9 +1317,14 @@ class LiteratureSearchEngine:
         filtered.sort(key=lambda p: p.relevance_score, reverse=True)
 
         # Cache results
-        self._set_cache(query, filtered)
+        if not self._backend_errors:
+            self._set_cache(query, filtered)
 
         return filtered
+
+    def get_last_search_backend_errors(self) -> dict[str, str]:
+        """Return backend failures from the most recent search call."""
+        return dict(self._backend_errors)
 
     async def deep_search(
         self, query: str, depth: int = 2
@@ -1491,7 +1516,7 @@ class LiteratureSearchEngine:
 
         except Exception as e:
             logger.error(f"Semantic Scholar search failed for '{query}': {e}")
-            return []
+            raise RuntimeError(f"Semantic Scholar search failed for '{query}': {e}") from e
 
     async def _search_arxiv(self, query: str, limit: int = 10) -> list[PaperReference]:
         """
@@ -1515,7 +1540,7 @@ class LiteratureSearchEngine:
         try:
             response_text = await self._http_get(url)
             if not response_text:
-                return []
+                raise RuntimeError("arXiv request returned empty payload")
 
             papers: list[PaperReference] = []
             root = ET.fromstring(response_text)
@@ -1558,7 +1583,7 @@ class LiteratureSearchEngine:
 
         except Exception as e:
             logger.error(f"arXiv search failed for '{query}': {e}")
-            return []
+            raise RuntimeError(f"arXiv search failed for '{query}': {e}") from e
 
     async def _http_get(self, url: str) -> str:
         """
@@ -1598,7 +1623,12 @@ class LiteratureSearchEngine:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10.0)
-            return stdout.decode("utf-8", errors="replace")
+            if process.returncode != 0:
+                raise RuntimeError(f"curl exited with code {process.returncode}")
+            output = stdout.decode("utf-8", errors="replace")
+            if not output:
+                raise RuntimeError("curl returned empty payload")
+            return output
         except Exception as e:
             logger.debug(f"curl fallback failed: {e}")
 
@@ -1610,10 +1640,13 @@ class LiteratureSearchEngine:
                 with urllib.request.urlopen(url, timeout=10) as response:
                     return response.read().decode("utf-8", errors="replace")
 
-            return await asyncio.to_thread(_urlopen)
+            output = await asyncio.to_thread(_urlopen)
+            if not output:
+                raise RuntimeError("urllib returned empty payload")
+            return output
         except Exception as e:
             logger.error(f"All HTTP strategies failed for {url}: {e}")
-            return ""
+            raise RuntimeError(f"All HTTP strategies failed for {url}: {e}") from e
 
     def _compute_relevance(self, paper: PaperReference, query: str) -> float:
         """

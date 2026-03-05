@@ -284,9 +284,108 @@ class FigureExtractor:
         Simple heuristic: look for large non-text regions that are likely
         to contain figures, plots, diagrams, etc.
         """
-        # This is a placeholder implementation
-        # In a real system, this would use computer vision techniques
-        # or ML models trained to detect figure regions
+        width = getattr(page, "width", None)
+        height = getattr(page, "height", None)
+        if width is None and hasattr(page, "rect"):
+            rect = page.rect
+            width = getattr(rect, "width", None)
+            height = getattr(rect, "height", None)
+
+        if not width or not height:
+            return []
+
+        page_area = float(width) * float(height)
+        regions: list[tuple[float, float, float, float]] = []
+        min_area = page_area * 0.012
+        min_size = 40.0
+        max_regions = 18
+
+        def _clamp(v: float, lo: float, hi: float) -> float:
+            return max(lo, min(hi, v))
+
+        def _iof(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+            ax0, ay0, ax1, ay1 = a
+            bx0, by0, bx1, by1 = b
+            if ax1 <= ax0 or ay1 <= ay0:
+                return 0.0
+            ix0 = max(ax0, bx0)
+            iy0 = max(ay0, by0)
+            ix1 = min(ax1, bx1)
+            iy1 = min(ay1, by1)
+            if ix1 <= ix0 or iy1 <= iy0:
+                return 0.0
+            inter = (ix1 - ix0) * (iy1 - iy0)
+            area_a = (ax1 - ax0) * (ay1 - ay0)
+            area_b = (bx1 - bx0) * (by1 - by0)
+            union = area_a + area_b - inter
+            return inter / union if union > 0 else 0.0
+
+        def _add_if_region(region: tuple[float, float, float, float]) -> None:
+            x0, y0, x1, y1 = (
+                _clamp(float(region[0]), 0.0, float(width)),
+                _clamp(float(region[1]), 0.0, float(height)),
+                _clamp(float(region[2]), 0.0, float(width)),
+                _clamp(float(region[3]), 0.0, float(height)),
+            )
+
+            if not (x1 > x0 and y1 > y0):
+                return
+            w = x1 - x0
+            h = y1 - y0
+            if w < min_size or h < min_size:
+                return
+            if w * h < min_area:
+                return
+
+            normalized = (x0, y0, x1, y1)
+            for existing in regions:
+                if _iof(existing, normalized) >= 0.45:
+                    return
+
+            regions.append(normalized)
+
+        # PDF image objects (most reliable signal)
+        if hasattr(page, "images") and page.images:
+            for image in page.images:
+                if not isinstance(image, dict):
+                    continue
+                x0 = image.get("x0")
+                y0 = image.get("y0", image.get("top"))
+                x1 = image.get("x1")
+                y1 = image.get("y1", image.get("bottom"))
+                if None in (x0, y0, x1, y1):
+                    continue
+                _add_if_region((x0, y0, x1, y1))
+
+        # Vector geometry rectangles from PDF pages (often chart-like containers)
+        if hasattr(page, "rects"):
+            for rect in page.rects:
+                if not isinstance(rect, dict):
+                    continue
+                x0 = rect.get("x0")
+                y0 = rect.get("y0", rect.get("top"))
+                x1 = rect.get("x1")
+                y1 = rect.get("y1", rect.get("bottom"))
+                if None in (x0, y0, x1, y1):
+                    continue
+                _add_if_region((x0, y0, x1, y1))
+
+        # FitZ text-dict image blocks if available
+        if hasattr(page, "get_text"):
+            try:
+                for block in page.get_text("dict").get("blocks", []):
+                    if block.get("type") != 1:
+                        continue
+                    block_bbox = block.get("bbox")
+                    if not block_bbox or len(block_bbox) != 4:
+                        continue
+                    _add_if_region(block_bbox)
+            except Exception:
+                pass
+
+        if regions:
+            return regions[:max_regions]
+
         return []
 
     async def _extract_captions_from_pdf(

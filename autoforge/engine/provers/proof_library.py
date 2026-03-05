@@ -940,6 +940,7 @@ class PaperReviewPipeline:
         # Step 6: Generate review report
         report = await self._generate_review_report(
             structure, logic_check, formalization, novelty, llm,
+            proof_results=proof_results,
         )
 
         logger.info("[PaperReview] Review complete")
@@ -1087,11 +1088,14 @@ Return Lean 4 code:
         for form in formalizations:
             # Quick check: count sorries
             sorry_count = form["lean_code"].count("sorry")
+            generation_succeeded = bool(form.get("success", False))
+            verified = generation_succeeded and sorry_count == 0
             results.append({
                 "name": form["name"],
-                "verified": sorry_count == 0,
+                "verified": verified,
                 "sorry_count": sorry_count,
-                "status": "complete" if sorry_count == 0 else "incomplete",
+                "status": "verified" if verified else "incomplete",
+                "generation_success": generation_succeeded,
             })
         return results
 
@@ -1135,14 +1139,28 @@ Return JSON:
         formalization: list[dict[str, Any]],
         novelty: dict[str, Any],
         llm: Any,
+        proof_results: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Generate comprehensive review report."""
         theorems = structure.get("theorems", [])
         valid_claims = sum(1 for c in logic_check if c.get("valid", False))
+        verification_map = {
+            item.get("name", ""): item for item in (proof_results or [])
+        }
+
+        verified = 0
+        for form in formalization:
+            details = verification_map.get(form.get("name", ""), {})
+            sorry_count = form["lean_code"].count("sorry")
+            if details.get("verified", False) and sorry_count == 0 and form.get("success", False):
+                verified += 1
         formalized = sum(1 for f in formalization if f.get("success", False))
 
         soundness_score = (valid_claims / len(logic_check)) if logic_check else 0.5
-        formalization_score = (formalized / len(formalization)) if formalization else 0.0
+        if proof_results:
+            formalization_score = (verified / len(formalization)) if formalization else 0.0
+        else:
+            formalization_score = (formalized / len(formalization)) if formalization else 0.0
         novelty_score = novelty.get("novelty_score", 0.5)
 
         overall_score = (soundness_score + formalization_score + novelty_score) / 3.0
@@ -1160,15 +1178,22 @@ Return JSON:
             "strengths": [
                 "Theorems identified and extracted",
                 f"{formalized}/{len(formalization)} theorems formalized",
+                f"{verified}/{len(formalization)} theorems verified",
             ],
             "weaknesses": [
                 f"Logic errors in {len(logic_check) - valid_claims} claims",
-                f"{sum(f['sorry_count'] for f in formalization)} sorries remain",
+                f"{sum(formalization[i].get('lean_code', '').count('sorry') for i in range(len(formalization)))} sorries remain",
+                f"{sum(1 for f in formalization if not verification_map.get(f['name'], {}).get('verified', False))} unverified proofs",
             ],
             "detailed_feedback": [
                 {
                     "theorem": f["name"],
-                    "status": f.get("success", False),
+                    "status": verification_map.get(f["name"], {}).get(
+                        "verified",
+                        not f.get("success", False),
+                    ),
+                    "verified": verification_map.get(f["name"], {}).get("verified", False),
+                    "sorry_count": f["lean_code"].count("sorry"),
                     "comment": f"Formalized with {f['lean_code'].count('sorry')} sorries",
                 }
                 for f in formalization

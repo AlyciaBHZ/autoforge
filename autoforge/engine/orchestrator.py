@@ -2271,6 +2271,29 @@ class Orchestrator:
             return None
         except asyncio.TimeoutError:
             return "syntax check timed out"
+        except (PermissionError, OSError) as e:
+            # Some sandboxed Windows environments disallow asyncio subprocess pipes.
+            logger.debug(f"Syntax check async exec failed for {path}: {e}")
+            try:
+                import subprocess
+
+                completed = await asyncio.to_thread(
+                    subprocess.run,
+                    list(cmd),
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if completed.returncode != 0:
+                    err = (completed.stderr or completed.stdout or "").strip()
+                    return (err or "syntax check failed")[:200]
+            except FileNotFoundError:
+                return None
+            except subprocess.TimeoutExpired:
+                return "syntax check timed out"
+            except Exception as e2:
+                logger.debug(f"Syntax check sync fallback failed for {path}: {e2}")
+                return None
         except Exception as e:
             logger.debug(f"Syntax check error for {path}: {e}")
             return None

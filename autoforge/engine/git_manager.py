@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,21 @@ async def get_git_version() -> str | None:
         stdout, _ = await proc.communicate()
         if proc.returncode == 0:
             return stdout.decode(errors="replace").strip()
-    except (OSError, FileNotFoundError):
+    except (OSError, FileNotFoundError, PermissionError):
+        # Some sandboxed Windows environments disallow asyncio subprocess pipes.
+        pass
+
+    try:
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            ["git", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if completed.returncode == 0:
+            return (completed.stdout or "").strip()
+    except Exception:
         pass
     return None
 

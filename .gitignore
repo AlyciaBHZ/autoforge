@@ -49,3 +49,9 @@ AutoForge_Audit*.docx
 
 # Local security/sensitive review notes
 CODE_REVIEW.md
+
+# Smoke test temp
+.tmp_smoke*/
+
+# Local audit markdown (do not commit)
+docs/CLAIMS_AUDIT.md

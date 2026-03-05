@@ -186,6 +186,70 @@ class SubprocessSandbox(SandboxBase):
             kwargs["preexec_fn"] = os.setsid
         return kwargs
 
+    async def _exec_sync_shell(self, command: str, timeout: int) -> SandboxResult:
+        """Fallback execution path using subprocess.run in a thread.
+
+        Some sandboxed Windows environments disallow asyncio subprocess pipes
+        (overlapped handle creation), while synchronous subprocess.run works.
+        """
+        def _run() -> SandboxResult:
+            try:
+                completed = subprocess.run(
+                    command,
+                    shell=True,
+                    cwd=self.working_dir,
+                    env=self.env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                return SandboxResult(
+                    exit_code=completed.returncode,
+                    stdout=completed.stdout or "",
+                    stderr=completed.stderr or "",
+                )
+            except subprocess.TimeoutExpired:
+                return SandboxResult(
+                    exit_code=-1,
+                    stdout="",
+                    stderr=f"Command timed out after {timeout}s",
+                    timed_out=True,
+                )
+            except Exception as e:
+                return SandboxResult(exit_code=-1, stdout="", stderr=str(e))
+
+        return await asyncio.to_thread(_run)
+
+    async def _exec_sync_args(self, args: list[str], timeout: int) -> SandboxResult:
+        """Fallback argument-vector execution path using subprocess.run."""
+        def _run() -> SandboxResult:
+            try:
+                completed = subprocess.run(
+                    args,
+                    shell=False,
+                    cwd=self.working_dir,
+                    env=self.env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                return SandboxResult(
+                    exit_code=completed.returncode,
+                    stdout=completed.stdout or "",
+                    stderr=completed.stderr or "",
+                )
+            except subprocess.TimeoutExpired:
+                return SandboxResult(
+                    exit_code=-1,
+                    stdout="",
+                    stderr=f"Command timed out after {timeout}s",
+                    timed_out=True,
+                )
+            except Exception as e:
+                return SandboxResult(exit_code=-1, stdout="", stderr=str(e))
+
+        return await asyncio.to_thread(_run)
+
     async def exec(self, command: str, timeout: int = 120) -> SandboxResult:
         """Execute a command as a subprocess."""
         logger.debug("[sandbox] exec: %s", command[:100])
@@ -216,7 +280,17 @@ class SubprocessSandbox(SandboxBase):
             env=self.env,
             **self._process_kwargs(),
         )
-        return await self._run_process(proc_coro, timeout, command[:100])
+        result = await self._run_process(proc_coro, timeout, command[:100])
+        if (
+            result.exit_code == -1
+            and not result.timed_out
+            and result.stderr
+            and not result.stderr.startswith("Command blocked by security filter:")
+        ):
+            fallback = await self._exec_sync_shell(shell_command, timeout)
+            if fallback.exit_code != -1 or fallback.timed_out:
+                return fallback
+        return result
 
     async def exec_args(self, args: list[str], timeout: int = 120) -> SandboxResult:
         """Execute an argument-vector command without invoking a shell."""
@@ -245,7 +319,17 @@ class SubprocessSandbox(SandboxBase):
             env=self.env,
             **self._process_kwargs(),
         )
-        return await self._run_process(proc_coro, timeout, args[0])
+        result = await self._run_process(proc_coro, timeout, args[0])
+        if (
+            result.exit_code == -1
+            and not result.timed_out
+            and result.stderr
+            and not result.stderr.startswith("Command blocked by security filter:")
+        ):
+            fallback = await self._exec_sync_args(args, timeout)
+            if fallback.exit_code != -1 or fallback.timed_out:
+                return fallback
+        return result
 
     async def stop(self) -> None:
         logger.debug("SubprocessSandbox stopped")

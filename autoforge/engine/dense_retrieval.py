@@ -747,6 +747,8 @@ class DenseRetriever:
         self.config = config or RetrievalConfig()
         self._provider: EmbeddingProvider | None = None
         self._index: PremiseIndex | None = None
+        self._initialized: bool = False
+        self._initialization_error: str | None = None
         self._stats = {
             "index_size": 0,
             "total_queries": 0,
@@ -762,6 +764,8 @@ class DenseRetriever:
     ) -> None:
         """Initialize retriever with premises."""
         logger.info(f"Initializing DenseRetriever with backend: {self.config.backend}")
+        self._initialization_error = None
+        self._initialized = False
 
         # Initialize provider
         try:
@@ -775,14 +779,23 @@ class DenseRetriever:
                 self._provider = TFIDFProvider(embedding_dim=self.config.embedding_dim)
             elif self.config.backend == EmbeddingBackend.LLM_EMBED:
                 if llm is None:
-                    logger.warning("LLM backend selected but no LLM provided, falling back to TF-IDF")
+                    logger.warning(
+                        "LLM backend selected but no LLM provided, falling back to TF-IDF"
+                    )
                     self._provider = TFIDFProvider(embedding_dim=self.config.embedding_dim)
                 else:
-                    self._provider = LLMEmbeddingProvider(llm, embedding_dim=self.config.embedding_dim)
+                    self._provider = LLMEmbeddingProvider(
+                        llm, embedding_dim=self.config.embedding_dim
+                    )
             else:
                 raise ValueError(f"Unknown backend: {self.config.backend}")
-        except RuntimeError:
-            logger.warning(f"Provider initialization failed, falling back to TF-IDF")
+        except RuntimeError as e:
+            self._initialization_error = f"Provider initialization failed: {e}"
+            logger.warning("Provider initialization failed, falling back to TF-IDF")
+            self._provider = TFIDFProvider(embedding_dim=self.config.embedding_dim)
+        except Exception as e:
+            self._initialization_error = f"Provider initialization failed: {e}"
+            logger.exception(f"Provider initialization failed, retrying with TF-IDF fallback: {e}")
             self._provider = TFIDFProvider(embedding_dim=self.config.embedding_dim)
 
         # Initialize index
@@ -790,21 +803,48 @@ class DenseRetriever:
 
         # Load premises
         if premises is not None:
-            await self._index.build_index(premises, self._provider)
-            self._stats["index_size"] = len(premises)
+            if self._provider is not None:
+                await self._index.build_index(premises, self._provider)
+                self._stats["index_size"] = len(premises)
         elif mathlib_path is not None:
             loader = MathlibPremiseLoader()
             premises = await loader.load_from_json(mathlib_path / "premises.json")
             if premises:
-                await self._index.build_index(premises, self._provider)
-                self._stats["index_size"] = len(premises)
+                if self._provider is not None:
+                    await self._index.build_index(premises, self._provider)
+                    self._stats["index_size"] = len(premises)
+            else:
+                self._stats["index_size"] = 0
+
+        if self._provider is None:
+            self._initialization_error = "No provider available"
+            logger.error("DenseRetriever initialization failed: no provider available")
+            return
 
         logger.info(f"Retriever initialized. Index size: {self._stats['index_size']}")
+        self._initialized = True
+
+    def get_initialization_state(self) -> dict[str, Any]:
+        """Return initialization diagnostics."""
+        return {
+            "initialized": self._initialized,
+            "error": self._initialization_error,
+            "index_size": self._stats["index_size"],
+            "backend": self.config.backend.value,
+        }
 
     async def retrieve_premises(
         self, goal_state: str, top_k: int = 0
     ) -> list[tuple[PremiseEntry, float]]:
         """Retrieve relevant premises for a proof goal."""
+        if not self._initialized:
+            if self._initialization_error:
+                logger.warning(
+                    f"Retriever not available: {self._initialization_error}"
+                )
+            else:
+                logger.warning("Retriever not initialized")
+            return []
         if self._index is None or self._provider is None:
             logger.warning("Retriever not initialized")
             return []
