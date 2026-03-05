@@ -196,6 +196,7 @@ class AdvancedConfig:
 
     # Context budget
     context_budget_tokens: int = 4000
+    dependency_context_min_tokens: int = 1200
     dag_ingest_confidence_threshold: float = 0.4
     dag_ingest_relevance_threshold: float = 0.3
 
@@ -234,6 +235,12 @@ class AdvancedConfig:
     def __post_init__(self) -> None:
         """Validate bounds on critical settings (D6)."""
         import warnings
+
+        if self.dependency_context_min_tokens < 0:
+            raise ValueError(
+                f"dependency_context_min_tokens must be >= 0 "
+                f"(got {self.dependency_context_min_tokens})"
+            )
 
         if self.lean_mcts_iterations <= 0:
             raise ValueError(

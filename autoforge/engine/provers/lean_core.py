@@ -35,6 +35,9 @@ class ProofStatus(str, Enum):
     UNPROVEN = "unproven"
     PROVING = "proving"
     PROVED = "proved"
+    FORMALIZED = "formalized"
+    COMPILES = "compiles"
+    VERIFIED_WITH_SORRY = "verified_with_sorry"
     FAILED = "failed"
     DECOMPOSED = "decomposed"  # Broken into subgoals
     SORRY = "sorry"            # Has 'sorry' placeholder
@@ -108,6 +111,10 @@ class ProofAttempt:
     attempts: int = 0
     verification_time: float = 0.0
     error: str = ""
+    proof_origin: str = ""             # direct | mcts | recursive
+    execution_backend: str = ""        # pantograph | heuristic | direct
+    used_formal_backend: bool = False
+    verification_backend: str = ""     # lean | simulated | unavailable
 
 
 @dataclass
@@ -157,6 +164,8 @@ class LeanVerificationResult:
     warnings: list[str] = field(default_factory=list)
     sorry_count: int = 0             # Number of sorry placeholders
     execution_time: float = 0.0
+    backend: str = "lean"
+    is_formal: bool = True
 
 
 # ══════════════════════════════════════════════════════════════
@@ -258,6 +267,8 @@ class LeanEnvironment:
                 warnings=warnings,
                 sorry_count=sorry_count,
                 execution_time=elapsed,
+                backend="lean",
+                is_formal=True,
             )
 
         except asyncio.TimeoutError:
@@ -265,12 +276,16 @@ class LeanEnvironment:
                 success=False,
                 errors=[f"Lean verification timed out after {timeout}s"],
                 execution_time=timeout,
+                backend="lean",
+                is_formal=True,
             )
         except Exception as e:
             return LeanVerificationResult(
                 success=False,
                 errors=[f"Lean execution error: {e}"],
                 execution_time=time.monotonic() - start,
+                backend="lean",
+                is_formal=True,
             )
 
     async def _llm_simulated_verify(self, lean_file: Path) -> LeanVerificationResult:
@@ -302,6 +317,8 @@ class LeanEnvironment:
             warnings=["[SIMULATED] Lean not installed — no formal guarantee"],
             sorry_count=sorry_count,
             execution_time=0.0,
+            backend="simulated",
+            is_formal=False,
         )
 
     async def init_project(self, project_dir: Path, name: str = "AutoForgeProof") -> bool:
@@ -446,13 +463,26 @@ class PantographREPL:
         self._session_active = False
 
     async def _simulate_tactic(self, tactic: str) -> ProofState:
-        """LLM-simulated tactic application (fallback)."""
-        # In practice, this would call an LLM to simulate proof state change
-        logger.debug(f"[Pantograph] Simulating tactic: {tactic}")
-        return ProofState(
-            goals=[],
-            hypotheses=[],
+        """Conservative fallback tactic application.
+
+        Never returns solved goals; this prevents false positives when Lean
+        session is unavailable.
+        """
+        logger.debug(f"[Pantograph] Simulating tactic without formal backend: {tactic}")
+
+        prior_goals = self._current_state.goals if self._current_state else []
+        prior_hyps = self._current_state.hypotheses if self._current_state else []
+        goals = prior_goals or ["[unknown_goal_state] formal tactic execution unavailable"]
+
+        simulated = ProofState(
+            goals=goals,
+            hypotheses=prior_hyps,
+            context="[simulated] Lean backend unavailable",
+            parent_tactic=tactic,
         )
+        self._current_state = simulated
+        self._history.append((tactic, simulated))
+        return simulated
 
 
 # ══════════════════════════════════════════════════════════════
@@ -478,6 +508,7 @@ class LeanProver:
         from autoforge.engine.provers.proof_search import (
             ConjectureEngine,
             MCTSProofSearch,
+            PantographExecutor,
             RecursiveProofDecomposer,
             TacticGenerator,
         )
@@ -492,8 +523,15 @@ class LeanProver:
         self._workspace = workspace or Path(".")
         self._lean_env = LeanEnvironment(workspace)
         self._tactic_gen = TacticGenerator()
-        self._mcts = MCTSProofSearch(self._tactic_gen)
-        self._decomposer = RecursiveProofDecomposer(self._tactic_gen, self._mcts)
+        self._mcts = MCTSProofSearch(
+            self._tactic_gen,
+            executor=PantographExecutor(self._lean_env),
+        )
+        self._decomposer = RecursiveProofDecomposer(
+            self._tactic_gen,
+            self._mcts,
+            lean_env=self._lean_env,
+        )
         self._conjecture_engine = ConjectureEngine()
         self._foundation = FoundationBuilder()
         self._formalizer = ArticleFormalizer(self._decomposer, self._lean_env)

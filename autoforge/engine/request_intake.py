@@ -158,7 +158,7 @@ class RequestIntakeService:
                 )
 
         await self._enforce_limits(requested_by)
-        project = await self.registry.enqueue(
+        project = await self.registry.enqueue_run(
             description=description_text,
             requested_by=requested_by,
             budget_usd=budget_value,

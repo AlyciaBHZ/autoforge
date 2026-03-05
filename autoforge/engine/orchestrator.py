@@ -502,7 +502,7 @@ class Orchestrator:
         if not result.success:
             raise RuntimeError(f"Director failed: {result.error}")
 
-        spec = director.parse_spec(result.output)
+        spec = await self._parse_spec_with_fallback(director, result.output, requirement)
 
         # Validate spec
         if not spec.get("modules"):
@@ -514,6 +514,38 @@ class Orchestrator:
         self._validate_build_contract(spec)
 
         return spec
+
+    async def _parse_spec_with_fallback(
+        self,
+        director: Any,
+        raw_output: str,
+        requirement: str,
+    ) -> dict[str, Any]:
+        """Parse director spec with guardrails against JSON drift."""
+        try:
+            return director.parse_spec(raw_output)
+        except Exception as e:
+            logger.warning("Director spec parsing failed, using fallback scaffold: %s", e)
+            safe_name = "project"
+            words = [w for w in re.findall(r"[A-Za-z0-9]+", requirement) if w]
+            if words:
+                safe_name = "-".join(words[:3]).lower()
+
+            fallback_spec = {
+                "project_name": safe_name,
+                "description": requirement,
+                "tech_stack": {"language": "python"},
+                "modules": [
+                    {
+                        "name": "core",
+                        "description": "Fallback module due to parse failure",
+                        "files": ["README.md"],
+                        "depends_on": [],
+                    }
+                ],
+                "build_contract": self._default_build_contract({"project_name": safe_name}),
+            }
+            return fallback_spec
 
     def _validate_build_contract(self, spec: dict[str, Any]) -> None:
         """Validate the build contract defines overnight-sized scope."""
@@ -969,17 +1001,21 @@ class Orchestrator:
             # Compute adaptive base budget
             base_budget_chars = self.config.context_budget_tokens * 4  # ~4 chars/token
             budget_chars = int(base_budget_chars * difficulty_multiplier * self._context_budget_multiplier * goal_multiplier)
+            dep_min_chars = int(getattr(self.config, "dependency_context_min_tokens", 1200) * 4)
+            dep_reserved_chars = min(max(dep_min_chars, budget_chars // 4), max(dep_min_chars, budget_chars // 2))
+            non_dep_budget_chars = max(1000, budget_chars - dep_reserved_chars)
+
             used_chars = 0
             context_parts: list[tuple[str, str]] = []  # (label, text)
 
             def _budget_remaining() -> int:
-                return max(0, budget_chars - used_chars)
+                return max(0, non_dep_budget_chars - used_chars)
 
             def _add_context(label: str, text: str | None, max_share: float = 0.3) -> None:
                 nonlocal used_chars
                 if not text:
                     return
-                cap = min(len(text), int(budget_chars * max_share), _budget_remaining())
+                cap = min(len(text), int(non_dep_budget_chars * max_share), _budget_remaining())
                 if cap <= 0:
                     return
                 trimmed = text[:cap]
@@ -1049,7 +1085,7 @@ class Orchestrator:
                 combined = "\n".join(text for _, text in context_parts)
                 builder.set_dynamic_constitution(combined)
                 logger.debug(
-                    f"[ContextBudget] {agent_id}: {used_chars}/{budget_chars} chars "
+                    f"[ContextBudget] {agent_id}: {used_chars}/{non_dep_budget_chars} chars (+dep reserve {dep_reserved_chars}) "
                     f"(difficulty={difficulty_level}×{difficulty_multiplier}, "
                     f"learn_mult={self._context_budget_multiplier:.2f}, "
                     f"{len(context_parts)} sources: "
@@ -1068,7 +1104,7 @@ class Orchestrator:
             )
 
             # Gather actual file contents from dependency tasks
-            dep_context = self._gather_dependency_context(task, working_dir)
+            dep_context = self._gather_dependency_context(task, working_dir, max_chars=dep_reserved_chars)
 
             result = await builder.run({
                 "task": task.to_dict(),
@@ -2186,7 +2222,7 @@ class Orchestrator:
             console.print(f"  [yellow]Enhancement planning failed: {result.error}[/yellow]")
             return
 
-        merged_spec = director.parse_spec(result.output)
+        merged_spec = await self._parse_spec_with_fallback(director, result.output, enhancement)
         self.spec = merged_spec
 
         # Save updated spec
