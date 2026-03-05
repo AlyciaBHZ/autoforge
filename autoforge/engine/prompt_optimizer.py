@@ -384,13 +384,12 @@ class PromptOptimizer:
                 if block.type == "text":
                     text += block.text
 
-            import re
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if not match:
+            from autoforge.engine.utils import extract_json_from_text
+            try:
+                data = extract_json_from_text(text)
+            except ValueError:
                 logger.warning("[PromptOpt] Could not parse optimization response")
                 return None
-
-            data = json.loads(match.group())
             improved = data.get("improved_prompt", "")
             if not improved or improved == best.content:
                 logger.info("[PromptOpt] No improvement proposed")
@@ -503,12 +502,11 @@ class PromptOptimizer:
                 if block.type == "text":
                     text += block.text
 
-            import re
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if not match:
+            from autoforge.engine.utils import extract_json_from_text
+            try:
+                data = extract_json_from_text(text)
+            except ValueError:
                 return None
-
-            data = json.loads(match.group())
             mutated = data.get("mutated_prompt", "")
             if not mutated:
                 return None

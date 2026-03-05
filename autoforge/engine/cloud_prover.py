@@ -331,9 +331,10 @@ class SSHServerBackend:
             ssh_cmd = ["ssh", "-o", "StrictHostKeyChecking=no"]
             if self.config.ssh_key_path:
                 ssh_cmd.extend(["-i", self.config.ssh_key_path])
+            import shlex
             ssh_cmd.extend([
                 host,
-                f"{self.config.ssh_lean_path} {remote_file} && rm {remote_file}",
+                f"{shlex.quote(self.config.ssh_lean_path)} {shlex.quote(remote_file)} && rm {shlex.quote(remote_file)}",
             ])
 
             lean_proc = await asyncio.create_subprocess_exec(
