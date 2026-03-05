@@ -1110,7 +1110,9 @@ class Orchestrator:
                 })
                 review = reviewer.parse_review(review_result.output)
 
-                if review.approved:
+                # Use config threshold (not just LLM's self-reported "approved")
+                min_score = round(self.config.quality_threshold * 10)
+                if review.score >= min_score:
                     if use_git:
                         # Merge worktree branch into main
                         await git.merge_branch(branch_name)
