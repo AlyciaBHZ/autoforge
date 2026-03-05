@@ -1073,6 +1073,44 @@ Return JSON array:
         )
         logger.info(f"[CapDAG] Saved: {len(self._nodes)} nodes, {len(self._edges)} edges")
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize DAG into a JSON-safe dict for federation sync."""
+        return {
+            "version": 1,
+            "growth_round": self._growth_round,
+            "stats": self._stats,
+            "nodes": {nid: node.to_dict() for nid, node in self._nodes.items()},
+            "edges": [e.to_dict() for e in self._edges],
+        }
+
+    def load_dict(self, data: dict[str, Any]) -> bool:
+        """Load DAG state from in-memory dict.
+
+        Existing graph content is preserved; input data is merged into current state.
+        """
+        try:
+            incoming = CapabilityDAG()
+            incoming._growth_round = int(data.get("growth_round", 0))
+            incoming._stats = data.get("stats", incoming._stats)
+
+            for ndata in data.get("nodes", {}).values():
+                node = CapabilityNode.from_dict(ndata)
+                incoming._nodes[node.id] = node
+                incoming._index_node(node)
+
+            for edata in data.get("edges", []):
+                edge = CapabilityEdge.from_dict(edata)
+                incoming._edges.append(edge)
+                incoming._adjacency.setdefault(edge.source_id, []).append(edge.target_id)
+                incoming._reverse_adj.setdefault(edge.target_id, []).append(edge.source_id)
+
+            self._growth_round = max(self._growth_round, incoming._growth_round)
+            self.merge(incoming)
+            return True
+        except Exception as e:
+            logger.warning(f"[CapDAG] load_dict failed: {e}")
+            return False
+
     def load(self, path: Path | None = None) -> bool:
         """Load DAG from disk."""
         load_path = path or self._storage_dir
@@ -1085,25 +1123,8 @@ Return JSON array:
 
         try:
             data = json.loads(dag_file.read_text(encoding="utf-8"))
-
-            self._growth_round = data.get("growth_round", 0)
-            self._stats = data.get("stats", self._stats)
-
-            for nid, ndata in data.get("nodes", {}).items():
-                node = CapabilityNode.from_dict(ndata)
-                self._nodes[nid] = node
-                self._index_node(node)
-
-            for edata in data.get("edges", []):
-                edge = CapabilityEdge.from_dict(edata)
-                self._edges.append(edge)
-                src, tgt = edge.source_id, edge.target_id
-                if src not in self._adjacency:
-                    self._adjacency[src] = []
-                self._adjacency[src].append(tgt)
-                if tgt not in self._reverse_adj:
-                    self._reverse_adj[tgt] = []
-                self._reverse_adj[tgt].append(src)
+            if not self.load_dict(data):
+                return False
 
             logger.info(f"[CapDAG] Loaded: {len(self._nodes)} nodes, "
                         f"{len(self._edges)} edges")

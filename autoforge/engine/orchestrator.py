@@ -42,6 +42,12 @@ from autoforge.engine.dynamic_constitution import DynamicConstitution
 from autoforge.engine.evolution import EvolutionEngine, FitnessScore, WorkflowGenome
 from autoforge.engine.process_reward import ProcessRewardModel, StepType
 from autoforge.engine.prompt_optimizer import PromptOptimizer
+from autoforge.engine.dag_federation import (
+    DAGFederationClient,
+    DAGFederationConfig,
+    build_snapshot_payload,
+    pull_into_local_knowledge,
+)
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -128,6 +134,7 @@ class Orchestrator:
         # CapabilityDAG bridge needs special handling
         self._capability_dag: Any = None
         self._dag_bridge: Any = None
+        self._dag_federation: DAGFederationClient | None = None
         self._lean_prover: Any = None
         self._multi_prover: Any = None
 
@@ -196,6 +203,15 @@ class Orchestrator:
             if getattr(c, flag, False):
                 self._try_init_engine(attr, module_path, class_name)
 
+        self._dag_federation = DAGFederationClient(
+            DAGFederationConfig(
+                enabled=bool(c.dag_federation_enabled),
+                endpoint=str(c.dag_federation_endpoint),
+                api_key=str(c.dag_federation_api_key),
+                timeout_seconds=float(c.dag_federation_timeout_seconds),
+            )
+        )
+
         # CapabilityDAG needs special handling (bridge depends on DAG)
         if c.capability_dag_enabled:
             try:
@@ -217,6 +233,20 @@ class Orchestrator:
             self._capability_dag.load(global_dag_dir)
             if self._capability_dag.size > 0:
                 console.print(f"  [cyan]CapabilityDAG:[/cyan] loaded {self._capability_dag.size} capabilities")
+
+        # Pull federated knowledge snapshot (community sync)
+        if self._dag_federation is not None and self._dag_federation.enabled:
+            pulled = await pull_into_local_knowledge(
+                federation=self._dag_federation,
+                capability_dag=self._capability_dag,
+                theoretical_reasoning=self._theoretical_reasoning,
+                global_theory_dir=self.config.project_root / ".autoforge" / "theories",
+            )
+            if pulled["dag_nodes"] > 0 or pulled["theories"] > 0:
+                console.print(
+                    f"  [cyan]DAG Federation:[/cyan] pulled +{pulled['dag_nodes']} DAG nodes, "
+                    f"{pulled['theories']} theory graphs"
+                )
 
         # Load theoretical reasoning state (cross-domain theory graphs)
         if self.config.theoretical_reasoning_enabled and self._theoretical_reasoning is not None:
@@ -442,6 +472,19 @@ class Orchestrator:
                 console.print(
                     f"  [cyan]CapabilityDAG:[/cyan] {self._capability_dag.size} total capabilities"
                 )
+
+            if self._dag_federation is not None and self._dag_federation.enabled:
+                payload = build_snapshot_payload(
+                    capability_dag=self._capability_dag,
+                    theoretical_reasoning=(
+                        self._theoretical_reasoning
+                        if self.config.theoretical_reasoning_enabled
+                        else None
+                    ),
+                )
+                pushed = await self._dag_federation.push_snapshot(payload)
+                if pushed:
+                    console.print("  [cyan]DAG Federation:[/cyan] remote snapshot updated")
 
             self._print_summary()
             return self.project_dir

@@ -101,6 +101,36 @@ pip install -e ".[all]"
 
 配置保存在 `~/.autoforge/config.toml`，也可以通过环境变量覆盖。
 
+### DAG 联邦同步（社区共享知识）配置
+
+如果你要开启“本地 DAG/理论图 ↔ 远端知识服务”同步，需要额外配置以下环境变量：
+
+```bash
+# 1) 开关（不配默认关闭）
+export FORGE_DAG_FEDERATION_ENABLED=true
+
+# 2) 远端快照服务地址（必填）
+export FORGE_DAG_FEDERATION_ENDPOINT="https://your-domain/api/dag/snapshot"
+
+# 3) 可选：鉴权
+export FORGE_DAG_FEDERATION_API_KEY="your_token"
+
+# 4) 可选：网络超时（秒，默认 10）
+export FORGE_DAG_FEDERATION_TIMEOUT_SECONDS=15
+```
+
+运行行为：
+
+- 启动时：先从 `FORGE_DAG_FEDERATION_ENDPOINT` 拉取远端知识快照，合并到本地。
+- 结束时：把本次运行后的合并结果推送回远端。
+
+远端接口约定（当前实现）：
+
+- `GET <endpoint>`：返回 JSON 快照（`capability_dag` + 可选 `theories`）
+- `POST <endpoint>`：接收同结构 JSON 快照并保存
+
+> 最小可用配置只有 2 项：`FORGE_DAG_FEDERATION_ENABLED=true` + `FORGE_DAG_FEDERATION_ENDPOINT=...`
+
 ### 支持的 LLM 提供商
 
 | 提供商 | 环境变量 | 强模型 | 快模型 |
