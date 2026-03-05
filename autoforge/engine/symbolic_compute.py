@@ -1946,55 +1946,221 @@ class SymbolicComputeEngine:
 
         logger.info(f"SymbolicComputeEngine initialized (preferred: {preferred_backend})")
 
-    async def compute(
-        self, expression: str, operation: str, **kwargs: Any
+    @staticmethod
+    def _coerce_string_list(value: Any) -> list[str]:
+        """Normalize various payloads into a list of non-empty strings."""
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return [str(v).strip() for v in value if str(v).strip()]
+        if not isinstance(value, str):
+            return [str(value).strip()]
+
+        raw = value.strip()
+        if not raw:
+            return []
+
+        if raw.startswith(("[", "{")):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(raw)
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+                except Exception:
+                    pass
+
+        return [part.strip() for part in re.split(r"[,;\n]", raw) if part.strip()]
+
+    @staticmethod
+    def _parse_expression_payload(raw_expression: str) -> Any | None:
+        """Parse expression payload when callers pass JSON-like strings."""
+        trimmed = (raw_expression or "").strip()
+        if not trimmed:
+            return None
+        if not (trimmed.startswith("{") or trimmed.startswith("[")):
+            return None
+        try:
+            return json.loads(trimmed)
+        except json.JSONDecodeError:
+            try:
+                return ast.literal_eval(trimmed)
+            except Exception:
+                return None
+
+    def _compute_backend_candidates(self, operation: str) -> list[ComputationBackend]:
+        """Return an ordered backend list for a single operation."""
+        op = (operation or "").strip().lower()
+        symbolic_ops = {"simplify", "solve", "integrate", "differentiate", "limit", "series", "matrix"}
+        advanced_ops = {"groebner", "compute_groebner", "cohomology", "compute_cohomology", "algebraic_geometry", "compute_algebraic_geometry"}
+        available = self.available_backends()
+
+        candidates: list[ComputationBackend] = []
+        if self.preferred_backend in available:
+            candidates.append(self.preferred_backend)
+
+        # Prefer symbolic for most common algebraic operations.
+        if op in advanced_ops:
+            fallback_order = [ComputationBackend.SAGE, ComputationBackend.SYMPY]
+        else:
+            fallback_order = [ComputationBackend.SYMPY, ComputationBackend.SAGE]
+
+        for backend in fallback_order:
+            if backend not in candidates and backend in available:
+                candidates.append(backend)
+
+        # Keep NUMERIC only for explicit numerical operations.
+        if op in {"numerical_spot_check", "numeric_spot_check"} and ComputationBackend.NUMERIC in available:
+            candidates.append(ComputationBackend.NUMERIC)
+
+        # Always include symbolic as final fallback for common ops when explicitly requested.
+        if symbolic_ops and ComputationBackend.SYMPY in available and ComputationBackend.SYMPY not in candidates:
+            candidates.append(ComputationBackend.SYMPY)
+
+        return candidates
+
+    async def _compute_with_backend(
+        self, expression: str, operation: str, backend: ComputationBackend, **kwargs: Any
     ) -> SymbolicResult:
-        """Perform a computation operation."""
-        if self.preferred_backend == ComputationBackend.SYMPY:
+        op = (operation or "").strip().lower()
+        if not op:
+            raise ValueError("operation is required")
+
+        if backend == ComputationBackend.SYMPY:
+            if not SYMPY_AVAILABLE:
+                raise RuntimeError("SymPy backend not available")
             if not self.sympy_engine:
-                if not SYMPY_AVAILABLE:
-                    raise RuntimeError("SymPy not available")
                 self.sympy_engine = SymPyEngine()
 
-            if operation == "simplify":
+            if op == "simplify":
                 return await self.sympy_engine.simplify(expression)
-            elif operation == "solve":
-                return await self.sympy_engine.solve(
-                    expression, kwargs.get("variable", "x")
-                )
-            elif operation == "integrate":
+            if op == "solve":
+                return await self.sympy_engine.solve(expression, kwargs.get("variable", "x"))
+            if op == "integrate":
                 return await self.sympy_engine.integrate(
                     expression,
                     variable=kwargs.get("variable", "x"),
                     limits=kwargs.get("limits"),
                 )
-            elif operation == "differentiate":
+            if op == "differentiate":
                 return await self.sympy_engine.differentiate(
                     expression,
                     variable=kwargs.get("variable", "x"),
                     order=kwargs.get("order", 1),
                 )
-            elif operation == "limit":
+            if op == "limit":
                 return await self.sympy_engine.limit(
                     expression,
                     variable=kwargs.get("variable", "x"),
                     point=kwargs.get("point", "0"),
                 )
-            elif operation == "series":
+            if op == "series":
                 return await self.sympy_engine.series_expand(
                     expression,
                     variable=kwargs.get("variable", "x"),
                     point=kwargs.get("point", "0"),
                     order=kwargs.get("order", 6),
                 )
-            elif operation == "matrix":
+            if op == "matrix":
                 return await self.sympy_engine.matrix_operation(
                     expression, kwargs.get("matrix_op", "determinant")
                 )
-            else:
-                raise ValueError(f"Unknown operation: {operation}")
-        else:
-            raise ValueError(f"Backend {self.preferred_backend} not yet supported")
+
+            raise NotImplementedError(f"SymPy backend does not support operation '{operation}'")
+
+        if backend == ComputationBackend.SAGE:
+            if not self.sage_engine:
+                self.sage_engine = SageEngine()
+
+            payload = self._parse_expression_payload(expression)
+
+            if op in {"groebner", "compute_groebner"}:
+                ideal_gens = self._coerce_string_list(kwargs.get("ideal_gens"))
+                ring_vars = self._coerce_string_list(kwargs.get("ring_vars"))
+                if not ideal_gens and isinstance(payload, dict):
+                    ideal_gens = self._coerce_string_list(
+                        payload.get("ideal_gens", payload.get("polynomials"))
+                    )
+                    ring_vars = self._coerce_string_list(
+                        payload.get("ring_vars", payload.get("variables"))
+                    )
+                if not ideal_gens or not ring_vars:
+                    raise ValueError(
+                        "Sage groebner requires ideal_gens and ring_vars"
+                    )
+                return await self.sage_engine.compute_groebner(ideal_gens, ring_vars)
+
+            if op in {"cohomology", "compute_cohomology"}:
+                complex_desc = kwargs.get("complex_desc")
+                if not complex_desc and isinstance(payload, dict):
+                    complex_desc = payload.get("complex_desc", payload.get("complex"))
+                if not complex_desc:
+                    complex_desc = expression
+                return await self.sage_engine.compute_cohomology(str(complex_desc).strip())
+
+            if op in {"algebraic_geometry", "compute_algebraic_geometry"}:
+                variety_desc = kwargs.get("variety_desc")
+                geo_op = (
+                    kwargs.get("algebraic_operation")
+                    or kwargs.get("geometry_operation")
+                    or kwargs.get("operation")
+                    or "dimension"
+                )
+                if not variety_desc and isinstance(payload, dict):
+                    variety_desc = payload.get("variety_desc", payload.get("variety"))
+                    if not geo_op:
+                        geo_op = payload.get("operation", geo_op)
+                if not variety_desc:
+                    variety_desc = expression
+                if not isinstance(geo_op, str) or not geo_op.strip():
+                    geo_op = "dimension"
+                return await self.sage_engine.algebraic_geometry(
+                    str(variety_desc).strip(),
+                    geo_op.strip(),
+                )
+
+            raise NotImplementedError(f"Sage backend does not support operation '{operation}'")
+
+        raise NotImplementedError(f"Backend {backend} not supported in compute() facade")
+
+    async def compute(
+        self, expression: str, operation: str, **kwargs: Any
+    ) -> SymbolicResult:
+        """Perform a computation operation."""
+        backends = self._compute_backend_candidates(operation)
+        last_error: Exception | None = None
+        operation_name = (operation or "").strip()
+
+        for backend in backends:
+            try:
+                result = await self._compute_with_backend(
+                    expression, operation_name, backend, **kwargs
+                )
+                if (
+                    result is not None
+                    and result.backend == ComputationBackend.SAGE
+                    and not result.success
+                    and "not available" in (result.error or "").lower()
+                ):
+                    raise RuntimeError("SageMath not available")
+                return result
+            except (RuntimeError, NotImplementedError, ValueError) as e:
+                logger.debug(
+                    "Compute backend %s failed for operation '%s': %s",
+                    backend.value,
+                    operation_name,
+                    e,
+                )
+                last_error = e
+                continue
+
+        raise RuntimeError(
+            f"No backend was able to execute operation '{operation_name}'"
+            + (f": {last_error}" if last_error else "")
+        ) from last_error
 
     async def verify(self, claim: str, llm: Any = None) -> VerificationEvidence:
         """Verify a mathematical claim."""
