@@ -20,9 +20,7 @@
 ## Quick Start
 
 ```bash
-git clone https://github.com/AlyciaBHZ/autoforge.git
-cd autoforge
-pip install -e .                              # Install from source
+pip install forgeai                           # Install from PyPI
 forgeai                                       # Start interactive session
 ```
 
@@ -32,11 +30,22 @@ On first launch, the setup wizard guides you through API key configuration (Anth
 <summary>Optional dependencies</summary>
 
 ```bash
-pip install -e ".[openai]"       # OpenAI support
-pip install -e ".[google]"       # Google Gemini support
-pip install -e ".[search]"       # Web search capabilities
-pip install -e ".[channels]"     # Telegram / Webhook channels
-pip install -e ".[all]"          # Install everything
+pip install "forgeai[openai]"    # OpenAI support
+pip install "forgeai[google]"    # Google Gemini support
+pip install "forgeai[search]"    # Web search capabilities
+pip install "forgeai[channels]"  # Telegram / Webhook channels
+pip install "forgeai[all]"       # Install everything
+```
+
+</details>
+
+<details>
+<summary>Install from source (developers)</summary>
+
+```bash
+git clone https://github.com/AlyciaBHZ/autoforge.git
+cd autoforge
+pip install -e ".[all]"
 ```
 
 </details>
@@ -97,7 +106,7 @@ AutoForge orchestrates 6 specialized AI agents through a 5-phase pipeline to tur
 | Provider | Environment Variable | Strong Models | Fast Models |
 |----------|---------------------|---------------|-------------|
 | **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4.6 | Claude Sonnet 4.5 |
-| **OpenAI** | `OPENAI_API_KEY` | o3, GPT-4o | o4-mini, GPT-4o-mini |
+| **OpenAI** | `OPENAI_API_KEY` | Codex 5.3, o3, GPT-4o | o4-mini, GPT-4o-mini |
 | **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro | Gemini 2.5 Flash, Gemini 2.0 Flash |
 
 **Auth methods:** API Key, Codex OAuth (browser login, uses ChatGPT subscription), Device Code (headless/SSH), OAuth2 Client Credentials, Azure/LiteLLM Bearer Token, Google ADC/Service Account, AWS Bedrock, and Google Vertex AI are all supported.

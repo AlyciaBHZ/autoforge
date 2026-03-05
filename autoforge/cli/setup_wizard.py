@@ -41,11 +41,12 @@ PROVIDERS = {
         ],
     },
     "openai": {
-        "name": "OpenAI (GPT / o-series)",
+        "name": "OpenAI (Codex / GPT / o-series)",
         "key_hint": "Get your key at https://platform.openai.com/api-keys",
         "validate": lambda x: x.startswith("sk-") and len(x) > 20,
         "invalid_msg": "Must start with 'sk-' and be at least 20 characters",
         "models_strong": [
+            {"name": "Codex 5.3 (newest, code-specialized)", "value": "codex-5.3"},
             {"name": "o3 (strongest reasoning)", "value": "o3"},
             {"name": "GPT-4o (fast + capable)", "value": "gpt-4o"},
         ],
