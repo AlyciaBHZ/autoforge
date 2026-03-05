@@ -41,9 +41,8 @@ docker/sandbox-data/
 *.db
 
 # Local audit docs (do not commit)
-AutoForge_Academic_Audit.docx
-AutoForge_Academic_Audit_V2.docx
-AutoForge_Audit_Report.docx
+AutoForge_Academic_Audit*.docx
+AutoForge_Audit*.docx
 
 # Local security/sensitive review notes
 CODE_REVIEW.md
