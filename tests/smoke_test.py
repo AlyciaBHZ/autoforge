@@ -159,10 +159,13 @@ def test_cli_parse_subcommands():
     assert args.sample_size == 4
 
     # Test paper reproduce
-    args = parser.parse_args(["paper", "reproduce", "robust graph learning", "--pick", "2"])
+    args = parser.parse_args(
+        ["paper", "reproduce", "robust graph learning", "--pick", "2", "--strict-contract"]
+    )
     assert args.command == "paper"
     assert args.paper_action == "reproduce"
     assert args.pick == 2
+    assert args.strict_contract is True
 
     # Test global flags
     args = parser.parse_args(["--budget", "5.0", "--mode", "research", "--mobile", "both", "generate", "test"])
@@ -1105,6 +1108,7 @@ def test_paper_repro_signals_and_simulation():
         extract_paper_signals,
         simulate_pipeline_feedback,
     )
+    from autoforge.engine.repro_contract import build_repro_report, validate_report_schema
 
     paper = PaperRecord(
         note_id="test123",
@@ -1138,6 +1142,20 @@ def test_paper_repro_signals_and_simulation():
     )
     assert fb["mode"] == "simulated_no_api_key"
     assert "p0_p4_status" in fb
+
+    report = build_repro_report(
+        run_id="run-test123",
+        paper_id=paper.note_id,
+        goal="speed up long-context sparse attention decoding",
+        mode="simulated_no_api_key",
+        profile="theory-first",
+        output_dir=Path("."),
+        strict_contract=True,
+        p0_p4_status=fb["p0_p4_status"],
+        artifacts_complete=True,
+        failure_reasons=[],
+    )
+    assert validate_report_schema(report) == []
 
 
 def test_service_files_exist():

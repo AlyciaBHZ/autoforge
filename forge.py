@@ -27,6 +27,7 @@ Paper reproduction:
     forgeai paper infer "research goal"           # Infer likely ICLR papers
     forgeai paper benchmark                       # Benchmark inference quality
     forgeai paper reproduce "goal"                # Build reproduction brief/prompt
+    forgeai paper reproduce "goal" --strict-contract  # Enforce artifact/schema contract
 """
 
 from autoforge.cli.app import main

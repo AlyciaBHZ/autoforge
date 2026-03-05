@@ -281,6 +281,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run full AutoForge generation using the built reproduction prompt",
     )
+    paper_repro.add_argument(
+        "--strict-contract",
+        action="store_true",
+        help="Enforce contract artifacts/report schema; fail with exit code 2 on violations",
+    )
 
     # Backward compatibility flags
     parser.add_argument(
@@ -810,6 +815,14 @@ async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
         infer_papers_from_goal,
         simulate_pipeline_feedback,
     )
+    from autoforge.engine.repro_contract import (
+        REQUIRED_ARTIFACT_FILES,
+        build_repro_report,
+        build_run_manifest,
+        derive_contract_status,
+        validate_contract_artifacts,
+        write_contract_outputs,
+    )
 
     goal = (args.goal or "").strip()
     if not goal:
@@ -822,6 +835,7 @@ async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
     corpus_size = max(100, min(int(getattr(args, "corpus_size", 600)), 2000))
     cache_hours = max(1, min(int(getattr(args, "cache_hours", 48)), 24 * 14))
     refresh = bool(getattr(args, "refresh_corpus", False))
+    strict_contract = bool(getattr(args, "strict_contract", False))
 
     try:
         papers = await asyncio.to_thread(
@@ -864,6 +878,8 @@ async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
         slug = _safe_slug(paper.title, max_len=48)
         out_dir = config.project_root / ".autoforge" / "paper_runs" / f"iclr{year}_{slug}_{paper.note_id}"
 
+    artifacts_written: list[str] = []
+
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "candidate.json").write_text(
@@ -886,20 +902,26 @@ async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
             ),
             encoding="utf-8",
         )
+        artifacts_written.append("candidate.json")
         (out_dir / "reproduction_brief.md").write_text(brief, encoding="utf-8")
+        artifacts_written.append("reproduction_brief.md")
         (out_dir / "generation_prompt.txt").write_text(prompt, encoding="utf-8")
+        artifacts_written.append("generation_prompt.txt")
         (out_dir / "paper_signals.json").write_text(
             json.dumps(signals.to_dict(), indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        artifacts_written.append("paper_signals.json")
         (out_dir / "verification_plan.json").write_text(
             json.dumps(verification_plan, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        artifacts_written.append("verification_plan.json")
         (out_dir / "environment_spec.json").write_text(
             json.dumps(env_spec, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        artifacts_written.append("environment_spec.json")
     except OSError as exc:
         console.print(f"[red]Failed to write reproduction artifacts:[/red] {exc}")
         return 1
@@ -910,43 +932,142 @@ async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
     console.print(f"signal_source: {signals.text_source}")
     console.print(f"artifacts: {out_dir}")
 
-    if not getattr(args, "run_generate", False):
-        return 0
+    run_generate = bool(getattr(args, "run_generate", False))
+    run_mode = "artifact_only"
+    exit_code = 0
+    failure_reasons: list[str] = []
+    p0_p4_status = derive_contract_status(
+        inference_score=chosen.score,
+        datasets=signals.datasets,
+        metrics=signals.metrics,
+        claimed_metrics=signals.claimed_metrics,
+        hardware_hints=signals.hardware_hints,
+        run_generate=run_generate,
+        has_api_key=bool(config.has_api_key),
+    )
 
-    if not config.has_api_key:
-        feedback = simulate_pipeline_feedback(
-            goal=goal,
-            paper=paper,
-            signals=signals,
-            inference_score=chosen.score,
-        )
-        try:
-            (out_dir / "simulated_pipeline_feedback.json").write_text(
-                json.dumps(feedback, indent=2, ensure_ascii=False),
-                encoding="utf-8",
+    if run_generate:
+        if not config.has_api_key:
+            run_mode = "simulated_no_api_key"
+            feedback = simulate_pipeline_feedback(
+                goal=goal,
+                paper=paper,
+                signals=signals,
+                inference_score=chosen.score,
             )
-        except OSError as exc:
-            console.print(f"[red]Failed to write simulated feedback:[/red] {exc}")
-            return 1
-        console.print(
-            "[yellow]No API key detected.[/yellow] "
-            "Generated simulated pipeline feedback at "
-            f"{out_dir / 'simulated_pipeline_feedback.json'}"
-        )
-        return 0
+            p0_p4_status = feedback.get("p0_p4_status", p0_p4_status)
+            try:
+                (out_dir / "simulated_pipeline_feedback.json").write_text(
+                    json.dumps(feedback, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                artifacts_written.append("simulated_pipeline_feedback.json")
+            except OSError as exc:
+                console.print(f"[red]Failed to write simulated feedback:[/red] {exc}")
+                failure_reasons.append(f"simulated feedback write failed: {exc}")
+                exit_code = 1
+            else:
+                console.print(
+                    "[yellow]No API key detected.[/yellow] "
+                    "Generated simulated pipeline feedback at "
+                    f"{out_dir / 'simulated_pipeline_feedback.json'}"
+                )
+        else:
+            from autoforge.engine.orchestrator import Orchestrator
 
-    from autoforge.engine.orchestrator import Orchestrator
+            run_mode = "generated_with_api_key"
+            console.print("[cyan]Running full AutoForge generation from inferred paper prompt...[/cyan]")
+            orchestrator = Orchestrator(config)
+            try:
+                project_dir = await orchestrator.run(prompt)
+                console.print(f"[green]Generation completed:[/green] {project_dir}")
+            except Exception as exc:
+                run_mode = "generation_failed"
+                failure_reasons.append(f"generation failed: {exc}")
+                console.print(f"[red]Generation failed:[/red] {exc}")
+                exit_code = 1
 
-    console.print("[cyan]Running full AutoForge generation from inferred paper prompt...[/cyan]")
-    orchestrator = Orchestrator(config)
+    manifest = build_run_manifest(
+        run_id=f"{config.run_id}-{paper.note_id}",
+        goal=goal,
+        mode=run_mode,
+        profile=env_spec.get("profile", "theory-first"),
+        strict_contract=strict_contract,
+        output_dir=out_dir,
+        paper={
+            "note_id": paper.note_id,
+            "title": paper.title,
+            "year": paper.year,
+            "openreview_url": paper.openreview_url,
+            "pdf_url": paper.pdf_url,
+        },
+        artifacts_written=artifacts_written + ["run_manifest.json", "repro_report.json", "repro_report.md"],
+    )
+    report = build_repro_report(
+        run_id=f"{config.run_id}-{paper.note_id}",
+        paper_id=paper.note_id,
+        goal=goal,
+        mode=run_mode,
+        profile=env_spec.get("profile", "theory-first"),
+        output_dir=out_dir,
+        strict_contract=strict_contract,
+        p0_p4_status=p0_p4_status,
+        artifacts_complete=True,
+        failure_reasons=failure_reasons,
+    )
     try:
-        project_dir = await orchestrator.run(prompt)
-    except Exception as exc:
-        console.print(f"[red]Generation failed:[/red] {exc}")
+        write_contract_outputs(output_dir=out_dir, manifest=manifest, report=report)
+        artifacts_written.extend(["run_manifest.json", "repro_report.json", "repro_report.md"])
+    except OSError as exc:
+        console.print(f"[red]Failed to write contract outputs:[/red] {exc}")
         return 1
 
-    console.print(f"[green]Generation completed:[/green] {project_dir}")
-    return 0
+    validation = validate_contract_artifacts(out_dir)
+    if not validation.ok:
+        merged_failures = list(failure_reasons) + validation.errors
+        report = build_repro_report(
+            run_id=f"{config.run_id}-{paper.note_id}",
+            paper_id=paper.note_id,
+            goal=goal,
+            mode=run_mode,
+            profile=env_spec.get("profile", "theory-first"),
+            output_dir=out_dir,
+            strict_contract=strict_contract,
+            p0_p4_status=p0_p4_status,
+            artifacts_complete=False,
+            failure_reasons=merged_failures,
+        )
+        manifest = build_run_manifest(
+            run_id=f"{config.run_id}-{paper.note_id}",
+            goal=goal,
+            mode=run_mode,
+            profile=env_spec.get("profile", "theory-first"),
+            strict_contract=strict_contract,
+            output_dir=out_dir,
+            paper={
+                "note_id": paper.note_id,
+                "title": paper.title,
+                "year": paper.year,
+                "openreview_url": paper.openreview_url,
+                "pdf_url": paper.pdf_url,
+            },
+            artifacts_written=artifacts_written,
+        )
+        try:
+            write_contract_outputs(output_dir=out_dir, manifest=manifest, report=report)
+        except OSError:
+            pass
+
+        console.print("[red]Contract validation failed.[/red]")
+        for err in validation.errors:
+            console.print(f"  - {err}")
+        if strict_contract:
+            return 2
+        console.print("[yellow]Continuing because --strict-contract is not enabled.[/yellow]")
+
+    expected = ", ".join(REQUIRED_ARTIFACT_FILES)
+    console.print(f"[dim]contract artifacts:[/dim] {expected}")
+    return exit_code
 
 
 def _resolve_command(argv: list[str]) -> tuple[argparse.Namespace, str | None]:

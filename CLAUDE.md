@@ -20,8 +20,8 @@ forgeai resume                               # Resume interrupted run
 forgeai setup                                # Reconfigure settings
 
 # Test
-python tests/smoke_test.py                   # 105-check smoke test suite
-python -m pytest tests/test_engines.py       # 112 behavioral/unit tests
+python tests/smoke_test.py                  # 127-check smoke test suite
+python -m pytest tests/test_engines.py      # 112 behavioral/unit tests
 
 # Daemon mode (24/7 background service)
 forgeai daemon start                         # Start daemon
@@ -74,9 +74,9 @@ engine/speculative_pipeline.py  Speculative pipeline — overlapping phase pre-e
 engine/hierarchical_decomp.py   Hierarchical decomposition — Parsel-style function-level task planning
 engine/lean_prover.py           Lean 4 theorem proving — Hilbert+COPRA+MCTS+STP+Pantograph+PaperReview+ProofRepair
 engine/multi_prover.py          Multi-prover formal verification — Coq, Isabelle, TLA+, Z3/SMT, Dafny cross-verification
-engine/autonomous_discovery.py  Autonomous theorem discovery — minimal kernel → conjecture generation → novelty filter → depth evaluation
-engine/paper_formalizer.py      Paper-specific Lean 4 formalization — theorem extraction, Lean codegen, Python reproducibility
-engine/cloud_prover.py          Cloud Lean 4 compilation — Docker, SSH, GitHub Codespaces backends with caching
+engine/autonomous_discovery.py  Autonomous theorem discovery — DomainContext-templated prompts, minimal kernel → conjecture generation → novelty filter → depth evaluation
+engine/paper_formalizer.py      Paper-specific Lean 4 formalization — real Lean compile, theorem extraction, Lean codegen, Python reproducibility, markdown report
+engine/cloud_prover.py          Cloud Lean 4 compilation — Docker, SSH, GitHub Codespaces backends with proof caching
 engine/capability_dag.py        CapabilityDAG — self-growing universal knowledge graph, community-mergeable
 engine/theoretical_reasoning.py Cross-domain scientific reasoning — TheoryGraph, multi-modal verification, theory evolution & article generation
 engine/task_dag.py           TaskDAG — dependency graph, scheduling, persistence
@@ -95,7 +95,7 @@ constitution/               Agent behavior rules, workflow definitions, quality 
 constitution/agents/*.md    Per-agent system prompts (loaded by agent_base.py)
 constitution/workflows/*.md Phase definitions (spec, build, verify, refactor, deliver)
 services/                   systemd + launchd service configs for daemon mode
-tests/smoke_test.py         105-check validation suite (no API key needed)
+tests/smoke_test.py         127-check validation suite (no API key needed)
 tests/test_engines.py       112 behavioral tests (SearchTree, MCTS, Evolution, etc.)
 scripts/git_sync.py         Automated git merge/cherry-pick workflow tool
 ```

@@ -32,6 +32,11 @@ Defaults are tuned for lightweight theory-first runs:
 - PDF parsing is opt-in (`--with-pdf`) to avoid extra network/CPU cost.
 - Environment spec is generated in `theory-first` profile (no heavy ML deps installed by default).
 
+Strict contract mode:
+- Add `--strict-contract` to enforce required artifact outputs and report schema validation.
+- On contract violation, command exits with code `2`.
+- Contract spec: `docs/contracts/paper_repro_contract_v1.md`.
+
 ## Example
 
 ```bash
@@ -39,6 +44,7 @@ autoforge paper infer "improve long-context reasoning with sparse attention" --y
 autoforge paper benchmark --year 2025 --sample-size 6 --top-k 5
 autoforge paper reproduce "robust graph learning under missing features" --year 2025 --pick 1
 autoforge paper reproduce "formal theorem proving with retrieval" --year 2025 --with-pdf
+autoforge paper reproduce "long-context sparse reasoning" --year 2025 --run-generate --strict-contract
 ```
 
 ## Current Limitations

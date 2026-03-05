@@ -47,4 +47,4 @@ forgeai = "autoforge.cli.app:main"
 include = ["autoforge*"]
 
 [tool.setuptools.package-data]
-autoforge = ["data/**/*"]
+autoforge = ["data/**/*", "contracts/*.json"]
