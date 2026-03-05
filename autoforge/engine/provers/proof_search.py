@@ -17,7 +17,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from autoforge.engine.provers.lean_core import (
     Conjecture,
@@ -28,6 +28,9 @@ from autoforge.engine.provers.lean_core import (
     ProofStep,
     TacticCandidate,
     TacticSource,
+    LeanEnvironment,
+    PantographREPL,
+    LeanVerificationResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,6 +134,11 @@ class AdaptiveBeamSearch:
                 logger.debug(f"[AdaptiveBeamSearch] Contracting width to {self.width}")
 
         # Track success rate for algorithm ratio
+        found_solution = 1.0 if completed_proofs else 0.0
+        self._success_rates.append(found_solution)
+        if len(self._success_rates) > 100:
+            self._success_rates = self._success_rates[-100:]
+
         if len(self._success_rates) > 0:
             self._algorithm_ratio = sum(self._success_rates) / len(self._success_rates)
 
@@ -660,6 +668,116 @@ Suggest Lean 4 tactics that use these lemmas. Return JSON array: ["tactic1", ...
 
 
 # ══════════════════════════════════════════════════════════════
+# Tactic Executor Abstractions
+# ══════════════════════════════════════════════════════════════
+
+
+class TacticExecutor(Protocol):
+    """Execution backend for applying tactics during search."""
+
+    async def start(self, theorem_context: str) -> bool:
+        ...
+
+    async def apply(self, state: ProofState, tactic: str) -> ProofState | None:
+        ...
+
+    async def undo(self) -> ProofState:
+        ...
+
+    async def close(self) -> None:
+        ...
+
+    @property
+    def backend_name(self) -> str:
+        ...
+
+    @property
+    def is_formal(self) -> bool:
+        ...
+
+
+class HeuristicExecutor:
+    """Heuristic fallback executor (non-formal)."""
+
+    @property
+    def backend_name(self) -> str:
+        return "heuristic"
+
+    @property
+    def is_formal(self) -> bool:
+        return False
+
+    async def start(self, theorem_context: str) -> bool:
+        return True
+
+    async def apply(self, state: ProofState, tactic: str) -> ProofState | None:
+        new_goals = list(state.goals)
+        new_hyps = list(state.hypotheses)
+
+        if tactic in ("simp", "norm_num", "omega", "ring", "decide", "trivial", "rfl"):
+            if new_goals:
+                new_goals = new_goals[1:]
+        elif tactic.startswith("intro"):
+            if new_goals:
+                new_hyps.append(f"(introduced by {tactic})")
+        elif tactic.startswith("cases") or tactic.startswith("induction"):
+            if new_goals:
+                new_goals = [f"case 1 of {new_goals[0]}", f"case 2 of {new_goals[0]}"] + new_goals[1:]
+
+        return ProofState(
+            goals=new_goals,
+            hypotheses=new_hyps,
+            context=f"After: {tactic}\n{state.context}",
+            depth=state.depth + 1,
+            parent_tactic=tactic,
+        )
+
+    async def undo(self) -> ProofState:
+        return ProofState(goals=["[undo_not_supported]"], hypotheses=[])
+
+    async def close(self) -> None:
+        return None
+
+
+class PantographExecutor:
+    """Pantograph-backed executor with heuristic fallback."""
+
+    def __init__(self, lean_env: LeanEnvironment, fallback: TacticExecutor | None = None) -> None:
+        self._repl = PantographREPL(lean_env)
+        self._fallback = fallback or HeuristicExecutor()
+        self._formal = False
+
+    @property
+    def backend_name(self) -> str:
+        return "pantograph" if self._formal else f"{self._fallback.backend_name}_fallback"
+
+    @property
+    def is_formal(self) -> bool:
+        return self._formal
+
+    async def start(self, theorem_context: str) -> bool:
+        self._formal = await self._repl.start_session()
+        if not self._formal:
+            await self._fallback.start(theorem_context)
+        return True
+
+    async def apply(self, state: ProofState, tactic: str) -> ProofState | None:
+        if self._formal:
+            return await self._repl.send_tactic(tactic)
+        return await self._fallback.apply(state, tactic)
+
+    async def undo(self) -> ProofState:
+        if self._formal:
+            return await self._repl.undo()
+        return await self._fallback.undo()
+
+    async def close(self) -> None:
+        if self._formal:
+            await self._repl.close()
+        await self._fallback.close()
+
+
+# ══════════════════════════════════════════════════════════════
 # MCTS Proof Search (DeepSeek-Prover-V1.5 style)
 # ══════════════════════════════════════════════════════════════
 
@@ -684,9 +802,12 @@ class MCTSProofSearch:
     MAX_CHILDREN = 8        # Max tactic candidates per node
     MIN_VISITS_EXPAND = 2   # Minimum visits before expanding
 
-    def __init__(self, tactic_gen: TacticGenerator) -> None:
+    def __init__(self, tactic_gen: TacticGenerator, executor: TacticExecutor | None = None) -> None:
         self._tactic_gen = tactic_gen
+        self._executor: TacticExecutor = executor or HeuristicExecutor()
         self._stats = {"nodes_explored": 0, "proofs_found": 0, "backtracks": 0}
+        self._last_search_formal = False
+        self._last_backend_name = self._executor.backend_name
 
     async def search(
         self,
@@ -704,53 +825,70 @@ class MCTSProofSearch:
         root = ProofSearchNode(state=root_state)
         best_proof: list[ProofStep] | None = None
 
-        for iteration in range(max_iterations):
-            # 1. SELECT — traverse tree using UCB1
-            node = self._select(root)
+        await self._executor.start(theorem_context)
+        self._last_search_formal = self._executor.is_formal
+        self._last_backend_name = self._executor.backend_name
 
-            if node.is_terminal:
-                continue
+        try:
+            for iteration in range(max_iterations):
+                node = self._select(root)
+                if node.is_terminal:
+                    continue
 
-            # 2. EXPAND — generate tactic candidates
-            if node.visits >= self.MIN_VISITS_EXPAND and node.depth < self.MAX_DEPTH:
-                candidates = await self._tactic_gen.generate_candidates(
-                    node.state, theorem_context, llm,
-                    informal_hint=informal_hint if node.depth < 3 else "",
-                )
-                for candidate in candidates[:self.MAX_CHILDREN]:
-                    child = ProofSearchNode(
-                        state=self._simulate_tactic(node.state, candidate.tactic),
-                        tactic=candidate.tactic,
-                        parent=node,
-                        depth=node.depth + 1,
+                if node.depth >= self.MAX_DEPTH:
+                    node.is_terminal = True
+                    self._backpropagate(node, 0.0)
+                    self._stats["backtracks"] += 1
+                    continue
+
+                if not node.children:
+                    candidates = await self._tactic_gen.generate_candidates(
+                        node.state, theorem_context, llm,
+                        informal_hint=informal_hint if node.depth < 3 else "",
                     )
-                    node.children.append(child)
+                    for candidate in candidates[:self.MAX_CHILDREN]:
+                        next_state = await self._executor.apply(node.state, candidate.tactic)
+                        if next_state is None:
+                            continue
+                        child = ProofSearchNode(
+                            state=next_state,
+                            tactic=candidate.tactic,
+                            parent=node,
+                            depth=node.depth + 1,
+                            is_terminal=self._is_proof_complete(next_state),
+                        )
+                        node.children.append(child)
 
-            # 3. SIMULATE — evaluate leaf node
-            if node.children:
-                leaf = node.children[0]  # Evaluate first child
-                value = await self._evaluate_state(leaf.state, llm)
+                    if not node.children:
+                        node.is_terminal = True
+                        self._backpropagate(node, 0.0)
+                        self._stats["backtracks"] += 1
+                        continue
 
-                # Check if proof is complete
-                if self._is_proof_complete(leaf.state):
-                    leaf.is_terminal = True
-                    value = 1.0
-                    proof_steps = self._extract_proof_path(leaf)
-                    if best_proof is None or len(proof_steps) < len(best_proof):
-                        best_proof = proof_steps
-                        self._stats["proofs_found"] += 1
-                        logger.info(f"[MCTS] Proof found at iteration {iteration}, "
-                                    f"depth {leaf.depth}")
+                rollout_children = sorted(
+                    node.children,
+                    key=lambda c: (c.visits == 0, c.value / c.visits if c.visits else c.value),
+                    reverse=True,
+                )[: min(3, len(node.children))]
 
-                # 4. BACKPROPAGATE
-                self._backpropagate(leaf, value)
-            else:
-                # Dead end
-                node.is_terminal = True
-                self._backpropagate(node, 0.0)
-                self._stats["backtracks"] += 1
+                for leaf in rollout_children:
+                    value = await self._evaluate_state(leaf.state, llm)
+                    if self._is_proof_complete(leaf.state):
+                        leaf.is_terminal = True
+                        value = 1.0
+                        proof_steps = self._extract_proof_path(leaf)
+                        if best_proof is None or len(proof_steps) < len(best_proof):
+                            best_proof = proof_steps
+                            self._stats["proofs_found"] += 1
+                            logger.info(
+                                f"[MCTS] Proof found at iteration {iteration}, depth {leaf.depth}, "
+                                f"backend={self._last_backend_name}"
+                            )
+                    self._backpropagate(leaf, value)
 
-            self._stats["nodes_explored"] += 1
+                self._stats["nodes_explored"] += 1
+        finally:
+            await self._executor.close()
 
         return best_proof
 
@@ -775,36 +913,6 @@ class MCTSProofSearch:
 
             node = best_child
         return node
-
-    def _simulate_tactic(self, state: ProofState, tactic: str) -> ProofState:
-        """Simulate applying a tactic (without actual Lean execution).
-
-        In a full implementation with Pantograph, this would actually
-        execute the tactic in Lean and return the new proof state.
-        Here we construct an estimated state for the LLM to evaluate.
-        """
-        new_goals = list(state.goals)
-        new_hyps = list(state.hypotheses)
-
-        # Heuristic: estimate effect of common tactics
-        if tactic in ("simp", "norm_num", "omega", "ring", "decide", "trivial", "rfl"):
-            if new_goals:
-                new_goals = new_goals[1:]  # Optimistic: closes first goal
-        elif tactic.startswith("intro"):
-            if new_goals:
-                new_hyps.append(f"(introduced by {tactic})")
-        elif tactic.startswith("cases") or tactic.startswith("induction"):
-            if new_goals:
-                # Splits into subgoals
-                new_goals = [f"case 1 of {new_goals[0]}", f"case 2 of {new_goals[0]}"] + new_goals[1:]
-
-        return ProofState(
-            goals=new_goals,
-            hypotheses=new_hyps,
-            context=f"After: {tactic}\n{state.context}",
-            depth=state.depth + 1,
-            parent_tactic=tactic,
-        )
 
     async def _evaluate_state(self, state: ProofState, llm: Any) -> float:
         """Evaluate proof state — estimated probability of completion.
@@ -855,9 +963,22 @@ class MCTSProofSearch:
         steps.reverse()
         return steps
 
-    def get_stats(self) -> dict[str, int]:
+    @property
+    def last_search_formal(self) -> bool:
+        """Whether the latest search used a formal execution backend."""
+        return self._last_search_formal
+
+    @property
+    def last_backend_name(self) -> str:
+        """Name of backend used in latest search."""
+        return self._last_backend_name
+
+    def get_stats(self) -> dict[str, int | str | bool]:
         """Return search statistics."""
-        return dict(self._stats)
+        stats: dict[str, int | str | bool] = dict(self._stats)
+        stats["formal_backend"] = self._last_search_formal
+        stats["backend_name"] = self._last_backend_name
+        return stats
 
 
 # ══════════════════════════════════════════════════════════════
@@ -890,9 +1011,15 @@ class RecursiveProofDecomposer:
     MAX_RECURSION_DEPTH = 5
     MAX_SUBGOALS = 8
 
-    def __init__(self, tactic_gen: TacticGenerator, mcts: MCTSProofSearch) -> None:
+    def __init__(
+        self,
+        tactic_gen: TacticGenerator,
+        mcts: MCTSProofSearch,
+        lean_env: LeanEnvironment | None = None,
+    ) -> None:
         self._tactic_gen = tactic_gen
         self._mcts = mcts
+        self._lean_env = lean_env or LeanEnvironment()
         self._decomposition_cache: dict[str, list[str]] = {}
 
     async def prove(
@@ -933,10 +1060,11 @@ class RecursiveProofDecomposer:
 
         if lean_proof:
             attempt.lean_proof = lean_proof
-            attempt.status = ProofStatus.PROVED
+            await self._verify_attempt(attempt, theorem_context=statement, require_formal_backend=False)
             attempt.attempts = 1
-            logger.info(f"[Decomposer] Direct proof succeeded for {attempt.theorem_id}")
-            return attempt
+            if attempt.status == ProofStatus.PROVED:
+                logger.info(f"[Decomposer] Direct proof formally verified for {attempt.theorem_id}")
+                return attempt
 
         # Step 3: MCTS proof search
         root_state = ProofState(
@@ -954,9 +1082,15 @@ class RecursiveProofDecomposer:
             tactics = [step.tactic_applied for step in mcts_proof]
             attempt.lean_proof = self._assemble_tactic_proof(statement, tactics)
             attempt.steps = mcts_proof
-            attempt.status = ProofStatus.PROVED
-            logger.info(f"[Decomposer] MCTS proof found for {attempt.theorem_id}")
-            return attempt
+            await self._verify_attempt(
+                attempt,
+                theorem_context=statement,
+                require_formal_backend=True,
+                backend_is_formal=self._mcts.last_search_formal,
+            )
+            if attempt.status == ProofStatus.PROVED:
+                logger.info(f"[Decomposer] MCTS proof formally verified for {attempt.theorem_id}")
+                return attempt
 
         # Step 4: Recursive decomposition (if not too deep)
         if depth < self.MAX_RECURSION_DEPTH:
@@ -988,15 +1122,70 @@ class RecursiveProofDecomposer:
                     )
                     if combined:
                         attempt.lean_proof = combined
-                        attempt.status = ProofStatus.PROVED
-                        logger.info(f"[Decomposer] Recursive proof complete for "
-                                    f"{attempt.theorem_id}")
-                        return attempt
+                        await self._verify_attempt(
+                            attempt,
+                            theorem_context=statement,
+                            require_formal_backend=False,
+                        )
+                        if attempt.status == ProofStatus.PROVED:
+                            logger.info(f"[Decomposer] Recursive proof complete for "
+                                        f"{attempt.theorem_id}")
+                            return attempt
 
         # All attempts failed
         attempt.status = ProofStatus.FAILED
         attempt.attempts = depth + 1
         return attempt
+
+    async def _verify_attempt(
+        self,
+        attempt: ProofAttempt,
+        *,
+        theorem_context: str,
+        require_formal_backend: bool = True,
+        backend_is_formal: bool = True,
+    ) -> None:
+        """Verify generated Lean proof and set strict proof status."""
+        attempt.status = ProofStatus.FORMALIZED
+
+        if not attempt.lean_proof.strip():
+            attempt.status = ProofStatus.FAILED
+            attempt.error = "Empty Lean proof"
+            return
+
+        if require_formal_backend and not backend_is_formal:
+            attempt.status = ProofStatus.FAILED
+            attempt.error = (
+                "Proof generated with non-formal backend; formal verification is required "
+                "before marking as PROVED"
+            )
+            return
+
+        lean_available = await self._lean_env.check_lean_installation()
+        if not lean_available:
+            attempt.status = ProofStatus.FAILED
+            attempt.error = "Lean toolchain unavailable; cannot grant formal PROVED status"
+            return
+
+        proof_file = self._lean_env._workspace / f".autoforge_proof_{attempt.theorem_id}.lean"
+        proof_file.parent.mkdir(parents=True, exist_ok=True)
+        proof_file.write_text(f"{theorem_context} := by\n{attempt.lean_proof}\n", encoding="utf-8")
+
+        verification = await self._lean_env.verify_file(proof_file)
+        attempt.verification_time = verification.execution_time
+
+        if verification.success and verification.sorry_count == 0:
+            attempt.status = ProofStatus.PROVED
+            attempt.error = ""
+        elif verification.success and verification.sorry_count > 0:
+            attempt.status = ProofStatus.VERIFIED_WITH_SORRY
+            attempt.error = f"Proof contains {verification.sorry_count} sorry placeholders"
+        elif not verification.errors:
+            attempt.status = ProofStatus.COMPILES
+            attempt.error = "Compiled but not fully verified"
+        else:
+            attempt.status = ProofStatus.FAILED
+            attempt.error = "; ".join(verification.errors[:3])
 
     async def _generate_informal_proof(
         self,
