@@ -260,6 +260,57 @@ def run_setup_wizard() -> None:
     console.print()
 
 
+def _default_auth_method(provider_id: str) -> str:
+    """Return the default auth method for a provider."""
+    # Most OpenAI users run with ChatGPT subscription auth, not OAuth2 client_credentials.
+    if provider_id == "openai":
+        return "codex_oauth"
+    return "api_key"
+
+
+def _maybe_run_openai_subscription_login(
+    inquirer: Any,
+    provider_id: str,
+    auth_method: str,
+    auth_configs: dict[str, dict[str, str]],
+) -> None:
+    """Optionally run Codex OAuth / Device Code login during setup."""
+    if provider_id != "openai" or auth_method not in ("codex_oauth", "device_code"):
+        return
+
+    if auth_method == "codex_oauth":
+        prompt = "Run Codex OAuth login now? (opens browser)"
+    else:
+        prompt = "Run Device Code login now?"
+
+    run_now = inquirer.confirm(message=prompt, default=True).execute()
+    if not run_now:
+        return
+
+    try:
+        import asyncio
+        from autoforge.engine.auth import CodexOAuthAuth, DeviceCodeAuth
+
+        provider = CodexOAuthAuth() if auth_method == "codex_oauth" else DeviceCodeAuth()
+        asyncio.run(provider.get_token())
+
+        # Persist tokens to reduce repeated login prompts.
+        access_token = getattr(provider, "_access_token", "")
+        refresh_token = getattr(provider, "_refresh_token", "")
+        expires_at = getattr(provider, "_expires_at", 0.0)
+        if access_token:
+            auth_configs[provider_id]["access_token"] = str(access_token)
+        if refresh_token:
+            auth_configs[provider_id]["refresh_token"] = str(refresh_token)
+        if expires_at:
+            auth_configs[provider_id]["expires_at"] = str(expires_at)
+
+        console.print("[green]OpenAI subscription login successful.[/green]")
+    except Exception as exc:
+        console.print(f"[yellow]OpenAI subscription login not completed:[/yellow] {exc}")
+        console.print("[dim]You can retry anytime with: autoforgeai setup[/dim]")
+
+
 def _collect_provider_credentials(
     inquirer: Any,
     pid: str,
@@ -272,13 +323,25 @@ def _collect_provider_credentials(
 
     # Ask auth method (skip if only one option)
     if len(auth_methods) > 1:
+        default_auth = _default_auth_method(pid)
         auth_method = inquirer.select(
             message=f"{info['name']} — authentication method:",
             choices=auth_methods,
-            default="api_key",
+            default=default_auth,
         ).execute()
     else:
-        auth_method = "api_key"
+        auth_method = _default_auth_method(pid)
+
+    if pid == "openai" and auth_method == "oauth2_client_credentials":
+        switch_to_codex = inquirer.confirm(
+            message=(
+                "OAuth2 Client Credentials requires your own enterprise token endpoint. "
+                "Switch to Codex OAuth browser login instead?"
+            ),
+            default=True,
+        ).execute()
+        if switch_to_codex:
+            auth_method = "codex_oauth"
 
     if auth_method == "api_key":
         key = inquirer.secret(
@@ -436,6 +499,7 @@ def _collect_provider_credentials(
             "Uses subscription quota (not API billing).[/dim]"
         )
         auth_configs[pid] = {"auth_method": "codex_oauth"}
+        _maybe_run_openai_subscription_login(inquirer, pid, auth_method, auth_configs)
 
     elif auth_method == "device_code":
         console.print(
@@ -444,6 +508,7 @@ def _collect_provider_credentials(
             "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.[/dim]"
         )
         auth_configs[pid] = {"auth_method": "device_code"}
+        _maybe_run_openai_subscription_login(inquirer, pid, auth_method, auth_configs)
 
 
 def _setup_github(inquirer: Any) -> dict[str, Any]:
@@ -566,13 +631,25 @@ def _validate_model_provider(
 
         # Offer full auth method selection (same as initial setup)
         if len(auth_methods) > 1:
+            default_auth = _default_auth_method(required_provider)
             auth_method = inquirer.select(
                 message=f"{info['name']} — authentication method:",
                 choices=auth_methods,
-                default="api_key",
+                default=default_auth,
             ).execute()
         else:
-            auth_method = "api_key"
+            auth_method = _default_auth_method(required_provider)
+
+        if required_provider == "openai" and auth_method == "oauth2_client_credentials":
+            switch_to_codex = inquirer.confirm(
+                message=(
+                    "OAuth2 Client Credentials requires your own enterprise token endpoint. "
+                    "Switch to Codex OAuth browser login instead?"
+                ),
+                default=True,
+            ).execute()
+            if switch_to_codex:
+                auth_method = "codex_oauth"
 
         if auth_method == "api_key":
             key = inquirer.secret(
@@ -647,6 +724,12 @@ def _validate_model_provider(
 
         elif auth_method in ("adc", "service_account", "codex_oauth", "device_code"):
             auth_configs[required_provider] = {"auth_method": auth_method}
+            _maybe_run_openai_subscription_login(
+                inquirer,
+                required_provider,
+                auth_method,
+                auth_configs,
+            )
 
 
 def _escape_toml_value(value: str) -> str:

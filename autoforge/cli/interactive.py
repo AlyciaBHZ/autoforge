@@ -64,6 +64,11 @@ def run_interactive() -> dict[str, Any]:
     return result
 
 
+def _current_workspace_path() -> str:
+    """Use the current working directory as the active project path."""
+    return str(Path.cwd().resolve())
+
+
 def _developer_session(inquirer: Any) -> dict[str, Any]:
     """Developer mode: generate or import a project."""
     action = inquirer.select(
@@ -87,13 +92,9 @@ def _developer_session(inquirer: Any) -> dict[str, Any]:
         result["description"] = description
 
     elif action == "import":
-        project_path = inquirer.filepath(
-            message="Path to project:",
-            validate=lambda x: Path(x).is_dir(),
-            invalid_message="Must be a valid directory",
-            only_directories=True,
-        ).execute()
+        project_path = _current_workspace_path()
         result["project_path"] = project_path
+        console.print(f"[dim]Using current workspace: {project_path}[/dim]")
 
         enhance = inquirer.confirm(
             message="Add new features to this project?",
@@ -151,13 +152,9 @@ def _academic_session(inquirer: Any) -> dict[str, Any]:
         ).execute()
         result["description"] = description
     elif action == "review":
-        project_path = inquirer.filepath(
-            message="Path to project:",
-            validate=lambda x: Path(x).is_dir(),
-            invalid_message="Must be a valid directory",
-            only_directories=True,
-        ).execute()
+        project_path = _current_workspace_path()
         result["project_path"] = project_path
+        console.print(f"[dim]Using current workspace: {project_path}[/dim]")
 
     budget = inquirer.number(
         message="Budget limit (USD):",
@@ -174,12 +171,8 @@ def _academic_session(inquirer: Any) -> dict[str, Any]:
 
 def _verification_session(inquirer: Any) -> dict[str, Any]:
     """Verification mode: review and verify existing codebases."""
-    project_path = inquirer.filepath(
-        message="Path to project to verify:",
-        validate=lambda x: Path(x).is_dir(),
-        invalid_message="Must be a valid directory",
-        only_directories=True,
-    ).execute()
+    project_path = _current_workspace_path()
+    console.print(f"[dim]Using current workspace: {project_path}[/dim]")
 
     result: dict[str, Any] = {
         "action": "review",
