@@ -1861,6 +1861,9 @@ class EloTournament:
             hypothesis_id: Unique identifier for the hypothesis.
             initial_rating: Optional custom initial rating (default 1500).
         """
+        if hypothesis_id in self._ratings:
+            return
+
         rating = initial_rating if initial_rating is not None else self.initial_rating
         self._ratings[hypothesis_id] = EloRating(
             hypothesis_id=hypothesis_id, rating=rating
@@ -2035,6 +2038,21 @@ Respond in JSON:
                 self.register_hypothesis(hyp_id)
 
         n = len(hypotheses)
+        if n == 0:
+            return {
+                "total_matches": 0,
+                "rankings": [],
+                "top_5": [],
+                "stats": self.get_tournament_stats(),
+            }
+        if n == 1:
+            return {
+                "total_matches": 0,
+                "rankings": self.get_rankings(),
+                "top_5": self.get_top_k(5),
+                "stats": self.get_tournament_stats(),
+            }
+
         if rounds is None:
             rounds = max(3, math.ceil(math.log2(n)))
 

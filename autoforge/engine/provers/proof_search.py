@@ -131,6 +131,11 @@ class AdaptiveBeamSearch:
                 logger.debug(f"[AdaptiveBeamSearch] Contracting width to {self.width}")
 
         # Track success rate for algorithm ratio
+        found_solution = 1.0 if completed_proofs else 0.0
+        self._success_rates.append(found_solution)
+        if len(self._success_rates) > 100:
+            self._success_rates = self._success_rates[-100:]
+
         if len(self._success_rates) > 0:
             self._algorithm_ratio = sum(self._success_rates) / len(self._success_rates)
 
