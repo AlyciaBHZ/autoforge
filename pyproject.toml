@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autoforgeai"
-version = "2.7.2"
+version = "2.7.3"
 description = "AutoForge AI-powered multi-agent development platform"
 readme = "README.md"
 license = "MIT"
