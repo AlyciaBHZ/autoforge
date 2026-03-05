@@ -20,6 +20,10 @@
 
 ## Table of Contents
 
+- [Quick Start](#quick-start)
+  - [Installation](#installation)
+  - [LLM Provider Configuration](#llm-provider-configuration)
+  - [Requirements](#requirements)
 - [Academic & Research Capabilities](#academic--research-capabilities)
   - [End-to-End Article Reasoning](#end-to-end-article-reasoning)
   - [Formal Verification & Theorem Proving](#formal-verification--theorem-proving)
@@ -27,12 +31,71 @@
   - [Full Paper Pipeline](#full-paper-pipeline)
   - [Key Techniques & Inspirations](#key-techniques--inspirations)
 - [Engineering Capabilities](#engineering-capabilities)
-  - [Quick Start](#quick-start)
   - [Architecture](#architecture)
   - [Usage](#usage)
   - [Intelligent Engines](#intelligent-engines)
-  - [Supported LLM Providers](#supported-llm-providers)
-- [Requirements](#requirements)
+
+---
+
+## Quick Start
+
+### Installation
+
+```bash
+pip install forgeai                           # Install from PyPI
+forgeai                                       # Start interactive session
+```
+
+On first launch, the setup wizard guides you through API key configuration (Anthropic / OpenAI / Google — any one), GitHub environment, and operating mode. Then you're dropped into a session where you describe a project and it gets built.
+
+<details>
+<summary>Optional dependencies</summary>
+
+```bash
+pip install "forgeai[openai]"    # OpenAI support
+pip install "forgeai[google]"    # Google Gemini support
+pip install "forgeai[search]"    # Web search capabilities
+pip install "forgeai[channels]"  # Telegram / Webhook channels
+pip install "forgeai[all]"       # Install everything
+```
+
+</details>
+
+<details>
+<summary>Install from source (developers)</summary>
+
+```bash
+git clone https://github.com/AlyciaBHZ/autoforge.git
+cd autoforge
+pip install -e ".[all]"
+```
+
+</details>
+
+### LLM Provider Configuration
+
+| Provider | Environment Variable | Strong Models | Fast Models |
+|----------|---------------------|---------------|-------------|
+| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4.6 | Claude Sonnet 4.5 |
+| **OpenAI** | `OPENAI_API_KEY` | Codex 5.3, o3, GPT-4o | o4-mini, GPT-4o-mini |
+| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro | Gemini 2.5 Flash, Gemini 2.0 Flash |
+
+**Auth methods:** API Key, Codex OAuth (browser login, uses ChatGPT subscription), Device Code (headless/SSH), OAuth2 Client Credentials, Azure/LiteLLM Bearer Token, Google ADC/Service Account, AWS Bedrock, and Google Vertex AI are all supported.
+
+Keys can also be stored in `~/.autoforge/config.toml`. Cross-provider example:
+
+```bash
+export FORGE_MODEL_STRONG=o3              # Strong model from OpenAI
+export FORGE_MODEL_FAST=gemini-2.5-flash  # Fast model from Google
+```
+
+### Requirements
+
+- **Python 3.11+** — [python.org](https://python.org)
+- **At least one LLM API key** — [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/api-keys) / [Google](https://aistudio.google.com/apikey)
+- **Git** (recommended) — for worktree isolation
+- **Docker** (optional) — for sandbox execution
+- **Lean 4** (optional) — for formal theorem proving
 
 ---
 
@@ -112,39 +175,6 @@ Core orchestrator: [`article_reasoning.py`](../autoforge/engine/article_reasonin
 ## Engineering Capabilities
 
 AutoForge is also a full-stack code generation engine — 6 specialised AI agents collaborate through a 5-phase pipeline to turn a natural-language description into a complete codebase.
-
-### Quick Start
-
-```bash
-pip install forgeai                           # Install from PyPI
-forgeai                                       # Start interactive session
-```
-
-On first launch, the setup wizard guides you through API key configuration (Anthropic / OpenAI / Google — any one), GitHub environment, and operating mode. Then you're dropped into a session where you describe a project and it gets built.
-
-<details>
-<summary>Optional dependencies</summary>
-
-```bash
-pip install "forgeai[openai]"    # OpenAI support
-pip install "forgeai[google]"    # Google Gemini support
-pip install "forgeai[search]"    # Web search capabilities
-pip install "forgeai[channels]"  # Telegram / Webhook channels
-pip install "forgeai[all]"       # Install everything
-```
-
-</details>
-
-<details>
-<summary>Install from source (developers)</summary>
-
-```bash
-git clone https://github.com/AlyciaBHZ/autoforge.git
-cd autoforge
-pip install -e ".[all]"
-```
-
-</details>
 
 ### Architecture
 
@@ -226,33 +256,6 @@ AutoForge includes multiple intelligent engines that work together across the co
 - **Function-Level Task Decomposition** — Breaks complex requirements into independently verifiable subtasks
 - **Speculative Pipeline** — Overlapping phase execution for faster builds
 - **Darwin Self-Rewriting** — Evolutionary self-rewriting agent constitutions and workflows
-
-### Supported LLM Providers
-
-| Provider | Environment Variable | Strong Models | Fast Models |
-|----------|---------------------|---------------|-------------|
-| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4.6 | Claude Sonnet 4.5 |
-| **OpenAI** | `OPENAI_API_KEY` | Codex 5.3, o3, GPT-4o | o4-mini, GPT-4o-mini |
-| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro | Gemini 2.5 Flash, Gemini 2.0 Flash |
-
-**Auth methods:** API Key, Codex OAuth (browser login, uses ChatGPT subscription), Device Code (headless/SSH), OAuth2 Client Credentials, Azure/LiteLLM Bearer Token, Google ADC/Service Account, AWS Bedrock, and Google Vertex AI are all supported.
-
-Keys can also be stored in `~/.autoforge/config.toml`. Cross-provider example:
-
-```bash
-export FORGE_MODEL_STRONG=o3              # Strong model from OpenAI
-export FORGE_MODEL_FAST=gemini-2.5-flash  # Fast model from Google
-```
-
----
-
-## Requirements
-
-- **Python 3.11+** — [python.org](https://python.org)
-- **At least one LLM API key** — [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/api-keys) / [Google](https://aistudio.google.com/apikey)
-- **Git** (recommended) — for worktree isolation
-- **Docker** (optional) — for sandbox execution
-- **Lean 4** (optional) — for formal theorem proving
 
 ---
 

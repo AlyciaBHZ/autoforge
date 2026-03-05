@@ -20,6 +20,10 @@
 
 ## 目录
 
+- [快速开始](#快速开始)
+  - [安装](#安装)
+  - [配置 LLM 提供商](#配置-llm-提供商)
+  - [系统要求](#系统要求)
 - [学术与科研能力](#学术与科研能力)
   - [端到端文章推理](#端到端文章推理)
   - [形式化验证与定理证明](#形式化验证与定理证明)
@@ -27,12 +31,71 @@
   - [论文全流程](#论文全流程)
   - [采用的核心技术与灵感来源](#采用的核心技术与灵感来源)
 - [工程能力](#工程能力)
-  - [快速开始](#快速开始)
   - [架构](#架构)
   - [使用方法](#使用方法)
   - [智能引擎](#智能引擎)
-  - [支持的 LLM 提供商](#支持的-llm-提供商)
-- [系统要求](#系统要求)
+
+---
+
+## 快速开始
+
+### 安装
+
+```bash
+pip install forgeai                           # 从 PyPI 安装
+forgeai                                       # 启动交互式会话
+```
+
+首次启动自动引导配置 API Key（Anthropic / OpenAI / Google 任选一家）、GitHub 环境和运行模式。之后直接进入会话，描述项目即开始构建。
+
+<details>
+<summary>可选依赖</summary>
+
+```bash
+pip install "forgeai[openai]"    # OpenAI 支持
+pip install "forgeai[google]"    # Google Gemini 支持
+pip install "forgeai[search]"    # Web 搜索能力
+pip install "forgeai[channels]"  # Telegram / Webhook 频道
+pip install "forgeai[all]"       # 全部安装
+```
+
+</details>
+
+<details>
+<summary>从源码安装（开发者）</summary>
+
+```bash
+git clone https://github.com/AlyciaBHZ/autoforge.git
+cd autoforge
+pip install -e ".[all]"
+```
+
+</details>
+
+### 配置 LLM 提供商
+
+| 提供商 | 环境变量 | 强模型 | 快模型 |
+|--------|----------|--------|--------|
+| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4.6 | Claude Sonnet 4.5 |
+| **OpenAI** | `OPENAI_API_KEY` | Codex 5.3、o3、GPT-4o | o4-mini、GPT-4o-mini |
+| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro | Gemini 2.5 Flash、Gemini 2.0 Flash |
+
+**认证方式：** API Key、Codex OAuth（浏览器登录，使用 ChatGPT 订阅）、Device Code（无头/SSH 环境）、OAuth2 客户端凭证、Azure/LiteLLM Bearer Token、Google ADC/Service Account、AWS Bedrock、Google Vertex AI 均受支持。
+
+也可以通过 `~/.autoforge/config.toml` 统一管理密钥。支持跨厂商混搭：
+
+```bash
+export FORGE_MODEL_STRONG=o3              # 强模型用 OpenAI
+export FORGE_MODEL_FAST=gemini-2.5-flash  # 快模型用 Google
+```
+
+### 系统要求
+
+- **Python 3.11+** — [python.org](https://python.org)
+- **至少一个 LLM API Key** — [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/api-keys) / [Google](https://aistudio.google.com/apikey)
+- **Git**（推荐）— 用于 Worktree 隔离并行开发
+- **Docker**（可选）— 用于沙盒执行
+- **Lean 4**（可选）— 用于形式化定理证明
 
 ---
 
@@ -112,39 +175,6 @@ AutoForge 内置完整的学术科研流水线，可作为 AI 驱动的自主科
 ## 工程能力
 
 AutoForge 同时也是一个全栈代码生成引擎——通过 6 个专业化 AI 智能体协作，经过 5 阶段流水线，将一句自然语言描述转化为完整的代码项目。
-
-### 快速开始
-
-```bash
-pip install forgeai                           # 从 PyPI 安装
-forgeai                                       # 启动交互式会话
-```
-
-首次启动自动引导配置 API Key（Anthropic / OpenAI / Google 任选一家）、GitHub 环境和运行模式。之后直接进入会话，描述项目即开始构建。
-
-<details>
-<summary>可选依赖</summary>
-
-```bash
-pip install "forgeai[openai]"    # OpenAI 支持
-pip install "forgeai[google]"    # Google Gemini 支持
-pip install "forgeai[search]"    # Web 搜索能力
-pip install "forgeai[channels]"  # Telegram / Webhook 频道
-pip install "forgeai[all]"       # 全部安装
-```
-
-</details>
-
-<details>
-<summary>从源码安装（开发者）</summary>
-
-```bash
-git clone https://github.com/AlyciaBHZ/autoforge.git
-cd autoforge
-pip install -e ".[all]"
-```
-
-</details>
 
 ### 架构
 
@@ -226,33 +256,6 @@ AutoForge 内置多个智能引擎，在代码生成全流程中自动协作：
 - **函数级任务分解** — 将复杂需求拆解为可独立验证的函数级子任务
 - **阶段预执行** — 流水线各阶段重叠并行，加速整体构建
 - **达尔文自改写** — 演化式自重写智能体宪法与工作流
-
-### 支持的 LLM 提供商
-
-| 提供商 | 环境变量 | 强模型 | 快模型 |
-|--------|----------|--------|--------|
-| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4.6 | Claude Sonnet 4.5 |
-| **OpenAI** | `OPENAI_API_KEY` | Codex 5.3、o3、GPT-4o | o4-mini、GPT-4o-mini |
-| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro | Gemini 2.5 Flash、Gemini 2.0 Flash |
-
-**认证方式：** API Key、Codex OAuth（浏览器登录，使用 ChatGPT 订阅）、Device Code（无头/SSH 环境）、OAuth2 客户端凭证、Azure/LiteLLM Bearer Token、Google ADC/Service Account、AWS Bedrock、Google Vertex AI 均受支持。
-
-也可以通过 `~/.autoforge/config.toml` 统一管理密钥。支持跨厂商混搭：
-
-```bash
-export FORGE_MODEL_STRONG=o3              # 强模型用 OpenAI
-export FORGE_MODEL_FAST=gemini-2.5-flash  # 快模型用 Google
-```
-
----
-
-## 系统要求
-
-- **Python 3.11+** — [python.org](https://python.org)
-- **至少一个 LLM API Key** — [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/api-keys) / [Google](https://aistudio.google.com/apikey)
-- **Git**（推荐）— 用于 Worktree 隔离并行开发
-- **Docker**（可选）— 用于沙盒执行
-- **Lean 4**（可选）— 用于形式化定理证明
 
 ---
 
