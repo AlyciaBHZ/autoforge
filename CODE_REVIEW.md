@@ -110,6 +110,77 @@ pipes, semicolons. The string `"write"` blocks `grep write` false positives.
 a structured error object. All other agents' parse methods (`reviewer.py:173-177`,
 `tester.py`, etc.) catch `JSONDecodeError` and return a default failure object.
 
+### BUG-13: TOCTOU race condition in LockManager.release()
+
+**`engine/lock_manager.py:71-84`** — Between reading the lock owner and
+unlinking the file, another process can release and re-claim the lock:
+```python
+owner = self._read_owner(lock_path)  # read
+if owner == agent_id:
+    lock_path.unlink()                # delete — but lock may have been re-claimed
+```
+Classic time-of-check-time-of-use race. **Severity: Critical.**
+
+### BUG-14: LockManager task_id path traversal — no sanitization
+
+**`engine/lock_manager.py:44`** — `task_id` used directly in filename:
+```python
+lock_path = self.lock_dir / f"{task_id}.lock"
+```
+A task ID like `../../etc/cron.d/evil` creates a file outside `lock_dir`.
+No `validate_path` call unlike `agent_base.py`. **Severity: Major.**
+
+### BUG-15: `BudgetExceededError` swallowed by agent_base catch-all
+
+**`engine/agent_base.py:378`** — The outermost `except Exception as e` in the
+agent loop catches `BudgetExceededError`, reporting it as a generic failure
+instead of propagating it to the orchestrator for proper handling.
+
+### BUG-16: Checkpoint reset corrupts `files_written_list`
+
+**`engine/agent_base.py:341-356`** — On checkpoint reset, `files_written` counter
+resets to 0 and `last_write_turn` resets to 0, but `files_written_list` (the
+list of file paths) is never cleared. Stale paths from the pre-reset
+conversation feed incorrect data to subsequent checkpoint evaluations.
+
+### BUG-17: UCB1 crashes with `math.log(0)` when parent unvisited
+
+**`engine/search_tree.py:650-651`** — If root node has `visit_count=0`,
+`math.log(parent_visits)` raises `ValueError: math domain error`. The child
+guard (`visit_count == 0 → return inf`) does not protect against zero parent.
+
+### BUG-18: JSON extraction regex `\{.*?\}` breaks on nested objects
+
+**`engine/search_tree.py:455,850`, `engine/checkpoints.py:180`** — The non-greedy
+`\{.*?\}` matches first `{` to first `}`. For `{"key": {"nested": true}}` it
+returns `{"key": {"nested": true}` — invalid JSON. Used in 3+ places.
+
+### BUG-19: `reset_failed` raises raw KeyError unlike sibling methods
+
+**`engine/task_dag.py:155-160`** — `self._tasks[task_id]` raises `KeyError`
+if task doesn't exist. All other methods (lines 129, 135, 143) check and raise
+`ValueError` with a clear message.
+
+### BUG-20: LockManager is fully synchronous in an async codebase
+
+**`engine/lock_manager.py`** — All filesystem operations are synchronous. In an
+async codebase (project convention: "All async"), these block the event loop.
+No `asyncio.to_thread()` wrapper.
+
+### BUG-21: Async HTTP clients never closed — resource leak in daemon mode
+
+**`engine/llm_router.py:227-264`** — `AsyncAnthropic`, `AsyncOpenAI`,
+`genai.Client` are created and cached but never closed. No `close()` or
+`__aexit__` on `LLMRouter`. In long-running daemon mode, connection pools
+accumulate indefinitely.
+
+### BUG-22: `detect_provider` false positive on "o"-prefixed models
+
+**`engine/llm_router.py:128`** — `model_lower.startswith(("o1", "o3", "o4"))`
+matches any model starting with these prefixes (e.g., `o100`, hypothetical
+`opus-4`). The exact-match set `_OPENAI_MODELS` already covers the intended
+models, making the prefix check overly greedy.
+
 ---
 
 ## Design Smells
@@ -142,6 +213,42 @@ of using `config.tools.github_token`.
 
 **`engine/orchestrator.py:762-767`** — Fragile keyword matching to determine
 task type.
+
+### SMELL-8: Tool lookup is O(n) linear scan per call
+
+**`engine/agent_base.py:161-162`** — `_execute_tool` iterates through
+`self._tools` list for every tool call. Should use a dict lookup.
+
+### SMELL-9: Checkpoint evaluator returns "all clear" on failure
+
+**`engine/checkpoints.py:198-203`** — When the LLM checkpoint check fails
+(exception), returns `on_track=True`. A failed safety check should be
+conservative (low score or propagate error), not optimistic.
+
+### SMELL-10: Checkpoints accumulate in memory with no eviction
+
+**`engine/checkpoints.py:104`** — `copy.deepcopy(messages)` called every
+`checkpoint_interval` turns. Messages contain full conversation history. For
+a 25-turn agent, each checkpoint can be megabytes. Never evicted.
+
+### SMELL-11: LockManager cache is computed but never actually used
+
+**`engine/lock_manager.py:127-130`** — `cached_count` is computed then
+immediately discarded by a full filesystem scan. The cache gives a false
+sense of optimization.
+
+### SMELL-12: `TaskDAG` has three confusingly similar completion methods
+
+**`engine/task_dag.py:105-120`** — `is_finished()`, `is_all_done()`,
+`is_complete()` with subtly different semantics. `is_complete` is a
+"backward-compatible alias" that does something different from both others.
+
+### SMELL-13: f-string logging wastes CPU for disabled log levels
+
+Throughout the codebase, `logger.debug(f"...")` interpolates the string
+unconditionally even when DEBUG is disabled. Should use `%`-style:
+`logger.debug("msg: %s", value)`. Affects `agent_base.py:117`,
+`llm_router.py:165`, `search_tree.py:325`, and many more.
 
 ---
 
@@ -179,6 +286,11 @@ a `_register_web_tools()` helper on AgentBase.
 ### DUP-7: `MAX_FILE_SIZE = 2 * 1024 * 1024` defined identically in 2 files
 
 `builder.py:174` and `gardener.py:119` — same constant, defined twice.
+
+### DUP-8: Broken JSON regex `\{.*?\}` duplicated in 3+ files
+
+`search_tree.py:455,850`, `checkpoints.py:180`, plus 7x in agents (BUG-7).
+All use the same broken non-greedy pattern that fails on nested JSON.
 
 ---
 
@@ -220,6 +332,11 @@ Builder has zero. No generic orchestration possible.
 `builder.py:187` returns `"bytes": len(content)`. `gardener.py:136` returns
 only `"status": "ok", "path": rel_path` with no size info.
 
+### INCON-7: `TaskDAG` error style inconsistent — KeyError vs ValueError
+
+`reset_failed()` raises raw `KeyError`, all other methods raise `ValueError`
+with descriptive message.
+
 ### INCON-3: Log levels inconsistent across error paths
 
 - Engine init failure: silent
@@ -249,25 +366,42 @@ only `"status": "ok", "path": rel_path` with no size info.
 
 ## Summary Scores
 
-| Dimension       | Score | Notes                                       |
-|----------------|-------|---------------------------------------------|
-| Architecture   | 3/10  | God Class, feature flag hell                |
-| Type Safety    | 2/10  | 20+ `Any`, `__getattr__` proxy             |
-| Error Handling | 2/10  | 54x `except Exception:`, inconsistent logs  |
-| Security       | 4/10  | Path traversal OK, sandbox blacklist broken |
-| Code Duplication| 2/10 | init waterfall, tool schemas, run templates |
-| Test Quality   | 3/10  | Quantity exists, quality poor               |
-| Maintainability| 2/10  | Adding engine requires 4+ file changes      |
-| Consistency    | 3/10  | Constructors, exceptions, logs all differ   |
+| Dimension       | Score | Notes                                          |
+|----------------|-------|-------------------------------------------------|
+| Architecture   | 3/10  | God Class, feature flag hell                    |
+| Type Safety    | 2/10  | 20+ `Any`, `__getattr__` proxy                  |
+| Error Handling | 2/10  | 54x `except Exception:`, inconsistent logs      |
+| Security       | 3/10  | Path traversal OK, sandbox/lockmanager broken   |
+| Code Duplication| 2/10 | init waterfall, tool schemas, run templates     |
+| Test Quality   | 3/10  | Quantity exists, quality poor                   |
+| Maintainability| 2/10  | Adding engine requires 4+ file changes          |
+| Consistency    | 3/10  | Constructors, exceptions, logs all differ       |
+| Concurrency    | 2/10  | TOCTOU in locks, sync ops in async, no cleanup  |
 
-## Priority Fixes
+**Total bugs found: 22** (3 critical, 10 major, 9 minor)
+**Design smells: 13** | **Duplications: 8** | **Inconsistencies: 7**
 
-1. Fix `LLMRouter._custom_providers` shared mutable class variable
-2. Add `logger.warning` to silent `except Exception:` blocks in `_init_engines`
-3. Pre-initialize all engine attributes to `None` in `__init__`
-4. Replace sandbox blacklist with whitelist or proper sandboxing
-5. Add `UnicodeDecodeError` handling to all agents' `_handle_read_file`
-6. Extract shared tool handlers (`read_file`, `write_file`, `list_files`) into AgentBase or mixin
-7. Extract JSON-from-LLM regex into a single shared utility
-8. Give `DirectorFixAgent` its own ROLE and constitution file
-9. Add type hints to all agent `__init__` parameters
+## Priority Fixes (by severity)
+
+### P0 — Critical (fix immediately)
+1. Fix `LLMRouter._custom_providers` shared mutable class variable (BUG-1)
+2. Fix TOCTOU race in `LockManager.release()` (BUG-13)
+3. Sanitize `task_id` in `LockManager` to prevent path traversal (BUG-14)
+
+### P1 — Major (fix before next release)
+4. Add `logger.warning` to silent `except Exception:` blocks in `_init_engines` (BUG-2)
+5. Pre-initialize all engine attributes to `None` in `__init__` (BUG-3)
+6. Replace sandbox blacklist with whitelist or proper sandboxing (BUG-4)
+7. Fix JSON extraction regex to handle nested objects (BUG-18)
+8. Don't swallow `BudgetExceededError` in `agent_base.py` catch-all (BUG-15)
+9. Add `UnicodeDecodeError` handling to all agents' `_handle_read_file` (BUG-8)
+10. Add `LLMRouter.close()` for async client cleanup (BUG-21)
+11. Guard `math.log(0)` in UCB1 calculation (BUG-17)
+
+### P2 — Refactoring (next sprint)
+12. Extract shared tool handlers into AgentBase or mixin (DUP-4,5,6)
+13. Extract JSON-from-LLM regex into a single shared utility (DUP-8)
+14. Abstract `_init_engines()` pattern into a generic loader (DUP-1)
+15. Give `DirectorFixAgent` its own ROLE and constitution file (BUG-10)
+16. Wrap `LockManager` in async (BUG-20)
+17. Add type hints to all agent `__init__` parameters (INCON-4)
