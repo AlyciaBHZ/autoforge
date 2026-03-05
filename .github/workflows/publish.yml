@@ -18,7 +18,7 @@ on:
           - testpypi
 
 permissions:
-  id-token: write
+  contents: read
 
 jobs:
   build:
@@ -76,12 +76,22 @@ PY
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.repository == 'pypi'
     needs: build
     runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Publish package
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+          PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          TEST_PYPI_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.repository }}" = "testpypi" ]; then
+            : "${TEST_PYPI_TOKEN?Missing TEST_PYPI_API_TOKEN secret}"
+            python -m twine upload --repository-url https://test.pypi.org/legacy/ dist/*
+          else
+            : "${PYPI_TOKEN?Missing PYPI_API_TOKEN secret}"
+            python -m twine upload dist/*
+          fi
