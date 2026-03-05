@@ -456,6 +456,9 @@ autoforgeai deploy <project_id>                # 显示部署指南
 
 支持 systemd (Linux) 和 launchd (macOS) 系统服务安装，详见 `services/` 目录。
 
+消息处理采用统一异步桥接事件模型（normal response / timeout / late response），
+即使超时后晚到消息也会被投递到上层，由业务策略决定如何处理。
+
 ---
 
 ## 许可证
