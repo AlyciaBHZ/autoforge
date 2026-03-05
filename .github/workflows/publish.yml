@@ -39,14 +39,7 @@ jobs:
       - name: Verify tag matches package version
         if: github.event_name == 'push' && startsWith(github.ref_name, 'v')
         run: |
-          VERSION=$(python - <<'PY'
-from tomllib import load
-from pathlib import Path
-
-with Path("pyproject.toml").open("rb") as f:
-    print(load(f)["project"]["version"])
-PY
-          )
+          VERSION=$(python -c "import pathlib, tomllib; print(tomllib.load(pathlib.Path('pyproject.toml').open('rb'))['project']['version'])")
           TAG="${GITHUB_REF_NAME#v}"
           if [ "$TAG" != "$VERSION" ]; then
             echo "Tag $TAG does not match pyproject version $VERSION"
