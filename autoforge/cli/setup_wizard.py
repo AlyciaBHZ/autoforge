@@ -46,10 +46,9 @@ PROVIDERS = {
         "validate": lambda x: x.startswith("sk-") and len(x) > 20,
         "invalid_msg": "Must start with 'sk-' and be at least 20 characters",
         "models_strong": [
-            {"name": "GPT-5.3-Codex (latest code-specialized)", "value": "gpt-5.3-codex"},
-            {"name": "GPT-5.2-Codex (stable code model)", "value": "gpt-5.2-codex"},
+            {"name": "GPT-5.2-Codex (recommended stable code model)", "value": "gpt-5.2-codex"},
+            {"name": "GPT-5.3-Codex (latest, access may vary)", "value": "gpt-5.3-codex"},
             {"name": "GPT-5.2 (latest general model)", "value": "gpt-5.2"},
-            {"name": "Codex 5.3 (alias)", "value": "codex-5.3"},
             {"name": "o3 (strongest reasoning)", "value": "o3"},
             {"name": "GPT-4o (legacy fallback)", "value": "gpt-4o"},
         ],

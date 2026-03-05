@@ -140,6 +140,19 @@ _OPENAI_MODELS = {
     "o1-preview",
 }
 
+_OPENAI_MODEL_ALIASES = {
+    # Historical alias from older AutoForge releases.
+    "codex-5.3": "gpt-5.3-codex",
+}
+
+_OPENAI_MODEL_FALLBACKS = [
+    "gpt-5.2-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5-mini",
+    "gpt-4o-mini",
+    "o4-mini",
+]
+
 
 def detect_provider(model: str) -> str:
     """Detect LLM provider from model name.
@@ -249,6 +262,41 @@ class LLMRouter:
         if model_lower.startswith(("o1", "o3", "o4", "o5", "codex-", "gpt-5")):
             return True
         if "codex" in model_lower:
+            return True
+        return False
+
+    def _canonicalize_openai_model(self, model: str) -> str:
+        """Normalize legacy OpenAI aliases into canonical API model names."""
+        return _OPENAI_MODEL_ALIASES.get(model.lower(), model)
+
+    def _openai_model_candidates(self, model: str) -> list[str]:
+        """Build fallback model candidates for OpenAI model access failures."""
+        candidates: list[str] = []
+        canonical = self._canonicalize_openai_model(model)
+        if canonical:
+            candidates.append(canonical)
+
+        for fallback in _OPENAI_MODEL_FALLBACKS:
+            if fallback not in candidates:
+                candidates.append(fallback)
+        return candidates
+
+    def _is_openai_model_access_error(self, exc: Exception) -> bool:
+        """Return True when OpenAI says the model is unavailable to this account."""
+        status_code = getattr(exc, "status_code", None)
+        body = getattr(exc, "body", None)
+        code = ""
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                code = str(err.get("code", "")).lower()
+
+        text = str(exc).lower()
+        if code == "model_not_found":
+            return True
+        if status_code == 404 and ("model" in text and ("not found" in text or "does not exist" in text)):
+            return True
+        if "do not have access" in text or "does not exist or you do not have access" in text:
             return True
         return False
 
@@ -525,6 +573,8 @@ class LLMRouter:
         if effective_max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
         provider = detect_provider(model)
+        if provider == "openai":
+            model = self._canonicalize_openai_model(model)
         budget_enforced = self._is_budget_enforced(provider)
         reservation = 0.0
         lock = self._get_budget_lock()
@@ -718,16 +768,49 @@ class LLMRouter:
         messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
         temperature: float | None = None,
     ) -> LLMResponse:
-        """Call OpenAI API and normalize the response."""
-        client = self._get_client("openai")
+        """Call OpenAI API and normalize the response with model fallback."""
+        candidates = self._openai_model_candidates(model)
+        last_exc: Exception | None = None
 
-        # OpenAI reasoning/codex models use max_completion_tokens
+        for idx, candidate in enumerate(candidates):
+            try:
+                return await self._call_openai_once(
+                    candidate,
+                    max_tokens,
+                    system,
+                    messages,
+                    tools,
+                    temperature=temperature,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if idx == len(candidates) - 1 or not self._is_openai_model_access_error(exc):
+                    raise
+                logger.warning(
+                    "OpenAI model '%s' is unavailable (%s). Falling back to '%s'.",
+                    candidate,
+                    exc,
+                    candidates[idx + 1],
+                )
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("OpenAI call failed without a concrete exception")
+
+    async def _call_openai_once(
+        self,
+        model: str,
+        max_tokens: int,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        temperature: float | None = None,
+    ) -> LLMResponse:
+        client = self._get_client("openai")
         is_reasoning = self._is_openai_reasoning_model(model)
         token_key = "max_completion_tokens" if is_reasoning else "max_tokens"
 
-        # Convert messages to OpenAI format
         oai_messages = self._messages_to_openai(system, messages, is_reasoning=is_reasoning)
-
         kwargs: dict[str, Any] = {
             "model": model,
             token_key: max_tokens,
@@ -740,19 +823,14 @@ class LLMRouter:
         if tools:
             kwargs["tools"] = self._tools_to_openai(tools)
 
-        raw = await self._retry_with_backoff(
-            lambda: client.chat.completions.create(**kwargs)
-        )
+        raw = await self._retry_with_backoff(lambda: client.chat.completions.create(**kwargs))
         choice = raw.choices[0]
         message = choice.message
 
-        # Normalize response
         content: list[ContentBlock] = []
-
         if message.content:
             content.append(ContentBlock(type="text", text=message.content))
 
-        # Tool calls
         stop_reason = "end_turn"
         if message.tool_calls:
             stop_reason = "tool_use"
@@ -774,7 +852,6 @@ class LLMRouter:
                 input_tokens=raw.usage.prompt_tokens or 0,
                 output_tokens=raw.usage.completion_tokens or 0,
             )
-
         return LLMResponse(content=content, stop_reason=stop_reason, usage=usage)
 
     def _messages_to_openai(

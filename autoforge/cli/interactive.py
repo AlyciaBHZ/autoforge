@@ -97,9 +97,13 @@ def _developer_session(inquirer: Any) -> dict[str, Any]:
         choices=[
             {"name": "Generate a new project", "value": "generate"},
             {"name": "Import & improve an existing project", "value": "import"},
+            {"name": "Configure providers/models", "value": "setup"},
         ],
         default="generate",
     ).execute()
+
+    if action == "setup":
+        return {"action": "setup"}
 
     result: dict[str, Any] = {"action": action}
 
@@ -160,9 +164,13 @@ def _academic_session(inquirer: Any) -> dict[str, Any]:
         choices=[
             {"name": "Generate a research project", "value": "generate"},
             {"name": "Analyze an existing codebase", "value": "review"},
+            {"name": "Configure providers/models", "value": "setup"},
         ],
         default="generate",
     ).execute()
+
+    if action == "setup":
+        return {"action": "setup"}
 
     result: dict[str, Any] = {"action": action}
 
@@ -197,6 +205,17 @@ def _academic_session(inquirer: Any) -> dict[str, Any]:
 
 def _verification_session(inquirer: Any) -> dict[str, Any]:
     """Verification mode: review and verify existing codebases."""
+    action = inquirer.select(
+        message="What would you like to do?",
+        choices=[
+            {"name": "Review current workspace", "value": "review"},
+            {"name": "Configure providers/models", "value": "setup"},
+        ],
+        default="review",
+    ).execute()
+    if action == "setup":
+        return {"action": "setup"}
+
     project_path = _current_workspace_path()
     console.print(f"[dim]Using current workspace: {project_path}[/dim]")
 

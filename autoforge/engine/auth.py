@@ -19,14 +19,80 @@ import hashlib
 import logging
 import os
 import secrets
+import sys
 import time
 import base64
 import urllib.parse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _persist_openai_auth_tokens(
+    auth_method: str,
+    access_token: str,
+    refresh_token: str,
+    expires_at: float,
+) -> None:
+    """Persist OpenAI subscription auth tokens into ~/.autoforge/config.toml."""
+    if not access_token:
+        return
+
+    config_dir = Path.home() / ".autoforge"
+    config_file = config_dir / "config.toml"
+
+    data: dict[str, Any] = {}
+    if config_file.exists():
+        try:
+            content = config_file.read_text(encoding="utf-8")
+            if content.strip():
+                if sys.version_info >= (3, 11):
+                    import tomllib
+                else:
+                    import tomli as tomllib  # type: ignore[no-redef]
+                parsed = tomllib.loads(content)
+                if isinstance(parsed, dict):
+                    data = parsed
+        except Exception as exc:
+            logger.debug("Could not parse existing config.toml before token persist: %s", exc)
+
+    auth_section = data.get("auth")
+    if not isinstance(auth_section, dict):
+        auth_section = {}
+        data["auth"] = auth_section
+
+    openai_section = auth_section.get("openai")
+    if not isinstance(openai_section, dict):
+        openai_section = {}
+        auth_section["openai"] = openai_section
+
+    openai_section["auth_method"] = auth_method
+    openai_section["access_token"] = access_token
+    if refresh_token:
+        openai_section["refresh_token"] = refresh_token
+    elif "refresh_token" in openai_section:
+        openai_section.pop("refresh_token", None)
+    if expires_at and expires_at > 0:
+        openai_section["expires_at"] = float(expires_at)
+    elif "expires_at" in openai_section:
+        openai_section.pop("expires_at", None)
+
+    try:
+        import tomli_w
+    except ImportError:
+        logger.warning("tomli_w is not available; skipping OpenAI token persistence")
+        return
+
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(tomli_w.dumps(data), encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(config_file, 0o600)
+    except Exception as exc:
+        logger.warning("Failed to persist OpenAI auth tokens: %s", exc)
 
 
 # ── Token result ──────────────────────────────────────────────────
@@ -396,6 +462,12 @@ class CodexOAuthAuth(AuthProvider):
             self._refresh_token = body["refresh_token"]
         expires_in = body.get("expires_in", 3600)
         self._expires_at = time.time() + expires_in
+        _persist_openai_auth_tokens(
+            auth_method="codex_oauth",
+            access_token=self._access_token,
+            refresh_token=self._refresh_token,
+            expires_at=self._expires_at,
+        )
 
         logger.info(f"Codex OAuth token refreshed, expires in {expires_in}s")
         return TokenResult(
@@ -531,6 +603,12 @@ class CodexOAuthAuth(AuthProvider):
         self._refresh_token = body.get("refresh_token", "")
         expires_in = body.get("expires_in", 3600)
         self._expires_at = time.time() + expires_in
+        _persist_openai_auth_tokens(
+            auth_method="codex_oauth",
+            access_token=self._access_token,
+            refresh_token=self._refresh_token,
+            expires_at=self._expires_at,
+        )
 
         logger.info(f"Codex OAuth login successful, token expires in {expires_in}s")
         return TokenResult(
@@ -611,6 +689,12 @@ class DeviceCodeAuth(AuthProvider):
             self._refresh_token = body["refresh_token"]
         expires_in = body.get("expires_in", 3600)
         self._expires_at = time.time() + expires_in
+        _persist_openai_auth_tokens(
+            auth_method="device_code",
+            access_token=self._access_token,
+            refresh_token=self._refresh_token,
+            expires_at=self._expires_at,
+        )
 
         logger.info(f"Device code token refreshed, expires in {expires_in}s")
         return TokenResult(
@@ -666,6 +750,12 @@ class DeviceCodeAuth(AuthProvider):
                     self._refresh_token = token_body.get("refresh_token", "")
                     tok_expires = token_body.get("expires_in", 3600)
                     self._expires_at = time.time() + tok_expires
+                    _persist_openai_auth_tokens(
+                        auth_method="device_code",
+                        access_token=self._access_token,
+                        refresh_token=self._refresh_token,
+                        expires_at=self._expires_at,
+                    )
                     logger.info("Device code login successful")
                     console.print("[green]Login successful![/green]")
                     return TokenResult(
@@ -701,6 +791,13 @@ class DeviceCodeAuth(AuthProvider):
 
 
 # ── Factory ───────────────────────────────────────────────────────
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def create_auth_provider(
@@ -768,6 +865,7 @@ def create_auth_provider(
         return CodexOAuthAuth(
             access_token=config.get("access_token", ""),
             refresh_token=config.get("refresh_token", ""),
+            expires_at=_as_float(config.get("expires_at", 0.0)),
         )
 
     # Device Code flow
@@ -775,6 +873,7 @@ def create_auth_provider(
         return DeviceCodeAuth(
             access_token=config.get("access_token", ""),
             refresh_token=config.get("refresh_token", ""),
+            expires_at=_as_float(config.get("expires_at", 0.0)),
         )
 
     # Unknown method — fallback with warning

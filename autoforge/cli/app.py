@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import inspect
 import json
 import logging
 import os
@@ -341,6 +342,22 @@ def _build_config_overrides(args: argparse.Namespace) -> dict:
     return overrides
 
 
+async def _close_orchestrator_llm(orchestrator: Any) -> None:
+    """Best-effort close of LLM client pools for interactive asyncio.run loops."""
+    llm = getattr(orchestrator, "llm", None)
+    if llm is None:
+        return
+    close_fn = getattr(llm, "close", None)
+    if close_fn is None:
+        return
+    try:
+        result = close_fn()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logging.getLogger(__name__).debug("Failed to close orchestrator LLM clients", exc_info=True)
+
+
 async def _run_generate(config, description: str) -> int:
     """Run the generate pipeline."""
     from autoforge.cli.display import show_startup_info
@@ -369,6 +386,8 @@ async def _run_generate(config, description: str) -> int:
         console.print(f"\n[red]Error:[/red] {e}")
         logging.getLogger(__name__).debug("Full traceback:", exc_info=True)
         return 1
+    finally:
+        await _close_orchestrator_llm(orchestrator)
 
 
 async def _run_review(config, project_path: str) -> int:
@@ -403,6 +422,8 @@ async def _run_review(config, project_path: str) -> int:
         console.print(f"\n[red]Error:[/red] {e}")
         logging.getLogger(__name__).debug("Full traceback:", exc_info=True)
         return 1
+    finally:
+        await _close_orchestrator_llm(orchestrator)
 
 
 async def _run_import(config, project_path: str, enhance: str = "") -> int:
@@ -438,6 +459,8 @@ async def _run_import(config, project_path: str, enhance: str = "") -> int:
         console.print(f"\n[red]Error:[/red] {e}")
         logging.getLogger(__name__).debug("Full traceback:", exc_info=True)
         return 1
+    finally:
+        await _close_orchestrator_llm(orchestrator)
 
 
 def _default_cli_requester() -> str:
@@ -986,6 +1009,8 @@ async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
                 failure_reasons.append(f"generation failed: {exc}")
                 console.print(f"[red]Generation failed:[/red] {exc}")
                 exit_code = 1
+            finally:
+                await _close_orchestrator_llm(orchestrator)
 
     manifest = build_run_manifest(
         run_id=f"{config.run_id}-{paper.note_id}",
@@ -1231,6 +1256,8 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
         except Exception as e:
             console.print(f"[red]Resume failed:[/red] {e}")
             return 1
+        finally:
+            await _close_orchestrator_llm(orchestrator)
 
     elif args.command == "daemon":
         action = getattr(args, "daemon_action", "")

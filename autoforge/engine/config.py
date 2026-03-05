@@ -422,6 +422,14 @@ class ForgeConfig:
         if not self.run_id:
             self.run_id = uuid.uuid4().hex[:12]
 
+        # Normalize legacy OpenAI aliases from older config files.
+        legacy_aliases = {"codex-5.3": "gpt-5.3-codex"}
+        for attr in ("model_strong", "model_fast"):
+            model_name = str(getattr(self, attr, "")).strip()
+            canonical = legacy_aliases.get(model_name.lower())
+            if canonical:
+                setattr(self, attr, canonical)
+
         # Warn (but don't block) if model names don't match known patterns
         logger = logging.getLogger(__name__)
         for label, model_name in (
