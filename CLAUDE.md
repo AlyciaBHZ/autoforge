@@ -133,7 +133,7 @@ scripts/git_sync.py         Automated git merge/cherry-pick workflow tool
 
 ## Coding Conventions
 
-- Python 3.11+ with `from __future__ import annotations`
+- Python 3.10+ with `from __future__ import annotations`
 - All async — use `async/await` and `asyncio` throughout
 - Type hints on all function signatures
 - `pathlib.Path` for all file paths (never string concatenation)

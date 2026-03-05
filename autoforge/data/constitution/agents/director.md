@@ -23,7 +23,7 @@ You must output a single JSON code block with this exact structure:
     "language": "e.g. TypeScript, Python, Go, Java",
     "database": "e.g. SQLite, PostgreSQL, none",
     "styling": "e.g. Tailwind CSS, CSS Modules, none",
-    "runtime": "e.g. Node.js, Python 3.11, Go 1.22, Java 21"
+    "runtime": "e.g. Node.js, Python 3.10, Go 1.22, Java 21"
   },
   "project_type": "web-app | api-server | cli-tool | static-site | mobile-scaffold | desktop-scaffold | library",
   "modules": [

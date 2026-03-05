@@ -675,14 +675,14 @@ def test_all_agents_instantiate():
         d = DirectorAgent(config, llm)
         assert d.ROLE == "director" and len(d._tools) == 4  # search_web + fetch_url + search_github + inspect_repo
         df = DirectorFixAgent(config, llm)
-        assert df.ROLE == "director"
+        assert df.ROLE == "director_fix"
         a = ArchitectAgent(config, llm)
         assert a.ROLE == "architect" and len(a._tools) == 5  # read_template + search_web + fetch_url + search_github + inspect_repo
         sb = SubprocessSandbox(wd)
         b = BuilderAgent(config, llm, working_dir=wd, sandbox=sb)
         assert b.ROLE == "builder" and len(b._tools) == 7  # write/read/list/run + grep_search + fetch_url + search_github
         r = ReviewerAgent(config, llm, working_dir=wd)
-        assert r.ROLE == "reviewer" and len(r._tools) == 2
+        assert r.ROLE == "reviewer" and len(r._tools) == 4  # read/list/run_check + grep_search
         t = TesterAgent(config, llm, working_dir=wd, sandbox=sb)
         assert t.ROLE == "tester" and len(t._tools) == 2
         g = GardenerAgent(config, llm, working_dir=wd)
@@ -1129,7 +1129,7 @@ def test_paper_repro_signals_and_simulation():
     assert "checklist" in plan and len(plan["checklist"]) >= 1
 
     env = build_environment_spec(paper, signals)
-    assert env["python"] == "3.11"
+    assert env["python"] == "3.10"
     dep_names = {d["name"] for d in env["dependencies"]}
     assert "torch" not in dep_names
     assert env["profile"] == "theory-first"

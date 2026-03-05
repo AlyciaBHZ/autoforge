@@ -6,9 +6,9 @@ echo ""
 
 # ── Check Python ──
 PYTHON_CMD=""
-for cmd in python3.12 python3.11 python3; do
+for cmd in python3.12 python3.11 python3.10 python3; do
     if command -v "$cmd" &>/dev/null; then
-        if "$cmd" -c "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)" 2>/dev/null; then
+        if "$cmd" -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
             PYTHON_CMD="$cmd"
             break
         fi
@@ -16,7 +16,7 @@ for cmd in python3.12 python3.11 python3; do
 done
 
 if [ -z "$PYTHON_CMD" ]; then
-    echo "Error: Python 3.11+ required"
+    echo "Error: Python 3.10+ required"
     echo "Install from: https://python.org"
     exit 1
 fi

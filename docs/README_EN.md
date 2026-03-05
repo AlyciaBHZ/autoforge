@@ -9,7 +9,7 @@
 
 **AI Multi-Agent Framework — Autonomous Research Reasoning · Formal Proving · Full-Stack Project Generation**
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](../LICENSE)
 [![Tests](https://img.shields.io/badge/tests-217%20checks-brightgreen.svg)](../tests/)
 [![Engines](https://img.shields.io/badge/engines-47%20modules-orange.svg)](../autoforge/engine/)
@@ -128,7 +128,7 @@ export FORGE_MODEL_FAST=gemini-2.5-flash  # Fast model from Google
 
 ### Requirements
 
-- **Python 3.11+** — [python.org](https://python.org)
+- **Python 3.10+** — [python.org](https://python.org)
 - **At least one LLM API key** — [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/api-keys) / [Google](https://aistudio.google.com/apikey)
 - **Git** (recommended) — for worktree isolation in parallel builds
 - **Docker** (optional) — for sandbox execution

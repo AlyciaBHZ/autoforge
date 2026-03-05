@@ -69,7 +69,7 @@ tests/smoke_test.py         31-check smoke test (no API key needed)
 
 ## Coding Standards
 
-- Python 3.11+, `from __future__ import annotations`
+- Python 3.10+, `from __future__ import annotations`
 - Fully async (`async/await`, `asyncio`)
 - Type hints on all signatures
 - `pathlib.Path` for file paths

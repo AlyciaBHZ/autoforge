@@ -9,7 +9,7 @@ set "PYTHON_CMD="
 for %%P in (python3 python) do (
     where %%P >nul 2>&1
     if !errorlevel! equ 0 (
-        %%P -c "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)" 2>nul
+        %%P -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>nul
         if !errorlevel! equ 0 (
             set "PYTHON_CMD=%%P"
             goto :found_python
@@ -17,7 +17,7 @@ for %%P in (python3 python) do (
     )
 )
 
-echo Error: Python 3.11+ required
+echo Error: Python 3.10+ required
 echo Install from: https://python.org
 echo Make sure to check "Add Python to PATH" during installation
 exit /b 1

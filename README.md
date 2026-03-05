@@ -9,7 +9,7 @@
 
 **AI 多智能体框架 — 自主科研推理 · 形式化证明 · 全栈项目生成**
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-217%20checks-brightgreen.svg)](tests/)
 [![Engines](https://img.shields.io/badge/engines-47%20modules-orange.svg)](autoforge/engine/)
@@ -129,7 +129,7 @@ export FORGE_MODEL_FAST=gemini-2.5-flash  # 快模型用 Google
 
 ### 系统要求
 
-- **Python 3.11+** — [python.org](https://python.org)
+- **Python 3.10+** — [python.org](https://python.org)
 - **至少一个 LLM API Key** — [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/api-keys) / [Google](https://aistudio.google.com/apikey)
 - **Git**（推荐）— 用于 Worktree 隔离并行构建
 - **Docker**（可选）— 用于沙盒执行

@@ -613,7 +613,7 @@ def build_environment_spec(
 ) -> dict[str, Any]:
     """Create a reproducibility-oriented environment spec."""
     base_deps = [
-        {"name": "python", "version": "3.11"},
+        {"name": "python", "version": "3.10"},
         {"name": "numpy", "version": "1.26.*"},
         {"name": "sympy", "version": "1.12.*"},
         {"name": "networkx", "version": "3.3.*"},
@@ -653,7 +653,7 @@ def build_environment_spec(
     return {
         "paper_title": paper.title,
         "note_id": paper.note_id,
-        "python": "3.11",
+        "python": "3.10",
         "profile": "theory-first" if theory_first else "general",
         "install_policy": install_policy,
         "platform": platform,

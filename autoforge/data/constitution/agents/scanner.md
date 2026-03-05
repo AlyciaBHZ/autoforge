@@ -38,7 +38,7 @@ Output a single JSON code block matching the standard AutoForge spec format:
     "language": "e.g. TypeScript, Python",
     "database": "e.g. SQLite, PostgreSQL, none",
     "styling": "e.g. Tailwind CSS, none",
-    "runtime": "e.g. Node.js, Python 3.11"
+    "runtime": "e.g. Node.js, Python 3.10"
   },
   "project_type": "web-app | api-server | cli-tool | static-site | mobile-scaffold | desktop-scaffold | library",
   "modules": [
