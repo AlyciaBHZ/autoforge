@@ -141,8 +141,17 @@ class TesterAgent(FileToolsMixin, AgentBase):
         _fail = TestResults(all_passed=False, summary="Could not parse test results — treating as failure")
 
         from autoforge.engine.utils import extract_json_from_text
+        schema = {
+            "type": "object",
+            "required": ["all_passed"],
+            "properties": {
+                "all_passed": {"type": "boolean"},
+                "summary": {"type": "string"},
+                "results": {"type": "array", "items": {"type": "object"}},
+            },
+        }
         try:
-            data = extract_json_from_text(output)
+            data = extract_json_from_text(output, schema=schema, strict=True)
         except ValueError as e:
             logger.warning("Could not find JSON in test output: %s", e)
             return _fail

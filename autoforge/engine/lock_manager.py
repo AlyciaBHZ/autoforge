@@ -245,3 +245,17 @@ class LockManager:
                 continue
         self._lock_cache.clear()
         logger.info("All locks cleared")
+
+    def clear_stale(self, max_age_seconds: int = 3600) -> None:
+        """Clear stale locks older than *max_age_seconds*.
+
+        This is used for best-effort recovery after interrupted runs without
+        disrupting active locks belonging to other workers.
+        """
+        for lock_file in self.lock_dir.glob("*.lock"):
+            try:
+                if self._is_stale(lock_file, max_age_seconds):
+                    lock_file.unlink(missing_ok=True)
+                    self._lock_cache.pop(lock_file.stem, None)
+            except OSError:
+                continue

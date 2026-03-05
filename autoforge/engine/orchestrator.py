@@ -1,4 +1,4 @@
-"""Orchestrator — the brain of AutoForge.
+﻿"""Orchestrator — the brain of AutoForge.
 
 Supports three pipelines:
   - Generate:  SPEC → BUILD → VERIFY → REFACTOR → DELIVER
@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from autoforge.engine.llm_router import BudgetExceededError, LLMRouter
 from autoforge.engine.lock_manager import LockManager
 from autoforge.engine.sandbox import SandboxBase, create_sandbox
 from autoforge.engine.task_dag import Task, TaskDAG, TaskPhase, TaskStatus
+from autoforge.engine.utils import count_tokens, truncate_text_to_token_budget
 
 # Agents — loaded via registry (no direct class imports needed at module level)
 from autoforge.engine.agents import AGENT_REGISTRY
@@ -112,6 +114,11 @@ class Orchestrator:
         # Adaptive context budget tracking
         self._context_budget_multiplier: float = 1.0
         self._context_success_history: list[bool] = []
+        self._dependency_prepared_dirs: set[str] = set()
+        self._dependency_state_lock = asyncio.Lock()
+        self._state_lock = threading.RLock()
+        self._task_transition_log: list[dict[str, Any]] = []
+        self._resumed_task_progress: list[dict[str, Any]] | None = None
 
         # ── Lazy-initialized advanced engines ──
         # Pre-initialize ALL engine attributes to None so they always exist,
@@ -308,6 +315,9 @@ class Orchestrator:
 
             # Integration check: verify cross-module imports before full test
             await self._integration_check()
+
+            # Dependency setup before verification: install dependencies for runtime/test tools.
+            await self._prepare_runtime_dependencies(self.project_dir)
 
             # Phase 3: VERIFY
             console.print("\n[bold blue]Phase 3: VERIFY[/bold blue] — Verifying project...")
@@ -596,54 +606,79 @@ class Orchestrator:
     # ──────────────────────────────────────────────
 
     async def _phase_build(self) -> None:
-        # Step 1: Architect designs and creates task DAG
-        console.print("  Designing architecture...")
-        architect = self._agent("architect", self.config, self.llm)
+        # Resume from persisted task plan if available.
+        dev_plan_file = self.project_dir / "dev_plan.json"
+        if dev_plan_file.exists():
+            try:
+                loaded = TaskDAG.load(dev_plan_file)
+                self._normalize_dag_for_resume(
+                    loaded,
+                    task_progress=self._resumed_task_progress,
+                )
+                self._resumed_task_progress = None
+                self.dag = loaded
+                console.print("  [cyan]Build:[/cyan] loaded existing dev_plan.json")
+            except Exception as e:
+                logger.warning("Failed to load existing dev_plan.json: %s", e)
+                self.dag = None
 
-        # Inject dynamic constitution into architect
-        if self._dynamic_constitution:
-            supplement = self._dynamic_constitution.build_supplementary_prompt("architect")
-            if supplement:
-                architect.set_dynamic_constitution(supplement)
+        if self.dag is None:
+            # Step 1: Architect designs and creates task DAG
+            console.print("  Designing architecture...")
+            architect = self._agent("architect", self.config, self.llm)
 
-        # Optionally use search tree for architecture exploration
-        if getattr(self.config, "search_tree_enabled", False):
-            arch_data = await self._explore_architectures(architect)
-        else:
-            arch_result = await architect.run({"spec": self.spec})
-            if not arch_result.success:
-                raise RuntimeError(f"Architect failed: {arch_result.error}")
-            arch_data = architect.parse_architecture(arch_result.output)
+            # Inject dynamic constitution into architect
+            if self._dynamic_constitution:
+                supplement = self._dynamic_constitution.build_supplementary_prompt("architect")
+                if supplement:
+                    architect.set_dynamic_constitution(supplement)
 
-        self.architecture = arch_data.get("architecture", {})
-        tasks_data = arch_data.get("tasks", [])
+            # Optionally use search tree for architecture exploration
+            if getattr(self.config, "search_tree_enabled", False):
+                arch_data = await self._explore_architectures(architect)
+            else:
+                arch_result = await architect.run({"spec": self.spec})
+                if not arch_result.success:
+                    raise RuntimeError(f"Architect failed: {arch_result.error}")
+                arch_data = architect.parse_architecture(arch_result.output)
 
-        if not tasks_data:
-            # Fallback: create a simple task per module
-            logger.warning("Architect produced no tasks, creating from modules")
-            tasks_data = self._tasks_from_modules()
+            self.architecture = arch_data.get("architecture", {})
+            tasks_data = arch_data.get("tasks", [])
 
-        # Enforce build contract task cap
-        contract = self.spec.get("build_contract", {})
-        max_tasks = contract.get("stop_conditions", {}).get("max_tasks", 15)
-        if len(tasks_data) > max_tasks:
-            console.print(
-                f"  [yellow]Task cap:[/yellow] Architect produced {len(tasks_data)} tasks, "
-                f"trimming to contract limit of {max_tasks}"
+            if not tasks_data:
+                # Fallback: create a simple task per module
+                logger.warning("Architect produced no tasks, creating from modules")
+                tasks_data = self._tasks_from_modules()
+
+            # Enforce build contract task cap
+            contract = self.spec.get("build_contract", {})
+            max_tasks = contract.get("stop_conditions", {}).get("max_tasks", 15)
+            if len(tasks_data) > max_tasks:
+                console.print(
+                    f"  [yellow]Task cap:[/yellow] Architect produced {len(tasks_data)} tasks, "
+                    f"trimming to contract limit of {max_tasks}"
+                )
+                tasks_data = tasks_data[:max_tasks]
+
+            self.dag = TaskDAG.from_dict(tasks_data)
+            console.print(f"  [green]Task DAG:[/green] {self.dag.total_tasks()} tasks created")
+
+            (self.project_dir / "architecture.md").write_text(
+                json.dumps(self.architecture, indent=2, ensure_ascii=False), encoding="utf-8"
             )
-            tasks_data = tasks_data[:max_tasks]
+            self._persist_build_plan()
 
-        self.dag = TaskDAG.from_dict(tasks_data)
-        console.print(f"  [green]Task DAG:[/green] {self.dag.total_tasks()} tasks created")
+        if not self.dag.has_pending_tasks(TaskPhase.BUILD):
+            console.print("  [green]Build:[/green] all tasks already completed")
+            return
 
-        # Save architecture and DAG
-        (self.project_dir / "architecture.md").write_text(
-            json.dumps(self.architecture, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        self.dag.save(self.project_dir / "dev_plan.json")
-        (self.project_dir / "DEV_PLAN.md").write_text(
-            self.dag.to_markdown(), encoding="utf-8"
-        )
+        if not self.architecture and (self.project_dir / "architecture.md").exists():
+            try:
+                self.architecture = json.loads(
+                    (self.project_dir / "architecture.md").read_text(encoding="utf-8")
+                )
+            except Exception:
+                logger.debug("Could not hydrate architecture from architecture.md during resume")
 
         # Step 2: Initialize git repo (if git is available)
         git: GitManager | None = None
@@ -691,6 +726,178 @@ class Orchestrator:
                 "acceptance_criteria": f"All files for {module['name']} module created and functional",
             })
         return tasks
+
+    def _normalize_dag_for_resume(
+        self,
+        dag: TaskDAG,
+        task_progress: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Normalize a resumed DAG before re-running BUILD."""
+        self.dag = dag
+        self._apply_task_progress_snapshot(dag, task_progress or [])
+        for task in dag.get_all_tasks():
+            if task.status == TaskStatus.IN_PROGRESS:
+                task.status = TaskStatus.TODO
+                task.claimed_by = None
+                if task.result:
+                    task.result = f"{task.result} (interrupted)"
+                else:
+                    task.result = "Reset from interrupted run"
+
+            if task.status == TaskStatus.FAILED and task.retry_count >= 3:
+                task.status = TaskStatus.BLOCKED
+
+        try:
+            dag.validate()
+        except ValueError as e:
+            logger.warning("Loaded dev_plan.json requires normalization: %s", e)
+
+    def _task_progress_snapshot(self) -> list[dict[str, Any]]:
+        if not self.dag:
+            return []
+        return [
+            {
+                "id": t.id,
+                "phase": t.phase.value,
+                "status": t.status.value,
+                "claimed_by": t.claimed_by,
+                "retry_count": t.retry_count,
+                "result": t.result,
+            }
+            for t in self.dag.get_all_tasks()
+        ]
+
+    def _record_task_transition(
+        self,
+        task_id: str,
+        from_status: str,
+        to_status: str,
+        reason: str,
+        agent_id: str | None = None,
+    ) -> None:
+        self._task_transition_log.append({
+            "ts": time.time(),
+            "task_id": task_id,
+            "from_status": from_status,
+            "to_status": to_status,
+            "reason": reason,
+            "agent_id": agent_id,
+        })
+        if len(self._task_transition_log) > 2000:
+            self._task_transition_log = self._task_transition_log[-2000:]
+
+    def _apply_task_progress_snapshot(
+        self, dag: TaskDAG, snapshot: list[dict[str, Any]] | None
+    ) -> None:
+        if not snapshot:
+            return
+        by_id = {item.get("id"): item for item in snapshot if isinstance(item, dict)}
+        for task in dag.get_all_tasks():
+            item = by_id.get(task.id)
+            if not isinstance(item, dict):
+                continue
+            status = item.get("status")
+            if isinstance(status, str):
+                try:
+                    task.status = TaskStatus(status)
+                except ValueError:
+                    pass
+            claimed_by = item.get("claimed_by")
+            if claimed_by is not None:
+                task.claimed_by = claimed_by
+            if isinstance(item.get("retry_count"), int):
+                task.retry_count = item["retry_count"]
+            result = item.get("result")
+            if result is not None:
+                task.result = str(result)
+
+    def _persist_build_plan(self) -> None:
+        if not self.dag or not self.project_dir:
+            return
+        with self._state_lock:
+            plan_file = self.project_dir / "dev_plan.json"
+            md_file = self.project_dir / "DEV_PLAN.md"
+            try:
+                self.dag.save(plan_file)
+                md_file.write_text(self.dag.to_markdown(), encoding="utf-8")
+            except OSError as exc:
+                logger.error("Failed to persist build plan: %s", exc)
+
+    def _mark_task_in_progress(self, task_id: str, agent_id: str) -> None:
+        if not self.dag:
+            return
+        with self._state_lock:
+            task = self.dag.get_task(task_id)
+            if task is None:
+                return
+            previous = task.status.value
+            self.dag.mark_in_progress(task_id, agent_id)
+            self._record_task_transition(
+                task_id,
+                previous,
+                TaskStatus.IN_PROGRESS.value,
+                "task_started",
+                agent_id=agent_id,
+            )
+            self._persist_build_plan()
+            self._save_state("build_in_progress")
+
+    def _mark_task_done(self, task_id: str, result: str) -> None:
+        if not self.dag:
+            return
+        with self._state_lock:
+            task = self.dag.get_task(task_id)
+            if task is None:
+                return
+            previous = task.status.value
+            self.dag.mark_done(task_id, result)
+            self._record_task_transition(
+                task_id,
+                previous,
+                TaskStatus.DONE.value,
+                "task_completed",
+            )
+            self._persist_build_plan()
+            self._save_state("build_in_progress")
+
+    def _mark_task_failed(self, task_id: str, error: str) -> None:
+        if not self.dag:
+            return
+        with self._state_lock:
+            task = self.dag.get_task(task_id)
+            if task is None:
+                return
+            previous = task.status.value
+            self.dag.mark_failed(task_id, error)
+            to_status = task.status.value
+            self._record_task_transition(
+                task_id,
+                previous,
+                to_status,
+                error[:200] if error else "task_failed",
+            )
+            self._persist_build_plan()
+            self._save_state("build_in_progress")
+
+    def _mark_task_blocked(self, task_id: str, reason: str) -> None:
+        if not self.dag:
+            return
+        with self._state_lock:
+            task = self.dag.get_task(task_id)
+            if task is None:
+                return
+            previous = task.status.value
+            task.status = TaskStatus.BLOCKED
+            task.result = reason
+            task.claimed_by = None
+            self._record_task_transition(
+                task_id,
+                previous,
+                TaskStatus.BLOCKED.value,
+                reason,
+            )
+            self._persist_build_plan()
+            self._save_state("build_in_progress")
 
     def _compute_context_shares(self, task_description: str) -> dict[str, float]:
         """Compute dynamic context source shares based on task characteristics.
@@ -816,9 +1023,10 @@ class Orchestrator:
                                     f"Task {task.id} failed {task_fail_counts[task.id]} times — "
                                     f"marking as permanently blocked"
                                 )
-                                task.status = TaskStatus.BLOCKED
+                                self._mark_task_blocked(task.id, "Blocked after repeated retries")
                             else:
                                 self.dag.reset_failed(task.id)
+                                self._persist_build_plan()
                                 all_salvageable = True
 
                     if not all_salvageable:
@@ -848,7 +1056,7 @@ class Orchestrator:
                     continue
 
                 if lock_manager.try_claim(task.id, agent_id):
-                    self.dag.mark_in_progress(task.id, agent_id)
+                    self._mark_task_in_progress(task.id, agent_id)
                     console.print(f"  [{agent_id}] Building: {task.id} — {task.description[:60]}")
 
                     # Track active files for overlap detection
@@ -888,10 +1096,7 @@ class Orchestrator:
             await asyncio.gather(*active_tasks.values())
 
         # Update DEV_PLAN
-        self.dag.save(self.project_dir / "dev_plan.json")
-        (self.project_dir / "DEV_PLAN.md").write_text(
-            self.dag.to_markdown(), encoding="utf-8"
-        )
+        self._persist_build_plan()
 
     async def _build_single_task(
         self,
@@ -967,24 +1172,40 @@ class Orchestrator:
                 goal_multiplier = 1.3
 
             # Compute adaptive base budget
-            base_budget_chars = self.config.context_budget_tokens * 4  # ~4 chars/token
-            budget_chars = int(base_budget_chars * difficulty_multiplier * self._context_budget_multiplier * goal_multiplier)
-            used_chars = 0
+            base_budget_tokens = self.config.context_budget_tokens
+            budget_tokens = max(
+                512,
+                int(base_budget_tokens * difficulty_multiplier * self._context_budget_multiplier * goal_multiplier),
+            )
+            used_tokens = 0
             context_parts: list[tuple[str, str]] = []  # (label, text)
 
             def _budget_remaining() -> int:
-                return max(0, budget_chars - used_chars)
+                return max(0, budget_tokens - used_tokens)
 
             def _add_context(label: str, text: str | None, max_share: float = 0.3) -> None:
-                nonlocal used_chars
+                nonlocal used_tokens
                 if not text:
                     return
-                cap = min(len(text), int(budget_chars * max_share), _budget_remaining())
-                if cap <= 0:
+                remaining = _budget_remaining()
+                if remaining <= 0:
                     return
-                trimmed = text[:cap]
+                share_budget = max(1, int(budget_tokens * max_share))
+                target_tokens = min(remaining, share_budget)
+                trimmed = truncate_text_to_token_budget(
+                    text,
+                    target_tokens,
+                    preserve_code_blocks=True,
+                )
+                if not trimmed:
+                    return
+                part_tokens = count_tokens(trimmed)
+                if part_tokens <= 0:
+                    return
+                if part_tokens > remaining:
+                    return
                 context_parts.append((label, trimmed))
-                used_chars += len(trimmed)
+                used_tokens += part_tokens
 
             # Get dynamic source shares based on task type
             dynamic_shares = self._compute_context_shares(task.description)
@@ -1033,14 +1254,14 @@ class Orchestrator:
 
             # P5: CapabilityDAG (universal knowledge graph)
             if self._dag_bridge is not None:
-                dag_budget = min(1500, _budget_remaining() // 4)
+                dag_budget = min(1200, _budget_remaining())
                 dag_context = self._dag_bridge.build_context(task.description, max_tokens=dag_budget)
                 _add_context("dag", dag_context, max_share=dynamic_shares.get("dag", 0.20))
 
             # P6: Theoretical reasoning (cross-domain theory knowledge)
             if self.config.theoretical_reasoning_enabled and self._theoretical_reasoning is not None and self._theoretical_reasoning._theories:
                 theory_context = self._build_theory_context(
-                    task.description, max_tokens=min(1000, _budget_remaining() // 4),
+                    task.description, max_tokens=min(1000, _budget_remaining()),
                 )
                 _add_context("theory", theory_context, max_share=dynamic_shares.get("theory", 0.15))
 
@@ -1049,7 +1270,7 @@ class Orchestrator:
                 combined = "\n".join(text for _, text in context_parts)
                 builder.set_dynamic_constitution(combined)
                 logger.debug(
-                    f"[ContextBudget] {agent_id}: {used_chars}/{budget_chars} chars "
+                    f"[ContextBudget] {agent_id}: {used_tokens}/{budget_tokens} tokens "
                     f"(difficulty={difficulty_level}×{difficulty_multiplier}, "
                     f"learn_mult={self._context_budget_multiplier:.2f}, "
                     f"{len(context_parts)} sources: "
@@ -1068,7 +1289,11 @@ class Orchestrator:
             )
 
             # Gather actual file contents from dependency tasks
-            dep_context = self._gather_dependency_context(task, working_dir)
+            dep_context = self._gather_dependency_context(
+                task,
+                working_dir,
+                max_tokens=min(1200, max(512, int(budget_tokens * 0.15))),
+            )
 
             result = await builder.run({
                 "task": task.to_dict(),
@@ -1105,7 +1330,7 @@ class Orchestrator:
                         "existing_files": self._list_project_files(),
                     })
                     if not fix_result.success:
-                        self.dag.mark_failed(task.id, f"Smoke check: {smoke_msg}")
+                        self._mark_task_failed(task.id, f"Smoke check: {smoke_msg}")
                         console.print(f"  [red][{agent_id}] Failed smoke check:[/red] {task.id}")
                         return
                     if use_git:
@@ -1133,7 +1358,7 @@ class Orchestrator:
                     if use_git:
                         # Merge worktree branch into main
                         await git.merge_branch(branch_name)
-                    self.dag.mark_done(task.id, f"score={review.score}")
+                    self._mark_task_done(task.id, f"score={review.score}")
                     console.print(f"  [green][{agent_id}] Done:[/green] {task.id} (score: {review.score})")
 
                     # Learning signal: task succeeded on first try (before smoke check fix, before any retries)
@@ -1179,17 +1404,17 @@ class Orchestrator:
                         if use_git:
                             await git.commit_worktree(branch_name, f"Revise: {task.description}", task.id)
                             await git.merge_branch(branch_name)
-                        self.dag.mark_done(task.id, "revised and approved")
+                        self._mark_task_done(task.id, "revised and approved")
                         console.print(f"  [green][{agent_id}] Done (revised):[/green] {task.id}")
                         # Learning signal: task needed revision (not first-try success)
                         self._adjust_context_budget(False)
                     else:
-                        self.dag.mark_failed(task.id, revision_result.error)
+                        self._mark_task_failed(task.id, revision_result.error)
                         console.print(f"  [red][{agent_id}] Failed:[/red] {task.id}")
                         # Learning signal: task failed completely (not first-try success)
                         self._adjust_context_budget(False)
             else:
-                self.dag.mark_failed(task.id, result.error)
+                self._mark_task_failed(task.id, result.error)
                 console.print(f"  [red][{agent_id}] Failed:[/red] {task.id} — {result.error[:80]}")
 
                 # Learning signal: initial builder run failed (not first-try success)
@@ -1209,7 +1434,7 @@ class Orchestrator:
                 await self._learn_from_task_failure(task, result.error, agent_id)
 
         except Exception as e:
-            self.dag.mark_failed(task.id, str(e))
+            self._mark_task_failed(task.id, str(e))
             console.print(f"  [red][{agent_id}] Error:[/red] {task.id} — {e}")
 
             # Meta-learning: analyze exception to create preventive rules
@@ -1262,6 +1487,20 @@ class Orchestrator:
             console.print(
                 f"  [yellow][{agent_id}] TDD fail (iter {iteration + 1}/{loops}),[/yellow] fixing..."
             )
+
+            failure = (test_result.stderr or "") + (test_result.stdout or "")
+            failure_lower = failure.lower()
+            if "not found" in failure_lower or "command not found" in failure_lower or "is not recognized" in failure_lower:
+                # Most likely missing test runtime/dependencies.
+                await self._prepare_runtime_dependencies(working_dir)
+                retry = await sandbox.exec(test_cmd, timeout=90)
+                if retry.exit_code == 0:
+                    console.print(
+                        f"  [{agent_id}] [green]Dependencies installed, TDD pass "
+                        f"(iter {iteration + 1}/{loops})[/green]"
+                    )
+                    return
+
             stdout_snippet = test_result.stdout[:2000] if test_result.stdout else ""
             stderr_snippet = test_result.stderr[:1000] if test_result.stderr else ""
 
@@ -1325,12 +1564,91 @@ class Orchestrator:
 
         return None
 
+    async def _prepare_runtime_dependencies(self, project_dir: Path) -> None:
+        """Install runtime/test dependencies for Node.js and Python projects.
+
+        This step runs after BUILD to avoid failures in VERIFY/TDD due to missing
+        modules and lockfile packages.
+        """
+        if not project_dir:
+            return
+
+        project_dir = project_dir.resolve()
+        marker = str(project_dir)
+        if marker in self._dependency_prepared_dirs:
+            return
+
+        async with self._dependency_state_lock:
+            if marker in self._dependency_prepared_dirs:
+                return
+
+            steps: list[tuple[str, str]] = []
+            if (project_dir / "package.json").exists():
+                if (project_dir / "package-lock.json").exists():
+                    steps.append(("npm ci --no-audit --no-fund", "npm dependencies (ci)"))
+                elif (project_dir / "yarn.lock").exists():
+                    steps.append(("yarn install --frozen-lockfile", "yarn dependencies"))
+                elif (project_dir / "pnpm-lock.yaml").exists():
+                    steps.append(("pnpm install --frozen-lockfile", "pnpm dependencies"))
+                else:
+                    steps.append(("npm install --no-audit --no-fund", "npm dependencies"))
+
+            if (project_dir / "requirements.txt").exists():
+                steps.append(("python -m pip install -r requirements.txt", "python requirements"))
+            if (project_dir / "pyproject.toml").exists():
+                steps.append(("python -m pip install -e .", "python package"))
+
+            if not steps:
+                self._dependency_prepared_dirs.add(marker)
+                return
+
+            sandbox = create_sandbox(self.config, project_dir)
+            async with sandbox:
+                for command, reason in steps:
+                    console.print(f"  [yellow]Dependency setup[/yellow]: {reason}")
+                    # Avoid retrying the same missing command repeatedly.
+                    if "npm" in command:
+                        check = await sandbox.exec("npm --version", timeout=30)
+                        if check.exit_code != 0:
+                            logger.warning("npm not available, skipping npm dependency install")
+                            continue
+                    if "yarn" in command:
+                        check = await sandbox.exec("yarn --version", timeout=30)
+                        if check.exit_code != 0:
+                            logger.warning("yarn not available, skipping yarn dependency install")
+                            continue
+                    if "pnpm" in command:
+                        check = await sandbox.exec("pnpm --version", timeout=30)
+                        if check.exit_code != 0:
+                            logger.warning("pnpm not available, skipping pnpm dependency install")
+                            continue
+                    if "pip install" in command:
+                        check = await sandbox.exec("python -m pip --version", timeout=30)
+                        if check.exit_code != 0:
+                            logger.warning("python pip not available, skipping python dependency install")
+                            continue
+
+                    result = await sandbox.exec(command, timeout=900)
+                    if result.exit_code != 0:
+                        logger.warning(
+                            "Dependency step failed: %s (exit %s) — %s",
+                            command,
+                            result.exit_code,
+                            result.stderr[:500],
+                        )
+                        # Even if one step fails, continue the pipeline.
+                        # _tdd_loop/VERIFY will surface actionable errors.
+                    else:
+                        logger.info("Dependency step succeeded: %s", command)
+
+            self._dependency_prepared_dirs.add(marker)
+
     # ──────────────────────────────────────────────
     # Dependency Context: pass upstream file contents to downstream builders
     # ──────────────────────────────────────────────
 
     def _gather_dependency_context(
-        self, task: Task, working_dir: Path, max_chars: int = 12000,
+        self, task: Task, working_dir: Path, max_tokens: int = 1500,
     ) -> str:
         """Read key files from dependency tasks so the builder has real context.
 
@@ -1338,13 +1656,13 @@ class Orchestrator:
         (models, types, interfaces) to write compatible imports and call sites.
         Without this, builders guess at interfaces and produce broken imports.
 
-        Returns a formatted string with file contents, truncated to max_chars.
+        Returns a formatted string with file contents, truncated by token budget.
         """
         if not self.dag or not task.depends_on:
             return ""
 
         dep_files: list[tuple[str, str]] = []  # (path, content)
-        total_chars = 0
+        remaining = max(1, max_tokens)
 
         # Collect files from all dependency tasks
         for dep_id in task.depends_on:
@@ -1364,13 +1682,21 @@ class Orchestrator:
                     content = full.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     continue
-                # Truncate individual files to keep total under budget
-                if len(content) > 3000:
-                    content = content[:3000] + "\n... (truncated)"
-                if total_chars + len(content) > max_chars:
+
+                budget_content = truncate_text_to_token_budget(
+                    content,
+                    max_tokens=remaining,
+                    preserve_code_blocks=True,
+                )
+                if not budget_content:
                     break
+
+                content = budget_content
+                content_tokens = count_tokens(content)
+                remaining -= content_tokens
                 dep_files.append((fpath, content))
-                total_chars += len(content)
+                if remaining <= 0:
+                    break
 
         if not dep_files:
             # Even without file contents, pass exports contracts
@@ -1401,7 +1727,13 @@ class Orchestrator:
         # Then show actual file contents
         for fpath, content in dep_files:
             parts.append(f"### `{fpath}`\n```\n{content}\n```\n")
-        return "\n".join(parts)
+
+        assembled = "\n".join(parts)
+        return truncate_text_to_token_budget(
+            assembled,
+            max_tokens=max_tokens,
+            preserve_code_blocks=True,
+        )
 
     # ──────────────────────────────────────────────
     # Pipeline Hardening: Smoke Check, Build Gate, File Overlap
@@ -1692,6 +2024,12 @@ class Orchestrator:
 
     async def _phase_verify(self) -> bool:
         """Run tests and attempt to fix failures. Returns True if all tests pass."""
+        if not self.project_dir:
+            return False
+
+        # Ensure runtime and test dependencies are installed before tests start.
+        await self._prepare_runtime_dependencies(self.project_dir)
+
         sandbox = create_sandbox(self.config, self.project_dir)
         async with sandbox:
             tester = self._agent("tester", self.config, self.llm, self.project_dir, sandbox)
@@ -2846,8 +3184,6 @@ class Orchestrator:
 
         keywords = set(task_description.lower().split())
         relevant_snippets: list[str] = []
-        char_budget = max_tokens * 4  # ~4 chars per token
-
         for title, theory in self._theoretical_reasoning._theories.items():
             # Check if theory title matches task
             title_words = set(title.lower().split("_"))
@@ -2868,7 +3204,7 @@ class Orchestrator:
                 ):
                     snippet = f"  [{node.concept_type.value}] {node.id}: {node.informal_statement[:150] or node.formal_statement[:150]}"
                     useful.append(snippet)
-                    if len("\n".join(useful)) > char_budget // max(len(self._theoretical_reasoning._theories), 1):
+                    if len(useful) > 8:
                         break
 
             if useful:
@@ -2882,7 +3218,11 @@ class Orchestrator:
             "The following cross-domain theoretical insights are available:\n\n"
             + "\n\n".join(relevant_snippets[:5])
         )
-        return result[:char_budget]
+        return truncate_text_to_token_budget(
+            result,
+            max_tokens=max_tokens,
+            preserve_code_blocks=True,
+        )
 
     # ──────────────────────────────────────────────
     # Theoretical Reasoning — Cross-Domain Scientific Discovery
@@ -3350,25 +3690,32 @@ class Orchestrator:
         if not self._state_file:
             return
 
+        task_progress = self._task_progress_snapshot()
+
         state = {
             "run_id": self.config.run_id,
             "phase": phase,
             "spec": self.spec,
             "architecture": self.architecture,
+            "task_progress": task_progress,
+            "task_progress_count": len(task_progress),
             "cost_usd": self.config.estimated_cost_usd,
             "total_input_tokens": self.config.total_input_tokens,
             "total_output_tokens": self.config.total_output_tokens,
             "token_usage": dict(self.config.token_usage),
+            "task_transition_log": self._task_transition_log[-1000:],
             "elapsed_seconds": time.time() - self._wall_start,
+            "updated_at": time.time(),
         }
         state_json = json.dumps(state, indent=2, ensure_ascii=False)
-        try:
-            # Atomic write: temp file in same dir → rename
-            tmp = self._state_file.parent / f".{self._state_file.name}.tmp"
-            tmp.write_text(state_json, encoding="utf-8")
-            tmp.replace(self._state_file)
-        except OSError as exc:
-            logger.error("Failed to save state to %s: %s", self._state_file, exc)
+        with self._state_lock:
+            try:
+                # Atomic write: temp file in same dir → rename
+                tmp = self._state_file.parent / f".{self._state_file.name}.tmp"
+                tmp.write_text(state_json, encoding="utf-8")
+                tmp.replace(self._state_file)
+            except OSError as exc:
+                logger.error("Failed to save state to %s: %s", self._state_file, exc)
 
     def _list_project_files(self) -> list[str]:
         """List all source files in the project directory."""
@@ -3415,6 +3762,18 @@ class Orchestrator:
         self.spec = state.get("spec", {})
         self.architecture = state.get("architecture", {})
         phase = state.get("phase", "")
+        task_progress = state.get("task_progress")
+        if isinstance(task_progress, list):
+            self._resumed_task_progress = [
+                item for item in task_progress
+                if isinstance(item, dict)
+            ]
+        transition_log = state.get("task_transition_log", [])
+        if isinstance(transition_log, list):
+            self._task_transition_log = [
+                entry for entry in transition_log
+                if isinstance(entry, dict)
+            ]
 
         # Restore token usage so budget tracking is accurate across resumes
         if "token_usage" in state and isinstance(state["token_usage"], dict):
@@ -3437,7 +3796,16 @@ class Orchestrator:
             await self._phase_verify()
             await self._phase_refactor()
             await self._phase_deliver()
+        elif phase == "build_in_progress":
+            await self._phase_build()
+            await self._phase_verify()
+            await self._phase_refactor()
+            await self._phase_deliver()
         elif phase == "build_complete":
+            await self._phase_verify()
+            await self._phase_refactor()
+            await self._phase_deliver()
+        elif phase == "verify_in_progress":
             await self._phase_verify()
             await self._phase_refactor()
             await self._phase_deliver()
@@ -3507,3 +3875,4 @@ class Orchestrator:
         console.print(f"  Duration:  {elapsed:.1f}s")
         console.print(f"  LLM calls: {self.llm.call_count}")
         console.print("=" * 56)
+

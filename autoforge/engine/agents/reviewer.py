@@ -203,8 +203,18 @@ class ReviewerAgent(FileToolsMixin, AgentBase):
         )
 
         from autoforge.engine.utils import extract_json_from_text
+        schema = {
+            "type": "object",
+            "required": ["approved", "score", "issues"],
+            "properties": {
+                "approved": {"type": "boolean"},
+                "score": {"type": "number"},
+                "issues": {"type": "array", "items": {"type": "object"}},
+                "summary": {"type": "string"},
+            },
+        }
         try:
-            data = extract_json_from_text(output)
+            data = extract_json_from_text(output, schema=schema, strict=True)
         except ValueError as e:
             logger.warning("Could not find JSON in review output: %s", e)
             return _fail

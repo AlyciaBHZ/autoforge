@@ -458,6 +458,9 @@ class LLMRouter:
         return await self.call(
             prompt,
             complexity=complexity,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            **kwargs,
         )
 
     async def call(
@@ -466,8 +469,11 @@ class LLMRouter:
         *,
         complexity: TaskComplexity,
         system: str = "",
+        max_tokens: int | None = None,
+        temperature: float | None = None,
         messages: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         """Make an LLM call with automatic provider routing.
 
@@ -486,6 +492,23 @@ class LLMRouter:
         Returns:
             LLMResponse with normalized content blocks.
         """
+        if kwargs:
+            if "max_completion_tokens" in kwargs and max_tokens is None:
+                alias_tokens = kwargs.pop("max_completion_tokens")
+                if isinstance(alias_tokens, int):
+                    max_tokens = alias_tokens
+                else:
+                    raise TypeError(
+                        "max_completion_tokens must be int when used as "
+                        "llm.call() compatibility alias"
+                    )
+
+            if kwargs:
+                raise TypeError(
+                    "llm.call() got unexpected keyword arguments: "
+                    + ", ".join(sorted(kwargs))
+                )
+
         # ── short-form compat: llm.call(prompt, complexity=...) ──
         if prompt_or_nothing is not None:
             if messages is not None:
@@ -495,7 +518,10 @@ class LLMRouter:
             messages = [{"role": "user", "content": prompt_or_nothing}]
         elif messages is None:
             raise ValueError("Either a positional prompt or messages= is required")
-        model, max_tokens = self._select_model(complexity)
+        model, default_max_tokens = self._select_model(complexity)
+        effective_max_tokens = default_max_tokens if max_tokens is None else max_tokens
+        if effective_max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
         provider = detect_provider(model)
         budget_enforced = self._is_budget_enforced(provider)
         reservation = 0.0
@@ -505,7 +531,7 @@ class LLMRouter:
                 model=model,
                 system=system,
                 messages=messages,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
             )
             async with lock:
                 projected = (
@@ -542,14 +568,35 @@ class LLMRouter:
                 custom = self._custom_providers[provider]
                 client = self._get_client(provider)
                 response = await self._retry_with_backoff(
-                    lambda: custom.call(client, model, system, messages, tools, max_tokens)
+                    lambda: custom.call(client, model, system, messages, tools, effective_max_tokens)
                 )
             elif provider == "anthropic":
-                response = await self._call_anthropic(model, max_tokens, system, messages, tools)
+                response = await self._call_anthropic(
+                    model,
+                    effective_max_tokens,
+                    system,
+                    messages,
+                    tools,
+                    temperature=temperature,
+                )
             elif provider == "openai":
-                response = await self._call_openai(model, max_tokens, system, messages, tools)
+                response = await self._call_openai(
+                    model,
+                    effective_max_tokens,
+                    system,
+                    messages,
+                    tools,
+                    temperature=temperature,
+                )
             elif provider == "google":
-                response = await self._call_google(model, max_tokens, system, messages, tools)
+                response = await self._call_google(
+                    model,
+                    effective_max_tokens,
+                    system,
+                    messages,
+                    tools,
+                    temperature=temperature,
+                )
             else:
                 raise ValueError(f"Unknown provider: {provider}")
             return response
@@ -577,6 +624,7 @@ class LLMRouter:
     async def _call_anthropic(
         self, model: str, max_tokens: int, system: str,
         messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+        temperature: float | None = None,
     ) -> LLMResponse:
         """Call Anthropic API and normalize the response."""
         client = self._get_client("anthropic")
@@ -590,6 +638,8 @@ class LLMRouter:
             "system": system,
             "messages": ant_messages,
         }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         if tools:
             kwargs["tools"] = tools  # Already in Anthropic format
 
@@ -664,6 +714,7 @@ class LLMRouter:
     async def _call_openai(
         self, model: str, max_tokens: int, system: str,
         messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+        temperature: float | None = None,
     ) -> LLMResponse:
         """Call OpenAI API and normalize the response."""
         client = self._get_client("openai")
@@ -682,6 +733,8 @@ class LLMRouter:
         }
         if is_reasoning:
             kwargs["reasoning_effort"] = self.config.openai_reasoning_effort
+        elif temperature is not None:
+            kwargs["temperature"] = temperature
         if tools:
             kwargs["tools"] = self._tools_to_openai(tools)
 
@@ -849,6 +902,7 @@ class LLMRouter:
     async def _call_google(
         self, model: str, max_tokens: int, system: str,
         messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+        temperature: float | None = None,
     ) -> LLMResponse:
         """Call Google Gemini API and normalize the response."""
         from google import genai
@@ -864,6 +918,8 @@ class LLMRouter:
             "max_output_tokens": max_tokens,
             "system_instruction": system,
         }
+        if temperature is not None:
+            config["temperature"] = temperature
 
         # Convert tools
         gemini_tools = None

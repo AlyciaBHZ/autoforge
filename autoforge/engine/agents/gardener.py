@@ -149,8 +149,16 @@ class GardenerAgent(FileToolsMixin, AgentBase):
     def parse_changes(self, output: str) -> dict[str, Any]:
         """Extract change summary from output."""
         from autoforge.engine.utils import extract_json_from_text
+        schema = {
+            "type": "object",
+            "required": ["changes_made", "summary"],
+            "properties": {
+                "changes_made": {"type": "array", "items": {"type": "object"}},
+                "summary": {"type": "string"},
+            },
+        }
         try:
-            return extract_json_from_text(output)
+            return extract_json_from_text(output, schema=schema, strict=True)
         except ValueError as e:
             logger.warning("Could not extract JSON from gardener output: %s", e)
             return {"changes_made": [], "summary": output[:500]}

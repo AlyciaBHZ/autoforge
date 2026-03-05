@@ -111,8 +111,19 @@ class DirectorAgent(AgentBase):
     def parse_spec(self, output: str) -> dict[str, Any]:
         """Extract JSON spec from the Director's output text."""
         from autoforge.engine.utils import extract_json_from_text
+        schema = {
+            "type": "object",
+            "required": ["project_name", "modules"],
+            "properties": {
+                "project_name": {"type": "string"},
+                "description": {"type": "string"},
+                "modules": {"type": "array", "items": {"type": "object"}},
+                "tech_stack": {"type": "object"},
+                "build_contract": {"type": "object"},
+            },
+        }
         try:
-            return extract_json_from_text(output)
+            return extract_json_from_text(output, schema=schema, strict=True)
         except ValueError as e:
             raise ValueError(f"Could not extract JSON spec from Director output: {e}") from e
 
@@ -172,7 +183,17 @@ class DirectorFixAgent(AgentBase):
     def parse_fix_task(self, output: str) -> dict[str, Any]:
         """Extract fix task from output."""
         from autoforge.engine.utils import extract_json_from_text
+        schema = {
+            "type": "object",
+            "required": ["id", "description", "files"],
+            "properties": {
+                "id": {"type": "string"},
+                "description": {"type": "string"},
+                "files": {"type": "array", "items": {"type": "string"}},
+                "owner": {"type": "string"},
+            },
+        }
         try:
-            return extract_json_from_text(output)
+            return extract_json_from_text(output, schema=schema, strict=True)
         except ValueError as e:
             raise ValueError(f"Could not extract fix task from Director output: {e}") from e

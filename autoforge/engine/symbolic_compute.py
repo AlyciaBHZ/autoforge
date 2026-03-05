@@ -1,4 +1,4 @@
-"""Symbolic Computation Backend — Integration of SymPy, SageMath, and CAS tools.
+﻿"""Symbolic Computation Backend 鈥?Integration of SymPy, SageMath, and CAS tools.
 
 This module provides a unified symbolic computation interface for verifying
 mathematical statements, solving equations, computing limits, and performing
@@ -10,7 +10,7 @@ Architecture:
   - VerificationEvidence: Claim verification with confidence
   - SymPyEngine: Async wrapper around SymPy
   - SageEngine: Optional SageMath CLI wrapper
-  - LaTeXParser: Convert LaTeX ↔ SymPy expressions
+  - LaTeXParser: Convert LaTeX 鈫?SymPy expressions
   - MathematicalVerifier: High-level claim verification
   - SymbolicComputeEngine: Main facade
 
@@ -18,7 +18,7 @@ Key features:
   - Safe expression parsing (sympify with guards)
   - Asyncio.to_thread() for CPU-bound operations
   - Optional SageMath via subprocess (if available)
-  - LaTeX ↔ SymPy bidirectional conversion
+  - LaTeX 鈫?SymPy bidirectional conversion
   - Symbolic identity checking and inequality verification
   - Algebraic geometry & matrix operations
   - Batch verification of mathematical claims
@@ -27,9 +27,11 @@ Key features:
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import logging
 import re
+from collections import Counter
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -37,9 +39,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+from autoforge.engine.utils import extract_json_from_text
+
 logger = logging.getLogger(__name__)
 
-# Optional imports — graceful degradation if unavailable
+# Optional imports 鈥?graceful degradation if unavailable
 try:
     import sympy as sp
     from sympy import symbols, sympify, simplify, solve, integrate, diff, limit, series
@@ -55,9 +59,9 @@ except ImportError:
     sp_parse_latex = None
 
 
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 # Enumerations
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 
 
 class ComputationBackend(str, Enum):
@@ -68,9 +72,9 @@ class ComputationBackend(str, Enum):
     NUMERIC = "numeric"                # Pure numerical computation
 
 
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 # Data Classes
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 
 
 @dataclass
@@ -123,9 +127,9 @@ class VerificationEvidence:
         }
 
 
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 # SymPy Engine
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 
 
 class SymPyEngine:
@@ -277,7 +281,7 @@ class SymPyEngine:
                 backend=self.backend,
                 success=True,
                 computation_time=time.time() - start,
-                steps=[f"Limit as {variable} → {point}"],
+                steps=[f"Limit as {variable} 鈫?{point}"],
             )
         except Exception as e:
             return SymbolicResult(
@@ -387,7 +391,7 @@ class SymPyEngine:
                 backend=self.backend,
                 success=True,
                 computation_time=time.time() - start,
-                steps=[f"Verified: {lhs} {'=' if is_equal else '≠'} {rhs}"],
+                steps=[f"Verified: {lhs} {'=' if is_equal else '鈮?} {rhs}"],
                 algorithm_ratio=1.0,  # Pure SymPy computation
             )
         except Exception as e:
@@ -544,7 +548,7 @@ class SymPyEngine:
         try:
             n = int(n_str)
             factors = await asyncio.to_thread(sp.factorint, n)
-            result_str = " × ".join(f"{p}^{e}" if e > 1 else str(p) for p, e in sorted(factors.items()))
+            result_str = " 脳 ".join(f"{p}^{e}" if e > 1 else str(p) for p, e in sorted(factors.items()))
             return SymbolicResult(
                 expression=n_str,
                 result=result_str,
@@ -641,9 +645,9 @@ class SymPyEngine:
             return str(result)
 
 
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 # SageMath Engine (Optional)
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 
 
 class SageEngine:
@@ -745,18 +749,39 @@ print(I.groebner_basis())
     async def compute_cohomology(self, complex_desc: str) -> SymbolicResult:
         """Compute cohomology of a chain complex."""
         start = time.time()
-        if not self._sage_available:
+        differentials = self._parse_chain_complex_description(complex_desc)
+        if not differentials:
             return SymbolicResult(
                 expression=complex_desc,
                 result="",
                 backend=self.backend,
                 success=False,
-                error="SageMath not available",
+                error="Unable to parse chain-complex descriptor",
                 computation_time=time.time() - start,
             )
         try:
-            # Placeholder for chain complex cohomology computation
-            code = f"# Cohomology computation: {complex_desc}\n# Not yet implemented"
+            if SYMPY_AVAILABLE:
+                cohomology_payload = self._compute_chain_cohomology_sympy(differentials)
+                return SymbolicResult(
+                    expression=complex_desc,
+                    result=json.dumps(cohomology_payload, ensure_ascii=False),
+                    backend=self.backend,
+                    success=True,
+                    computation_time=time.time() - start,
+                    steps=["Computed chain cohomology using matrix rank fallback"],
+                )
+
+            if not self._sage_available:
+                return SymbolicResult(
+                    expression=complex_desc,
+                    result="",
+                    backend=self.backend,
+                    success=False,
+                    error="SymPy unavailable and SageMath not available for cohomology",
+                    computation_time=time.time() - start,
+                )
+
+            code = self._build_sage_chain_cohomology_code(differentials)
             output = await self._run_sage(code, timeout=30)
             return SymbolicResult(
                 expression=complex_desc,
@@ -780,25 +805,54 @@ print(I.groebner_basis())
     ) -> SymbolicResult:
         """Perform algebraic geometry operations on varieties."""
         start = time.time()
-        if not self._sage_available:
+        normalized_op = (operation or "").strip().lower()
+        if not normalized_op:
+            normalized_op = "dimension"
+
+        if not self._sage_available and not SYMPY_AVAILABLE:
             return SymbolicResult(
                 expression=variety_desc,
                 result="",
                 backend=self.backend,
                 success=False,
-                error="SageMath not available",
+                error="No algebraic-geometry backend available (SageMath/SymPy)",
                 computation_time=time.time() - start,
             )
         try:
-            # Placeholder for algebraic geometry operations
-            code = f"# AlgebraicGeometry: {variety_desc}, operation: {operation}\n# Not yet implemented"
-            output = await self._run_sage(code, timeout=30)
+            equations = self._parse_variety_data(variety_desc)
+            if not equations:
+                return SymbolicResult(
+                    expression=variety_desc,
+                    result="",
+                    backend=self.backend,
+                    success=False,
+                    error="Unable to parse variety description",
+                    computation_time=time.time() - start,
+                )
+
+            if self._sage_available and normalized_op in {"dimension", "dim", "irreducible", "is_irreducible"}:
+                code = self._build_sage_algebraic_geometry_code(
+                    variety_desc, normalized_op
+                )
+                output = await self._run_sage(code, timeout=30)
+                return SymbolicResult(
+                    expression=variety_desc,
+                    result=output,
+                    backend=self.backend,
+                    success=True,
+                    computation_time=time.time() - start,
+                )
+
+            output = self._compute_algebraic_geometry_fallback(
+                equations, normalized_op
+            )
             return SymbolicResult(
                 expression=variety_desc,
                 result=output,
                 backend=self.backend,
                 success=True,
                 computation_time=time.time() - start,
+                steps=["Algebraic geometry fallback inference from parsed equations"],
             )
         except Exception as e:
             return SymbolicResult(
@@ -809,6 +863,343 @@ print(I.groebner_basis())
                 error=str(e),
                 computation_time=time.time() - start,
             )
+
+    def _parse_json_or_ast(self, raw: str) -> Any | None:
+        """Parse JSON or Python literal payload with best-effort decoding."""
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+        try:
+            return ast.literal_eval(raw)
+        except Exception:
+            return None
+
+    def _parse_matrix(self, raw_matrix: Any) -> list[list[str]] | None:
+        """Normalize a matrix payload into rows of strings."""
+        if raw_matrix is None:
+            return None
+        matrix = raw_matrix
+        if isinstance(matrix, str):
+            matrix = self._parse_json_or_ast(matrix)
+        if not isinstance(matrix, list):
+            return None
+        if not matrix:
+            return []
+        parsed: list[list[str]] = []
+        for row in matrix:
+            if not isinstance(row, list):
+                return None
+            parsed_row: list[str] = []
+            for value in row:
+                if isinstance(value, (int, float)):
+                    parsed_row.append(str(value))
+                elif isinstance(value, str):
+                    parsed_row.append(value.strip())
+                else:
+                    parsed_row.append(str(value))
+            parsed.append(parsed_row)
+        return parsed
+
+    def _parse_chain_complex_description(
+        self, complex_desc: str
+    ) -> list[tuple[int, int, list[list[str]]]]:
+        """Parse chain complex descriptors into (from, to, matrix) tuples."""
+        payload = self._parse_json_or_ast(complex_desc)
+        entries: list[tuple[int, int, list[list[str]]]] = []
+
+        if isinstance(payload, list):
+            for idx, item in enumerate(payload):
+                from_grade = idx + 1
+                to_grade = idx
+                matrix = item
+                if isinstance(item, dict):
+                    from_grade = int(item.get("from", from_grade))
+                    to_grade = int(item.get("to", item.get("to_degree", to_grade)))
+                    matrix = item.get("matrix", item.get("m", item.get("map")))
+                parsed = self._parse_matrix(matrix)
+                if parsed is not None:
+                    entries.append((from_grade, to_grade, parsed))
+
+        if isinstance(payload, dict):
+            chain_blocks = (
+                payload.get("chain_complex")
+                or payload.get("differentials")
+                or payload.get("maps")
+                or payload.get("matrices")
+            )
+            if isinstance(chain_blocks, list):
+                for idx, item in enumerate(chain_blocks):
+                    from_grade = idx + 1
+                    to_grade = idx
+                    matrix = item
+                    if isinstance(item, dict):
+                        from_grade = int(item.get("from", from_grade))
+                        to_grade = int(item.get("to", item.get("to_degree", to_grade)))
+                        matrix = item.get("matrix", item.get("m", item.get("map")))
+                    parsed = self._parse_matrix(matrix)
+                    if parsed is not None:
+                        entries.append((from_grade, to_grade, parsed))
+
+            if not entries:
+                for key, value in payload.items():
+                    match = re.match(r"d(\d+)", str(key).lower())
+                    if not match:
+                        continue
+                    from_grade = int(match.group(1))
+                    to_grade = from_grade - 1
+                    parsed = self._parse_matrix(value)
+                    if parsed is not None:
+                        entries.append((from_grade, to_grade, parsed))
+
+        if not entries and complex_desc:
+            for match in re.finditer(r"d(\d+)\s*[:=]\s*(\[[\s\S]*?\])", complex_desc):
+                from_grade = int(match.group(1))
+                parsed = self._parse_matrix(match.group(2))
+                if parsed is not None:
+                    entries.append((from_grade, from_grade - 1, parsed))
+
+        return sorted(entries, key=lambda item: item[0])
+
+    def _compute_chain_cohomology_sympy(
+        self, differentials: list[tuple[int, int, list[list[str]]]]
+    ) -> dict[str, Any]:
+        """Compute cohomology dimensions from differential matrices."""
+        if not SYMPY_AVAILABLE:
+            raise RuntimeError("SymPy unavailable")
+
+        matrix_by_grade: dict[int, Any] = {}
+        rank_by_grade: dict[int, int] = {}
+        dim_by_grade: dict[int, int] = {}
+        warnings: list[str] = []
+
+        for from_grade, to_grade, matrix in differentials:
+            sp_matrix = sp.Matrix([[sp.sympify(v) for v in row] for row in matrix])
+            matrix_by_grade[from_grade] = sp_matrix
+            rank_by_grade[from_grade] = int(sp_matrix.rank())
+            dim_by_grade[from_grade] = sp_matrix.cols
+            dim_by_grade.setdefault(to_grade, sp_matrix.rows)
+
+        max_grade = max(dim_by_grade.keys(), default=0)
+
+        for grade in sorted(matrix_by_grade.keys()):
+            next_matrix = matrix_by_grade.get(grade + 1)
+            current_matrix = matrix_by_grade.get(grade)
+            if next_matrix is None or current_matrix is None:
+                continue
+            if current_matrix.shape[1] == next_matrix.shape[0]:
+                comp = current_matrix * next_matrix
+                if comp != sp.zeros(current_matrix.rows, next_matrix.cols):
+                    warnings.append(
+                        f"Chain condition violated at d_{grade} * d_{grade + 1}"
+                    )
+
+        cohomology_dims: dict[str, int] = {}
+        for grade in range(max_grade + 1):
+            if grade not in dim_by_grade:
+                continue
+            dim = dim_by_grade[grade]
+            rank_in = rank_by_grade.get(grade, 0)
+            rank_out = rank_by_grade.get(grade + 1, 0)
+            dim_ker = max(0, dim - rank_in)
+            cohomology_dims[f"H^{grade}"] = max(0, dim_ker - rank_out)
+
+        euler = 0
+        for label, dim in cohomology_dims.items():
+            try:
+                exponent = int(label.split("^", 1)[1])
+                euler += ((-1) ** exponent) * int(dim)
+            except Exception:
+                pass
+
+        return {
+            "type": "chain_cohomology",
+            "operation": "cohomology",
+            "differential_ranks": {
+                str(k): v for k, v in sorted(rank_by_grade.items(), key=lambda item: item[0])
+            },
+            "dimensions": dim_by_grade,
+            "cohomology_dimensions": cohomology_dims,
+            "euler_characteristic": euler,
+            "warnings": warnings,
+        }
+
+    def _build_sage_chain_cohomology_code(
+        self, differentials: list[tuple[int, int, list[list[str]]]]
+    ) -> str:
+        """Build a Sage payload script for cohomology dimension reporting."""
+        lines: list[str] = [
+            "from sage.all import *",
+            "import json",
+        ]
+        dims: dict[int, int] = {}
+        matrix_names: dict[int, str] = {}
+        for from_grade, to_grade, matrix in differentials:
+            lines.append(
+                f"d_{from_grade} = Matrix({self._matrix_to_sage_literal(matrix)})"
+            )
+            matrix_names[from_grade] = f"d_{from_grade}"
+            dims[from_grade] = len(matrix[0]) if matrix and matrix[0] else 0
+            dims[to_grade] = len(matrix)
+        lines.append("ranks = {" + ", ".join(
+            f'"{g}": int({name}.rank())' for g, name in matrix_names.items()
+        ) + "}")
+        lines.append("cohomology = {}")
+        lines.append("warnings = []")
+        lines.append("max_grade = max(dims.keys()) if dims else 0")
+        lines.append("for n in range(max_grade + 1):")
+        lines.append("    dim_n = dims.get(n)")
+        lines.append("    if dim_n is None:")
+        lines.append("        continue")
+        lines.append("    rank_in = ranks.get(n, 0)")
+        lines.append("    rank_out = ranks.get(n + 1, 0)")
+        lines.append("    ker_dim = max(0, dim_n - rank_in)")
+        lines.append("    cohomology['H^%s' % n] = max(0, ker_dim - rank_out)")
+        lines.append("for n in sorted(list(ranks.keys())):")
+        lines.append("    if n + 1 in ranks:")
+        lines.append("        A = globals().get('d_%s' % n)")
+        lines.append("        B = globals().get('d_%s' % (n + 1))")
+        lines.append("        if A is not None and B is not None and A.ncols() == B.nrows():")
+        lines.append("            if (A * B) != 0:")
+        lines.append(
+            "                warnings.append('Chain condition violated at d_%s * d_%s' % (n, n + 1))"
+        )
+        lines.append("euler = 0")
+        lines.append("for key, value in cohomology.items():")
+        lines.append("    try:")
+        lines.append("        idx = int(key.split('^')[1])")
+        lines.append("        euler += (-1) ** idx * int(value)")
+        lines.append("    except Exception:")
+        lines.append("        pass")
+        lines.append(
+            "print(json.dumps({"
+            "'type': 'chain_cohomology', "
+            "'operation': 'cohomology', "
+            "'differential_ranks': {k: int(v) for k, v in ranks.items()}, "
+            "'dimensions': {k: int(v) for k, v in dims.items()}, "
+            "'cohomology_dimensions': {k: int(v) for k, v in cohomology.items()}, "
+            "'euler_characteristic': int(euler), "
+            "'warnings': warnings})"
+            "))"
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _matrix_to_sage_literal(matrix: list[list[str]]) -> str:
+        rows = ["[" + ", ".join(v for v in row) + "]" for row in matrix]
+        return "[" + ", ".join(rows) + "]"
+
+    def _parse_variety_data(self, variety_desc: str) -> list[str]:
+        text = (variety_desc or "").strip()
+        if not text:
+            return []
+        payload = self._parse_json_or_ast(text)
+        equations: list[str] = []
+        if isinstance(payload, dict):
+            raw = payload.get("equations") or payload.get("variety") or payload.get("ideal")
+            if isinstance(raw, list):
+                equations = [str(item) for item in raw if isinstance(item, str)]
+        elif isinstance(payload, list):
+            equations = [str(item) for item in payload if isinstance(item, str)]
+        if not equations and "=" in text:
+            for part in re.split(r"[;\n,]", text):
+                chunks = [chunk.strip() for chunk in part.split("=")]
+                if len(chunks) == 2 and chunks[0] and chunks[1]:
+                    equations.append(f"({chunks[0]})-({chunks[1]})")
+        return equations
+
+    def _compute_algebraic_geometry_fallback(
+        self, equations: list[str], operation: str
+    ) -> str:
+        if not SYMPY_AVAILABLE:
+            return "SymPy unavailable for fallback algebraic geometry analysis"
+        op = (operation or "").strip().lower()
+        exprs = [sp.sympify(eq) for eq in equations if str(eq).strip()]
+        symbols = sorted({s for expr in exprs for s in expr.free_symbols}, key=lambda s: s.name)
+        var_count = len(symbols)
+
+        if op in {"dimension", "dim"}:
+            eq_count = len(exprs)
+            dim = max(0, var_count - eq_count)
+            return json.dumps({
+                "type": "algebraic_geometry",
+                "operation": "dimension",
+                "variables": [str(s) for s in symbols],
+                "equation_count": eq_count,
+                "dimension_estimate": dim,
+                "note": "Estimated by variable/equation count",
+            }, ensure_ascii=False)
+
+        if op in {"irreducible", "is_irreducible"}:
+            factors: list[dict[str, str]] = []
+            all_irreducible = True
+            for expr in exprs:
+                factor = str(sp.factor(expr))
+                factors.append({"expression": str(expr), "factorization": factor})
+                if "*" in factor:
+                    all_irreducible = False
+            return json.dumps({
+                "type": "algebraic_geometry",
+                "operation": "irreducible",
+                "variables": [str(s) for s in symbols],
+                "all_irreducible": all_irreducible,
+                "factorizations": factors,
+            }, ensure_ascii=False)
+
+        return json.dumps({
+            "type": "algebraic_geometry",
+            "operation": op,
+            "variables": [str(s) for s in symbols],
+            "equations": [str(expr) for expr in exprs],
+            "note": "Operation not implemented; returned normalized equation profile",
+        }, ensure_ascii=False)
+
+    def _build_sage_algebraic_geometry_code(
+        self, variety_desc: str, operation: str
+    ) -> str:
+        equations = self._parse_variety_data(variety_desc)
+        var_names: set[str] = set()
+        for eq in equations:
+            for name in re.findall(r"\b[a-zA-Z][a-zA-Z0-9_]*\b", eq):
+                if name not in {"oo", "inf", "pi", "sin", "cos", "log", "exp", "sqrt"}:
+                    var_names.add(name)
+        vars_sorted = sorted(var_names)
+        if not vars_sorted:
+            return (
+                "import json\n"
+                "print(json.dumps({'error': 'No variables found in variety description'}))"
+            )
+        header = (
+            f"R.<{', '.join(vars_sorted)}> = PolynomialRing(QQ, {len(vars_sorted)})\n"
+        )
+        equations_payload = ", ".join([eq for eq in equations])
+        if operation in {"dimension", "dim"}:
+            return (
+                "import json\n"
+                + header
+                + f"I = Ideal([{equations_payload}])\n"
+                + "try:\n"
+                + "    print(json.dumps({'type':'algebraic_geometry','operation':'dimension','dimension':str(I.dimension())}))\n"
+                + "except Exception as exc:\n    print(json.dumps({'error': str(exc)}))"
+            )
+
+        if operation in {"irreducible", "is_irreducible"}:
+            return (
+                "import json\n"
+                + header
+                + f"I = Ideal([{equations_payload}])\n"
+                + "try:\n"
+                + "    print(json.dumps({'type':'algebraic_geometry','operation':'irreducible','prime':str(I.is_prime()),'radical':str(I.is_radical())}))\n"
+                + "except Exception as exc:\n    print(json.dumps({'error': str(exc)}))"
+            )
+
+        return (
+            "import json\n"
+            f"print(json.dumps({{'type': 'algebraic_geometry', 'operation': '{operation}', 'error': 'Operation not supported by Sage fallback'}}))"
+        )
 
     async def _run_sage(self, code: str, timeout: int = 30) -> str:
         """Run Sage code via subprocess and return output."""
@@ -832,9 +1223,9 @@ print(I.groebner_basis())
             raise TimeoutError(f"Sage computation timed out after {timeout}s")
 
 
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 # LaTeX Parser
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 
 
 class LaTeXParser:
@@ -919,9 +1310,9 @@ class LaTeXParser:
         return result
 
 
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 # Mathematical Verifier
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 
 
 class MathematicalVerifier:
@@ -935,22 +1326,80 @@ class MathematicalVerifier:
 
     async def verify_claim(self, claim_text: str, llm: Any = None) -> VerificationEvidence:
         """Verify a mathematical claim using multiple strategies."""
-        # For now, extract math expressions from claim and verify algebraically
         logger.debug(f"Verifying claim: {claim_text}")
-        # Placeholder: real implementation would use LLM to extract math expressions
+        if not self.engine:
+            raise RuntimeError("SymPy engine required for claim verification")
+
+        claim_payload = await self._extract_math_from_claim(claim_text, llm)
+        claim_type = str(claim_payload.get("type", "")).lower()
+
+        if claim_type in {"algebraic_identity", "equation", "identity", "equality"}:
+            return await self.verify_algebraic_identity(
+                str(claim_payload.get("lhs", "")),
+                str(claim_payload.get("rhs", "")),
+            )
+        if claim_type in {"limit", "limit_check", "limit_claim"}:
+            return await self.verify_limit_claim(
+                str(claim_payload.get("expr", "")),
+                str(claim_payload.get("var", "x")),
+                str(claim_payload.get("point", "0")),
+                str(claim_payload.get("expected", "")),
+            )
+        if claim_type in {"series", "series_convergence", "convergence"}:
+            return await self.verify_convergence(
+                str(claim_payload.get("series_expr", "")),
+                str(claim_payload.get("var", "n")),
+                expected=claim_payload.get("expected"),
+            )
+        if claim_type == "eigenvalue":
+            return await self.verify_eigenvalue_claim(
+                str(claim_payload.get("matrix", "")),
+                [str(v) for v in claim_payload.get("expected_eigenvalues", [])]
+                if isinstance(claim_payload.get("expected_eigenvalues"), list)
+                else [],
+            )
+        if claim_type == "numerical_spot_check":
+            test_points = claim_payload.get("test_points", [])
+            return await self.numerical_spot_check(
+                str(claim_payload.get("expr", "")),
+                [dict(point) for point in test_points if isinstance(point, dict)],
+                expected_fn=claim_payload.get("expected_fn"),
+            )
+
+        inferred = self._infer_math_claim_type(claim_text)
+        inferred_type = inferred.get("type")
+        if inferred_type == "limit":
+            return await self.verify_limit_claim(
+                str(inferred.get("expr", "")),
+                str(inferred.get("var", "x")),
+                str(inferred.get("point", "0")),
+                str(inferred.get("expected", "")),
+            )
+        if inferred_type == "series_convergence":
+            return await self.verify_convergence(
+                str(inferred.get("series_expr", "")),
+                str(inferred.get("var", "n")),
+                expected=inferred.get("expected"),
+            )
+        if inferred_type == "algebraic_identity":
+            return await self.verify_algebraic_identity(
+                str(inferred.get("lhs", "")),
+                str(inferred.get("rhs", "")),
+            )
+
         return VerificationEvidence(
             claim=claim_text,
-            verification_type="placeholder",
+            verification_type="unknown",
             result=SymbolicResult(
                 expression=claim_text,
                 result="",
                 backend=ComputationBackend.SYMPY,
                 success=False,
-                error="Not yet implemented",
+                error="Could not classify claim into a supported mathematical check",
             ),
             supports_claim=False,
             confidence=0.0,
-            explanation="Claim verification requires LLM-assisted math extraction",
+            explanation="No supported structure detected in claim",
         )
 
     async def verify_algebraic_identity(
@@ -979,9 +1428,22 @@ class MathematicalVerifier:
             raise RuntimeError("SymPy engine required for limit verification")
 
         result = await self.engine.limit(expr, var, point)
-        supports = result.success and result.result == expected
+        expected_norm = self._normalize_expr(expected)
+        supports = False
+        if result.success and result.result and expected_norm:
+            actual_norm = self._normalize_expr(result.result)
+            if actual_norm == expected_norm:
+                supports = True
+            else:
+                try:
+                    lhs = await self.engine._parse_expr(actual_norm)
+                    rhs = await self.engine._parse_expr(expected_norm)
+                    diff = await asyncio.to_thread(lambda: simplify(lhs - rhs))
+                    supports = diff == 0
+                except Exception:
+                    supports = False
         return VerificationEvidence(
-            claim=f"lim_{{{var}→{point}}} {expr} = {expected}",
+            claim=f"lim_{{{var}→{point}}} {expr} = {expected_norm}",
             verification_type="limit_check",
             result=result,
             supports_claim=supports,
@@ -989,26 +1451,153 @@ class MathematicalVerifier:
             explanation="Limit computed symbolically with SymPy",
         )
 
-    async def verify_convergence(self, series_expr: str, var: str) -> VerificationEvidence:
+    async def verify_convergence(
+        self,
+        series_expr: str,
+        var: str,
+        expected: Any | None = None,
+    ) -> VerificationEvidence:
         """Verify that a series converges."""
         if not self.engine:
             raise RuntimeError("SymPy engine required for convergence verification")
 
-        # Placeholder: real convergence testing is complex
+        expr = (series_expr or "").strip()
+        if not expr:
+            result = SymbolicResult(
+                expression=series_expr,
+                result="",
+                backend=ComputationBackend.SYMPY,
+                success=False,
+                error="No expression provided",
+            )
+            return VerificationEvidence(
+                claim=f"Series {series_expr} in {var} converges",
+                verification_type="series_convergence",
+                result=result,
+                supports_claim=False,
+                confidence=0.0,
+                explanation=result.error,
+            )
+
+        symbol = sp.Symbol(var)
+        try:
+            parsed_expr = await self.engine._parse_expr(expr)
+        except Exception as e:
+            result = SymbolicResult(
+                expression=series_expr,
+                result="",
+                backend=ComputationBackend.SYMPY,
+                success=False,
+                error=f"Failed to parse series expression: {e}",
+            )
+            return VerificationEvidence(
+                claim=f"Series {series_expr} in {var} converges",
+                verification_type="series_convergence",
+                result=result,
+                supports_claim=False,
+                confidence=0.0,
+                explanation=result.error,
+            )
+
+        checks: list[str] = []
+        evidence_score = 0
+        supports = None
+        expected_converges = self._coerce_expected_bool(expected)
+
+        # 1) Use summation where possible
+        try:
+            sum_result = await asyncio.to_thread(sp.summation, parsed_expr, (symbol, 1, sp.oo))
+            if sum_result in {sp.oo, -sp.oo, sp.zoo}:
+                supports = False
+                checks.append("Symbolic summation diverges")
+            elif getattr(sum_result, "is_finite", False):
+                supports = True
+                checks.append(f"Symbolic summation finite: {sum_result}")
+                evidence_score += 1
+        except Exception as e:
+            checks.append(f"Symbolic summation unavailable: {e}")
+
+        # 2) Ratio test
+        if supports is None:
+            try:
+                ratio_expr = sp.Abs(parsed_expr.subs(symbol, symbol + 1) / parsed_expr)
+                ratio = await asyncio.to_thread(limit, ratio_expr, symbol, sp.oo)
+                checks.append(f"ratio_limit={ratio}")
+                if ratio.is_number:
+                    ratio_value = float(ratio.evalf())
+                    if ratio_value < 1:
+                        supports = True
+                        evidence_score += 1
+                    elif ratio_value > 1:
+                        supports = False
+                    elif ratio_value == 1.0:
+                        checks.append("Ratio test inconclusive at L=1")
+            except Exception as e:
+                checks.append(f"Ratio test failed: {e}")
+
+        # 3) Numeric tail behavior when symbolic path is inconclusive
+        numeric_support = None
+        try:
+            abs_expr = sp.Abs(parsed_expr)
+            evaluator = sp.lambdify(symbol, abs_expr, modules="math")
+            terms = []
+            for n in [20, 40, 80, 160, 320, 640]:
+                value = evaluator(n)
+                if value is None:
+                    raise ValueError("Evaluator returned null")
+                terms.append(float(value))
+            checks.append(f"tail_terms={terms}")
+            if all(terms[i] > terms[i + 1] for i in range(len(terms) - 1)):
+                numeric_support = True
+                evidence_score += 1
+            elif all(terms[i] < terms[i + 1] * 1.02 for i in range(len(terms) - 1)):
+                numeric_support = False
+            elif terms[-1] < terms[0] * 0.3:
+                # Mild monotone-like decay signal
+                numeric_support = True
+        except Exception as e:
+            checks.append(f"Tail numeric check failed: {e}")
+
+        if supports is None and numeric_support is not None:
+            supports = numeric_support
+
+        supports_claim = False if expected_converges is not None else bool(supports)
+        if supports is not None and expected_converges is not None:
+            supports_claim = supports is expected_converges
+
+        confidence = 0.0
+        if supports is True:
+            confidence = min(0.95, 0.35 + 0.3 * evidence_score)
+        elif supports is False:
+            confidence = min(0.95, 0.35 + 0.15 * evidence_score)
+        else:
+            confidence = 0.2
+
         result = SymbolicResult(
             expression=series_expr,
-            result="",
+            result=(
+                "inconclusive"
+                if supports is None
+                else ("converges" if supports else "diverges")
+            ),
             backend=ComputationBackend.SYMPY,
-            success=False,
-            error="Convergence testing not yet implemented",
+            success=True,
+            steps=checks,
+            error="",
         )
+
+        explanation = "Series convergence inferred from summation, ratio, and numeric tail checks"
+        if expected_converges is not None:
+            target_text = "converges" if expected_converges else "diverges"
+            explanation = f"Expected behavior: {target_text}. {explanation}"
+
         return VerificationEvidence(
             claim=f"Series {series_expr} in {var} converges",
             verification_type="series_convergence",
             result=result,
-            supports_claim=False,
-            confidence=0.0,
-            explanation="Series convergence requires ratio/root test or other analytic criteria",
+            supports_claim=supports_claim,
+            confidence=confidence,
+            explanation=explanation,
         )
 
     async def verify_eigenvalue_claim(
@@ -1019,12 +1608,13 @@ class MathematicalVerifier:
             raise RuntimeError("SymPy engine required for eigenvalue verification")
 
         result = await self.engine.matrix_operation(matrix_str, "eigenvalues")
+        supports = self._eigenvalue_claim_matches(result, expected_eigenvalues)
         return VerificationEvidence(
             claim=f"Matrix eigenvalues are {expected_eigenvalues}",
             verification_type="eigenvalue",
             result=result,
-            supports_claim=result.success,
-            confidence=0.85 if result.success else 0.1,
+            supports_claim=supports,
+            confidence=0.85 if supports else (0.1 if result.success else 0.0),
             explanation="Eigenvalues computed symbolically",
         )
 
@@ -1106,16 +1696,231 @@ class MathematicalVerifier:
         self, claim_text: str, llm: Any
     ) -> dict[str, Any]:
         """Use LLM to extract mathematical content from natural language claim."""
-        # Placeholder: real implementation would prompt an LLM
+        # 1) explicit JSON payload (most robust)
+        try:
+            extracted = extract_json_from_text(
+                claim_text,
+                schema=self._math_claim_schema(),
+                strict=True,
+            )
+            if isinstance(extracted, dict) and extracted.get("type"):
+                return self._normalize_extracted_payload(extracted)
+        except ValueError:
+            pass
+
+        # 2) optional LLM-assisted extraction (best effort; safe fallback)
+        if llm is not None and hasattr(llm, "call"):
+            maybe = await self._extract_with_llm(llm, claim_text)
+            if maybe:
+                return self._normalize_extracted_payload(maybe)
+
+        # 3) heuristic fallback
+        return self._infer_math_claim_type(claim_text)
+
+    def _normalize_expr(self, expr: str) -> str:
+        expr = (expr or "").strip()
+        expr = expr.replace("∞", "oo")
+        expr = expr.replace("→", "->")
+        expr = expr.replace("−", "-")
+        expr = expr.replace("–", "-")
+        expr = expr.replace("＝", "=")
+        return expr
+
+    @staticmethod
+    def _math_claim_schema() -> dict[str, Any]:
         return {
-            "type": "unknown",
-            "content": claim_text,
+            "type": "object",
+            "properties": {
+                "type": {"type": "string"},
+                "lhs": {"type": "string"},
+                "rhs": {"type": "string"},
+                "expr": {"type": "string"},
+                "var": {"type": "string"},
+                "point": {"type": "string"},
+                "series_expr": {"type": "string"},
+                "matrix": {"type": "string"},
+                "expected_eigenvalues": {"type": "array"},
+                "test_points": {"type": "array"},
+                "expected_fn": {"type": "string"},
+            },
+            "required": ["type"],
         }
 
+    def _strip_markdown_fences(self, text: str) -> str:
+        if not text:
+            return ""
+        match = re.search(r"```[a-zA-Z]*\n(.*?)\n```", text, re.S)
+        if match:
+            return match.group(1).strip()
+        return text.strip()
 
-# ══════════════════════════════════════════════════════════════
+    def _normalize_extracted_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(payload)
+        normalized["type"] = str(normalized.get("type", "unknown")).lower().replace("-", "_")
+        for key in ("lhs", "rhs", "expr", "series_expr", "point", "expected"):
+            if key in normalized and isinstance(normalized[key], str):
+                normalized[key] = self._normalize_expr(normalized[key])
+        if "var" in normalized and isinstance(normalized["var"], str):
+            normalized["var"] = normalized["var"].strip() or "n"
+        return normalized
+
+    @staticmethod
+    def _coerce_expected_bool(value: Any | None) -> bool | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if not normalized:
+                return None
+            if normalized in {"true", "t", "1", "yes", "y", "converges", "convergent"}:
+                return True
+            if normalized in {"false", "f", "0", "no", "n", "does not converge", "diverges", "divergent", "发散"}:
+                return False
+        return None
+
+    @staticmethod
+    def _eigenvalue_claim_matches(result: SymbolicResult, expected: list[str]) -> bool:
+        if not result.success:
+            return False
+        if not expected:
+            return True
+
+        parsed = (
+            (result.result or "")
+            .replace("{", "")
+            .replace("}", "")
+            .replace("[", "")
+            .replace("]", "")
+            .replace("(", "")
+            .replace(")", "")
+            .strip()
+            .replace(" ", "")
+        )
+        if not parsed:
+            return False
+
+        actual = Counter(token for token in (part.strip() for part in parsed.split(",")) if token)
+        expected_set = Counter(
+            str(v).strip().replace(" ", "") for v in expected if str(v).strip()
+        )
+        return actual == expected_set
+
+    async def _extract_with_llm(self, llm: Any, claim_text: str) -> dict[str, Any] | None:
+        from autoforge.engine.llm_router import TaskComplexity
+
+        prompt = (
+            "Extract math claim structure as strict JSON.\n"
+            "Allowed types: algebraic_identity, limit, series_convergence, numerical_spot_check, eigenvalue.\n"
+            "Return object with fields type, lhs, rhs, expr, var, point, expected, series_expr, matrix, expected_eigenvalues.\n"
+            "No Markdown, JSON only.\n\n"
+            f"Claim: {claim_text}"
+        )
+        try:
+            response = await llm.call(
+                prompt,
+                complexity=TaskComplexity.STANDARD,
+                max_tokens=400,
+            )
+        except Exception:
+            return None
+
+        text = ""
+        for block in getattr(response, "content", []):
+            if getattr(block, "type", "") == "text":
+                text += str(getattr(block, "text", ""))
+        if not text:
+            return None
+        try:
+            payload = extract_json_from_text(
+                text,
+                schema=self._math_claim_schema(),
+                strict=True,
+            )
+            if isinstance(payload, dict) and payload.get("type"):
+                return payload
+        except ValueError:
+            return None
+        return None
+
+    def _infer_math_claim_type(self, claim_text: str) -> dict[str, Any]:
+        text = self._strip_markdown_fences(claim_text).strip()
+        if not text:
+            return {"type": "unknown", "content": ""}
+
+        lower = text.lower()
+
+        # Limit patterns: lim_{x->a} f(x) = L or limit(x->a, f(x)) = L
+        lim_match = re.search(
+            r"lim(?:it)?\s*_\{\s*([a-zA-Z])\s*(?:→|->)\s*([^}]+)\}\s*([^\n=]+)\s*=?\s*(.*)",
+            text,
+            flags=re.I,
+        )
+        if lim_match:
+            return {
+                "type": "limit",
+                "var": lim_match.group(1),
+                "point": lim_match.group(2),
+                "expr": lim_match.group(3),
+                "expected": lim_match.group(4),
+            }
+
+        lim_fn_match = re.search(
+            r"limit\s*\(\s*([a-zA-Z])\s*(?:→|->)\s*([^,)]*)\s*,\s*([^)]+)\)\s*=?\s*(.*)",
+            text,
+            flags=re.I,
+        )
+        if lim_fn_match:
+            return {
+                "type": "limit",
+                "var": lim_fn_match.group(1),
+                "point": lim_fn_match.group(2),
+                "expr": lim_fn_match.group(3),
+                "expected": lim_fn_match.group(4),
+            }
+
+        # Series / convergence
+        if "converge" in lower or "收敛" in text or "发散" in text:
+            expected = None
+            if "diverge" in lower or "发散" in text:
+                expected = False
+            elif "converge" in lower or "收敛" in text:
+                expected = True
+
+            series_expr = text
+            var = None
+            for candidate in ("n", "k", "m", "i", "j"):
+                if re.search(rf"\b{candidate}\b", text):
+                    var = candidate
+                    break
+            if var is None:
+                var = "n"
+            return {
+                "type": "series_convergence",
+                "series_expr": self._normalize_expr(series_expr),
+                "var": var,
+                "expected": expected,
+            }
+
+        # Algebraic identity
+        eq_match = re.search(r"(.+?)\s*(?:==|=)\s*(.+)", text, flags=re.S)
+        if eq_match:
+            lhs = eq_match.group(1).strip()
+            rhs = eq_match.group(2).strip()
+            if lhs and rhs:
+                return {
+                    "type": "algebraic_identity",
+                    "lhs": self._normalize_expr(lhs),
+                    "rhs": self._normalize_expr(rhs),
+                }
+
+        return {
+            "type": "unknown",
+            "content": self._normalize_expr(text),
+        }
 # Main Facade
-# ══════════════════════════════════════════════════════════════
+# 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 
 
 class SymbolicComputeEngine:

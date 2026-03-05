@@ -178,7 +178,19 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     """Robustly extract JSON object from LLM response text."""
     from autoforge.engine.utils import extract_json_from_text
     try:
-        return extract_json_from_text(text)
+        return extract_json_from_text(
+            text,
+            schema={
+                "type": "object",
+                "required": ["consistent", "conflicts", "confidence"],
+                "properties": {
+                    "consistent": {"type": "boolean"},
+                    "conflicts": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "number"},
+                    "action": {"type": "string"},
+                },
+            },
+        )
     except ValueError:
         return None
 

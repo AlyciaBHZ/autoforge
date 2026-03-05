@@ -269,7 +269,10 @@ class TaskDAG:
         """Persist DAG state to JSON for resume capability."""
         data = [t.to_dict() for t in self._tasks.values()]
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        payload = json.dumps(data, indent=2, ensure_ascii=False)
+        tmp = path.parent / f".{path.name}.tmp"
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(path)
         logger.debug(f"DAG saved to {path}")
 
     @classmethod

@@ -178,7 +178,19 @@ class CheckpointManager:
 
             from autoforge.engine.utils import extract_json_from_text
             try:
-                data = extract_json_from_text(text)
+                data = extract_json_from_text(
+                    text,
+                    schema={
+                        "type": "object",
+                        "required": ["on_track", "score", "suggested_action"],
+                        "properties": {
+                            "on_track": {"type": "boolean"},
+                            "score": {"type": "number"},
+                            "feedback": {"type": "string"},
+                            "suggested_action": {"type": "string"},
+                        },
+                    },
+                )
                 score = float(data.get("score", 0.5))
 
                 verdict = CheckpointVerdict(

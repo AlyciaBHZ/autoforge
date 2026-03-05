@@ -156,8 +156,17 @@ class ArchitectAgent(AgentBase):
     def parse_architecture(self, output: str) -> dict[str, Any]:
         """Extract architecture and tasks from the Architect's output."""
         from autoforge.engine.utils import extract_json_from_text
+        schema = {
+            "type": "object",
+            "required": ["architecture", "tasks"],
+            "properties": {
+                "architecture": {"type": "object"},
+                "tasks": {"type": "array", "items": {"type": "object"}},
+                "deliverables": {"type": "array", "items": {"type": "string"}},
+            },
+        }
         try:
-            return extract_json_from_text(output)
+            return extract_json_from_text(output, schema=schema, strict=True)
         except (ValueError, json.JSONDecodeError) as e:
             raise ValueError(f"Could not extract architecture from Architect output: {e}") from e
 

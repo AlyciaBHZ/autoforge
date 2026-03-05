@@ -243,8 +243,19 @@ class ScannerAgent(AgentBase):
     def parse_scan(self, output: str) -> ScanResult:
         """Extract structured scan result from agent output."""
         from autoforge.engine.utils import extract_json_from_text
+        schema = {
+            "type": "object",
+            "required": ["spec", "gaps", "completeness"],
+            "properties": {
+                "spec": {"type": "object"},
+                "gaps": {"type": "array", "items": {"type": "string"}},
+                "completeness": {"type": "number"},
+                "description": {"type": "string"},
+                "excluded": {"type": "array", "items": {"type": "string"}},
+            },
+        }
         try:
-            data = extract_json_from_text(output)
+            data = extract_json_from_text(output, schema=schema, strict=True)
         except (ValueError, json.JSONDecodeError) as e:
             logger.warning("Could not parse scanner output: %s", e)
             return ScanResult(summary="Failed to parse scan results")
