@@ -176,10 +176,9 @@ class CheckpointManager:
                 if block.type == "text":
                     text += block.text
 
-            import re
-            match = re.search(r"\{.*?\}", text, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
+            from autoforge.engine.utils import extract_json_from_text
+            try:
+                data = extract_json_from_text(text)
                 score = float(data.get("score", 0.5))
 
                 verdict = CheckpointVerdict(
@@ -189,10 +188,10 @@ class CheckpointManager:
                     feedback=data.get("feedback", ""),
                     suggested_action=data.get("suggested_action", "continue"),
                 )
-            else:
+            except (ValueError, json.JSONDecodeError):
                 verdict = CheckpointVerdict(
-                    on_track=True, score=0.5,
-                    feedback="Could not parse evaluation — continuing.",
+                    on_track=False, score=0.3,
+                    feedback="Could not parse evaluation — treating as low-confidence.",
                 )
 
         except Exception as e:

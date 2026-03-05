@@ -12,6 +12,7 @@ task scheduling, and state persistence.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -36,7 +37,7 @@ from autoforge.engine.agents import AGENT_REGISTRY
 # startup time when features are disabled.  Only the types actually needed
 # at runtime are imported; everything else stays behind the config gate.
 from autoforge.engine.dynamic_constitution import DynamicConstitution
-from autoforge.engine.evolution import EvolutionEngine, WorkflowGenome
+from autoforge.engine.evolution import EvolutionEngine, FitnessScore, WorkflowGenome
 from autoforge.engine.process_reward import ProcessRewardModel, StepType
 from autoforge.engine.prompt_optimizer import PromptOptimizer
 
@@ -50,6 +51,45 @@ class UserPausedError(Exception):
 
 class Orchestrator:
     """Main orchestrator for the AutoForge pipeline."""
+
+    # Registry of optional engines: (attr_name, config_flag, module_path, class_name)
+    # Used by _init_engines() to avoid repetitive if-try-import-assign blocks.
+    _ENGINE_REGISTRY: list[tuple[str, str, str, str]] = [
+        # Core ML engines (no try/except — failures are fatal)
+        ("_evomac", "evomac_enabled", "autoforge.engine.evomac", "EvoMACEngine"),
+        ("_sica", "sica_enabled", "autoforge.engine.sica", "SICAEngine"),
+        ("_rag", "rag_enabled", "autoforge.engine.rag_retrieval", "RAGRetrievalEngine"),
+        ("_formal_verifier", "formal_verify_enabled", "autoforge.engine.formal_verify", "FormalVerifier"),
+        ("_debate", "debate_enabled", "autoforge.engine.agent_debate", "ConditionalDebateEngine"),
+        ("_security_scanner", "security_scan_enabled", "autoforge.engine.security_scan", "SecurityScanner"),
+        ("_reflexion", "reflexion_enabled", "autoforge.engine.reflexion", "ReflexionEngine"),
+        ("_adaptive_compute", "adaptive_compute_enabled", "autoforge.engine.adaptive_compute", "AdaptiveComputeRouter"),
+        ("_ldb", "ldb_debugger_enabled", "autoforge.engine.ldb_debugger", "LDBDebugger"),
+        ("_speculative", "speculative_enabled", "autoforge.engine.speculative_pipeline", "SpeculativePipeline"),
+        ("_decomposer", "hierarchical_decomp_enabled", "autoforge.engine.hierarchical_decomp", "HierarchicalDecomposer"),
+        ("_autonomous_discovery", "autonomous_discovery_enabled", "autoforge.engine.autonomous_discovery", "DiscoveryOrchestrator"),
+        ("_paper_formalizer", "paper_formalizer_enabled", "autoforge.engine.paper_formalizer", "PaperFormalizer"),
+        ("_cloud_prover", "cloud_prover_enabled", "autoforge.engine.cloud_prover", "CloudProver"),
+        ("_theoretical_reasoning", "theoretical_reasoning_enabled", "autoforge.engine.theoretical_reasoning", "TheoreticalReasoningEngine"),
+        ("_reasoning_extension", "theoretical_reasoning_enabled", "autoforge.engine.reasoning_extension", "ReasoningExtensionEngine"),
+        ("_article_verifier", "theoretical_reasoning_enabled", "autoforge.engine.article_verifier", "ArticleVerifier"),
+        # Research & academic pipeline (v2.9+)
+        ("_world_model", "world_model_enabled", "autoforge.engine.world_model", "WorldModel"),
+        ("_recursive_decomp_prover", "recursive_decomp_prover_enabled", "autoforge.engine.recursive_decomp_prover", "RecursiveDecompProver"),
+        ("_self_play_conjecture", "self_play_conjecture_enabled", "autoforge.engine.self_play_conjecture", "SelfPlayEngine"),
+        ("_curriculum_learning", "curriculum_learning_enabled", "autoforge.engine.curriculum_learning", "LifelongLearner"),
+        ("_literature_search", "literature_search_enabled", "autoforge.engine.literature_search", "LiteratureSearchEngine"),
+        ("_experiment_loop", "experiment_loop_enabled", "autoforge.engine.experiment_loop", "ExperimentLoop"),
+        ("_paper_writer", "paper_writer_enabled", "autoforge.engine.paper_writer", "PaperWriter"),
+        ("_dense_retrieval", "dense_retrieval_enabled", "autoforge.engine.dense_retrieval", "DenseRetriever"),
+        ("_rl_proof_search", "rl_proof_search_enabled", "autoforge.engine.rl_proof_search", "RLMCTSSearch"),
+        ("_article_reasoning", "article_reasoning_enabled", "autoforge.engine.article_reasoning", "ArticleReasoningOrchestrator"),
+        ("_vlm_figure", "vlm_figure_enabled", "autoforge.engine.vlm_figure", "VLMFigurePipeline"),
+        ("_symbolic_compute", "symbolic_compute_enabled", "autoforge.engine.symbolic_compute", "SymbolicComputeEngine"),
+        ("_peer_review", "peer_review_enabled", "autoforge.engine.peer_review", "PeerReviewPipeline"),
+        ("_proof_embedding", "proof_embedding_enabled", "autoforge.engine.proof_embedding", "ProofEmbeddingEngine"),
+        ("_pantograph_repl", "pantograph_repl_enabled", "autoforge.engine.provers.pantograph_repl", "PantographREPL"),
+    ]
 
     def __init__(self, config: ForgeConfig) -> None:
         self.config = config
@@ -74,29 +114,16 @@ class Orchestrator:
         self._context_success_history: list[bool] = []
 
         # ── Lazy-initialized advanced engines ──
-        # Only created when the corresponding config flag is True.
-        # Reduces startup time and memory when features are disabled.
-        self._evomac: Any = None
-        self._sica: Any = None
-        self._rag: Any = None
-        self._formal_verifier: Any = None
-        self._debate: Any = None
-        self._security_scanner: Any = None
-        self._reflexion: Any = None
-        self._adaptive_compute: Any = None
-        self._ldb: Any = None
-        self._speculative: Any = None
-        self._decomposer: Any = None
-        self._lean_prover: Any = None
-        self._multi_prover: Any = None
+        # Pre-initialize ALL engine attributes to None so they always exist,
+        # even when the corresponding config flag is False.
+        for attr, _flag, _mod, _cls in self._ENGINE_REGISTRY:
+            setattr(self, attr, None)
+        # CapabilityDAG bridge needs special handling
         self._capability_dag: Any = None
         self._dag_bridge: Any = None
-        self._theoretical_reasoning: Any = None
-        self._autonomous_discovery: Any = None
-        self._paper_formalizer: Any = None
-        self._cloud_prover: Any = None
-        self._reasoning_extension: Any = None
-        self._article_verifier: Any = None
+        self._lean_prover: Any = None
+        self._multi_prover: Any = None
+
         self._init_engines()
 
     @property
@@ -114,163 +141,46 @@ class Orchestrator:
         cls = AGENT_REGISTRY[role]
         return cls(*args, **kwargs)
 
+    def _try_init_engine(self, attr: str, module_path: str, class_name: str) -> None:
+        """Try to import and instantiate a single engine.
+
+        Logs a warning on failure instead of silently swallowing the error.
+        """
+        import importlib
+        try:
+            mod = importlib.import_module(module_path)
+            cls = getattr(mod, class_name)
+            setattr(self, attr, cls())
+        except ImportError as e:
+            logger.warning(
+                "Engine %s unavailable (import failed): %s", class_name, e
+            )
+        except Exception as e:
+            logger.warning(
+                "Engine %s failed to initialize: %s", class_name, e,
+                exc_info=True,
+            )
+
     def _init_engines(self) -> None:
-        """Lazily initialize only the engines that are enabled in config."""
+        """Initialize only the engines that are enabled in config.
+
+        Uses _ENGINE_REGISTRY to avoid repetitive if-try-import blocks.
+        Each engine that fails to load is logged with a warning instead
+        of being silently swallowed.
+        """
         c = self.config
-        if c.evomac_enabled:
-            from autoforge.engine.evomac import EvoMACEngine
-            self._evomac = EvoMACEngine()
-        if c.sica_enabled:
-            from autoforge.engine.sica import SICAEngine
-            self._sica = SICAEngine()
-        if c.rag_enabled:
-            from autoforge.engine.rag_retrieval import RAGRetrievalEngine
-            self._rag = RAGRetrievalEngine()
-        if c.formal_verify_enabled:
-            from autoforge.engine.formal_verify import FormalVerifier
-            self._formal_verifier = FormalVerifier()
-        if c.debate_enabled:
-            from autoforge.engine.agent_debate import ConditionalDebateEngine
-            self._debate = ConditionalDebateEngine()
-        if c.security_scan_enabled:
-            from autoforge.engine.security_scan import SecurityScanner
-            self._security_scanner = SecurityScanner()
-        if c.reflexion_enabled:
-            from autoforge.engine.reflexion import ReflexionEngine
-            self._reflexion = ReflexionEngine()
-        if c.adaptive_compute_enabled:
-            from autoforge.engine.adaptive_compute import AdaptiveComputeRouter
-            self._adaptive_compute = AdaptiveComputeRouter()
-        if c.ldb_debugger_enabled:
-            from autoforge.engine.ldb_debugger import LDBDebugger
-            self._ldb = LDBDebugger()
-        if c.speculative_enabled:
-            from autoforge.engine.speculative_pipeline import SpeculativePipeline
-            self._speculative = SpeculativePipeline()
-        if c.hierarchical_decomp_enabled:
-            from autoforge.engine.hierarchical_decomp import HierarchicalDecomposer
-            self._decomposer = HierarchicalDecomposer()
+        for attr, flag, module_path, class_name in self._ENGINE_REGISTRY:
+            if getattr(c, flag, False):
+                self._try_init_engine(attr, module_path, class_name)
+
+        # CapabilityDAG needs special handling (bridge depends on DAG)
         if c.capability_dag_enabled:
-            from autoforge.engine.capability_dag import CapabilityDAG, DAGBridge
-            self._capability_dag = CapabilityDAG()
-            self._dag_bridge = DAGBridge(self._capability_dag)
-        if c.theoretical_reasoning_enabled:
-            from autoforge.engine.theoretical_reasoning import TheoreticalReasoningEngine
-            self._theoretical_reasoning = TheoreticalReasoningEngine()
-            # Optional extension/verifier modules: keep best-effort imports.
             try:
-                from autoforge.engine.reasoning_extension import ReasoningExtensionEngine
-
-                self._reasoning_extension = ReasoningExtensionEngine()
-            except Exception:
-                self._reasoning_extension = None
-            try:
-                from autoforge.engine.article_verifier import ArticleVerifier
-
-                self._article_verifier = ArticleVerifier()
-            except Exception:
-                self._article_verifier = None
-        if c.autonomous_discovery_enabled:
-            from autoforge.engine.autonomous_discovery import DiscoveryOrchestrator
-            self._autonomous_discovery = DiscoveryOrchestrator()
-        if c.paper_formalizer_enabled:
-            from autoforge.engine.paper_formalizer import PaperFormalizer
-            self._paper_formalizer = PaperFormalizer()
-        if c.cloud_prover_enabled:
-            from autoforge.engine.cloud_prover import CloudProver
-            self._cloud_prover = CloudProver()
-
-        # ── Research & academic pipeline (v2.9+) ──
-        if c.world_model_enabled:
-            try:
-                from autoforge.engine.world_model import WorldModel
-                self._world_model = WorldModel()
-            except Exception:
-                self._world_model = None
-        if c.recursive_decomp_prover_enabled:
-            try:
-                from autoforge.engine.recursive_decomp_prover import RecursiveDecompProver
-                self._recursive_decomp_prover = RecursiveDecompProver()
-            except Exception:
-                self._recursive_decomp_prover = None
-        if c.self_play_conjecture_enabled:
-            try:
-                from autoforge.engine.self_play_conjecture import SelfPlayEngine
-                self._self_play_conjecture = SelfPlayEngine()
-            except Exception:
-                self._self_play_conjecture = None
-        if c.curriculum_learning_enabled:
-            try:
-                from autoforge.engine.curriculum_learning import LifelongLearner
-                self._curriculum_learning = LifelongLearner()
-            except Exception:
-                self._curriculum_learning = None
-        if c.literature_search_enabled:
-            try:
-                from autoforge.engine.literature_search import LiteratureSearchEngine
-                self._literature_search = LiteratureSearchEngine()
-            except Exception:
-                self._literature_search = None
-        if c.experiment_loop_enabled:
-            try:
-                from autoforge.engine.experiment_loop import ExperimentLoop
-                self._experiment_loop = ExperimentLoop()
-            except Exception:
-                self._experiment_loop = None
-        if c.paper_writer_enabled:
-            try:
-                from autoforge.engine.paper_writer import PaperWriter
-                self._paper_writer = PaperWriter()
-            except Exception:
-                self._paper_writer = None
-        if c.dense_retrieval_enabled:
-            try:
-                from autoforge.engine.dense_retrieval import DenseRetriever
-                self._dense_retrieval = DenseRetriever()
-            except Exception:
-                self._dense_retrieval = None
-        if c.rl_proof_search_enabled:
-            try:
-                from autoforge.engine.rl_proof_search import RLMCTSSearch
-                self._rl_proof_search = RLMCTSSearch()
-            except Exception:
-                self._rl_proof_search = None
-        if c.article_reasoning_enabled:
-            try:
-                from autoforge.engine.article_reasoning import ArticleReasoningOrchestrator
-                self._article_reasoning = ArticleReasoningOrchestrator()
-            except Exception:
-                self._article_reasoning = None
-        if c.vlm_figure_enabled:
-            try:
-                from autoforge.engine.vlm_figure import VLMFigurePipeline
-                self._vlm_figure = VLMFigurePipeline()
-            except Exception:
-                self._vlm_figure = None
-        if c.symbolic_compute_enabled:
-            try:
-                from autoforge.engine.symbolic_compute import SymbolicComputeEngine
-                self._symbolic_compute = SymbolicComputeEngine()
-            except Exception:
-                self._symbolic_compute = None
-        if c.peer_review_enabled:
-            try:
-                from autoforge.engine.peer_review import PeerReviewPipeline
-                self._peer_review = PeerReviewPipeline()
-            except Exception:
-                self._peer_review = None
-        if c.proof_embedding_enabled:
-            try:
-                from autoforge.engine.proof_embedding import ProofEmbeddingEngine
-                self._proof_embedding = ProofEmbeddingEngine()
-            except Exception:
-                self._proof_embedding = None
-        if c.pantograph_repl_enabled:
-            try:
-                from autoforge.engine.provers.pantograph_repl import PantographREPL
-                self._pantograph_repl = PantographREPL
-            except Exception:
-                self._pantograph_repl = None
+                from autoforge.engine.capability_dag import CapabilityDAG, DAGBridge
+                self._capability_dag = CapabilityDAG()
+                self._dag_bridge = DAGBridge(self._capability_dag)
+            except Exception as e:
+                logger.warning("CapabilityDAG failed to initialize: %s", e)
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
@@ -464,7 +374,7 @@ class Orchestrator:
 
             # Reasoning extension: save state
             if self._reasoning_extension is not None:
-                ext_dir = Path(".autoforge") / "reasoning_extension"
+                ext_dir = self._forge_dir / "reasoning_extension"
                 self._reasoning_extension.save(ext_dir)
 
             # Theoretical reasoning: save theory graphs (project-level + global)
@@ -1313,29 +1223,29 @@ class Orchestrator:
                 pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
                 scripts = pkg.get("scripts", {})
                 if "test" in scripts:
-                    return "npm test -- --passWithNoTests 2>&1 || true"
+                    return "npm test -- --passWithNoTests 2>&1"
             except (json.JSONDecodeError, OSError):
                 pass
 
         # Python / pytest
         if (work_dir / "pytest.ini").exists() or (work_dir / "setup.cfg").exists():
-            return "python -m pytest --tb=short -q 2>&1 || true"
+            return "python -m pytest --tb=short -q 2>&1"
         pyproject = work_dir / "pyproject.toml"
         if pyproject.exists():
             try:
                 content = pyproject.read_text(encoding="utf-8")
                 if "pytest" in content or "tool.pytest" in content:
-                    return "python -m pytest --tb=short -q 2>&1 || true"
+                    return "python -m pytest --tb=short -q 2>&1"
             except OSError:
                 pass
 
         # Rust / cargo
         if (work_dir / "Cargo.toml").exists():
-            return "cargo test 2>&1 || true"
+            return "cargo test 2>&1"
 
         # Go
         if (work_dir / "go.mod").exists():
-            return "go test ./... 2>&1 || true"
+            return "go test ./... 2>&1"
 
         return None
 
@@ -1552,7 +1462,7 @@ class Orchestrator:
             # Director creates fix tasks
             fix_director = self._agent("director_fix", self.config, self.llm)
             for failure in failures[:3]:  # Limit fixes per attempt
-                failure_id = f"fix-{hash(str(failure)) % 10000}"
+                failure_id = f"fix-{int(hashlib.sha256(str(failure).encode()).hexdigest()[:8], 16) % 10000}"
                 failure_msg = failure if isinstance(failure, str) else str(failure)
 
                 # LDB: block-level fault localization
@@ -1588,8 +1498,8 @@ class Orchestrator:
                     fix_task = fix_director.parse_fix_task(fix_result.output)
 
                     # Builder executes fix (with LDB + Reflexion context)
-                    builder = BuilderAgent(
-                        self.config, self.llm,
+                    builder = self._agent(
+                        "builder", self.config, self.llm,
                         working_dir=self.project_dir,
                         sandbox=sandbox,
                     )
@@ -1619,7 +1529,7 @@ class Orchestrator:
                 # Reflexion: mark as resolved
                 if self.config.reflexion_enabled:
                     for failure in failures[:3]:
-                        fid = f"fix-{hash(str(failure)) % 10000}"
+                        fid = f"fix-{int(hashlib.sha256(str(failure).encode()).hexdigest()[:8], 16) % 10000}"
                         self._reflexion.mark_success(fid)
                 return
 
@@ -1627,7 +1537,7 @@ class Orchestrator:
             if self.config.reflexion_enabled:
                 for failure in failures[:3]:
                     failure_msg = failure if isinstance(failure, str) else str(failure)
-                    fid = f"fix-{hash(str(failure)) % 10000}"
+                    fid = f"fix-{int(hashlib.sha256(str(failure).encode()).hexdigest()[:8], 16) % 10000}"
                     try:
                         await self._reflexion.reflect_on_failure(
                             task_id=fid,
@@ -1642,7 +1552,7 @@ class Orchestrator:
         # Mark persistent failures
         if self.config.reflexion_enabled:
             for failure in (test_results.failures or [])[:3]:
-                fid = f"fix-{hash(str(failure)) % 10000}"
+                fid = f"fix-{int(hashlib.sha256(str(failure).encode()).hexdigest()[:8], 16) % 10000}"
                 self._reflexion.mark_persistent(fid)
 
         console.print("  [yellow]Some issues remain after fix attempts[/yellow]")
@@ -1660,7 +1570,7 @@ class Orchestrator:
         })
         review = reviewer.parse_review(review_result.output)
 
-        if review.score >= int(self.config.quality_threshold * 10):
+        if review.score >= round(self.config.quality_threshold * 10):
             console.print(f"  [green]Quality score: {review.score}/10 — no refactoring needed[/green]")
             return
 
@@ -1734,7 +1644,7 @@ class Orchestrator:
             # Phase 3: REFACTOR (developer mode only)
             if (
                 self.config.mode == "developer"
-                and review.score < int(self.config.quality_threshold * 10)
+                and review.score < round(self.config.quality_threshold * 10)
                 and review.issues
             ):
                 console.print("\n[bold blue]Phase 3: REFACTOR[/bold blue] — Applying fixes...")
@@ -2084,7 +1994,7 @@ class Orchestrator:
             return architect.parse_architecture(arch_result.output)
 
         # Step 2: Set up search tree
-        from autoforge.engine.search_tree import SearchTree
+        from autoforge.engine.search_tree import SearchTree, evaluate_candidate
         self._search_tree = SearchTree()
         root = self._search_tree.create_root(
             description="Architecture exploration",

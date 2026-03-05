@@ -148,16 +148,38 @@ class ScannerAgent(AgentBase):
                     continue
         return json.dumps(files[:500])  # Limit to 500 files
 
+    # Read-only commands the scanner is allowed to execute
+    _ALLOWED_COMMANDS = frozenset({
+        "ls", "cat", "head", "tail", "wc", "find", "tree", "file",
+        "grep", "rg", "ag", "awk", "sed", "sort", "uniq", "diff",
+        "stat", "du", "git", "python", "node", "go", "cargo",
+    })
+
     async def _handle_run_command(self, input_data: dict[str, Any]) -> str:
-        """Execute safe read-only commands for analysis."""
+        """Execute safe read-only commands for analysis.
+
+        Uses an allowlist of safe commands instead of a bypassable blocklist.
+        """
         import asyncio
+        import shlex
 
         command = input_data["command"]
 
-        # Block write commands
-        blocked = ["rm ", "mv ", "cp ", "write", "install", "npm ", "pip ", "delete", "> ", ">> "]
-        if any(b in command.lower() for b in blocked):
-            return json.dumps({"error": "Only read-only commands allowed in scanner"})
+        # Allowlist: only permit known-safe read-only commands
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return json.dumps({"error": "Invalid command syntax"})
+        if not parts:
+            return json.dumps({"error": "Empty command"})
+
+        # Extract the base command name (strip path prefix)
+        base_cmd = parts[0].rsplit("/", 1)[-1]
+        if base_cmd not in self._ALLOWED_COMMANDS:
+            return json.dumps({
+                "error": f"Command '{base_cmd}' not in scanner allowlist. "
+                f"Allowed: {', '.join(sorted(self._ALLOWED_COMMANDS))}"
+            })
 
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -220,17 +242,12 @@ class ScannerAgent(AgentBase):
 
     def parse_scan(self, output: str) -> ScanResult:
         """Extract structured scan result from agent output."""
-        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
-        if match:
-            data = json.loads(match.group(1).strip())
-        else:
-            start = output.find("{")
-            end = output.rfind("}")
-            if start != -1 and end != -1:
-                data = json.loads(output[start : end + 1])
-            else:
-                logger.warning("Could not parse scanner output")
-                return ScanResult(summary="Failed to parse scan results")
+        from autoforge.engine.utils import extract_json_from_text
+        try:
+            data = extract_json_from_text(output)
+        except (ValueError, json.JSONDecodeError) as e:
+            logger.warning("Could not parse scanner output: %s", e)
+            return ScanResult(summary="Failed to parse scan results")
 
         return ScanResult(
             spec=data,

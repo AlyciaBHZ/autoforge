@@ -535,6 +535,9 @@ class MCTSNode:
             return float("inf")  # Unvisited nodes have infinite UCB1
 
         exploitation = self.q_value
+        # Guard against math.log(0) when parent is unvisited
+        if parent_visits <= 0:
+            return exploitation
         exploration = exploration_constant * math.sqrt(
             math.log(parent_visits) / self.visit_count
         )

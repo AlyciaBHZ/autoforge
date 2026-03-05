@@ -92,7 +92,7 @@ async def _grep_system(
 ) -> list[dict[str, Any]]:
     """Search using system grep (POSIX)."""
     cmd = [
-        "grep", "-rn",
+        "grep", "-rn", "-i",
         "--color=never",
         f"--max-count={max_results}",
     ]

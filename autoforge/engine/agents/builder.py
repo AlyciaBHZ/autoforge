@@ -7,14 +7,14 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from autoforge.engine.agent_base import AgentBase, ToolDefinition
+from autoforge.engine.agent_base import AgentBase, FileToolsMixin, ToolDefinition
 from autoforge.engine.llm_router import TaskComplexity
 from autoforge.engine.sandbox import SandboxBase
 
 logger = logging.getLogger(__name__)
 
 
-class BuilderAgent(AgentBase):
+class BuilderAgent(FileToolsMixin, AgentBase):
     """Implements specific tasks by writing production-quality code.
 
     Each Builder works in its own working directory (either a git worktree
@@ -165,69 +165,6 @@ class BuilderAgent(AgentBase):
                 input_schema=SEARCH_GITHUB_TOOL_SCHEMA,
                 handler=partial(handle_search_github, github_token=github_token),
             ))
-
-    def _validate_path(self, rel_path: str) -> Path:
-        """Validate and resolve a relative path, preventing path traversal."""
-        return self.validate_path(rel_path, self.working_dir)
-
-    # 2 MB per file limit to prevent runaway writes
-    MAX_FILE_SIZE = 2 * 1024 * 1024
-
-    async def _handle_write_file(self, input_data: dict[str, Any]) -> str:
-        rel_path = input_data["path"]
-        content = input_data["content"]
-        if len(content) > self.MAX_FILE_SIZE:
-            return json.dumps({
-                "error": f"File too large ({len(content)} bytes). Max is {self.MAX_FILE_SIZE} bytes.",
-            })
-        full_path = self._validate_path(rel_path)
-        full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_text(content, encoding="utf-8")
-        self._artifacts[rel_path] = str(full_path)
-        return json.dumps({"status": "ok", "path": rel_path, "bytes": len(content)})
-
-    async def _handle_read_file(self, input_data: dict[str, Any]) -> str:
-        rel_path = input_data["path"]
-        full_path = self._validate_path(rel_path)
-        if not full_path.exists():
-            return json.dumps({"error": f"File not found: {rel_path}"})
-        content = full_path.read_text(encoding="utf-8")
-        return content
-
-    async def _handle_list_files(self, input_data: dict[str, Any]) -> str:
-        rel_path = input_data.get("path", ".")
-        full_path = self._validate_path(rel_path)
-        if not full_path.is_dir():
-            return json.dumps({"error": f"Not a directory: {rel_path}"})
-        base_resolved = self.working_dir.resolve()
-        files = []
-        for p in sorted(full_path.rglob("*")):
-            if p.is_file() and ".git" not in p.parts:
-                # Prevent symlinks from escaping the workspace
-                if not p.resolve().is_relative_to(base_resolved):
-                    continue
-                try:
-                    files.append(str(p.relative_to(self.working_dir)))
-                except ValueError:
-                    continue
-        return json.dumps(files)
-
-    async def _handle_run_command(self, input_data: dict[str, Any]) -> str:
-        command = input_data["command"]
-        if self.sandbox:
-            result = await self.sandbox.exec(command)
-            return json.dumps({
-                "exit_code": result.exit_code,
-                "stdout": result.stdout[:5000],
-                "stderr": result.stderr[:2000],
-            })
-        else:
-            logger.warning(f"[{self.agent_id}] No sandbox available, skipping: {command[:80]}")
-            return json.dumps({
-                "warning": "No sandbox available — command was NOT executed. "
-                           "This is expected when running without Docker.",
-                "command": command,
-            })
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         task = context.get("task", {})

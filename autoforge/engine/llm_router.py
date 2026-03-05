@@ -125,7 +125,7 @@ def detect_provider(model: str) -> str:
     model_lower = model.lower()
 
     # OpenAI: check exact matches and prefixes
-    if model_lower in _OPENAI_MODELS or model_lower.startswith(("gpt-", "codex-", "o1", "o3", "o4")):
+    if model_lower in _OPENAI_MODELS or model_lower.startswith(("gpt-", "codex-", "o1-", "o3-", "o4-")):
         return "openai"
 
     # Google Gemini
@@ -148,7 +148,10 @@ class LLMRouter:
     """
 
     # Custom provider registry — populated via register_provider()
+    # NOTE: class-level registry is intentionally shared so providers
+    # registered once are available to all router instances.
     _custom_providers: dict[str, LLMProvider] = {}
+    _custom_providers_initialized: bool = False
 
     @classmethod
     def register_provider(cls, name: str, provider: LLMProvider) -> None:
@@ -161,8 +164,12 @@ class LLMRouter:
             name: Provider identifier (e.g., "mistral", "cohere").
             provider: An LLMProvider implementation.
         """
+        # Copy-on-write to avoid mutating a shared default dict
+        if not cls._custom_providers_initialized:
+            cls._custom_providers = {}
+            cls._custom_providers_initialized = True
         cls._custom_providers[name] = provider
-        logger.info(f"Registered custom LLM provider: {name}")
+        logger.info("Registered custom LLM provider: %s", name)
 
     def __init__(self, config: ForgeConfig) -> None:
         self.config = config
@@ -171,6 +178,24 @@ class LLMRouter:
         self._auth_providers: dict[str, Any] = {}  # Cached AuthProvider per provider
         self._budget_lock: asyncio.Lock | None = None
         self._reserved_budget_usd: float = 0.0
+
+    async def close(self) -> None:
+        """Close all cached async HTTP clients to release connection pools."""
+        for provider, client in self._clients.items():
+            try:
+                if hasattr(client, "close"):
+                    await client.close()
+                elif hasattr(client, "aclose"):
+                    await client.aclose()
+            except Exception:
+                logger.debug("Failed to close %s client", provider)
+        self._clients.clear()
+
+    async def __aenter__(self) -> LLMRouter:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.close()
 
     def _get_budget_lock(self) -> asyncio.Lock:
         """Lazily create lock to avoid cross-event-loop lock reuse."""

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from autoforge.engine.agent_base import AgentBase, ToolDefinition
+from autoforge.engine.agent_base import AgentBase, FileToolsMixin, ToolDefinition
 from autoforge.engine.llm_router import TaskComplexity
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ class ReviewResult:
     summary: str
 
 
-class ReviewerAgent(AgentBase):
+class ReviewerAgent(FileToolsMixin, AgentBase):
     """Reviews code for correctness, security, and quality.
 
     Has read-only access to project files. Produces a structured
@@ -72,37 +72,6 @@ class ReviewerAgent(AgentBase):
                 handler=self._handle_list_files,
             ),
         ]
-
-    async def _handle_read_file(self, input_data: dict[str, Any]) -> str:
-        rel_path = input_data["path"]
-        try:
-            full_path = self.validate_path(rel_path, self.working_dir)
-        except ValueError:
-            return json.dumps({"error": "Path traversal not allowed"})
-        if not full_path.exists():
-            return json.dumps({"error": f"File not found: {rel_path}"})
-        return full_path.read_text(encoding="utf-8")
-
-    async def _handle_list_files(self, input_data: dict[str, Any]) -> str:
-        rel_path = input_data.get("path", ".")
-        try:
-            full_path = self.validate_path(rel_path, self.working_dir)
-        except ValueError:
-            return json.dumps({"error": "Path traversal not allowed"})
-        if not full_path.is_dir():
-            return json.dumps({"error": f"Not a directory: {rel_path}"})
-        base_resolved = self.working_dir.resolve()
-        files = []
-        for p in sorted(full_path.rglob("*")):
-            if p.is_file() and ".git" not in p.parts:
-                # Prevent symlinks from escaping the workspace
-                if not p.resolve().is_relative_to(base_resolved):
-                    continue
-                try:
-                    files.append(str(p.relative_to(self.working_dir)))
-                except ValueError:
-                    continue
-        return json.dumps(files)
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         task = context.get("task", {})
@@ -155,25 +124,11 @@ class ReviewerAgent(AgentBase):
             summary="Could not parse review output — manual review required",
         )
 
-        # Try JSON code block first, then raw JSON
-        raw: str | None = None
-        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
-        if match:
-            raw = match.group(1).strip()
-        else:
-            start = output.find("{")
-            end = output.rfind("}")
-            if start != -1 and end != -1:
-                raw = output[start : end + 1]
-
-        if raw is None:
-            logger.warning("Could not find JSON in review output, rejecting")
-            return _fail
-
+        from autoforge.engine.utils import extract_json_from_text
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Invalid JSON in review output: {e}")
+            data = extract_json_from_text(output)
+        except ValueError as e:
+            logger.warning("Could not find JSON in review output: %s", e)
             return _fail
 
         return ReviewResult(

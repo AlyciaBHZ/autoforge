@@ -70,7 +70,7 @@ class GenerationStep:
     tool_calls: list[str] = field(default_factory=list)
     # Execution feedback (CodePRM core idea)
     execution_attempted: bool = False
-    execution_success: bool = False
+    execution_success: bool | None = False
     execution_output: str = ""     # stdout/stderr from running the code
     syntax_valid: bool = True
     # Reward scores
@@ -337,6 +337,10 @@ class ProcessRewardModel:
     def get_trajectory(self, task_id: str) -> StepTrajectory | None:
         """Get the trajectory for a task."""
         return self._trajectories.get(task_id)
+
+    def cleanup_trajectory(self, task_id: str) -> None:
+        """Remove a finalized trajectory to free memory."""
+        self._trajectories.pop(task_id, None)
 
     def get_reward_signal_for_search(self, task_id: str) -> float:
         """Get an aggregate reward signal for the search tree.

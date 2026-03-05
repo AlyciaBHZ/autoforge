@@ -115,44 +115,20 @@ class SubprocessSandbox(SandboxBase):
         self.working_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"SubprocessSandbox ready at {self.working_dir}")
 
-    async def exec(self, command: str, timeout: int = 120) -> SandboxResult:
-        """Execute a command as a subprocess."""
-        logger.debug(f"[sandbox] exec: {command[:100]}")
+    async def _run_process(
+        self,
+        proc_coro: Any,
+        timeout: int,
+        command_desc: str,
+    ) -> SandboxResult:
+        """Shared process execution with timeout handling and cleanup.
 
-        # Validate command against blocked patterns
-        try:
-            self._sanitize_command(command)
-        except ValueError as e:
-            logger.warning(f"[sandbox] Command blocked: {e}")
-            return SandboxResult(
-                exit_code=-1,
-                stdout="",
-                stderr=f"Command blocked by security filter: {e}",
-            )
-
-        # On Windows, wrap Unix-style commands to run via bash/sh if available
-        shell_command = command
-        if sys.platform == "win32" and not command.startswith("cmd"):
-            sh = shutil.which("bash") or shutil.which("sh")
-            if sh:
-                shell_command = f'"{sh}" -c {_shell_quote(command)}'
-
+        Extracted to avoid duplicating timeout/kill/error logic between
+        exec() and exec_args().
+        """
         proc: asyncio.subprocess.Process | None = None
         try:
-            # On POSIX, start a new process group so we can kill the entire
-            # tree on timeout (not just the shell parent).
-            kwargs: dict = {}
-            if sys.platform != "win32":
-                kwargs["preexec_fn"] = os.setsid
-
-            proc = await asyncio.create_subprocess_shell(
-                shell_command,
-                cwd=self.working_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=self.env,
-                **kwargs,
-            )
+            proc = await proc_coro
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout
             )
@@ -185,65 +161,73 @@ class SubprocessSandbox(SandboxBase):
                 exit_code=-1, stdout="", stderr=str(e)
             )
 
-    async def exec_args(self, args: list[str], timeout: int = 120) -> SandboxResult:
-        """Execute an argument-vector command without invoking a shell."""
-        if not args:
-            return SandboxResult(exit_code=-1, stdout="", stderr="No command provided")
+    def _process_kwargs(self) -> dict:
+        """Return common subprocess kwargs (process group on POSIX)."""
+        kwargs: dict = {}
+        if sys.platform != "win32":
+            kwargs["preexec_fn"] = os.setsid
+        return kwargs
 
-        joined = " ".join(args)
-        logger.debug(f"[sandbox] exec_args: {joined[:100]}")
+    async def exec(self, command: str, timeout: int = 120) -> SandboxResult:
+        """Execute a command as a subprocess."""
+        logger.debug("[sandbox] exec: %s", command[:100])
 
+        # Validate command against blocked patterns
         try:
-            self._sanitize_command(joined)
+            self._sanitize_command(command)
         except ValueError as e:
-            logger.warning(f"[sandbox] Command blocked: {e}")
+            logger.warning("[sandbox] Command blocked: %s", e)
             return SandboxResult(
                 exit_code=-1,
                 stdout="",
                 stderr=f"Command blocked by security filter: {e}",
             )
 
-        proc: asyncio.subprocess.Process | None = None
-        try:
-            kwargs: dict = {}
-            if sys.platform != "win32":
-                kwargs["preexec_fn"] = os.setsid
+        # On Windows, wrap Unix-style commands to run via bash/sh if available
+        shell_command = command
+        if sys.platform == "win32" and not command.startswith("cmd"):
+            sh = shutil.which("bash") or shutil.which("sh")
+            if sh:
+                shell_command = f'"{sh}" -c {_shell_quote(command)}'
 
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                cwd=self.working_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=self.env,
-                **kwargs,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            return SandboxResult(
-                exit_code=proc.returncode if proc.returncode is not None else -1,
-                stdout=stdout.decode(errors="replace"),
-                stderr=stderr.decode(errors="replace"),
-            )
-        except asyncio.TimeoutError:
-            if proc is not None:
-                try:
-                    if sys.platform != "win32" and proc.pid is not None:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    else:
-                        proc.kill()
-                except (ProcessLookupError, OSError):
-                    pass
-                try:
-                    await proc.communicate()
-                except Exception:
-                    pass
-            return SandboxResult(
-                exit_code=-1,
-                stdout="",
-                stderr=f"Command timed out after {timeout}s",
-                timed_out=True,
-            )
-        except Exception as e:
-            return SandboxResult(exit_code=-1, stdout="", stderr=str(e))
+        proc_coro = asyncio.create_subprocess_shell(
+            shell_command,
+            cwd=self.working_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=self.env,
+            **self._process_kwargs(),
+        )
+        return await self._run_process(proc_coro, timeout, command[:100])
+
+    async def exec_args(self, args: list[str], timeout: int = 120) -> SandboxResult:
+        """Execute an argument-vector command without invoking a shell."""
+        if not args:
+            return SandboxResult(exit_code=-1, stdout="", stderr="No command provided")
+
+        logger.debug("[sandbox] exec_args: %s", " ".join(args)[:100])
+
+        # Sanitize args individually — don't join into a shell string
+        for arg in args:
+            try:
+                self._sanitize_command(arg)
+            except ValueError as e:
+                logger.warning("[sandbox] Argument blocked: %s", e)
+                return SandboxResult(
+                    exit_code=-1,
+                    stdout="",
+                    stderr=f"Command blocked by security filter: {e}",
+                )
+
+        proc_coro = asyncio.create_subprocess_exec(
+            *args,
+            cwd=self.working_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=self.env,
+            **self._process_kwargs(),
+        )
+        return await self._run_process(proc_coro, timeout, args[0])
 
     async def stop(self) -> None:
         logger.debug("SubprocessSandbox stopped")

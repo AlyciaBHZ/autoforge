@@ -282,12 +282,12 @@ Ensure hypotheses are:
             content = response.content if hasattr(response, 'content') else str(response)
 
             # Extract JSON from response
-            json_match = re.search(r'\{[\s\S]*\}', content)
-            if not json_match:
+            from autoforge.engine.utils import extract_json_from_text
+            try:
+                data = extract_json_from_text(content)
+            except ValueError:
                 self.logger.error("No JSON found in hypothesis generation response")
                 return []
-
-            data = json.loads(json_match.group())
             hypotheses = []
 
             for i, h_data in enumerate(data.get('hypotheses', [])):
@@ -369,12 +369,12 @@ Provide the refined hypothesis in JSON format:
             response = await llm.call(prompt, complexity=TaskComplexity.HIGH)
             content = response.content if hasattr(response, 'content') else str(response)
 
-            json_match = re.search(r'\{[\s\S]*\}', content)
-            if not json_match:
+            from autoforge.engine.utils import extract_json_from_text
+            try:
+                data = extract_json_from_text(content)
+            except ValueError:
                 self.logger.error("No JSON in refined hypothesis response")
                 return hypothesis
-
-            data = json.loads(json_match.group())
 
             refined = Hypothesis(
                 id=f"hyp-{uuid.uuid4().hex[:8]}",
@@ -559,9 +559,6 @@ class ExperimentRunner:
         Returns:
             ExperimentResult with metrics and artifacts
         """
-        if config is None:
-            config = self.config
-
         exec_config = config or self.config
         run_id = uuid.uuid4().hex[:8]
         work_dir = exec_config.workspace_dir / f"run-{run_id}"
@@ -733,12 +730,12 @@ Guidelines:
             response = await llm.call(prompt, complexity=TaskComplexity.HIGH)
             content = response.content if hasattr(response, 'content') else str(response)
 
-            json_match = re.search(r'\{[\s\S]*\}', content)
-            if not json_match:
+            from autoforge.engine.utils import extract_json_from_text
+            try:
+                data = extract_json_from_text(content)
+            except ValueError:
                 self.logger.warning("No JSON in analysis response, falling back to basic")
                 return await self._analyze_basic(hypothesis, result, previous_best_metric)
-
-            data = json.loads(json_match.group())
             return (
                 data.get('analysis', ''),
                 data.get('next_action', 'refine_hypothesis'),
@@ -918,7 +915,7 @@ class ExperimentLoop:
                 if code_attempts >= self.config.max_code_attempts:
                     self.logger.warning("Max code attempts reached")
                     break
-                iteration_num -= 1  # Don't count failed attempts as iterations
+                continue  # Retry without counting as a new iteration
             elif next_action in ("accept", "reject"):
                 self.logger.info(f"Hypothesis {next_action}ed")
                 break

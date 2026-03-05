@@ -410,7 +410,6 @@ class PantographREPL:
             new_state = ProofState(
                 goals=[line.strip() for line in response.splitlines() if "⊢" in line],
                 hypotheses=[],
-                remaining_sorries=response.count("sorry"),
             )
             self._current_state = new_state
             self._history.append((tactic, new_state))

@@ -327,13 +327,12 @@ async def _llm_security_scan(
             if block.type == "text":
                 text += block.text
 
-        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-        raw_json = match.group(1).strip() if match else text.strip()
-        # Fallback: try extracting JSON array directly
-        if not match and "[" in text:
-            raw_json = text[text.index("["):text.rindex("]") + 1]
-        if raw_json:
-            items = json.loads(raw_json)
+        from autoforge.engine.utils import extract_json_list_from_text
+        try:
+            items = extract_json_list_from_text(text)
+        except ValueError:
+            items = []
+        if items:
             findings = []
             for item in items:
                 if isinstance(item, dict):

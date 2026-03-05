@@ -32,6 +32,14 @@ class LockManager:
     agents can claim the same task.
     """
 
+    # Characters allowed in task IDs to prevent path traversal
+    _SAFE_ID_CHARS = frozenset(
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789"
+        "-_."
+    )
+
     def __init__(self, lock_dir: Path) -> None:
         self.lock_dir = lock_dir
         self.lock_dir.mkdir(parents=True, exist_ok=True)
@@ -39,9 +47,28 @@ class LockManager:
         # Falls back to filesystem scanning when potentially stale.
         self._lock_cache: dict[str, str] = {}
 
+    @classmethod
+    def _sanitize_id(cls, task_id: str) -> str:
+        """Sanitize task_id to prevent path traversal.
+
+        Raises ValueError if the ID contains unsafe characters.
+        """
+        if not task_id:
+            raise ValueError("Empty task_id")
+        if not all(c in cls._SAFE_ID_CHARS for c in task_id):
+            raise ValueError(
+                f"Task ID contains unsafe characters: {task_id!r}"
+            )
+        return task_id
+
+    def _lock_path(self, task_id: str) -> Path:
+        """Return sanitized lock file path for a task ID."""
+        safe_id = self._sanitize_id(task_id)
+        return self.lock_dir / f"{safe_id}.lock"
+
     def try_claim(self, task_id: str, agent_id: str) -> bool:
         """Atomically claim a task. Returns True if successful."""
-        lock_path = self.lock_dir / f"{task_id}.lock"
+        lock_path = self._lock_path(task_id)
         try:
             if _IS_WINDOWS:
                 # O_CREAT | O_EXCL is atomic on NTFS — fails if file exists
@@ -69,23 +96,51 @@ class LockManager:
                 self.release(task_id, agent_id)
 
     def release(self, task_id: str, agent_id: str) -> bool:
-        """Release a task lock. Only the owner can release."""
-        lock_path = self.lock_dir / f"{task_id}.lock"
+        """Release a task lock. Only the owner can release.
+
+        Uses atomic rename to avoid TOCTOU race: rename the lock to a
+        temp name (atomic), verify ownership, then delete. If ownership
+        doesn't match, rename back.
+        """
+        lock_path = self._lock_path(task_id)
+        # Atomic rename to prevent concurrent release/claim races
+        tmp_path = lock_path.with_suffix(".releasing")
         try:
-            owner = self._read_owner(lock_path)
-            if owner == agent_id:
-                lock_path.unlink()
-                self._lock_cache.pop(task_id, None)
-                logger.info(f"Task {task_id} released by {agent_id}")
-                return True
+            lock_path.rename(tmp_path)
+        except FileNotFoundError:
+            self._lock_cache.pop(task_id, None)
             return False
-        except (FileNotFoundError, OSError):
+        except OSError:
+            self._lock_cache.pop(task_id, None)
+            return False
+
+        try:
+            owner = self._read_owner(tmp_path)
+            if owner == agent_id:
+                tmp_path.unlink(missing_ok=True)
+                self._lock_cache.pop(task_id, None)
+                logger.info("Task %s released by %s", task_id, agent_id)
+                return True
+            else:
+                # Not our lock — rename back
+                try:
+                    tmp_path.rename(lock_path)
+                except OSError:
+                    # If rename-back fails, clean up to avoid orphan
+                    tmp_path.unlink(missing_ok=True)
+                return False
+        except Exception:
+            # On any error, try to restore the lock file
+            try:
+                tmp_path.rename(lock_path)
+            except OSError:
+                tmp_path.unlink(missing_ok=True)
             self._lock_cache.pop(task_id, None)
             return False
 
     def get_owner(self, task_id: str) -> str | None:
         """Query who owns a task lock."""
-        lock_path = self.lock_dir / f"{task_id}.lock"
+        lock_path = self._lock_path(task_id)
         try:
             return self._read_owner(lock_path)
         except (FileNotFoundError, OSError):

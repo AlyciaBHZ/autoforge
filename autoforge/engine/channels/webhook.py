@@ -185,7 +185,7 @@ async def start_webhook_server(
 
         workspace = Path(project.workspace_path).resolve()
         guide_path = (workspace / "DEPLOY_GUIDE.md").resolve()
-        if not str(guide_path).startswith(str(workspace)):
+        if not guide_path.is_relative_to(workspace):
             raise HTTPException(status_code=403, detail="Access denied")
         if not guide_path.exists():
             raise HTTPException(status_code=404, detail="Deploy guide not found")

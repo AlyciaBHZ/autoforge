@@ -39,24 +39,12 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
-    """Robustly extract JSON object from LLM response text.
-
-    Handles markdown fences, nested braces, and surrounding text.
-    """
-    if "{" not in text:
-        return None
+    """Robustly extract JSON object from LLM response text."""
+    from autoforge.engine.utils import extract_json_from_text
     try:
-        json_str = text[text.index("{"):text.rindex("}") + 1]
-        return json.loads(json_str)
-    except (json.JSONDecodeError, ValueError):
-        # Fallback: try non-greedy regex for simple objects
-        match = re.search(r"\{[^{}]*\}", text)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-    return None
+        return extract_json_from_text(text)
+    except ValueError:
+        return None
 
 
 # ──────────────────────────────────────────────
