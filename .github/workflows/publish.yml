@@ -76,7 +76,7 @@ jobs:
             echo "::error::TEST_PYPI API token is empty. Set TEST_PYPI_API_TOKEN in repo secrets."
             exit 1
           fi
-          python -m twine upload --repository-url https://test.pypi.org/legacy/ dist/*
+          python -m twine upload --skip-existing --repository-url https://test.pypi.org/legacy/ dist/*
 
       - name: Publish to PyPI
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.repository == 'pypi'
@@ -88,4 +88,4 @@ jobs:
             echo "::error::PYPI_API_TOKEN is empty. Set PYPI_API_TOKEN in repo secrets."
             exit 1
           fi
-          python -m twine upload dist/*
+          python -m twine upload --skip-existing dist/*
