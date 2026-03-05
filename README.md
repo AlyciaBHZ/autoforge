@@ -63,6 +63,8 @@ pip install "autoforgeai[channels]"  # Telegram / Webhook 频道
 pip install "autoforgeai[all]"       # 全部安装
 ```
 
+> OpenAI SDK 从 `2.7.16` 起已包含在默认安装中，通常不需要额外安装 `[openai]`。
+
 </details>
 
 <details>

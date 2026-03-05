@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 name = "autoforgeai"
 
-version = "2.7.15"
+version = "2.7.16"
 description = "AutoForge AI-powered multi-agent development platform"
 
 readme = "README.md"
@@ -21,6 +21,7 @@ requires-python = ">=3.10"
 
 dependencies = [
     "anthropic>=0.84.0",
+    "openai>=1.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0",
     "pyyaml>=6.0",

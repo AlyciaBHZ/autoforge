@@ -320,7 +320,7 @@ class LLMRouter:
             except ImportError:
                 raise ImportError(
                     "OpenAI provider requires the 'openai' package. "
-                    "Install it with: pip install autoforgeai[openai]"
+                    "Install it with: pip install openai"
                 ) from None
             if isinstance(auth, (CodexOAuthAuth, DeviceCodeAuth)):
                 # Token-based auth: client gets a dummy key, real token
