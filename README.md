@@ -20,7 +20,9 @@
 ## 快速开始
 
 ```bash
-pip install forgeai                           # 安装
+git clone https://github.com/AlyciaBHZ/autoforge.git
+cd autoforge
+pip install -e .                              # 安装（从源码）
 forgeai                                       # 启动交互式会话
 ```
 
@@ -30,22 +32,11 @@ forgeai                                       # 启动交互式会话
 <summary>可选依赖</summary>
 
 ```bash
-pip install forgeai[openai]       # OpenAI 支持
-pip install forgeai[google]       # Google Gemini 支持
-pip install forgeai[search]       # Web 搜索能力
-pip install forgeai[channels]     # Telegram / Webhook 频道
-pip install forgeai[all]          # 全部安装
-```
-
-</details>
-
-<details>
-<summary>从源码安装（开发者）</summary>
-
-```bash
-git clone https://github.com/AlyciaBHZ/autoforge.git
-cd autoforge
-pip install -e ".[all]"
+pip install -e ".[openai]"       # OpenAI 支持
+pip install -e ".[google]"       # Google Gemini 支持
+pip install -e ".[search]"       # Web 搜索能力
+pip install -e ".[channels]"     # Telegram / Webhook 频道
+pip install -e ".[all]"          # 全部安装
 ```
 
 </details>

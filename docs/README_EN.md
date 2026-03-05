@@ -20,7 +20,9 @@
 ## Quick Start
 
 ```bash
-pip install forgeai                           # Install
+git clone https://github.com/AlyciaBHZ/autoforge.git
+cd autoforge
+pip install -e .                              # Install from source
 forgeai                                       # Start interactive session
 ```
 
@@ -30,22 +32,11 @@ On first launch, the setup wizard guides you through API key configuration (Anth
 <summary>Optional dependencies</summary>
 
 ```bash
-pip install forgeai[openai]       # OpenAI support
-pip install forgeai[google]       # Google Gemini support
-pip install forgeai[search]       # Web search capabilities
-pip install forgeai[channels]     # Telegram / Webhook channels
-pip install forgeai[all]          # Install everything
-```
-
-</details>
-
-<details>
-<summary>Install from source (developers)</summary>
-
-```bash
-git clone https://github.com/AlyciaBHZ/autoforge.git
-cd autoforge
-pip install -e ".[all]"
+pip install -e ".[openai]"       # OpenAI support
+pip install -e ".[google]"       # Google Gemini support
+pip install -e ".[search]"       # Web search capabilities
+pip install -e ".[channels]"     # Telegram / Webhook channels
+pip install -e ".[all]"          # Install everything
 ```
 
 </details>
