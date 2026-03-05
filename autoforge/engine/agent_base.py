@@ -380,7 +380,14 @@ class AgentBase(ABC):
 
                         self._log_action(
                             "schema_repair_exhausted",
-                            "using last best-effort output",
+                            "failing because output does not match required schema",
+                        )
+                        return _build_result(
+                            False,
+                            error=(
+                                "LLM output did not satisfy the required JSON "
+                                f"schema after {max_schema_retries} attempts"
+                            ),
                         )
                     self._output_parts.append(current_text)
                     self._log_action("completed", f"turns={turns}")

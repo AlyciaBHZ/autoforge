@@ -37,15 +37,21 @@ def _load_tiktoken_encoder() -> Any | None:
     return _TOKEN_ENCODER
 
 
-def _parse_relaxed_json(text: str) -> Any | None:
-    """Parse JSON with relaxed fallback.
+def _parse_json(
+    text: str,
+    *,
+    strict: bool = False,
+) -> Any | None:
+    """Parse JSON with strict or relaxed fallback.
 
-    Primary path uses json.loads; fallback uses ast.literal_eval for common
-    single-quote / tuple-like drift introduced by LLM output.
+    In strict mode, only strict JSON is accepted. In relaxed mode, common
+    single-quote / tuple-like drift is also accepted.
     """
     try:
         return json.loads(text)
     except json.JSONDecodeError:
+        if strict:
+            return None
         try:
             return ast.literal_eval(text)
         except (ValueError, SyntaxError, TypeError):
@@ -127,6 +133,7 @@ def _iter_candidate_json_snippets(
     *,
     allow_objects: bool = True,
     allow_arrays: bool = True,
+    allow_truncated: bool = False,
 ) -> list[str]:
     """Collect likely JSON snippets from text in descending reliability order."""
     candidates: list[str] = []
@@ -177,8 +184,6 @@ def _iter_candidate_json_snippets(
 
     # 4) Last-resort scan from each opening bracket/object boundary.
     for start in [m.start() for m in re.finditer(r"[{[]", text)]:
-        if start in seen:
-            continue
         raw_snippet = text[start:]
         if not raw_snippet:
             continue
@@ -186,7 +191,12 @@ def _iter_candidate_json_snippets(
             continue
         if raw_snippet[0] == "[" and not allow_arrays:
             continue
-        for repaired in _try_parse_with_truncation_correction(raw_snippet):
+        snippet_variants = (
+            _try_parse_with_truncation_correction(raw_snippet)
+            if allow_truncated
+            else [raw_snippet.strip()]
+        )
+        for repaired in snippet_variants:
             if not repaired:
                 continue
             normalized = repaired
@@ -207,19 +217,27 @@ def _iter_parsed_candidates(
     *,
     allow_objects: bool,
     allow_arrays: bool,
+    strict: bool = False,
+    allow_repair: bool = True,
 ) -> list[Any]:
     parsed_candidates: list[Any] = []
-    for raw in _iter_candidate_json_snippets(text, allow_objects=allow_objects, allow_arrays=allow_arrays):
-        parsed = _parse_relaxed_json(raw)
+    for raw in _iter_candidate_json_snippets(
+        text,
+        allow_objects=allow_objects,
+        allow_arrays=allow_arrays,
+        allow_truncated=not strict,
+    ):
+        parsed = _parse_json(raw, strict=strict)
         if parsed is not None:
             parsed_candidates.append(parsed)
             continue
 
-        repaired = _repair_json(raw)
-        parsed = _parse_relaxed_json(repaired)
-        if parsed is not None:
-            parsed_candidates.append(parsed)
-            continue
+        if allow_repair:
+            repaired = _repair_json(raw)
+            parsed = _parse_json(repaired, strict=strict)
+            if parsed is not None:
+                parsed_candidates.append(parsed)
+                continue
 
     return parsed_candidates
 
@@ -311,12 +329,19 @@ def extract_json_from_text(
     schema: dict[str, Any] | None = None,
     *,
     strict: bool = False,
+    allow_repair: bool = True,
 ) -> dict[str, Any]:
     """Extract a JSON object from LLM output text."""
     if not text:
         raise ValueError("Empty text no JSON to extract")
 
-    for payload in _iter_parsed_candidates(text, allow_objects=True, allow_arrays=False):
+    for payload in _iter_parsed_candidates(
+        text,
+        allow_objects=True,
+        allow_arrays=False,
+        strict=strict,
+        allow_repair=allow_repair and not strict,
+    ):
         if not isinstance(payload, dict):
             continue
         if (
@@ -341,12 +366,19 @@ def extract_json_list_from_text(
     item_schema: dict[str, Any] | None = None,
     *,
     strict: bool = False,
+    allow_repair: bool = True,
 ) -> list[Any]:
     """Extract a JSON array from LLM output text."""
     if not text:
         raise ValueError("Empty text no JSON to extract")
 
-    for payload in _iter_parsed_candidates(text, allow_objects=False, allow_arrays=True):
+    for payload in _iter_parsed_candidates(
+        text,
+        allow_objects=False,
+        allow_arrays=True,
+        strict=strict,
+        allow_repair=allow_repair and not strict,
+    ):
         if isinstance(payload, list):
             if item_schema is None:
                 return payload
