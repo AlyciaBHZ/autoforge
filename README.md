@@ -40,6 +40,7 @@
   - [智能引擎](#智能引擎)
 - [CLI 命令参考](#cli-命令参考)
 - [守护进程模式](#守护进程模式)
+- [待落实：DAG 联邦同步](#待落实dag-联邦同步代码框架已就绪服务器未-setup)
 
 ---
 
@@ -425,6 +426,43 @@ autoforgeai deploy <project_id>                # 显示部署指南
 ```
 
 支持 systemd (Linux) 和 launchd (macOS) 系统服务安装，详见 `services/` 目录。
+
+---
+
+## 待落实：DAG 联邦同步（代码框架已就绪，服务器未 setup）
+
+> 状态：**待落实**
+>
+> 当前仓库已具备联邦同步代码框架（客户端 pull/push、服务端示例、配置项），
+> 但你需要先完成远端服务部署（例如 Vercel API + 持久化存储，或自有服务器）后才能正式启用。
+
+如果你要开启“本地 DAG/理论图 ↔ 远端知识服务”同步，需要额外配置以下环境变量：
+
+```bash
+# 1) 开关（不配默认关闭）
+export FORGE_DAG_FEDERATION_ENABLED=true
+
+# 2) 远端快照服务地址（必填）
+export FORGE_DAG_FEDERATION_ENDPOINT="https://your-domain/api/dag/snapshot"
+
+# 3) 可选：鉴权
+export FORGE_DAG_FEDERATION_API_KEY="your_token"
+
+# 4) 可选：网络超时（秒，默认 10）
+export FORGE_DAG_FEDERATION_TIMEOUT_SECONDS=15
+```
+
+运行行为：
+
+- 启动时：先从 `FORGE_DAG_FEDERATION_ENDPOINT` 拉取远端知识快照，合并到本地。
+- 结束时：把本次运行后的合并结果推送回远端。
+
+远端接口约定（当前实现）：
+
+- `GET <endpoint>`：返回 JSON 快照（`capability_dag` + 可选 `theories`）
+- `POST <endpoint>`：接收同结构 JSON 快照并保存
+
+> 最小可用配置只有 2 项：`FORGE_DAG_FEDERATION_ENABLED=true` + `FORGE_DAG_FEDERATION_ENDPOINT=...`
 
 ---
 

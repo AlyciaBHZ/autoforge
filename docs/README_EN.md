@@ -98,6 +98,37 @@ Step 5 │ GitHub environment
 
 Configuration is saved to `~/.autoforge/config.toml` and can be overridden via environment variables.
 
+### DAG Federation (community knowledge sync) configuration
+
+To enable remote synchronization of local CapabilityDAG + theory graphs, configure:
+
+```bash
+# 1) Feature flag (disabled by default)
+export FORGE_DAG_FEDERATION_ENABLED=true
+
+# 2) Remote snapshot endpoint (required)
+export FORGE_DAG_FEDERATION_ENDPOINT="https://your-domain/api/dag/snapshot"
+
+# 3) Optional auth token
+export FORGE_DAG_FEDERATION_API_KEY="your_token"
+
+# 4) Optional timeout in seconds (default: 10)
+export FORGE_DAG_FEDERATION_TIMEOUT_SECONDS=15
+```
+
+Runtime behavior:
+
+- On startup: pull remote snapshot and merge into local knowledge.
+- On run completion: push merged local snapshot back to remote.
+
+Current endpoint contract:
+
+- `GET <endpoint>` returns JSON snapshot (`capability_dag` and optional `theories`).
+- `POST <endpoint>` accepts the same JSON snapshot structure.
+
+Minimum required config is just:
+`FORGE_DAG_FEDERATION_ENABLED=true` + `FORGE_DAG_FEDERATION_ENDPOINT=...`.
+
 ### Supported LLM Providers
 
 | Provider | Environment Variable | Strong Models | Fast Models |
