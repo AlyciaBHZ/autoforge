@@ -72,13 +72,15 @@ class AsyncBridgeAgent(Generic[RequestPayloadT, ResponsePayloadT]):
         on_timeout: Callable[[BridgeTimeoutEvent], Awaitable[None]] | None = None,
         on_response: Callable[[BridgeResponse[ResponsePayloadT]], Awaitable[None]] | None = None,
         on_late_response: Callable[[BridgeResponse[ResponsePayloadT]], Awaitable[None]] | None = None,
+        max_timed_out_history: int = 1024,
     ) -> None:
         self.timeout_seconds = timeout_seconds
+        self.max_timed_out_history = max_timed_out_history
         self._on_timeout = on_timeout
         self._on_response = on_response
         self._on_late_response = on_late_response
         self._pending: dict[str, asyncio.Future[BridgeResponse[ResponsePayloadT]]] = {}
-        self._timed_out_ids: set[str] = set()
+        self._timed_out_ids: dict[str, datetime] = {}
         self._timeout_tasks: dict[str, asyncio.Task[None]] = {}
         self._outbound_tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -105,10 +107,28 @@ class AsyncBridgeAgent(Generic[RequestPayloadT, ResponsePayloadT]):
         outbound_task = asyncio.create_task(sender(outbound_request))
         self._outbound_tasks[rid] = outbound_task
 
-        def _clear_outbound(_: asyncio.Task[None], req_id: str = rid) -> None:
+        def _complete_outbound(task: asyncio.Task[None], req_id: str = rid) -> None:
             self._outbound_tasks.pop(req_id, None)
+            timeout_task = self._timeout_tasks.pop(req_id, None)
+            fut = self._pending.pop(req_id, None)
 
-        outbound_task.add_done_callback(_clear_outbound)
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                if timeout_task is not None:
+                    timeout_task.cancel()
+                if fut is not None and not fut.done():
+                    fut.set_exception(exc)
+                return
+
+            if fut is not None:
+                self._pending[req_id] = fut
+            if timeout_task is not None:
+                self._timeout_tasks[req_id] = timeout_task
+
+        outbound_task.add_done_callback(_complete_outbound)
         return PendingBridgeRequest(request_id=rid, future=fut)
 
     async def receive(self, request_id: str, payload: ResponsePayloadT) -> None:
@@ -121,19 +141,15 @@ class AsyncBridgeAgent(Generic[RequestPayloadT, ResponsePayloadT]):
         if request_id in self._timed_out_ids:
             if self._on_late_response is not None:
                 await self._on_late_response(response)
-            self._timed_out_ids.discard(request_id)
+            self._timed_out_ids.pop(request_id, None)
             return
 
         fut = self._pending.pop(request_id, None)
         timeout_task = self._timeout_tasks.pop(request_id, None)
-        outbound_task = self._outbound_tasks.pop(request_id, None)
+        self._outbound_tasks.pop(request_id, None)
+
         if timeout_task is not None:
             timeout_task.cancel()
-        if outbound_task is not None and outbound_task.done():
-            try:
-                outbound_task.result()
-            except Exception:
-                pass
 
         if fut is None:
             if self._on_late_response is not None:
@@ -145,6 +161,21 @@ class AsyncBridgeAgent(Generic[RequestPayloadT, ResponsePayloadT]):
         if self._on_response is not None:
             await self._on_response(response)
 
+    async def close(self) -> None:
+        """Cancel outstanding work and fail pending futures for shutdown."""
+        for task in self._timeout_tasks.values():
+            task.cancel()
+        for task in self._outbound_tasks.values():
+            task.cancel()
+        self._timeout_tasks.clear()
+        self._outbound_tasks.clear()
+
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(asyncio.CancelledError("bridge closed"))
+        self._pending.clear()
+        self._timed_out_ids.clear()
+
     async def _timeout_after(self, request_id: str) -> None:
         try:
             await asyncio.sleep(self.timeout_seconds)
@@ -154,7 +185,9 @@ class AsyncBridgeAgent(Generic[RequestPayloadT, ResponsePayloadT]):
                 return
 
             fut.set_exception(asyncio.TimeoutError(f"request timed out: {request_id}"))
-            self._timed_out_ids.add(request_id)
+            self._timed_out_ids[request_id] = datetime.now(timezone.utc)
+            while len(self._timed_out_ids) > self.max_timed_out_history:
+                self._timed_out_ids.pop(next(iter(self._timed_out_ids)))
 
             if self._on_timeout is not None:
                 await self._on_timeout(
