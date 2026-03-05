@@ -32,14 +32,11 @@ import asyncio
 import json
 import logging
 import re
-import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
-
-import httpx
+from typing import Any
 
 # Optional imports for PDF and image processing
 try:
@@ -239,40 +236,42 @@ class FigureExtractor:
         figures = []
 
         doc = fitz.open(pdf_path)
-        for page_num, page in enumerate(doc, start=1):
-            # Extract images from page
-            image_list = page.get_images(full=True)
-            for img_idx, img in enumerate(image_list):
-                figure_id = f"fig_{page_num}_{img_idx}"
-                # Get image rectangle
-                xref = img[0]
-                bbox = page.get_image_bbox(xref)
+        try:
+            for page_num, page in enumerate(doc, start=1):
+                # Extract images from page
+                image_list = page.get_images(full=True)
+                for img_idx, img in enumerate(image_list):
+                    figure_id = f"fig_{page_num}_{img_idx}"
+                    # get_image_bbox expects the full image tuple, not just xref
+                    bbox = page.get_image_bbox(img)
 
-                metadata = FigureMetadata(
-                    figure_id=figure_id,
-                    figure_type=FigureType.OTHER,
-                    caption="",
-                    label=figure_id,
-                    page_number=page_num,
-                    bounding_box=(bbox.x0, bbox.y0, bbox.x1, bbox.y1),
-                    source_path=pdf_path,
-                )
-                figures.append(metadata)
+                    metadata = FigureMetadata(
+                        figure_id=figure_id,
+                        figure_type=FigureType.OTHER,
+                        caption="",
+                        label=figure_id,
+                        page_number=page_num,
+                        bounding_box=(bbox.x0, bbox.y0, bbox.x1, bbox.y1),
+                        source_path=pdf_path,
+                    )
+                    figures.append(metadata)
 
-            # Detect additional figure regions
-            detected_regions = self._detect_figure_regions(page)
-            for region_idx, region in enumerate(detected_regions):
-                figure_id = f"fig_region_{page_num}_{region_idx}"
-                metadata = FigureMetadata(
-                    figure_id=figure_id,
-                    figure_type=FigureType.OTHER,
-                    caption="",
-                    label=figure_id,
-                    page_number=page_num,
-                    bounding_box=region,
-                    source_path=pdf_path,
-                )
-                figures.append(metadata)
+                # Detect additional figure regions
+                detected_regions = self._detect_figure_regions(page)
+                for region_idx, region in enumerate(detected_regions):
+                    figure_id = f"fig_region_{page_num}_{region_idx}"
+                    metadata = FigureMetadata(
+                        figure_id=figure_id,
+                        figure_type=FigureType.OTHER,
+                        caption="",
+                        label=figure_id,
+                        page_number=page_num,
+                        bounding_box=region,
+                        source_path=pdf_path,
+                    )
+                    figures.append(metadata)
+        finally:
+            doc.close()
 
         return figures
 
@@ -299,19 +298,25 @@ class FigureExtractor:
         Returns:
             Mapping of page number → list of captions on that page
         """
-        captions: dict[int, list[str]] = {}
-
         if pdfplumber is None:
-            return captions
+            return {}
+
+        return await asyncio.to_thread(self._extract_captions_sync, pdf_path)
+
+    def _extract_captions_sync(self, pdf_path: Path) -> dict[int, list[str]]:
+        """Synchronous caption extraction (run via to_thread)."""
+        captions: dict[int, list[str]] = {}
 
         with pdfplumber.open(pdf_path) as pdf:
             for page_num, page in enumerate(pdf.pages, start=1):
                 text = page.extract_text() or ""
-                # Simple pattern: look for "Figure X:" or "Fig. X:"
-                pattern = r"(?:Figure|Fig\.?)\s+\d+[:\.]?\s*(.+?)(?=\n|Figure|Fig\.)"
-                matches = re.findall(pattern, text, re.IGNORECASE)
+                # Match "Figure X:" or "Fig. X:" including multiline captions
+                pattern = r"(?:Figure|Fig\.?)\s+(\d+)[:\.]?\s*(.+?)(?=\n\s*\n|(?:Figure|Fig\.)\s+\d|$)"
+                matches = re.findall(pattern, text, re.IGNORECASE | re.DOTALL)
                 if matches:
-                    captions[page_num] = matches
+                    captions[page_num] = [
+                        (num, caption.strip()) for num, caption in matches
+                    ]
 
         return captions
 
@@ -320,11 +325,21 @@ class FigureExtractor:
         figures: list[FigureMetadata],
         captions: dict[int, list[str]],
     ) -> list[FigureMetadata]:
-        """Map extracted captions to figures by page."""
+        """Map extracted captions to figures by page.
+
+        Assigns captions to figures in order within each page.
+        """
+        # Group figures by page
+        page_figures: dict[int, list[FigureMetadata]] = {}
         for figure in figures:
-            page_captions = captions.get(figure.page_number, [])
-            if page_captions:
-                figure.caption = page_captions[0]
+            page_figures.setdefault(figure.page_number, []).append(figure)
+
+        for page_num, page_figs in page_figures.items():
+            page_captions = captions.get(page_num, [])
+            for idx, fig in enumerate(page_figs):
+                if idx < len(page_captions):
+                    _num, caption_text = page_captions[idx]
+                    fig.caption = caption_text
 
         return figures
 
@@ -375,20 +390,19 @@ class VLMAnalyzer:
 
         # Call VLM with image
         try:
-            response = await asyncio.to_thread(
-                self._call_vlm_with_image,
-                image_path,
-                prompt,
-            )
+            response = await self._call_vlm_with_image(image_path, prompt)
 
             analysis_dict = self._parse_analysis_response(response)
 
-            # Create metadata
+            # Create metadata — gracefully handle unknown figure types from VLM
+            try:
+                fig_type = FigureType(analysis_dict.get("figure_type", "other"))
+            except ValueError:
+                fig_type = FigureType.OTHER
+
             metadata = FigureMetadata(
                 figure_id=image_path.stem,
-                figure_type=FigureType(
-                    analysis_dict.get("figure_type", "other")
-                ),
+                figure_type=fig_type,
                 caption=caption,
                 label=image_path.stem,
                 source_path=image_path,
@@ -472,10 +486,7 @@ Provide:
 Return as JSON with keys: similarities, differences, relationship, consistency."""
 
         try:
-            response = await asyncio.to_thread(
-                self._call_llm_text,
-                prompt,
-            )
+            response = await self._call_llm_text(prompt)
             return json.loads(response)
         except Exception as e:
             self.logger.error(f"Error comparing figures: {e}")
@@ -516,11 +527,7 @@ Return as JSON array with objects like:
 Only return valid JSON."""
 
         try:
-            response = await asyncio.to_thread(
-                self._call_vlm_with_image,
-                image_path,
-                prompt,
-            )
+            response = await self._call_vlm_with_image(image_path, prompt)
 
             # Try to extract JSON from response
             json_match = re.search(r"\[.*\]", response, re.DOTALL)
@@ -570,17 +577,13 @@ Only return valid JSON."""
             "confidence": 0.5,
         }
 
-    def _call_vlm_with_image(self, image_path: Path, prompt: str) -> str:
+    async def _call_vlm_with_image(self, image_path: Path, prompt: str) -> str:
         """Call VLM with an image via the LLM router.
 
         Reads the image file, base64-encodes it, and sends it as an image
         content block alongside the text prompt.  Works with any provider
         that supports vision (Anthropic Claude, OpenAI GPT-4V, Gemini).
-
-        The method is synchronous because callers wrap it with
-        ``asyncio.to_thread()``.
         """
-        import asyncio
         import base64
         import mimetypes
 
@@ -611,41 +614,20 @@ Only return valid JSON."""
             }
         ]
 
-        # Run the async LLM call from this sync context
-        async def _do_call() -> str:
-            resp = await self.llm.call(
-                complexity=TaskComplexity.HIGH,
-                system="You are an expert academic figure analyst. Respond in valid JSON.",
-                messages=messages,
-            )
-            # Extract text from response content blocks
-            parts = []
-            for block in resp.content:
-                if hasattr(block, "text") and block.text:
-                    parts.append(block.text)
-            return "\n".join(parts)
+        resp = await self.llm.call(
+            complexity=TaskComplexity.HIGH,
+            system="You are an expert academic figure analyst. Respond in valid JSON.",
+            messages=messages,
+        )
+        # Extract text from response content blocks
+        parts = []
+        for block in resp.content:
+            if hasattr(block, "text") and block.text:
+                parts.append(block.text)
+        return "\n".join(parts)
 
-        # Get or create event loop
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            # We're already in an async context called via to_thread —
-            # create a new loop in this thread.
-            return asyncio.run(_do_call())
-        else:
-            return asyncio.run(_do_call())
-
-    def _call_llm_text(self, prompt: str) -> str:
-        """Call LLM with a text-only prompt via the LLM router.
-
-        Synchronous wrapper; callers use ``asyncio.to_thread()`` to avoid
-        blocking the event loop.
-        """
-        import asyncio
-
+    async def _call_llm_text(self, prompt: str) -> str:
+        """Call LLM with a text-only prompt via the LLM router."""
         if self.llm is None:
             raise RuntimeError(
                 "VLMAnalyzer requires an LLM router instance (self.llm). "
@@ -656,27 +638,16 @@ Only return valid JSON."""
 
         messages = [{"role": "user", "content": prompt}]
 
-        async def _do_call() -> str:
-            resp = await self.llm.call(
-                complexity=TaskComplexity.STANDARD,
-                system="You are an expert academic figure analyst. Respond in valid JSON.",
-                messages=messages,
-            )
-            parts = []
-            for block in resp.content:
-                if hasattr(block, "text") and block.text:
-                    parts.append(block.text)
-            return "\n".join(parts)
-
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            return asyncio.run(_do_call())
-        else:
-            return asyncio.run(_do_call())
+        resp = await self.llm.call(
+            complexity=TaskComplexity.STANDARD,
+            system="You are an expert academic figure analyst. Respond in valid JSON.",
+            messages=messages,
+        )
+        parts = []
+        for block in resp.content:
+            if hasattr(block, "text") and block.text:
+                parts.append(block.text)
+        return "\n".join(parts)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -757,15 +728,16 @@ class FigureReproducer:
         x_values = [p.get("x", 0) for p in analysis.data_points]
         y_values = [p.get("y", 0) for p in analysis.data_points]
 
+        safe_caption = repr(analysis.metadata.caption)
         code = f'''import matplotlib.pyplot as plt
 import numpy as np
 
-x = {x_values}
-y = {y_values}
+x = {x_values!r}
+y = {y_values!r}
 
 plt.figure(figsize=(10, 6))
 plt.plot(x, y, 'b-o', linewidth=2, markersize=6)
-plt.title("{analysis.metadata.caption}")
+plt.title({safe_caption})
 plt.xlabel("X-axis")
 plt.ylabel("Y-axis")
 plt.grid(True, alpha=0.3)
@@ -783,9 +755,10 @@ plt.close()
         if not analysis.data_points:
             return ""
 
+        safe_caption = repr(analysis.metadata.caption)
         code = f'''import matplotlib.pyplot as plt
 
-data = {analysis.data_points}
+data = {analysis.data_points!r}
 
 fig, ax = plt.subplots(figsize=(10, 6))
 ax.axis('tight')
@@ -797,7 +770,7 @@ table.auto_set_font_size(False)
 table.set_fontsize(10)
 table.scale(1, 2)
 
-plt.title("{analysis.metadata.caption}")
+plt.title({safe_caption})
 plt.tight_layout()
 plt.savefig("{{output_path}}", dpi=150, bbox_inches="tight")
 plt.close()
@@ -812,12 +785,14 @@ plt.close()
         if not analysis.data_points:
             return ""
 
+        safe_caption = repr(analysis.metadata.caption)
+        is_bar = analysis.metadata.figure_type == FigureType.BAR_CHART
         code = f'''import matplotlib.pyplot as plt
 
-data = {analysis.data_points}
+data = {analysis.data_points!r}
 
 plt.figure(figsize=(10, 6))
-if "{analysis.metadata.figure_type.value}" == "bar_chart":
+if {is_bar!r}:
     labels = [str(p.get("x", "")) for p in data]
     values = [p.get("y", 0) for p in data]
     plt.bar(labels, values)
@@ -826,7 +801,7 @@ else:  # scatter
     y = [p.get("y", 0) for p in data]
     plt.scatter(x, y)
 
-plt.title("{analysis.metadata.caption}")
+plt.title({safe_caption})
 plt.tight_layout()
 plt.savefig("{{output_path}}", dpi=150, bbox_inches="tight")
 plt.close()
@@ -838,7 +813,7 @@ plt.close()
         code: str,
         output_path: Path,
     ) -> bool:
-        """Execute Python code to generate figure.
+        """Execute Python code to generate figure using sandboxed execution.
 
         Args:
             code: Python code string
@@ -847,38 +822,45 @@ plt.close()
         Returns:
             True if successful, False otherwise
         """
+        from autoforge.engine.sandbox import SubprocessSandbox
+
         # Replace placeholder with actual output path
         code = code.replace("{output_path}", str(output_path))
 
-        # Write to temporary file and execute
-        with tempfile.NamedTemporaryFile(
-            suffix=".py", mode="w", delete=False
-        ) as f:
-            f.write(code)
-            temp_path = Path(f.name)
+        # Write code into a temp working directory and execute in sandbox
+        work_dir = output_path.parent / "_sandbox_tmp"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        code_file = work_dir / "plot_code.py"
+        code_file.write_text(code)
 
+        sandbox = SubprocessSandbox(work_dir)
         try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["python", str(temp_path)],
-                capture_output=True,
+            await sandbox.start()
+            result = await sandbox.exec(
+                f"python plot_code.py",
                 timeout=30,
             )
+            await sandbox.stop()
 
-            success = result.returncode == 0 and output_path.exists()
+            success = result.exit_code == 0 and output_path.exists()
 
             if not success and result.stderr:
-                self.logger.warning(f"Execution error: {result.stderr.decode()}")
+                self.logger.warning(f"Execution error: {result.stderr}")
 
             return success
-        except subprocess.TimeoutExpired:
-            self.logger.error(f"Code execution timeout for {output_path}")
-            return False
         except Exception as e:
             self.logger.error(f"Error executing code: {e}")
+            try:
+                await sandbox.stop()
+            except Exception:
+                pass
             return False
         finally:
-            temp_path.unlink(missing_ok=True)
+            code_file.unlink(missing_ok=True)
+            try:
+                work_dir.rmdir()
+            except OSError:
+                pass
 
     def _fix_code_errors(self, code: str, error: str) -> str:
         """Attempt to fix code based on error message."""
@@ -935,10 +917,7 @@ Assess:
 Return as JSON with keys: supported, confidence, evidence, contradictions"""
 
             try:
-                response = await asyncio.to_thread(
-                    self._call_llm_text,
-                    prompt,
-                )
+                response = await self._call_llm_text(prompt)
                 result = json.loads(response)
                 results.append(
                     VerificationResult(
@@ -1001,19 +980,14 @@ Assess:
 Return as JSON with keys: matches, discrepancies, explanations, quality"""
 
         try:
-            response = await asyncio.to_thread(
-                self._call_llm_text,
-                prompt,
-            )
+            response = await self._call_llm_text(prompt)
             return json.loads(response)
         except Exception as e:
             self.logger.error(f"Error cross-referencing data: {e}")
             return {"matches": [], "discrepancies": []}
 
-    def _call_llm_text(self, prompt: str) -> str:
+    async def _call_llm_text(self, prompt: str) -> str:
         """Call LLM with a text-only prompt via the LLM router."""
-        import asyncio
-
         if self.llm is None:
             raise RuntimeError("FigureVerifier requires an LLM router instance.")
 
@@ -1021,23 +995,16 @@ Return as JSON with keys: matches, discrepancies, explanations, quality"""
 
         messages = [{"role": "user", "content": prompt}]
 
-        async def _do_call() -> str:
-            resp = await self.llm.call(
-                complexity=TaskComplexity.STANDARD,
-                system="You are an expert at verifying academic figure claims. Respond in valid JSON.",
-                messages=messages,
-            )
-            parts = []
-            for block in resp.content:
-                if hasattr(block, "text") and block.text:
-                    parts.append(block.text)
-            return "\n".join(parts)
-
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-        return asyncio.run(_do_call())
+        resp = await self.llm.call(
+            complexity=TaskComplexity.STANDARD,
+            system="You are an expert at verifying academic figure claims. Respond in valid JSON.",
+            messages=messages,
+        )
+        parts = []
+        for block in resp.content:
+            if hasattr(block, "text") and block.text:
+                parts.append(block.text)
+        return "\n".join(parts)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1194,16 +1161,19 @@ class VLMFigurePipeline:
 
         try:
             doc = fitz.open(pdf_path)
-            page = doc[metadata.page_number - 1]
+            try:
+                page = doc[metadata.page_number - 1]
 
-            # Render page region containing figure
-            bbox = fitz.Rect(metadata.bounding_box)
-            pix = page.get_pixmap(clip=bbox, matrix=fitz.Matrix(2, 2))
+                # Render page region containing figure
+                bbox = fitz.Rect(metadata.bounding_box)
+                pix = page.get_pixmap(clip=bbox, matrix=fitz.Matrix(2, 2))
 
-            output_path = output_dir / f"{metadata.figure_id}.png"
-            pix.save(output_path)
+                output_path = output_dir / f"{metadata.figure_id}.png"
+                pix.save(output_path)
 
-            return output_path
+                return output_path
+            finally:
+                doc.close()
         except Exception as e:
             self.logger.error(
                 f"Error extracting figure image {metadata.figure_id}: {e}"
