@@ -217,6 +217,113 @@ class ExperimentConfig:
             raise ValueError("improvement_threshold must be 0.0-1.0")
 
 
+class HypothesisRanker:
+    """Bayesian-optimization-inspired hypothesis ranking.
+
+    Maintains a surrogate model of *hypothesis features → experiment outcome*
+    so that, after a few observations, the next hypothesis is chosen to
+    maximise Expected Improvement rather than relying on the LLM's
+    self-reported confidence.
+
+    Uses a lightweight Gaussian Process (from scikit-learn if available,
+    else falls back to confidence-weighted ranking).
+
+    This is a **non-invasive layer** — it ranks/selects among LLM-generated
+    candidates; it does NOT replace the LLM for hypothesis *generation*.
+    """
+
+    def __init__(self) -> None:
+        self._observations: list[tuple[list[float], float]] = []  # (features, outcome)
+        self._gp: Any = None  # GaussianProcessRegressor or None
+        self._has_sklearn = False
+        self.logger = logging.getLogger(f"{__name__}.HypothesisRanker")
+        try:
+            from sklearn.gaussian_process import GaussianProcessRegressor
+            from sklearn.gaussian_process.kernels import Matern
+            self._gp = GaussianProcessRegressor(
+                kernel=Matern(nu=2.5),
+                alpha=1e-6,
+                normalize_y=True,
+                n_restarts_optimizer=2,
+            )
+            self._has_sklearn = True
+        except ImportError:
+            self.logger.info("[BO] scikit-learn not available; using confidence-weighted fallback")
+
+    @staticmethod
+    def _featurize(h: Hypothesis) -> list[float]:
+        """Extract numeric features from a hypothesis for the GP.
+
+        Features:
+          - confidence (0-1)
+          - is_refined (0 or 1)
+          - statement length (proxy for specificity)
+          - rationale length (proxy for depth of reasoning)
+        """
+        return [
+            h.confidence,
+            1.0 if h.is_refined() else 0.0,
+            min(len(h.statement) / 500.0, 1.0),
+            min(len(h.rationale) / 1000.0, 1.0),
+        ]
+
+    def observe(self, hypothesis: Hypothesis, outcome: float) -> None:
+        """Record the outcome of testing a hypothesis."""
+        features = self._featurize(hypothesis)
+        self._observations.append((features, outcome))
+
+        if self._has_sklearn and len(self._observations) >= 3:
+            import numpy as np
+            X = np.array([obs[0] for obs in self._observations])
+            y = np.array([obs[1] for obs in self._observations])
+            try:
+                self._gp.fit(X, y)
+            except Exception as e:
+                self.logger.debug(f"[BO] GP fit failed: {e}")
+
+    def rank(self, candidates: list[Hypothesis]) -> list[Hypothesis]:
+        """Rank hypotheses by Expected Improvement (or confidence fallback).
+
+        Returns candidates sorted best-first.
+        """
+        if not candidates:
+            return []
+
+        # Not enough data for GP — fall back to confidence ranking
+        if not self._has_sklearn or len(self._observations) < 3:
+            return sorted(candidates, key=lambda h: h.confidence, reverse=True)
+
+        import numpy as np
+        from scipy.stats import norm
+
+        X_cand = np.array([self._featurize(h) for h in candidates])
+        try:
+            mu, sigma = self._gp.predict(X_cand, return_std=True)
+        except Exception:
+            return sorted(candidates, key=lambda h: h.confidence, reverse=True)
+
+        # Current best observed outcome
+        y_best = max(obs[1] for obs in self._observations)
+
+        # Expected Improvement acquisition function
+        ei = np.zeros(len(candidates))
+        for i in range(len(candidates)):
+            if sigma[i] > 1e-8:
+                z = (mu[i] - y_best) / sigma[i]
+                ei[i] = (mu[i] - y_best) * norm.cdf(z) + sigma[i] * norm.pdf(z)
+            else:
+                ei[i] = max(0.0, mu[i] - y_best)
+
+        # Sort by EI descending
+        ranked_indices = np.argsort(-ei)
+        return [candidates[i] for i in ranked_indices]
+
+    def select_best(self, candidates: list[Hypothesis]) -> Hypothesis:
+        """Select the single best hypothesis."""
+        ranked = self.rank(candidates)
+        return ranked[0]
+
+
 class HypothesisGenerator:
     """Generates and refines scientific hypotheses using LLM guidance."""
 
@@ -970,6 +1077,7 @@ class ExperimentLoop:
         self.coder = ExperimentCoder(config)
         self.runner = ExperimentRunner(config)
         self.analyzer = ResultAnalyzer(config)
+        self.ranker = HypothesisRanker()
 
     async def run(
         self,
@@ -1005,8 +1113,9 @@ class ExperimentLoop:
 
         self.logger.info(f"Generated {len(hypotheses)} hypotheses")
 
-        # Select best hypothesis (highest confidence initially)
-        current_hypothesis = max(hypotheses, key=lambda h: h.confidence)
+        # Select best hypothesis via Bayesian ranker (falls back to
+        # confidence ranking when fewer than 3 observations exist)
+        current_hypothesis = self.ranker.select_best(hypotheses)
         self.logger.info(
             f"Selected hypothesis {current_hypothesis.id}: {current_hypothesis.statement}"
         )
@@ -1062,13 +1171,17 @@ class ExperimentLoop:
             iterations.append(iteration)
             self.logger.info(f"Iteration {iteration_num} complete. Next action: {next_action}")
 
-            # Track best result
+            # Track best result and feed outcome to Bayesian ranker
             if result.success and result.has_metrics():
                 first_metric = list(result.metrics.values())[0]
+                self.ranker.observe(current_hypothesis, first_metric)
                 if first_metric > best_metric:
                     best_metric = first_metric
                     best_iteration = iteration
                     code_attempts = 0
+            else:
+                # Record failure as low outcome so BO steers away
+                self.ranker.observe(current_hypothesis, -1.0)
 
             # Phase 5: Decide whether to continue/iterate
             if not self._should_continue(iterations, current_hypothesis):

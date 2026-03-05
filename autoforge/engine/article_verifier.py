@@ -675,9 +675,13 @@ class FormalizationPipeline:
     """
 
     MAX_REPAIR_ITERATIONS = 3
+    MCTS_MAX_SIMULATIONS = 64
+    MCTS_MAX_DEPTH = 30
+    MCTS_TIMEOUT_PER_SORRY = 30  # seconds per sorry gap
 
-    def __init__(self) -> None:
+    def __init__(self, *, use_mcts: bool = True) -> None:
         self._formalization_cache: dict[str, str] = {}
+        self._use_mcts = use_mcts
 
     async def formalize_claim(
         self,
@@ -732,8 +736,22 @@ class FormalizationPipeline:
 
             if verify_result["success"]:
                 if verify_result["sorry_count"] > 0:
-                    claim.verification_status = VerificationStatus.VERIFIED_WITH_SORRY
-                    claim.sorry_count = verify_result["sorry_count"]
+                    # ── MCTS sorry elimination ──────────────────────
+                    if self._use_mcts:
+                        lean_code = await self._attempt_mcts_sorry_elimination(
+                            lean_code, claim, llm,
+                        )
+                        claim.lean_formalization = lean_code
+                        re_verify = await self._verify_lean(lean_code)
+                        if re_verify["success"]:
+                            verify_result = re_verify
+                    # ────────────────────────────────────────────────
+                    if verify_result["sorry_count"] > 0:
+                        claim.verification_status = VerificationStatus.VERIFIED_WITH_SORRY
+                        claim.sorry_count = verify_result["sorry_count"]
+                    else:
+                        claim.verification_status = VerificationStatus.VERIFIED
+                        claim.sorry_count = 0
                 else:
                     claim.verification_status = VerificationStatus.VERIFIED
                     claim.sorry_count = 0
@@ -793,6 +811,124 @@ class FormalizationPipeline:
             claim.cross_verification = {"error": str(e)}
 
         return claim
+
+    # ── MCTS sorry elimination ──────────────────────────────────
+
+    @staticmethod
+    def _extract_sorry_blocks(lean_code: str) -> list[dict[str, Any]]:
+        """Find all ``sorry`` placeholders and their surrounding context.
+
+        Returns a list of dicts with keys:
+            - ``start``, ``end``: char offsets of ``sorry`` in *lean_code*
+            - ``goal_hint``: preceding lines that may hint at the local goal
+        """
+        blocks: list[dict[str, Any]] = []
+        for m in re.finditer(r"\bsorry\b", lean_code):
+            # Grab up to 5 preceding lines as context for the prover
+            prefix = lean_code[: m.start()]
+            preceding_lines = prefix.rsplit("\n", 6)[-5:]
+            blocks.append({
+                "start": m.start(),
+                "end": m.end(),
+                "goal_hint": "\n".join(preceding_lines).strip(),
+            })
+        return blocks
+
+    async def _attempt_mcts_sorry_elimination(
+        self,
+        lean_code: str,
+        claim: VerifiableClaim,
+        llm: Any,
+    ) -> str:
+        """Replace ``sorry`` placeholders via MCTS proof search.
+
+        Strategy:
+          1. Parse sorry locations in the Lean code.
+          2. For each sorry, extract the local goal context and construct a
+             standalone theorem stub to search for.
+          3. Invoke ``RLProofSearch.search()`` with a tight budget.
+          4. If a proof is found, splice it back into *lean_code* replacing
+             ``sorry``.
+          5. Fall back gracefully — if MCTS infrastructure is unavailable
+             (no Pantograph binary, etc.) just return the original code.
+
+        The replacement is done in reverse offset order so that earlier
+        offsets stay valid as later ``sorry`` tokens get replaced.
+        """
+        sorry_blocks = self._extract_sorry_blocks(lean_code)
+        if not sorry_blocks:
+            return lean_code
+
+        try:
+            from autoforge.engine.rl_proof_search import RLConfig, RLProofSearch
+        except Exception:
+            logger.debug("[MCTS] rl_proof_search unavailable — skipping")
+            return lean_code
+
+        config = RLConfig(
+            num_simulations=self.MCTS_MAX_SIMULATIONS,
+            max_proof_depth=self.MCTS_MAX_DEPTH,
+            use_value_network=True,
+            use_policy_network=True,
+        )
+        searcher = RLProofSearch(config, llm)
+
+        # Optionally hook up Pantograph as the verifier for tactic application
+        try:
+            from autoforge.engine.provers.pantograph_repl import (
+                PantographConfig,
+                PantographREPL,
+            )
+            repl = PantographREPL(PantographConfig())
+            await repl.start()
+            searcher.verifier = repl
+        except Exception:
+            logger.debug("[MCTS] Pantograph unavailable — using LLM-only mode")
+
+        # Process sorry blocks in reverse order to keep offsets stable
+        result_code = lean_code
+        for block in reversed(sorry_blocks):
+            # Build a proof search query from the goal hint
+            goal_query = (
+                f"-- Context from article claim: {claim.label}\n"
+                f"-- Local proof state before sorry:\n"
+                f"{block['goal_hint']}\n"
+                f"-- Goal: Fill in a valid Lean 4 tactic proof for `sorry`"
+            )
+            try:
+                proved, proof_text, _experiences = await asyncio.wait_for(
+                    searcher.search(goal_query, max_depth=self.MCTS_MAX_DEPTH),
+                    timeout=self.MCTS_TIMEOUT_PER_SORRY,
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.debug(
+                    "[MCTS] Search timed out or failed for sorry at offset %d: %s",
+                    block["start"], exc,
+                )
+                continue
+
+            if proved and proof_text:
+                # Splice the discovered proof in place of ``sorry``
+                result_code = (
+                    result_code[: block["start"]]
+                    + proof_text.strip()
+                    + result_code[block["end"] :]
+                )
+                logger.info(
+                    "[MCTS] Replaced sorry at offset %d with %d-char proof",
+                    block["start"], len(proof_text),
+                )
+
+        # Clean up Pantograph REPL if we started one
+        if hasattr(searcher, "verifier") and hasattr(searcher.verifier, "stop"):
+            try:
+                await searcher.verifier.stop()
+            except Exception:
+                pass
+
+        return result_code
+
+    # ── LLM-based formalization ───────────────────────────────
 
     async def _auto_formalize(
         self,
@@ -967,9 +1103,9 @@ class ArticleVerifier:
       7. Generate comprehensive report
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, use_mcts: bool = True) -> None:
         self._parser = ArticleParser()
-        self._pipeline = FormalizationPipeline()
+        self._pipeline = FormalizationPipeline(use_mcts=use_mcts)
 
     async def verify_article(
         self,

@@ -59,13 +59,16 @@ class LLMProvider:
 
 @dataclass
 class ContentBlock:
-    """A block of content in an LLM response (text or tool_use)."""
+    """A block of content in an LLM response (text, tool_use, or image)."""
 
-    type: str  # "text" or "tool_use"
+    type: str  # "text", "tool_use", or "image"
     text: str = ""
     id: str = ""
     name: str = ""
     input: dict[str, Any] = field(default_factory=dict)
+    # Vision fields — used when type == "image"
+    media_type: str = ""  # e.g. "image/png", "image/jpeg"
+    image_data: str = ""  # base64-encoded image bytes
 
 
 @dataclass
@@ -532,6 +535,18 @@ class LLMRouter:
                                 "name": item.name,
                                 "input": item.input,
                             })
+                        elif item.type == "image":
+                            converted.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": item.media_type or "image/png",
+                                    "data": item.image_data,
+                                },
+                            })
+                    elif isinstance(item, dict) and item.get("type") == "image":
+                        # Already in raw dict format
+                        converted.append(item)
                     else:
                         converted.append(item)
                 result.append({"role": msg["role"], "content": converted})
@@ -652,13 +667,13 @@ class LLMRouter:
                 result.append(oai_msg)
 
             elif role == "user":
-                # May contain tool_result items or plain text.
-                # Collect tool results and user text separately to avoid
+                # May contain tool_result items, images, or plain text.
+                # Collect tool results and user content separately to avoid
                 # interleaving — OpenAI expects all tool messages grouped
                 # right after the assistant tool_calls message.
                 if isinstance(content, list):
                     tool_msgs: list[dict[str, Any]] = []
-                    user_text_parts: list[str] = []
+                    user_content_parts: list[dict[str, Any]] = []
                     for item in content:
                         if isinstance(item, dict) and item.get("type") == "tool_result":
                             tool_msgs.append({
@@ -666,16 +681,35 @@ class LLMRouter:
                                 "tool_call_id": item["tool_use_id"],
                                 "content": item.get("content", ""),
                             })
+                        elif isinstance(item, ContentBlock) and item.type == "image":
+                            # OpenAI vision: data URI format
+                            mt = item.media_type or "image/png"
+                            user_content_parts.append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mt};base64,{item.image_data}",
+                                },
+                            })
+                        elif isinstance(item, dict) and item.get("type") == "image":
+                            src = item.get("source", {})
+                            mt = src.get("media_type", "image/png")
+                            data = src.get("data", "")
+                            user_content_parts.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mt};base64,{data}"},
+                            })
                         else:
-                            text = item if isinstance(item, str) else str(item)
-                            user_text_parts.append(text)
+                            text = item if isinstance(item, str) else (
+                                item.text if isinstance(item, ContentBlock) else str(item)
+                            )
+                            user_content_parts.append({"type": "text", "text": text})
                     # Emit tool messages first (they belong to the preceding
                     # assistant turn), then a single user message if any.
                     result.extend(tool_msgs)
-                    if user_text_parts:
+                    if user_content_parts:
                         result.append({
                             "role": "user",
-                            "content": "\n".join(user_text_parts),
+                            "content": user_content_parts,
                         })
                 elif isinstance(content, str):
                     result.append({"role": "user", "content": content})
@@ -779,6 +813,11 @@ class LLMRouter:
                             parts.append(types.Part(function_call=types.FunctionCall(
                                 name=item.name, args=item.input
                             )))
+                        elif item.type == "image":
+                            import base64 as _b64
+                            raw = _b64.b64decode(item.image_data)
+                            mt = item.media_type or "image/png"
+                            parts.append(types.Part.from_data(data=raw, mime_type=mt))
                     elif isinstance(item, dict):
                         if item.get("type") == "tool_result":
                             parts.append(types.Part(function_response=types.FunctionResponse(
@@ -787,6 +826,12 @@ class LLMRouter:
                             )))
                         elif item.get("type") == "text":
                             parts.append(types.Part.from_text(text=item.get("text", "")))
+                        elif item.get("type") == "image":
+                            import base64 as _b64
+                            src = item.get("source", {})
+                            raw = _b64.b64decode(src.get("data", ""))
+                            mt = src.get("media_type", "image/png")
+                            parts.append(types.Part.from_data(data=raw, mime_type=mt))
                     elif isinstance(item, str):
                         parts.append(types.Part.from_text(text=item))
             elif isinstance(content, str):

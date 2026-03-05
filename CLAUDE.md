@@ -46,6 +46,22 @@ python scripts/git_sync.py pick-range 0,2-4 # Cherry-pick by index from main
 
 6 agents: Director (Opus, requirements), Architect (Opus, design), Builder (Sonnet, code), Reviewer (Sonnet, review), Tester (Sonnet, test), Gardener (Sonnet, refactor).
 
+## Academic Pipeline — Algorithmic Reasoning
+
+The academic verification stack prioritizes deterministic algorithms over LLM prompt wrappers wherever possible. Key design decisions:
+
+**Peer Review** (`peer_review.py`): Confidence-weighted Bayesian aggregation replaces naive score averaging. Reviewer reliability is quantified via Fleiss' kappa inter-rater agreement; outlier reviewers are flagged by MAD-based bias detection (> 2× median absolute deviation).
+
+**Theoretical Reasoning** (`theoretical_reasoning.py`): Cross-domain reasoning uses a mathematical domain inclusion lattice (N⊂Z⊂Q⊂R⊂C) for principled generalization/specialization instead of ad-hoc string replacement. Theory composition operates on dependency-graph transitive closure with SymPy structural unification. Cross-domain analogy detection uses relation-fingerprint Jaccard matching on 1-hop graph neighborhoods.
+
+**Experiment Loop** (`experiment_loop.py`): Statistical analysis uses Cohen's d effect size and Wilson score confidence intervals for grounded accept/reject decisions. Hypothesis selection is driven by a Gaussian Process surrogate with Expected Improvement acquisition (Bayesian optimization), replacing naive confidence-max selection.
+
+**Formal Verification** (`article_verifier.py`): The formalization pipeline connects to `RLProofSearch` (PUCT-MCTS) and optionally Pantograph REPL for sorry elimination — attempting real proof search before falling back to LLM re-prompting. Budget-controlled (64 simulations, 30s timeout per sorry gap) with graceful degradation.
+
+**Vision** (`vlm_figure.py`, `llm_router.py`): Multi-modal `ContentBlock` supports native image payloads across Anthropic, OpenAI, and Gemini backends. Figure analysis and verification use real VLM calls instead of stubs.
+
+**Memory Safety**: All long-lived caches (`cloud_prover.py`, `literature_search.py`) are LRU-bounded to prevent unbounded memory growth.
+
 ## Key Files
 
 ```
@@ -65,7 +81,7 @@ engine/sica.py                  SICA — self-improving coding agent, constituti
 engine/rag_retrieval.py         Library-level RAG — BM25+TF-IDF hybrid cross-project code retrieval
 engine/formal_verify.py         Formal verification — multi-level linting, type checking, LLM formal analysis
 engine/reasoning_extension.py   Autonomous reasoning extension — minimal kernel self-growth, numbered conclusions, publication gate
-engine/article_verifier.py      Article verification pipeline — claim extraction, Lean 4 formalization, cross-prover verification
+engine/article_verifier.py      Article verification pipeline — claim extraction, Lean 4 formalization, MCTS sorry elimination, cross-prover verification
 engine/agent_debate.py          Conditional debate — reward-guided multi-agent architecture debate
 engine/security_scan.py         RedCode security scanning — pattern matching + LLM deep vulnerability analysis
 engine/reflexion.py             Reflexion — verbal RL with episodic memory for failure-informed retries
@@ -77,22 +93,22 @@ engine/lean_prover.py           Lean 4 theorem proving — Hilbert+COPRA+MCTS+ST
 engine/multi_prover.py          Multi-prover formal verification — Coq, Isabelle, TLA+, Z3/SMT, Dafny cross-verification
 engine/autonomous_discovery.py  Autonomous theorem discovery — DomainContext-templated prompts, minimal kernel → conjecture generation → novelty filter → depth evaluation
 engine/paper_formalizer.py      Paper-specific Lean 4 formalization — real Lean compile, theorem extraction, Lean codegen, Python reproducibility, markdown report
-engine/cloud_prover.py          Cloud Lean 4 compilation — Docker, SSH, GitHub Codespaces backends with proof caching
+engine/cloud_prover.py          Cloud Lean 4 compilation — Docker, SSH, GitHub Codespaces backends with LRU-bounded proof caching
 engine/capability_dag.py        CapabilityDAG — self-growing universal knowledge graph, community-mergeable
-engine/theoretical_reasoning.py Cross-domain scientific reasoning — TheoryGraph, multi-modal verification, theory evolution & article generation
-engine/experiment_loop.py       Closed-loop experiment pipeline — AI Scientist v2-style hypothesis→code→run→analyze→iterate with ablation studies
+engine/theoretical_reasoning.py Cross-domain scientific reasoning — domain lattice, graph-structural analogy, transitive composition, theory evolution
+engine/experiment_loop.py       Closed-loop experiment pipeline — GP-based hypothesis ranking, Cohen's d + Wilson CI analysis, ablation studies
 engine/paper_writer.py          Automated paper writing — LaTeX generation, BibTeX management, figure generation, NeurIPS/ICML/ICLR templates
 engine/dense_retrieval.py       Dense embedding premise selection — ReProver/LeanDojo-style retrieval replacing Jaccard, FAISS support
 engine/benchmark_eval.py        Standard benchmark evaluation — miniF2F, PutnamBench, LeanWorkbook, ProofNet harnesses with Pass@k
 engine/rl_proof_search.py       RL proof search — AlphaProof/DeepSeek-Prover-V2 style PUCT-MCTS with policy/value networks, expert iteration
-engine/literature_search.py     Enhanced literature search — citation graph traversal, SPECTER2 embedding search, full-text analysis, gap detection
+engine/literature_search.py     Enhanced literature search — LRU-bounded citation graph, SPECTER2 embedding search, full-text analysis, gap detection
 engine/paper_repro.py           Enhanced paper reproduction — full pipeline: goal→paper→signals→code→execute→compare→report
 engine/provers/lean_lake.py     Real Lean 4 Lake integration — proper Mathlib project scaffolding, Lake build, project pool, 32 import mappings
 engine/provers/pantograph_repl.py Pantograph REPL client — machine-to-machine Lean 4 interaction, incremental tactic application, BFS/DFS proof search
 engine/article_reasoning.py     End-to-end article reasoning orchestrator — unified pipeline: ingest→parse→verify→formalize→discover→extend→generate
-engine/vlm_figure.py            VLM-powered figure analysis — extraction, analysis, reproduction, verification of paper figures
+engine/vlm_figure.py            VLM-powered figure analysis — real multi-modal LLM calls for extraction, analysis, reproduction, verification
 engine/symbolic_compute.py      Symbolic computation backend — SymPy/SageMath integration, LaTeX↔SymPy, algebraic verification
-engine/peer_review.py           Peer review simulation — multi-reviewer academic review, rebuttal, meta-review, iterative revision
+engine/peer_review.py           Peer review simulation — Bayesian scoring, Fleiss' κ agreement, MAD bias detection, rebuttal & meta-review
 engine/proof_embedding.py       Proof embedding & transfer — cross-domain tactic suggestion, memory bank, experience tracking, FAISS indexing
 engine/task_dag.py           TaskDAG — dependency graph, scheduling, persistence
 engine/lock_manager.py      Cross-platform atomic task locking (symlink on POSIX, O_CREAT|O_EXCL on Windows)

@@ -571,29 +571,112 @@ Only return valid JSON."""
         }
 
     def _call_vlm_with_image(self, image_path: Path, prompt: str) -> str:
-        """Call VLM with image.
+        """Call VLM with an image via the LLM router.
 
-        Raises NotImplementedError so callers get a clear signal rather
-        than silently receiving empty results that propagate downstream.
-        Subclasses or integrators must override with an actual VLM backend
-        (e.g. Claude Messages API with vision, GPT-4V, etc.).
+        Reads the image file, base64-encodes it, and sends it as an image
+        content block alongside the text prompt.  Works with any provider
+        that supports vision (Anthropic Claude, OpenAI GPT-4V, Gemini).
+
+        The method is synchronous because callers wrap it with
+        ``asyncio.to_thread()``.
         """
-        raise NotImplementedError(
-            f"_call_vlm_with_image is not implemented. "
-            f"Provide a VLM backend to analyse {image_path.name}. "
-            f"Override this method in a subclass or set self.llm."
-        )
+        import asyncio
+        import base64
+        import mimetypes
+
+        if self.llm is None:
+            raise RuntimeError(
+                "VLMAnalyzer requires an LLM router instance (self.llm). "
+                "Pass one to the constructor."
+            )
+
+        # Read and encode the image
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+
+        raw_bytes = image_path.read_bytes()
+        b64_data = base64.b64encode(raw_bytes).decode("ascii")
+        mime = mimetypes.guess_type(str(image_path))[0] or "image/png"
+
+        # Build a user message with image + text content blocks
+        from autoforge.engine.llm_router import ContentBlock, TaskComplexity
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    ContentBlock(type="image", media_type=mime, image_data=b64_data),
+                    ContentBlock(type="text", text=prompt),
+                ],
+            }
+        ]
+
+        # Run the async LLM call from this sync context
+        async def _do_call() -> str:
+            resp = await self.llm.call(
+                complexity=TaskComplexity.HIGH,
+                system="You are an expert academic figure analyst. Respond in valid JSON.",
+                messages=messages,
+            )
+            # Extract text from response content blocks
+            parts = []
+            for block in resp.content:
+                if hasattr(block, "text") and block.text:
+                    parts.append(block.text)
+            return "\n".join(parts)
+
+        # Get or create event loop
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            # We're already in an async context called via to_thread —
+            # create a new loop in this thread.
+            return asyncio.run(_do_call())
+        else:
+            return asyncio.run(_do_call())
 
     def _call_llm_text(self, prompt: str) -> str:
-        """Call LLM with text-only prompt.
+        """Call LLM with a text-only prompt via the LLM router.
 
-        Raises NotImplementedError so callers get a clear signal rather
-        than silently receiving empty results.
+        Synchronous wrapper; callers use ``asyncio.to_thread()`` to avoid
+        blocking the event loop.
         """
-        raise NotImplementedError(
-            "_call_llm_text is not implemented. "
-            "Provide an LLM backend by overriding this method in a subclass."
-        )
+        import asyncio
+
+        if self.llm is None:
+            raise RuntimeError(
+                "VLMAnalyzer requires an LLM router instance (self.llm). "
+                "Pass one to the constructor."
+            )
+
+        from autoforge.engine.llm_router import TaskComplexity
+
+        messages = [{"role": "user", "content": prompt}]
+
+        async def _do_call() -> str:
+            resp = await self.llm.call(
+                complexity=TaskComplexity.STANDARD,
+                system="You are an expert academic figure analyst. Respond in valid JSON.",
+                messages=messages,
+            )
+            parts = []
+            for block in resp.content:
+                if hasattr(block, "text") and block.text:
+                    parts.append(block.text)
+            return "\n".join(parts)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            return asyncio.run(_do_call())
+        else:
+            return asyncio.run(_do_call())
 
 
 # ══════════════════════════════════════════════════════════════
@@ -928,9 +1011,33 @@ Return as JSON with keys: matches, discrepancies, explanations, quality"""
             return {"matches": [], "discrepancies": []}
 
     def _call_llm_text(self, prompt: str) -> str:
-        """Call LLM with text prompt."""
-        # Placeholder implementation
-        return ""
+        """Call LLM with a text-only prompt via the LLM router."""
+        import asyncio
+
+        if self.llm is None:
+            raise RuntimeError("FigureVerifier requires an LLM router instance.")
+
+        from autoforge.engine.llm_router import TaskComplexity
+
+        messages = [{"role": "user", "content": prompt}]
+
+        async def _do_call() -> str:
+            resp = await self.llm.call(
+                complexity=TaskComplexity.STANDARD,
+                system="You are an expert at verifying academic figure claims. Respond in valid JSON.",
+                messages=messages,
+            )
+            parts = []
+            for block in resp.content:
+                if hasattr(block, "text") and block.text:
+                    parts.append(block.text)
+            return "\n".join(parts)
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        return asyncio.run(_do_call())
 
 
 # ══════════════════════════════════════════════════════════════
