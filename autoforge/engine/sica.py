@@ -640,6 +640,7 @@ class RewriteConfig:
     mutation_rate: float = 0.3        # Probability of mutation during evolution
     crossover_rate: float = 0.5       # Probability of crossover
     fitness_threshold: float = 0.0    # Minimum fitness delta to keep a candidate
+    model: str = "claude-sonnet-4-20250514"  # Model for rewrite generation
     allowed_modules: list[str] = field(default_factory=lambda: [
         "constitution",
         "workflows",
@@ -739,7 +740,7 @@ class DarwinSelfRewriter:
 
             # Call LLM
             response = await llm.messages.create(
-                model="claude-opus-4-6",
+                model=self.config.model,
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -942,7 +943,7 @@ Do NOT include explanations or markdown outside the code block."""
 Apply ONE small, focused {mutation_type} mutation. Return only the mutated code block."""
 
             response = await llm.messages.create(
-                model="claude-opus-4-6",
+                model=self.config.model,
                 max_tokens=2048,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -1011,7 +1012,7 @@ Create a hybrid that takes the best parts from both while maintaining correctnes
 Return ONLY the complete hybrid code in a markdown block."""
 
             response = await llm.messages.create(
-                model="claude-opus-4-6",
+                model=self.config.model,
                 max_tokens=2048,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -1161,6 +1162,9 @@ Return ONLY the complete hybrid code in a markdown block."""
                 logger.warning(f"[Darwin] Evolution stopped at generation {gen}")
                 break
 
+        # Save state after evolution completes
+        self._save_evolution_state()
+
         # Return best overall
         best = max(self._population, key=lambda c: c.fitness_delta)
         logger.info(
@@ -1175,21 +1179,16 @@ Return ONLY the complete hybrid code in a markdown block."""
 
         Uses tournament size of 2 (binary tournament).
         """
+        import random
+
         if not population:
             return []
 
         parents = []
-        tournament_size = 2
+        tournament_size = min(2, len(population))
 
         for _ in range(min(2, len(population))):  # Select 2 parents
-            tournament = [
-                population[i]
-                for i in sorted([
-                    hash(f"{population[i].candidate_id}-{time.time()}") % len(population)
-                    for _ in range(tournament_size)
-                ])
-            ][:tournament_size]
-
+            tournament = random.sample(population, tournament_size)
             winner = max(tournament, key=lambda c: c.fitness_delta)
             parents.append(winner)
 
@@ -1260,7 +1259,7 @@ Return ONLY the complete hybrid code in a markdown block."""
             )
 
             # Validate with SICA
-            is_valid = self.sica_engine.validate_proposal(proposal, constitution_dir)
+            is_valid, reason = self.sica_engine.validate_proposal(proposal)
             if not is_valid:
                 logger.warning("[Darwin] Proposal failed SICA validation")
                 return False

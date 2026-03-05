@@ -55,6 +55,7 @@ class LearnedRule:
     id: str
     pattern: str              # What failure pattern this addresses
     rule: str                 # The rule/instruction to prevent it
+    source_role: str = ""     # Which agent role this rule originated from (empty = all)
     confidence: float = 0.0   # How well this rule works (updated over time)
     times_applied: int = 0
     times_helped: int = 0     # Times it prevented the failure
@@ -169,17 +170,11 @@ class DynamicConstitution:
                 if block.type == "text":
                     text += block.text
 
-            import re
-            match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-            if match:
-                raw = json.loads(match.group(1).strip())
-            else:
-                start = text.find("[")
-                end = text.rfind("]")
-                if start != -1 and end != -1:
-                    raw = json.loads(text[start:end + 1])
-                else:
-                    raw = []
+            from autoforge.engine.utils import extract_json_list_from_text
+            try:
+                raw = extract_json_list_from_text(text)
+            except ValueError:
+                raw = []
 
             patches = []
             for i, item in enumerate(raw):
@@ -292,10 +287,11 @@ class DynamicConstitution:
                 break
 
     def _get_applicable_rules(self, role: str) -> list[LearnedRule]:
-        """Get learned rules with confidence above threshold."""
+        """Get learned rules applicable to a role, with confidence above threshold."""
         return [
             r for r in self._learned_rules
             if r.confidence >= 0.3  # Only include rules that have shown some value
+            and (not r.source_role or r.source_role == role)
         ]
 
     def _save_knowledge_base(self) -> None:
@@ -310,6 +306,7 @@ class DynamicConstitution:
                         "id": r.id,
                         "pattern": r.pattern,
                         "rule": r.rule,
+                        "source_role": r.source_role,
                         "confidence": r.confidence,
                         "times_applied": r.times_applied,
                         "times_helped": r.times_helped,
@@ -336,6 +333,7 @@ class DynamicConstitution:
                     id=r["id"],
                     pattern=r["pattern"],
                     rule=r["rule"],
+                    source_role=r.get("source_role", ""),
                     confidence=r.get("confidence", 0.5),
                     times_applied=r.get("times_applied", 0),
                     times_helped=r.get("times_helped", 0),

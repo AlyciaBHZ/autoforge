@@ -132,8 +132,6 @@ class EvoMACEngine:
     MIN_ITERATIONS_FOR_EVOLUTION = 3
     # Gradient severity threshold for applying updates
     GRADIENT_APPLY_THRESHOLD = 0.3
-    # Maximum accumulated gradients per agent before forced update
-    MAX_PENDING_GRADIENTS = 10
 
     def __init__(self, project_dir: Path | None = None) -> None:
         self.project_dir = project_dir
@@ -252,20 +250,10 @@ class EvoMACEngine:
         """Parse LLM output into TextGradient objects."""
         gradients = []
 
-        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-        if match:
-            raw_text = match.group(1).strip()
-        else:
-            start = text.find("[")
-            end = text.rfind("]")
-            if start != -1 and end != -1:
-                raw_text = text[start:end + 1]
-            else:
-                return []
-
+        from autoforge.engine.utils import extract_json_list_from_text
         try:
-            items = json.loads(raw_text)
-        except json.JSONDecodeError:
+            items = extract_json_list_from_text(text)
+        except ValueError:
             return []
 
         for item in items:
@@ -380,14 +368,24 @@ class EvoMACEngine:
 
     # ──────── Topology Evolution ────────
 
-    def record_gradient_outcome(self, target_role: str, helped: bool) -> None:
+    def record_gradient_outcome(
+        self, target_role: str, helped: bool, source_role: str = "",
+    ) -> None:
         """Record whether applied gradients actually improved the agent.
 
         This feedback drives topology evolution: effective edges are
         strengthened, ineffective ones are weakened or pruned.
+
+        Args:
+            target_role: The agent that received the gradient.
+            helped: Whether the gradient led to improvement.
+            source_role: The agent that sent the gradient. If empty,
+                updates all active edges targeting this role (legacy behavior).
         """
         for edge in self._topology:
             if edge.target == target_role and edge.active:
+                if source_role and edge.source != source_role:
+                    continue
                 if helped:
                     edge.gradients_helped += 1
                     edge.weight = min(2.0, edge.weight + 0.1)
