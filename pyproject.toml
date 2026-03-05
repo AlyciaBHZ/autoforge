@@ -113,6 +113,8 @@ all = [
 
 forgeai = "autoforge.cli.app:main"
 
+autoforgeai = "autoforge.cli.app:main"
+
 
 
 [tool.setuptools.packages.find]

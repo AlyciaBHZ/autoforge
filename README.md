@@ -47,7 +47,7 @@
 ### 安装
 
 ```bash
-pip install forgeai          # 从 PyPI 安装
+pip install autoforgeai       # 从 PyPI 安装
 forgeai                      # 启动（首次运行自动进入配置引导）
 ```
 
@@ -55,11 +55,11 @@ forgeai                      # 启动（首次运行自动进入配置引导）
 <summary>可选依赖</summary>
 
 ```bash
-pip install "forgeai[openai]"    # OpenAI 支持
-pip install "forgeai[google]"    # Google Gemini 支持
-pip install "forgeai[search]"    # Web 搜索能力
-pip install "forgeai[channels]"  # Telegram / Webhook 频道
-pip install "forgeai[all]"       # 全部安装
+pip install "autoforgeai[openai]"    # OpenAI 支持
+pip install "autoforgeai[google]"    # Google Gemini 支持
+pip install "autoforgeai[search]"    # Web 搜索能力
+pip install "autoforgeai[channels]"  # Telegram / Webhook 频道
+pip install "autoforgeai[all]"       # 全部安装
 ```
 
 </details>
