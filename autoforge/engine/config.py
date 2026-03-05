@@ -308,6 +308,7 @@ class ForgeConfig:
     # Execution
     max_agents: int = 3
     max_retries: int = 3
+    max_build_resets: int = 3
     quality_threshold: float = 0.7
     verbose: bool = False
     log_level: str = "INFO"

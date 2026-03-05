@@ -290,9 +290,12 @@ class Orchestrator:
             if self.config.speculative_enabled:
                 await self._speculative.speculate_test_scaffold(self.spec, self.project_dir)
 
+            # Integration check: verify cross-module imports before full test
+            await self._integration_check()
+
             # Phase 3: VERIFY
             console.print("\n[bold blue]Phase 3: VERIFY[/bold blue] — Verifying project...")
-            await self._phase_verify()
+            verify_passed = await self._phase_verify()
 
             # Formal verification: static analysis + LLM formal checks
             if self.config.formal_verify_enabled:
@@ -331,8 +334,19 @@ class Orchestrator:
             if self.config.evomac_enabled:
                 await self._evomac_backward_pass()
 
+            # Quality gate: if tests still fail after VERIFY, attempt security-informed fixes
+            if not verify_passed and self.config.security_scan_enabled:
+                console.print("  [yellow]VERIFY→REFACTOR gate: feeding scan findings back for fixing[/yellow]")
+                await self._fix_from_security_scan()
+
             # Phase 4: REFACTOR
-            console.print("\n[bold blue]Phase 4: REFACTOR[/bold blue] — Improving quality...")
+            if verify_passed:
+                console.print("\n[bold blue]Phase 4: REFACTOR[/bold blue] — Improving quality...")
+            else:
+                console.print(
+                    "\n[bold yellow]Phase 4: REFACTOR[/bold yellow] — "
+                    "Improving quality (some tests still failing, proceeding with best-effort)..."
+                )
             await self._phase_refactor()
             self._save_state("refactor_complete")
 
@@ -693,13 +707,18 @@ class Orchestrator:
             # Reduce decomp (less structured planning needed for test fixes)
             shares["reflexion"] = 0.30
             shares["decomp"] = 0.15
-            logger.debug(f"[ContextShares] Testing task detected — boosted reflexion, reduced decomp")
+            logger.debug("[ContextShares] Testing task detected — boosted reflexion, reduced decomp")
         elif is_creation:
             # Boost decomp (structured planning helps new implementations)
             # Reduce reflexion (fewer failure patterns for brand new code)
             shares["decomp"] = 0.35
             shares["reflexion"] = 0.12
-            logger.debug(f"[ContextShares] Creation task detected — boosted decomp, reduced reflexion")
+            logger.debug("[ContextShares] Creation task detected — boosted decomp, reduced reflexion")
+
+        # Normalize shares so they sum to 1.0 (prevents over-allocation)
+        total = sum(shares.values())
+        if total > 0:
+            shares = {k: v / total for k, v in shares.items()}
 
         return shares
 
@@ -751,8 +770,10 @@ class Orchestrator:
         # Track which files are being written by active tasks (Section F)
         active_files: set[str] = set()
         overlap_files = file_overlaps or {}
-        max_resets = 3
+        max_resets = getattr(self.config, "max_build_resets", 3)
         reset_count = 0
+        # Track which task IDs have failed repeatedly for fail-fast
+        task_fail_counts: dict[str, int] = {}
 
         while self.dag.has_pending_tasks(TaskPhase.BUILD):
             ready = self.dag.get_ready_tasks()
@@ -768,10 +789,26 @@ class Orchestrator:
                             max_resets,
                         )
                         break
-                    # Retry failed tasks
+
+                    # Fail-fast: skip tasks that have failed every reset
+                    all_salvageable = False
                     for task in self.dag.get_tasks_by_phase(TaskPhase.BUILD):
                         if task.status == TaskStatus.FAILED:
-                            self.dag.reset_failed(task.id)
+                            task_fail_counts[task.id] = task_fail_counts.get(task.id, 0) + 1
+                            if task_fail_counts[task.id] >= max_resets:
+                                logger.warning(
+                                    f"Task {task.id} failed {task_fail_counts[task.id]} times — "
+                                    f"marking as permanently blocked"
+                                )
+                                task.status = TaskStatus.BLOCKED
+                            else:
+                                self.dag.reset_failed(task.id)
+                                all_salvageable = True
+
+                    if not all_salvageable:
+                        logger.error("All remaining failed tasks are unsalvageable — stopping build")
+                        break
+
                     reset_count += 1
                     continue
                 break
@@ -1014,11 +1051,15 @@ class Orchestrator:
                 files_touched=task.files,
             )
 
+            # Gather actual file contents from dependency tasks
+            dep_context = self._gather_dependency_context(task, working_dir)
+
             result = await builder.run({
                 "task": task.to_dict(),
                 "spec": self.spec,
                 "architecture": json.dumps(self.architecture, indent=2, ensure_ascii=False),
                 "existing_files": existing_files,
+                "dependency_context": dep_context,
             })
 
             if result.success:
@@ -1058,7 +1099,7 @@ class Orchestrator:
                 await self._tdd_loop(task, builder, sandbox, working_dir, agent_id, use_git, git, branch_name)
 
                 # Quick review
-                reviewer = self._agent("reviewer", self.config, self.llm, working_dir)
+                reviewer = self._agent("reviewer", self.config, self.llm, working_dir, sandbox=sandbox)
                 if self._dynamic_constitution:
                     supplement = self._dynamic_constitution.build_supplementary_prompt("reviewer")
                     if supplement:
@@ -1066,10 +1107,13 @@ class Orchestrator:
                 review_result = await reviewer.run({
                     "task": task.to_dict(),
                     "spec": self.spec,
+                    "architecture": self.architecture,
                 })
                 review = reviewer.parse_review(review_result.output)
 
-                if review.approved:
+                # Use config threshold (not just LLM's self-reported "approved")
+                min_score = round(self.config.quality_threshold * 10)
+                if review.score >= min_score:
                     if use_git:
                         # Merge worktree branch into main
                         await git.merge_branch(branch_name)
@@ -1093,10 +1137,24 @@ class Orchestrator:
                 else:
                     # Revision needed — retry with feedback (not first-try success)
                     logger.info(f"Task {task.id} needs revision: {review.summary}")
+                    # Build structured feedback with both summary and specific issues
+                    fix_parts = [f"Review rejected (score {review.score}/{min_score} required):\n{review.summary}"]
+                    if review.issues:
+                        fix_parts.append("\n\nSpecific issues to fix:")
+                        for issue in review.issues:
+                            sev = issue.get("severity", "?")
+                            f_path = issue.get("file", "?")
+                            line = issue.get("line", "?")
+                            desc = issue.get("description", "")
+                            suggestion = issue.get("suggestion", "")
+                            fix_parts.append(f"  [{sev}] {f_path}:{line} — {desc}")
+                            if suggestion:
+                                fix_parts.append(f"    Fix: {suggestion}")
+
                     revision_result = await builder.run({
                         "task": {
                             **task.to_dict(),
-                            "fix_strategy": review.summary,
+                            "fix_strategy": "\n".join(fix_parts),
                         },
                         "spec": self.spec,
                         "existing_files": self._list_project_files(),
@@ -1205,8 +1263,10 @@ class Orchestrator:
                 "existing_files": self._list_project_files(),
             })
             if not fix_result.success:
-                logger.info(f"[{agent_id}] TDD fix failed, moving to review")
-                return  # Builder can't fix — move on to reviewer
+                logger.info(f"[{agent_id}] TDD fix attempt failed (iter {iteration + 1}/{loops})")
+                # Continue to next iteration instead of bailing — builder may
+                # succeed on the next try with fresh context
+                continue
 
             if use_git and git:
                 await git.commit_worktree(
@@ -1250,8 +1310,183 @@ class Orchestrator:
         return None
 
     # ──────────────────────────────────────────────
+    # Dependency Context: pass upstream file contents to downstream builders
+    # ──────────────────────────────────────────────
+
+    def _gather_dependency_context(
+        self, task: Task, working_dir: Path, max_chars: int = 12000,
+    ) -> str:
+        """Read key files from dependency tasks so the builder has real context.
+
+        When task B depends on task A, B's builder needs to see A's actual code
+        (models, types, interfaces) to write compatible imports and call sites.
+        Without this, builders guess at interfaces and produce broken imports.
+
+        Returns a formatted string with file contents, truncated to max_chars.
+        """
+        if not self.dag or not task.depends_on:
+            return ""
+
+        dep_files: list[tuple[str, str]] = []  # (path, content)
+        total_chars = 0
+
+        # Collect files from all dependency tasks
+        for dep_id in task.depends_on:
+            dep_task = self.dag.get_task(dep_id)
+            if dep_task is None or dep_task.status != TaskStatus.DONE:
+                continue
+            for fpath in dep_task.files:
+                full = working_dir / fpath
+                if not full.is_file():
+                    continue
+                # Prioritize interface-like files: types, models, schemas, index
+                # Skip test files and large assets
+                fname = full.name.lower()
+                if any(skip in fname for skip in (".test.", ".spec.", ".min.", ".lock")):
+                    continue
+                try:
+                    content = full.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                # Truncate individual files to keep total under budget
+                if len(content) > 3000:
+                    content = content[:3000] + "\n... (truncated)"
+                if total_chars + len(content) > max_chars:
+                    break
+                dep_files.append((fpath, content))
+                total_chars += len(content)
+
+        if not dep_files:
+            # Even without file contents, pass exports contracts
+            exports_parts = []
+            for dep_id in task.depends_on:
+                dep_task = self.dag.get_task(dep_id)
+                if dep_task and dep_task.exports:
+                    exports_parts.append(
+                        f"- **{dep_id}** ({', '.join(dep_task.files)}): {dep_task.exports}"
+                    )
+            if exports_parts:
+                return (
+                    "## Dependency Interfaces\n"
+                    "These upstream tasks provide the following interfaces:\n"
+                    + "\n".join(exports_parts) + "\n"
+                )
+            return ""
+
+        # Build context with both file contents and interface contracts
+        parts = ["## Dependency Files (from upstream tasks — use these for correct imports)\n"]
+
+        # First, show interface contracts (compact summary)
+        for dep_id in task.depends_on:
+            dep_task = self.dag.get_task(dep_id)
+            if dep_task and dep_task.exports:
+                parts.append(f"**{dep_id}** exports: {dep_task.exports}\n")
+
+        # Then show actual file contents
+        for fpath, content in dep_files:
+            parts.append(f"### `{fpath}`\n```\n{content}\n```\n")
+        return "\n".join(parts)
+
+    # ──────────────────────────────────────────────
     # Pipeline Hardening: Smoke Check, Build Gate, File Overlap
     # ──────────────────────────────────────────────
+
+    async def _integration_check(self) -> None:
+        """Run cross-module syntax/import checks after BUILD, before VERIFY.
+
+        Catches broken imports between modules early — cheaper than full test suite.
+        If issues are found, attempts a quick fix pass with a builder.
+        """
+        if not self.project_dir:
+            return
+
+        console.print("  Running integration check...")
+        sandbox = create_sandbox(self.config, self.project_dir)
+        issues: list[str] = []
+
+        async with sandbox:
+            # Detect project type and run appropriate syntax checks
+            tech = self.spec.get("tech_stack", {})
+            lang = tech.get("language", "").lower()
+
+            if "python" in lang:
+                # Check all Python files compile
+                py_files = list(self.project_dir.rglob("*.py"))
+                for pf in py_files[:30]:  # Cap to avoid excessive checks
+                    rel = pf.relative_to(self.project_dir)
+                    result = await sandbox.exec(
+                        f"python -m py_compile {rel}", timeout=10,
+                    )
+                    if result.exit_code != 0:
+                        err = (result.stderr or result.stdout or "")[:200]
+                        issues.append(f"{rel}: {err}")
+
+            elif "typescript" in lang:
+                # Run tsc --noEmit for type checking
+                if (self.project_dir / "tsconfig.json").exists():
+                    result = await sandbox.exec("npx tsc --noEmit 2>&1", timeout=60)
+                    if result.exit_code != 0:
+                        # Extract first few errors
+                        lines = (result.stdout or "").strip().split("\n")
+                        for line in lines[:10]:
+                            if "error TS" in line:
+                                issues.append(line.strip())
+
+            elif "javascript" in lang:
+                # Check all JS files parse
+                js_files = list(self.project_dir.rglob("*.js"))
+                js_files = [f for f in js_files if "node_modules" not in str(f)]
+                for jf in js_files[:30]:
+                    rel = jf.relative_to(self.project_dir)
+                    result = await sandbox.exec(
+                        f"node --check {rel}", timeout=10,
+                    )
+                    if result.exit_code != 0:
+                        err = (result.stderr or "")[:200]
+                        issues.append(f"{rel}: {err}")
+
+            if not issues:
+                console.print("  [green]Integration check passed[/green]")
+                return
+
+            # Report issues and attempt quick fix
+            console.print(
+                f"  [yellow]Integration check found {len(issues)} issue(s)[/yellow]"
+            )
+            for issue in issues[:5]:
+                console.print(f"    - {issue[:100]}")
+
+            # Quick fix attempt: send a builder to fix the integration issues
+            try:
+                builder = self._agent(
+                    "builder", self.config, self.llm,
+                    working_dir=self.project_dir, sandbox=sandbox,
+                )
+                fix_result = await builder.run({
+                    "task": {
+                        "id": "INTEGRATION-FIX",
+                        "description": "Fix cross-module integration issues",
+                        "files": list({
+                            issue.split(":")[0]
+                            for issue in issues
+                            if ":" in issue
+                        })[:5],
+                        "fix_strategy": (
+                            "The following integration errors were found after "
+                            "building all modules. Fix the broken imports, missing "
+                            "exports, and type mismatches:\n\n"
+                            + "\n".join(f"- {i}" for i in issues[:10])
+                        ),
+                    },
+                    "spec": self.spec,
+                    "existing_files": self._list_project_files(),
+                })
+                if fix_result.success:
+                    console.print("  [green]Integration fixes applied[/green]")
+                else:
+                    console.print("  [yellow]Integration fix attempt did not fully succeed[/yellow]")
+            except Exception as e:
+                logger.warning("Integration fix failed: %s", e)
 
     async def _smoke_check(
         self, task: Task, work_dir: Path
@@ -1384,7 +1619,29 @@ class Orchestrator:
                 f"exceeds contract limit of {max_files}"
             )
 
-        if not missing and len(build_tasks) <= max_tasks:
+        # Check 5: Deliverables — verify required artifacts exist
+        deliverables = contract.get("deliverables", [])
+        missing_deliverables: list[str] = []
+        for deliverable in deliverables:
+            d_lower = deliverable.lower()
+            # Check for common deliverable patterns
+            if "readme" in d_lower:
+                if not (project_dir / "README.md").exists() and not (project_dir / "readme.md").exists():
+                    missing_deliverables.append(deliverable)
+            elif "package.json" in d_lower:
+                if not (project_dir / "package.json").exists():
+                    missing_deliverables.append(deliverable)
+            elif "source code" in d_lower:
+                # Already validated via file existence check above
+                pass
+        if missing_deliverables:
+            console.print(
+                f"  [yellow]Build gate warning:[/yellow] "
+                f"missing deliverables: {', '.join(missing_deliverables)}"
+            )
+
+        gate_ok = not missing and len(build_tasks) <= max_tasks and not missing_deliverables
+        if gate_ok:
             console.print("  [green]Build gate passed[/green]")
 
     def _detect_file_overlaps(
@@ -1417,7 +1674,8 @@ class Orchestrator:
     # Phase 3: VERIFY
     # ──────────────────────────────────────────────
 
-    async def _phase_verify(self) -> None:
+    async def _phase_verify(self) -> bool:
+        """Run tests and attempt to fix failures. Returns True if all tests pass."""
         sandbox = create_sandbox(self.config, self.project_dir)
         async with sandbox:
             tester = self._agent("tester", self.config, self.llm, self.project_dir, sandbox)
@@ -1436,9 +1694,33 @@ class Orchestrator:
 
             if test_results.all_passed:
                 console.print("  [green]All tests passed[/green]")
+                return True
+
+            console.print(f"  [yellow]Some tests failed — attempting fixes[/yellow]")
+            await self._fix_failures(test_results, sandbox)
+
+            # Re-check: did fixes resolve all failures?
+            re_result = await tester.run({"spec": self.spec})
+            final_results = tester.parse_results(re_result.output)
+
+            # Update saved results
+            (self.project_dir / "test_results.json").write_text(
+                json.dumps({
+                    "all_passed": final_results.all_passed,
+                    "results": final_results.results,
+                    "summary": final_results.summary,
+                }, indent=2),
+                encoding="utf-8",
+            )
+
+            if final_results.all_passed:
+                console.print("  [green]All tests pass after fixes[/green]")
             else:
-                console.print(f"  [yellow]Some tests failed — attempting fixes[/yellow]")
-                await self._fix_failures(test_results, sandbox)
+                n_fail = len(final_results.failures)
+                console.print(
+                    f"  [yellow]VERIFY gate: {n_fail} test(s) still failing[/yellow]"
+                )
+            return final_results.all_passed
 
     async def _fix_failures(self, test_results, sandbox: SandboxBase) -> None:
         """Attempt to fix test failures using Director + Builder + Reflexion + LDB.
@@ -1562,27 +1844,68 @@ class Orchestrator:
     # ──────────────────────────────────────────────
 
     async def _phase_refactor(self) -> None:
-        # Quick review of overall quality
-        reviewer = self._agent("reviewer", self.config, self.llm, self.project_dir)
-        review_result = await reviewer.run({
-            "task": {"id": "FINAL", "description": "Final quality review", "files": self._list_project_files()},
-            "spec": self.spec,
-        })
-        review = reviewer.parse_review(review_result.output)
-
-        if review.score >= round(self.config.quality_threshold * 10):
-            console.print(f"  [green]Quality score: {review.score}/10 — no refactoring needed[/green]")
-            return
-
-        console.print(f"  Quality score: {review.score}/10 — refactoring...")
-
-        if review.issues:
-            gardener = self._agent("gardener", self.config, self.llm, self.project_dir)
-            await gardener.run({
-                "review": {"issues": review.issues, "summary": review.summary},
+        sandbox = create_sandbox(self.config, self.project_dir)
+        async with sandbox:
+            # Full project review with verification tools
+            reviewer = self._agent("reviewer", self.config, self.llm, self.project_dir, sandbox=sandbox)
+            review_result = await reviewer.run({
+                "task": {"id": "FINAL", "description": "Final quality review", "files": self._list_project_files()},
                 "spec": self.spec,
+                "full_project_review": True,
             })
-            console.print("  [green]Refactoring complete[/green]")
+            review = reviewer.parse_review(review_result.output)
+
+            if review.score >= round(self.config.quality_threshold * 10):
+                console.print(f"  [green]Quality score: {review.score}/10 — no refactoring needed[/green]")
+                return
+
+            console.print(f"  Quality score: {review.score}/10 — refactoring...")
+
+            if review.issues:
+                gardener = self._agent("gardener", self.config, self.llm, self.project_dir)
+                await gardener.run({
+                    "review": {"issues": review.issues, "summary": review.summary},
+                    "spec": self.spec,
+                })
+
+                # Post-refactor verification: ensure gardener didn't break anything
+                console.print("  Verifying refactored code...")
+                tech = self.spec.get("tech_stack", {})
+                lang = tech.get("language", "").lower()
+                broke = False
+
+                if "python" in lang:
+                    for pf in list(self.project_dir.rglob("*.py"))[:30]:
+                        rel = pf.relative_to(self.project_dir)
+                        result = await sandbox.exec(f"python -m py_compile {rel}", timeout=10)
+                        if result.exit_code != 0:
+                            console.print(f"  [yellow]Refactor broke {rel}[/yellow]")
+                            broke = True
+                elif "typescript" in lang and (self.project_dir / "tsconfig.json").exists():
+                    result = await sandbox.exec("npx tsc --noEmit 2>&1", timeout=60)
+                    if result.exit_code != 0:
+                        broke = True
+                        console.print("  [yellow]Refactor introduced type errors[/yellow]")
+
+                if broke:
+                    # Attempt auto-fix
+                    builder = self._agent(
+                        "builder", self.config, self.llm,
+                        working_dir=self.project_dir, sandbox=sandbox,
+                    )
+                    await builder.run({
+                        "task": {
+                            "id": "POST-REFACTOR-FIX",
+                            "description": "Fix syntax/type errors introduced by refactoring",
+                            "files": self._list_project_files(),
+                            "fix_strategy": "Refactoring introduced syntax or type errors. Fix them while preserving the refactoring improvements.",
+                        },
+                        "spec": self.spec,
+                        "existing_files": self._list_project_files(),
+                    })
+                    console.print("  [green]Post-refactor fixes applied[/green]")
+                else:
+                    console.print("  [green]Refactoring verified — no regressions[/green]")
 
     # ──────────────────────────────────────────────
     # Phase 5: DELIVER
@@ -2280,6 +2603,44 @@ class Orchestrator:
                 console.print(f"  [green]Security scan passed[/green] ({report.low_count} low issues)")
         except Exception as e:
             logger.warning(f"Security scan failed: {e}")
+
+    async def _fix_from_security_scan(self) -> None:
+        """Read security_report.json and ask builder to fix critical/high issues."""
+        report_path = self._forge_dir / "security_report.json"
+        if not report_path.exists():
+            return
+        try:
+            report_data = json.loads(report_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+
+        # Only fix critical and high severity findings
+        findings = [
+            f for f in report_data.get("findings", [])
+            if f.get("severity") in ("critical", "high")
+        ]
+        if not findings:
+            return
+
+        console.print(f"  Fixing {len(findings)} critical/high security issue(s)...")
+        sandbox = create_sandbox(self.config, self.project_dir)
+        async with sandbox:
+            builder = self._agent("builder", self.config, self.llm, self.project_dir, sandbox)
+            for finding in findings[:5]:  # Cap at 5 fixes per pass
+                fix_prompt = (
+                    f"Fix this security vulnerability:\n"
+                    f"  File: {finding.get('file', 'unknown')}\n"
+                    f"  Line: {finding.get('line', '?')}\n"
+                    f"  Severity: {finding.get('severity')}\n"
+                    f"  Issue: {finding.get('description', '')}\n"
+                    f"  Suggestion: {finding.get('suggestion', '')}\n\n"
+                    f"Read the file, understand the context, and apply the minimal fix."
+                )
+                await builder.run({
+                    "task": {"id": f"sec-fix-{finding.get('file', 'unknown')}", "description": fix_prompt, "files": [finding.get("file", "")]},
+                    "spec": self.spec,
+                    "existing_files": self._list_project_files(),
+                })
 
     # ──────────────────────────────────────────────
     # CapabilityDAG — Knowledge Ingestion

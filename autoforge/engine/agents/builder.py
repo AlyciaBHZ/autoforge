@@ -171,6 +171,7 @@ class BuilderAgent(FileToolsMixin, AgentBase):
         spec = context.get("spec", {})
         architecture = context.get("architecture", "")
         existing_files = context.get("existing_files", [])
+        dep_context = context.get("dependency_context", "")
 
         parts = [
             f"You are implementing a task for the project '{spec.get('project_name', '')}'.\n",
@@ -185,6 +186,12 @@ class BuilderAgent(FileToolsMixin, AgentBase):
 
         if task.get("fix_strategy"):
             parts.append(f"\n## Fix Strategy\n{task['fix_strategy']}\n")
+
+        # Dependency context: actual file contents from upstream tasks
+        # This is the most important context — it shows the builder exactly
+        # what interfaces, types, and functions are available from dependencies.
+        if dep_context:
+            parts.append(f"\n{dep_context}\n")
 
         parts.append(f"\n## Project Spec\n```json\n{json.dumps(spec, indent=2, ensure_ascii=False)}\n```\n")
 
@@ -205,6 +212,8 @@ class BuilderAgent(FileToolsMixin, AgentBase):
             "Use the write_file tool to create each required file. "
             "Write complete, production-ready code. "
             "Include proper imports, type hints, error handling, and comments.\n"
+            "IMPORTANT: Use the dependency files above to ensure your imports and "
+            "function calls match the actual interfaces defined in upstream modules.\n"
         )
 
         return "".join(parts)

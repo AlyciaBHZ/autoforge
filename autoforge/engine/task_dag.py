@@ -41,6 +41,7 @@ class Task:
     claimed_by: str | None = None
     result: str | None = None
     acceptance_criteria: str = ""
+    exports: str = ""  # Interface contract: what this task provides to downstream tasks
     retry_count: int = 0
 
     def is_ready(self, completed_ids: set[str]) -> bool:
@@ -59,6 +60,7 @@ class Task:
             "claimed_by": self.claimed_by,
             "result": self.result,
             "acceptance_criteria": self.acceptance_criteria,
+            "exports": self.exports,
             "retry_count": self.retry_count,
         }
 
@@ -230,6 +232,7 @@ class TaskDAG:
                     claimed_by=item.get("claimed_by"),
                     result=item.get("result"),
                     acceptance_criteria=item.get("acceptance_criteria", ""),
+                    exports=item.get("exports", ""),
                     retry_count=item.get("retry_count", 0),
                 )
                 dag.add_task(task)
