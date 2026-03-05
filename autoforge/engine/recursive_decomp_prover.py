@@ -100,10 +100,11 @@ class RecursiveDecompProver:
         Returns:
             The root ProofGoal with final status.
         """
-        logger.info(f"Starting proof for concept: {concept.name}")
+        concept_label = concept.label or concept.id
+        logger.info(f"Starting proof for concept: {concept_label}")
 
         # Create root goal
-        statement = concept.description or concept.name
+        statement = concept.formal_statement or concept.informal_statement or concept_label
         lean_statement = concept.formal_statement or ""
         goal_id = self._generate_goal_id(statement)
 
@@ -120,7 +121,7 @@ class RecursiveDecompProver:
 
         # Recursively prove
         result = await self._recursive_prove(root_goal, llm, graph)
-        logger.info(f"Proof result for {concept.name}: status={result.status}")
+        logger.info(f"Proof result for {concept_label}: status={result.status}")
 
         return result
 
@@ -466,7 +467,7 @@ Be strategic: each subgoal should be simpler than the original."""
         # 1. Local graph retrieval
         if graph:
             try:
-                for concept in graph.concepts.values():
+                for concept in graph.nodes.values():
                     if (
                         concept.formal_statement
                         and concept.concept_type
@@ -479,7 +480,7 @@ Be strategic: each subgoal should be simpler than the original."""
                         if overlap_score > 0.1:
                             lemmas.append(
                                 RetrievedLemma(
-                                    name=concept.name,
+                                    name=concept.label,
                                     statement=concept.formal_statement,
                                     relevance_score=overlap_score,
                                     source="local_graph",

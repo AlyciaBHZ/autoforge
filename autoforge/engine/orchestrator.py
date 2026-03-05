@@ -2836,6 +2836,7 @@ class Orchestrator:
                         output_dir=formal_dir / name,
                         lean_compile=lean_compile,
                         run_python=run_python,
+                        cloud_prover=self._cloud_prover if lean_compile else None,
                     )
 
                     console.print(

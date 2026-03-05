@@ -356,6 +356,7 @@ class PaperFormalizer:
         output_dir: Path | None = None,
         lean_compile: bool = False,
         run_python: bool = False,
+        cloud_prover: Any | None = None,
     ) -> FormalizationReport:
         """Formalize all extractable statements in a paper.
 
@@ -365,6 +366,7 @@ class PaperFormalizer:
             output_dir: Directory to save outputs
             lean_compile: Whether to attempt Lean compilation
             run_python: Whether to run generated Python scripts
+            cloud_prover: Optional CloudProver instance for remote Lean compilation
 
         Returns:
             FormalizationReport with detailed results
@@ -386,7 +388,15 @@ class PaperFormalizer:
         # Step 2: Generate Lean 4 code for each
         lean_tasks = []
         for unit in units:
-            lean_tasks.append(self._formalize_one(unit, llm, lean_compile, run_python))
+            lean_tasks.append(
+                self._formalize_one(
+                    unit,
+                    llm,
+                    lean_compile,
+                    run_python,
+                    cloud_prover=cloud_prover,
+                )
+            )
 
         results = await asyncio.gather(*lean_tasks, return_exceptions=True)
 
@@ -470,6 +480,8 @@ class PaperFormalizer:
         llm: Any,
         lean_compile: bool,
         run_python: bool,
+        *,
+        cloud_prover: Any | None = None,
     ) -> FormalizationUnit:
         """Formalize a single statement."""
         # Generate Lean 4 code
@@ -484,7 +496,7 @@ class PaperFormalizer:
 
             # Attempt compilation if enabled
             if lean_compile and lean_code:
-                compiled = await self._try_lean_compile(unit)
+                compiled = await self._try_lean_compile(unit, cloud_prover=cloud_prover)
                 if compiled:
                     if "sorry" not in lean_code:
                         unit.lean_status = FormalizationStatus.LEAN_PROVED
@@ -512,7 +524,12 @@ class PaperFormalizer:
 
         return unit
 
-    async def _try_lean_compile(self, unit: FormalizationUnit) -> bool:
+    async def _try_lean_compile(
+        self,
+        unit: FormalizationUnit,
+        *,
+        cloud_prover: Any | None = None,
+    ) -> bool:
         """Try to compile Lean code.
 
         Strategy (D3 — real compilation):
@@ -569,25 +586,44 @@ class PaperFormalizer:
                 return False
 
         # ── 2. Try CloudProver if enabled ────────────────────
-        try:
-            from autoforge.engine.cloud_prover import CloudProver, CloudProverConfig
-            # Only use if the orchestrator has wired one in
-            # (we check a module-level flag rather than instantiating)
-            # Lightweight: just log that local lean is missing
-            logger.debug("[Formalizer] lean binary not found; cloud prover not wired in this context")
-        except ImportError:
-            pass
+        if cloud_prover is not None and hasattr(cloud_prover, "verify_lean"):
+            try:
+                full_code = LeanCodeGenerator.PREAMBLE + "\n" + unit.lean_code
+                job = await cloud_prover.verify_lean(full_code, label=unit.label)
+                if getattr(job, "compiled_ok", False):
+                    logger.info(f"[Formalizer] Cloud Lean compiled OK: {unit.label}")
+                    return True
+
+                errors = list(getattr(job, "errors", []) or [])
+                if errors:
+                    for err in errors[:3]:
+                        unit.lean_errors.append(f"Cloud compile error: {str(err)[:500]}")
+                else:
+                    result_text = str(getattr(job, "result", "") or "")
+                    if result_text:
+                        unit.lean_errors.append(f"Cloud compile error: {result_text[:500]}")
+                    else:
+                        status = getattr(job, "status", "unknown")
+                        unit.lean_errors.append(f"Cloud compile failed with status: {status}")
+            except Exception as e:
+                unit.lean_errors.append(f"Cloud compile exception: {e}")
+                return False
+        else:
+            logger.debug("[Formalizer] lean binary not found and no cloud prover available")
 
         return False
 
     async def _run_python_verification(self, unit: FormalizationUnit) -> str:
         """Run a Python verification script in a sandboxed subprocess."""
+        import os
         import subprocess
+        import sys
         import tempfile
 
         if not unit.python_script:
             return ""
 
+        script_path = ""
         try:
             with tempfile.NamedTemporaryFile(
                 mode='w', suffix='.py', delete=False
@@ -596,7 +632,7 @@ class PaperFormalizer:
                 script_path = f.name
 
             result = subprocess.run(
-                ["python3", script_path],
+                [sys.executable, script_path],
                 capture_output=True,
                 text=True,
                 timeout=60,
@@ -615,6 +651,12 @@ class PaperFormalizer:
             return "TIMEOUT: Script exceeded 60s limit"
         except Exception as e:
             return f"ERROR: {e}"
+        finally:
+            if script_path:
+                try:
+                    os.unlink(script_path)
+                except OSError:
+                    pass
 
     async def _save_outputs(
         self,
