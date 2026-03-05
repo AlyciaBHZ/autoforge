@@ -14,3 +14,5 @@ google-auth>=2.0
 # Optional search tools
 duckduckgo-search>=7.0,<9.0
 html2text>=2024.2
+# Testing
+pytest>=8.0

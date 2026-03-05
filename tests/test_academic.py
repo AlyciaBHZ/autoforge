@@ -355,6 +355,38 @@ class _TinyLLM:
         return R()
 
 
+class _StickyFormalExecutor:
+    """Stateful formal executor stub to verify MCTS state replay behavior."""
+
+    def __init__(self):
+        self._busy = False
+
+    @property
+    def backend_name(self) -> str:
+        return "sticky_formal"
+
+    @property
+    def is_formal(self) -> bool:
+        return True
+
+    async def start(self, theorem_context: str) -> bool:
+        self._busy = False
+        return True
+
+    async def apply(self, state: ProofState, tactic: str) -> ProofState | None:
+        if self._busy:
+            return None
+        self._busy = True
+        return ProofState(goals=["still_open"], hypotheses=[], parent_tactic=tactic)
+
+    async def undo(self) -> ProofState:
+        self._busy = False
+        return ProofState(goals=["still_open"], hypotheses=[])
+
+    async def close(self) -> None:
+        self._busy = False
+
+
 class TestProofPipelineP0(unittest.TestCase):
     """Regression tests for real proof-chain safety guarantees."""
 
@@ -421,12 +453,41 @@ class TestProofPipelineP0(unittest.TestCase):
         async def no_decompose(*args, **kwargs):
             return []
 
+        async def no_lean(*args, **kwargs):
+            return False
+
         decomposer._generate_informal_proof = fake_informal  # type: ignore[assignment]
         decomposer._informal_to_formal = fake_formal  # type: ignore[assignment]
         decomposer._decompose = no_decompose  # type: ignore[assignment]
+        decomposer._lean_env.check_lean_installation = no_lean  # type: ignore[assignment]
 
         attempt = asyncio.run(decomposer.prove("theorem t : True", "", _TinyLLM()))
         self.assertNotEqual(attempt.status, ProofStatus.PROVED)
+        self.assertEqual(attempt.status, ProofStatus.FAILED)
+
+    def test_mcts_formal_executor_replays_for_each_sibling(self):
+        tactic_gen = TacticGenerator()
+        mcts = MCTSProofSearch(tactic_gen, executor=_StickyFormalExecutor())
+
+        async def fake_generate(*args, **kwargs):
+            return [
+                type("C", (), {"tactic": "first"})(),
+                type("C", (), {"tactic": "second"})(),
+            ]
+
+        seen: list[str] = []
+
+        async def fake_eval(state, llm=None):
+            seen.append(state.parent_tactic)
+            return 0.4
+
+        tactic_gen.generate_candidates = fake_generate  # type: ignore[assignment]
+        mcts._evaluate_state = fake_eval  # type: ignore[assignment]
+
+        root = ProofState(goals=["Goal"], hypotheses=[])
+        asyncio.run(mcts.search(root, "theorem t : True", _TinyLLM(), max_iterations=1))
+
+        self.assertGreaterEqual(len(set(seen)), 2)
 
     def test_mcts_proof_branch_requires_formal_backend(self):
         tactic_gen = TacticGenerator()

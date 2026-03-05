@@ -1710,7 +1710,8 @@ class Orchestrator:
                     branch_name, f"TDD fix: {task.description}", task.id
                 )
 
-    def _normalize_package_manager(self, raw_manager: str | None) -> str:
+    @staticmethod
+    def _normalize_package_manager(raw_manager: str | None) -> str:
         if not raw_manager:
             return ""
         normalized = str(raw_manager).strip().lower()
@@ -1719,7 +1720,8 @@ class Orchestrator:
                 return manager
         return ""
 
-    def _detect_package_manager(self, project_dir: Path) -> str:
+    @staticmethod
+    def _detect_package_manager(project_dir: Path) -> str:
         package_manager = "npm"
         package_json = project_dir / "package.json"
         if package_json.exists():
@@ -1727,7 +1729,7 @@ class Orchestrator:
                 package = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
                 if isinstance(package, dict):
                     raw = package.get("packageManager")
-                    if normalized := self._normalize_package_manager(raw):
+                    if normalized := Orchestrator._normalize_package_manager(raw):
                         return normalized
             except (json.JSONDecodeError, OSError):
                 pass
@@ -1751,9 +1753,14 @@ class Orchestrator:
                 return script_name
         return None
 
-    def _build_node_test_command(self, manager: str, script_name: str | None) -> str:
-        manager = self._normalize_package_manager(manager) or "npm"
+    @staticmethod
+    def _build_node_test_command(manager: str, script_name: str | None) -> str:
+        manager = Orchestrator._normalize_package_manager(manager) or "npm"
         if script_name:
+            if manager == "npm" and script_name == "test":
+                return "npm test -- --passWithNoTests 2>&1"
+            if manager == "pnpm" and script_name == "test":
+                return "pnpm test -- --passWithNoTests 2>&1"
             return f"{manager} run {script_name} 2>&1"
 
         if manager == "npm":
@@ -1781,9 +1788,9 @@ class Orchestrator:
                 if isinstance(package, dict):
                     scripts = package.get("scripts")
                     if isinstance(scripts, dict):
-                        package_manager = self._detect_package_manager(work_dir)
-                        script_name = self._select_node_test_script(scripts)
-                        return self._build_node_test_command(package_manager, script_name)
+                        package_manager = Orchestrator._detect_package_manager(work_dir)
+                        script_name = Orchestrator._select_node_test_script(scripts)
+                        return Orchestrator._build_node_test_command(package_manager, script_name)
             except (json.JSONDecodeError, OSError):
                 pass
 
@@ -1828,10 +1835,10 @@ class Orchestrator:
 
         # Native make-based test flow
         makefile = work_dir / "Makefile"
-        if makefile.exists() and self._makefile_has_test_target(makefile):
+        if makefile.exists() and Orchestrator._makefile_has_test_target(makefile):
             return "make test"
         lowercase_makefile = work_dir / "makefile"
-        if lowercase_makefile.exists() and self._makefile_has_test_target(lowercase_makefile):
+        if lowercase_makefile.exists() and Orchestrator._makefile_has_test_target(lowercase_makefile):
             return "make test"
 
         return None

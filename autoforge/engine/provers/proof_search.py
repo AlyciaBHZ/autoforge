@@ -847,7 +847,20 @@ class MCTSProofSearch:
                         node.state, theorem_context, llm,
                         informal_hint=informal_hint if node.depth < 3 else "",
                     )
+                    can_expand_node = True
                     for candidate in candidates[:self.MAX_CHILDREN]:
+                        if self._last_search_formal:
+                            can_expand_node = await self._sync_formal_executor_to_node(
+                                node=node,
+                                root_state=root_state,
+                                theorem_context=theorem_context,
+                            )
+                            if not can_expand_node:
+                                logger.warning(
+                                    "[MCTS] Failed to replay formal state for node depth=%s",
+                                    node.depth,
+                                )
+                                break
                         next_state = await self._executor.apply(node.state, candidate.tactic)
                         if next_state is None:
                             continue
@@ -860,7 +873,7 @@ class MCTSProofSearch:
                         )
                         node.children.append(child)
 
-                    if not node.children:
+                    if not can_expand_node or not node.children:
                         node.is_terminal = True
                         self._backpropagate(node, 0.0)
                         self._stats["backtracks"] += 1
@@ -892,6 +905,44 @@ class MCTSProofSearch:
             await self._executor.close()
 
         return best_proof
+
+    async def _sync_formal_executor_to_node(
+        self,
+        *,
+        node: ProofSearchNode,
+        root_state: ProofState,
+        theorem_context: str,
+    ) -> bool:
+        """Replay tactics so a formal backend is aligned with ``node`` state.
+
+        Stateful formal executors (Lean REPL/Pantograph) cannot branch from
+        multiple siblings unless we restore the exact proof context per branch.
+        """
+        await self._executor.close()
+        await self._executor.start(theorem_context)
+        self._last_search_formal = self._executor.is_formal
+        self._last_backend_name = self._executor.backend_name
+
+        if not self._last_search_formal:
+            return True
+
+        replay_state = root_state
+        for tactic in self._extract_tactic_sequence(node):
+            next_state = await self._executor.apply(replay_state, tactic)
+            if next_state is None:
+                return False
+            replay_state = next_state
+        return True
+
+    def _extract_tactic_sequence(self, node: ProofSearchNode) -> list[str]:
+        """Return tactics from root to ``node`` (excluding root)."""
+        seq: list[str] = []
+        cur: ProofSearchNode | None = node
+        while cur is not None and cur.parent is not None:
+            seq.append(cur.tactic)
+            cur = cur.parent
+        seq.reverse()
+        return seq
 
     def _select(self, node: ProofSearchNode) -> ProofSearchNode:
         """Select leaf node using UCB1."""

@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 name = "autoforgeai"
 
-version = "2.7.18"
+version = "2.7.19"
 description = "AutoForge AI-powered multi-agent development platform"
 
 readme = "README.md"
@@ -81,6 +81,8 @@ google = ["google-genai>=1.0", "google-auth>=2.0"]
 
 search = ["duckduckgo-search>=7.0,<9.0", "html2text>=2024.2"]
 
+dev = ["pytest>=8.0"]
+
 channels = [
 
     "fastapi>=0.115.0",
@@ -108,6 +110,8 @@ all = [
     "uvicorn>=0.32.0",
 
     "python-telegram-bot>=21.0",
+
+    "pytest>=8.0",
 
 ]
 
