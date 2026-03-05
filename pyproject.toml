@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 name = "autoforgeai"
 
-version = "2.7.12"
+version = "2.7.13"
 description = "AutoForge AI-powered multi-agent development platform"
 
 readme = "README.md"
@@ -113,8 +113,6 @@ all = [
 
 
 [project.scripts]
-
-forgeai = "autoforge.cli.app:main"
 
 autoforgeai = "autoforge.cli.app:main"
 

@@ -277,7 +277,7 @@ class LLMRouter:
             except ImportError:
                 raise ImportError(
                     "OpenAI provider requires the 'openai' package. "
-                    "Install it with: pip install forgeai[openai]"
+                    "Install it with: pip install autoforgeai[openai]"
                 ) from None
             if isinstance(auth, (CodexOAuthAuth, DeviceCodeAuth)):
                 # Token-based auth: client gets a dummy key, real token
@@ -292,7 +292,7 @@ class LLMRouter:
             except ImportError:
                 raise ImportError(
                     "Google provider requires the 'google-genai' package. "
-                    "Install it with: pip install forgeai[google]"
+                    "Install it with: pip install autoforgeai[google]"
                 ) from None
             auth_method = auth_config.get("google", {}).get("auth_method", "api_key")
             if auth_method in ("adc", "service_account"):

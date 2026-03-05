@@ -2,34 +2,34 @@
 
 ## What This Project Is
 
-AutoForge is a Python framework that uses 6 AI agents to automatically generate complete, runnable software projects from a natural language description. Run `forgeai` to start an interactive session.
+AutoForge is a Python framework that uses 6 AI agents to automatically generate complete, runnable software projects from a natural language description. Run `autoforgeai` to start an interactive session.
 
 ## Commands
 
 ```bash
 # Install
-pip install forgeai                          # From PyPI
+pip install autoforgeai                      # From PyPI
 pip install -e .                             # From source
 pip install -e ".[all]"                      # From source (all extras)
 
 # Run
-forgeai                                      # Interactive session (recommended)
-forgeai generate "project description"       # Generate a project
-forgeai generate "desc" --budget 5.00        # With budget limit
-forgeai status                               # Show all projects
-forgeai resume                               # Resume interrupted run
-forgeai setup                                # Reconfigure settings
+autoforgeai                                  # Interactive session (recommended)
+autoforgeai generate "project description"   # Generate a project
+autoforgeai generate "desc" --budget 5.00    # With budget limit
+autoforgeai status                           # Show all projects
+autoforgeai resume                           # Resume interrupted run
+autoforgeai setup                            # Reconfigure settings
 
 # Test
 python tests/smoke_test.py                  # 127-check smoke test suite
 python -m pytest tests/test_engines.py      # 112 behavioral/unit tests
 
 # Daemon mode (24/7 background service)
-forgeai daemon start                         # Start daemon
-forgeai daemon status                        # Check status
-forgeai queue "project description"          # Add to build queue
-forgeai projects                             # List all projects
-forgeai deploy <project_id>                  # Show deploy guide
+autoforgeai daemon start                     # Start daemon
+autoforgeai daemon status                    # Check status
+autoforgeai queue "project description"      # Add to build queue
+autoforgeai projects                         # List all projects
+autoforgeai deploy <project_id>              # Show deploy guide
 
 # Version control (git sync)
 python scripts/git_sync.py status           # Show branch sync status vs main

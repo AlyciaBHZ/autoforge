@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """AutoForge — AI-powered multi-agent development platform.
 
-Preferred usage (install first: pip install forgeai):
-    forgeai                                      # Interactive session
-    forgeai generate "Build a Todo app"          # Generate new project
-    forgeai review ./my-project                  # Review existing project
-    forgeai import ./my-project                  # Import & improve
-    forgeai setup                                # Configure settings
+Preferred usage (install first: pip install autoforgeai):
+    autoforgeai                                  # Interactive session
+    autoforgeai generate "Build a Todo app"      # Generate new project
+    autoforgeai review ./my-project              # Review existing project
+    autoforgeai import ./my-project              # Import & improve
+    autoforgeai setup                            # Configure settings
 
 Legacy usage (still supported):
     python forge.py "Build a Todo app"
@@ -14,20 +14,20 @@ Legacy usage (still supported):
     python forge.py --status
 
 Daemon mode:
-    forgeai daemon start                         # Start 24/7 daemon
-    forgeai daemon stop                          # Stop daemon
-    forgeai daemon status                        # Check daemon status
+    autoforgeai daemon start                     # Start 24/7 daemon
+    autoforgeai daemon stop                      # Stop daemon
+    autoforgeai daemon status                    # Check daemon status
 
 Queue management:
-    forgeai queue "project description"          # Add to queue
-    forgeai projects                             # List all projects
-    forgeai deploy <project_id>                  # Show deploy guide
+    autoforgeai queue "project description"      # Add to queue
+    autoforgeai projects                         # List all projects
+    autoforgeai deploy <project_id>              # Show deploy guide
 
 Paper reproduction:
-    forgeai paper infer "research goal"           # Infer likely ICLR papers
-    forgeai paper benchmark                       # Benchmark inference quality
-    forgeai paper reproduce "goal"                # Build reproduction brief/prompt
-    forgeai paper reproduce "goal" --strict-contract  # Enforce artifact/schema contract
+    autoforgeai paper infer "research goal"      # Infer likely ICLR papers
+    autoforgeai paper benchmark                  # Benchmark inference quality
+    autoforgeai paper reproduce "goal"           # Build reproduction brief/prompt
+    autoforgeai paper reproduce "goal" --strict-contract  # Enforce artifact/schema contract
 """
 
 from autoforge.cli.app import main

@@ -1,6 +1,6 @@
 # Paper Reproduction Contract v1
 
-This contract defines the minimum overnight-sized acceptance bar for `forgeai paper reproduce`.
+This contract defines the minimum overnight-sized acceptance bar for `autoforgeai paper reproduce`.
 
 ## Scope
 
@@ -28,7 +28,7 @@ Every run must produce these files inside the run output directory:
 
 ## CLI Contract
 
-`forgeai paper reproduce ... --strict-contract`
+`autoforgeai paper reproduce ... --strict-contract`
 
 - When enabled, missing required artifacts or schema violations are fatal.
 - Fatal contract errors exit with code `2`.

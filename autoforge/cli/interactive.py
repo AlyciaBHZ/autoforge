@@ -1,7 +1,7 @@
 """Interactive session mode for AutoForge — session-based workflow.
 
 Flow:
-  forgeai → first-run setup (API key / GitHub / mode) → session loop
+  autoforgeai → first-run setup (API key / GitHub / mode) → session loop
   Each session: describe project → build → show result → next session
 """
 

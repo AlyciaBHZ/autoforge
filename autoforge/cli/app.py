@@ -52,18 +52,18 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  forgeai                                     # Interactive session\n"
-            '  forgeai generate "Build a Todo app"         # Generate new project\n'
-            "  forgeai review ./my-project                 # Review existing project\n"
-            "  forgeai import ./my-project                 # Import & improve\n"
-            "  forgeai setup                               # Configure settings\n"
-            "  forgeai status                              # Show project status\n"
-            "  forgeai daemon start                        # Start queue daemon\n"
-            '  forgeai queue "Build an API"                # Queue project\n'
-            "  forgeai projects                            # List queued/history\n"
-            "  forgeai deploy <project_id>                 # Print deploy guide\n"
-            '  forgeai paper infer "goal text"             # Infer likely ICLR papers\n'
-            "  forgeai paper benchmark                     # Evaluate paper inference quality\n"
+            "  autoforgeai                                 # Interactive session\n"
+            '  autoforgeai generate "Build a Todo app"     # Generate new project\n'
+            "  autoforgeai review ./my-project             # Review existing project\n"
+            "  autoforgeai import ./my-project             # Import & improve\n"
+            "  autoforgeai setup                           # Configure settings\n"
+            "  autoforgeai status                          # Show project status\n"
+            "  autoforgeai daemon start                    # Start queue daemon\n"
+            '  autoforgeai queue "Build an API"            # Queue project\n'
+            "  autoforgeai projects                        # List queued/history\n"
+            "  autoforgeai deploy <project_id>             # Print deploy guide\n"
+            '  autoforgeai paper infer "goal text"         # Infer likely ICLR papers\n'
+            "  autoforgeai paper benchmark                 # Evaluate paper inference quality\n"
         ),
     )
 
@@ -347,7 +347,7 @@ async def _run_generate(config, description: str) -> int:
     from autoforge.engine.orchestrator import Orchestrator
 
     if not config.has_api_key:
-        console.print("[red]Error:[/red] No API key configured. Run: forgeai setup")
+        console.print("[red]Error:[/red] No API key configured. Run: autoforgeai setup")
         return 1
 
     show_startup_info(
@@ -377,7 +377,7 @@ async def _run_review(config, project_path: str) -> int:
     from autoforge.engine.orchestrator import Orchestrator
 
     if not config.has_api_key:
-        console.print("[red]Error:[/red] No API key configured. Run: forgeai setup")
+        console.print("[red]Error:[/red] No API key configured. Run: autoforgeai setup")
         return 1
 
     path = Path(project_path).resolve()
@@ -411,7 +411,7 @@ async def _run_import(config, project_path: str, enhance: str = "") -> int:
     from autoforge.engine.orchestrator import Orchestrator
 
     if not config.has_api_key:
-        console.print("[red]Error:[/red] No API key configured. Run: forgeai setup")
+        console.print("[red]Error:[/red] No API key configured. Run: autoforgeai setup")
         return 1
 
     path = Path(project_path).resolve()
@@ -494,7 +494,7 @@ async def _run_daemon_start(config) -> int:
     from autoforge.engine.daemon import ForgeDaemon
 
     if not config.has_api_key:
-        console.print("[red]Error:[/red] No API key configured. Run: forgeai setup")
+        console.print("[red]Error:[/red] No API key configured. Run: autoforgeai setup")
         return 1
 
     running_pid = _read_daemon_pid_file(config.daemon_pid_file)
@@ -587,7 +587,7 @@ async def _run_daemon_install(config) -> int:
         console.print("  launchctl load ~/Library/LaunchAgents/com.autoforge.daemon.plist")
     else:
         console.print("Windows service install is not automated yet.")
-        console.print("Run daemon manually: forgeai daemon start")
+        console.print("Run daemon manually: autoforgeai daemon start")
     return 0
 
 
@@ -1122,7 +1122,7 @@ def _run_interactive_sync(args: argparse.Namespace) -> int:
         from autoforge.cli.interactive import run_interactive
     except ImportError:
         console.print("[red]Error:[/red] InquirerPy not installed. Run: pip install InquirerPy")
-        console.print("Or use subcommands directly: forgeai generate \"your description\"")
+        console.print("Or use subcommands directly: autoforgeai generate \"your description\"")
         return 1
 
     # Session loop: mode → action → build → next session
@@ -1219,7 +1219,7 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
         from autoforge.engine.orchestrator import Orchestrator
 
         if not config.has_api_key:
-            console.print("[red]Error:[/red] No API key configured. Run: forgeai setup")
+            console.print("[red]Error:[/red] No API key configured. Run: autoforgeai setup")
             return 1
 
         orchestrator = Orchestrator(config)

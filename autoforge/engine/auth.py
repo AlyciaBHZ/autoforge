@@ -207,7 +207,7 @@ class GoogleADCAuth(AuthProvider):
         except ImportError:
             raise ImportError(
                 "Google ADC/service account auth requires 'google-auth'. "
-                "Install it with: pip install forgeai[google]"
+                "Install it with: pip install autoforgeai[google]"
             ) from None
 
         async with self._get_lock():

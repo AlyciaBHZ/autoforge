@@ -47,19 +47,19 @@
 ### Installation
 
 ```bash
-pip install forgeai          # Install from PyPI
-forgeai                      # Launch (first run enters setup wizard automatically)
+pip install autoforgeai      # Install from PyPI
+autoforgeai                  # Launch (first run enters setup wizard automatically)
 ```
 
 <details>
 <summary>Optional dependencies</summary>
 
 ```bash
-pip install "forgeai[openai]"    # OpenAI support
-pip install "forgeai[google]"    # Google Gemini support
-pip install "forgeai[search]"    # Web search capabilities
-pip install "forgeai[channels]"  # Telegram / Webhook channels
-pip install "forgeai[all]"       # Install everything
+pip install "autoforgeai[openai]"    # OpenAI support
+pip install "autoforgeai[google]"    # Google Gemini support
+pip install "autoforgeai[search]"    # Web search capabilities
+pip install "autoforgeai[channels]"  # Telegram / Webhook channels
+pip install "autoforgeai[all]"       # Install everything
 ```
 
 </details>
@@ -77,7 +77,7 @@ pip install -e ".[all]"
 
 ### First-Run Setup Wizard
 
-Running `forgeai` for the first time launches an interactive setup wizard. Every step is optional (Ctrl+C to skip). Reconfigure anytime with `forgeai setup`:
+Running `autoforgeai` for the first time launches an interactive setup wizard. Every step is optional (Ctrl+C to skip). Reconfigure anytime with `autoforgeai setup`:
 
 ```
 Step 1 │ Configure LLM providers (optional)
@@ -138,7 +138,7 @@ export FORGE_MODEL_FAST=gemini-2.5-flash  # Fast model from Google
 
 ## Three Operating Modes
 
-After configuration, `forgeai` enters an interactive session where you first select a mode:
+After configuration, `autoforgeai` enters an interactive session where you first select a mode:
 
 ```
 ? Select mode:
@@ -210,9 +210,9 @@ Core orchestrator: [`article_reasoning.py`](../autoforge/engine/article_reasonin
 AutoForge can infer relevant papers from a high-level research goal and build full reproduction plans:
 
 ```bash
-forgeai paper infer "improve sample efficiency in offline RL"   # Infer relevant ICLR papers
-forgeai paper benchmark                                         # Evaluate inference quality
-forgeai paper reproduce "goal" --with-pdf --run-generate        # End-to-end reproduction
+autoforgeai paper infer "improve sample efficiency in offline RL"   # Infer relevant ICLR papers
+autoforgeai paper benchmark                                         # Evaluate inference quality
+autoforgeai paper reproduce "goal" --with-pdf --run-generate        # End-to-end reproduction
 ```
 
 Pipeline: research goal → OpenReview paper retrieval → TF-IDF ranking → signal extraction → reproduction plan → optional auto-execution
@@ -319,27 +319,27 @@ Default budget cap: $10. Override with `--budget`.
 
 ```bash
 # Interactive (recommended)
-forgeai                                        # Guided session
+autoforgeai                                    # Guided session
 
 # Project generation
-forgeai generate "REST API for a bookstore with JWT auth"
-forgeai generate "Landing page for SaaS" --budget 3.00
+autoforgeai generate "REST API for a bookstore with JWT auth"
+autoforgeai generate "Landing page for SaaS" --budget 3.00
 
 # Code review
-forgeai review ./my-project
+autoforgeai review ./my-project
 
 # Import & enhance
-forgeai import ./my-project --enhance "add dark mode"
+autoforgeai import ./my-project --enhance "add dark mode"
 
 # Run management
-forgeai status                                 # Show all projects
-forgeai resume                                 # Resume interrupted run
-forgeai setup                                  # Reconfigure
+autoforgeai status                             # Show all projects
+autoforgeai resume                             # Resume interrupted run
+autoforgeai setup                              # Reconfigure
 
 # Paper reproduction
-forgeai paper infer "research goal"            # Infer relevant papers
-forgeai paper benchmark                        # Evaluate inference quality
-forgeai paper reproduce "goal" --run-generate  # End-to-end reproduction
+autoforgeai paper infer "research goal"        # Infer relevant papers
+autoforgeai paper benchmark                    # Evaluate inference quality
+autoforgeai paper reproduce "goal" --run-generate  # End-to-end reproduction
 ```
 
 Global flags: `--budget`, `--agents`, `--model`, `--mode`, `--mobile`, `--tdd`, `--verbose`
@@ -351,13 +351,13 @@ Global flags: `--budget`, `--agents`, `--model`, `--mode`, `--mobile`, `--tdd`, 
 AutoForge can run as a 24/7 background service, accepting build requests via CLI, Telegram, or Webhook:
 
 ```bash
-forgeai daemon start                           # Start daemon
-forgeai daemon status                          # Check status
-forgeai daemon stop                            # Stop
+autoforgeai daemon start                       # Start daemon
+autoforgeai daemon status                      # Check status
+autoforgeai daemon stop                        # Stop
 
-forgeai queue "Blog with markdown support"     # Queue a build
-forgeai projects                               # List all projects
-forgeai deploy <project_id>                    # Show deployment guide
+autoforgeai queue "Blog with markdown support" # Queue a build
+autoforgeai projects                           # List all projects
+autoforgeai deploy <project_id>                # Show deployment guide
 ```
 
 Supports systemd (Linux) and launchd (macOS) service installation — see `services/` directory.

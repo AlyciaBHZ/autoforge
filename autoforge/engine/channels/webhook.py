@@ -40,7 +40,7 @@ async def start_webhook_server(
     except ImportError:
         raise ImportError(
             "Webhook server requires 'fastapi' and 'uvicorn'. "
-            "Install them with: pip install forgeai[channels]"
+            "Install them with: pip install autoforgeai[channels]"
         ) from None
 
     if config.webhook_require_auth and not config.webhook_secret:
