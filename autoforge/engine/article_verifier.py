@@ -226,6 +226,91 @@ class ArticleVerificationReport:
 
 
 # ══════════════════════════════════════════════════════════════
+# Claim Extraction Patterns
+# ══════════════════════════════════════════════════════════════
+
+
+class ClaimExtractor:
+    """Extract mathematical claims from unstructured text using regex patterns."""
+
+    # Patterns for claim indicators
+    CLAIM_PATTERNS = {
+        "theorem": r"(?:The )?[Tt]heorem\s+(\d+(?:\.\d+)*)[:\.]?\s*(.+?)(?=\n\n|\n(?:[Pp]roof|Lemma|Theorem))",
+        "lemma": r"(?:The )?[Ll]emma\s+(\d+(?:\.\d+)*)[:\.]?\s*(.+?)(?=\n\n|\n(?:[Pp]roof|Lemma|Theorem))",
+        "proposition": r"(?:The )?[Pp]roposition\s+(\d+(?:\.\d+)*)[:\.]?\s*(.+?)(?=\n\n|\n(?:[Pp]roof|Proposition))",
+        "corollary": r"(?:The )?[Cc]orollary\s+(\d+(?:\.\d+)*)[:\.]?\s*(.+?)(?=\n\n|\n(?:[Pp]roof|Corollary))",
+        "conjecture": r"(?:The )?[Cc]onjecture\s+(\d+(?:\.\d+)*)[:\.]?\s*(.+?)(?=\n\n|\n)",
+        "definition": r"(?:The )?[Dd]efinition\s+(\d+(?:\.\d+)*)[:\.]?\s*(.+?)(?=\n\n|\n)",
+    }
+
+    # Numerical claim patterns
+    NUMERICAL_CLAIMS = [
+        r"(≈|approximately|about)\s+([\d.]+)%",  # percentage claims
+        r"(at least|≥)\s+([\d.]+)",  # lower bound claims
+        r"(at most|≤)\s+([\d.]+)",  # upper bound claims
+        r"(exactly|=)\s+([\d.]+)",  # equality claims
+    ]
+
+    # Reference cross-check patterns
+    REFERENCE_PATTERNS = [
+        r"(Figure|Fig\.?)\s+(\d+(?:\.\d+)*)",
+        r"(Table|Tab\.?)\s+(\d+(?:\.\d+)*)",
+        r"(Equation|Eq\.?)\s+(\d+(?:\.\d+)*)",
+        r"(Section|Sec\.?)\s+(\d+(?:\.\d+)*)",
+    ]
+
+    @staticmethod
+    def extract_claims_from_text(text: str) -> list[VerifiableClaim]:
+        """Extract mathematical claims from unstructured text."""
+        claims = []
+        claim_id_counter = 0
+
+        # Extract structured claims
+        for claim_type, pattern in ClaimExtractor.CLAIM_PATTERNS.items():
+            matches = re.finditer(pattern, text, re.MULTILINE | re.DOTALL)
+            for match in matches:
+                label = f"{claim_type.title()} {match.group(1)}"
+                statement = match.group(2).strip()[:500]
+
+                claim = VerifiableClaim(
+                    id=f"claim_{claim_id_counter}",
+                    claim_type=ClaimType[claim_type.upper()],
+                    label=label,
+                    statement=statement,
+                )
+                claims.append(claim)
+                claim_id_counter += 1
+
+        return claims
+
+    @staticmethod
+    def extract_numerical_claims(text: str) -> list[tuple[str, str]]:
+        """Extract numerical claims from text."""
+        numerical_claims = []
+        for pattern in ClaimExtractor.NUMERICAL_CLAIMS:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                operator = match.group(1)
+                value = match.group(2)
+                numerical_claims.append((operator, value))
+        return numerical_claims
+
+    @staticmethod
+    def extract_references(text: str) -> dict[str, list[int]]:
+        """Extract cross-references (figure/table/equation/section numbers)."""
+        references = {}
+        for ref_type, pattern in zip(
+            ["figures", "tables", "equations", "sections"],
+            ClaimExtractor.REFERENCE_PATTERNS
+        ):
+            matches = re.finditer(pattern, text)
+            numbers = [int(match.group(2).split('.')[0]) for match in matches]
+            if numbers:
+                references[ref_type] = sorted(set(numbers))
+        return references
+
+
+# ══════════════════════════════════════════════════════════════
 # Article Parser
 # ══════════════════════════════════════════════════════════════
 

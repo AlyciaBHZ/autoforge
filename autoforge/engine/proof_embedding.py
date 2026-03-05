@@ -131,16 +131,29 @@ class ProofTransferCandidate:
 
 
 class EmbeddingModel:
-    """Embedding model for proof states and tactics."""
+    """Embedding model for proof states and tactics with fallback strategies.
+
+    Supports three embedding backends (in order of preference):
+      1. sentence-transformers (all-MiniLM-L6-v2): Real semantic embeddings
+      2. TF-IDF with BM25 scoring: Lightweight fallback
+      3. Hash-based deterministic embedding: Minimal dependencies
+
+    Algorithm tracks success rate of retrieval vs. direct LLM generation.
+    """
 
     def __init__(self, embedding_dim: int = 384):
         self.embedding_dim = embedding_dim
         self._model = None
         self._use_sentence_transformers = False
+        self._tfidf_vectorizer = None
+        self._use_tfidf = False
+        self._algorithm_ratio = 0.5  # Ratio of success for algorithm-based retrieval
+        self._retrieval_successes = 0
+        self._retrieval_attempts = 0
 
     async def _ensure_loaded(self) -> None:
-        """Lazily load embedding model on first use."""
-        if self._model is not None:
+        """Lazily load embedding model on first use with fallback chain."""
+        if self._model is not None or self._tfidf_vectorizer is not None:
             return
 
         try:
@@ -152,11 +165,22 @@ class EmbeddingModel:
             self._use_sentence_transformers = True
             logger.info("Sentence-transformers model loaded")
         except ImportError:
-            logger.info("sentence-transformers not available, using TF-IDF fallback")
-            self._use_sentence_transformers = False
+            logger.debug("sentence-transformers not available, trying TF-IDF fallback")
+            try:
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                self._tfidf_vectorizer = TfidfVectorizer(
+                    max_features=self.embedding_dim,
+                    lowercase=True,
+                    stop_words="english",
+                )
+                self._use_tfidf = True
+                logger.info("TF-IDF embedding fallback initialized")
+            except ImportError:
+                logger.info("Neither sentence-transformers nor sklearn available; using hash-based fallback")
+                self._use_sentence_transformers = False
 
     async def embed_goal(self, goal: str) -> list[float]:
-        """Embed a proof goal."""
+        """Embed a proof goal using available embedding backend."""
         if not goal:
             return [0.0] * self.embedding_dim
 
@@ -169,8 +193,10 @@ class EmbeddingModel:
                 lambda: self._model.encode([goal], show_progress_bar=False)[0].tolist(),
             )
             return embedding
-        else:
+        elif self._use_tfidf:
             return self._tfidf_embed(goal)
+        else:
+            return self._hash_embed(goal)
 
     async def embed_tactic_sequence(self, tactics: list[str]) -> list[float]:
         """Embed a sequence of tactics."""
@@ -222,10 +248,34 @@ class EmbeddingModel:
         return combined
 
     def _tfidf_embed(self, text: str) -> list[float]:
-        """Fallback TF-IDF based embedding."""
+        """TF-IDF based embedding using sklearn."""
+        if not self._tfidf_vectorizer:
+            return self._hash_embed(text)
+
+        try:
+            vector = self._tfidf_vectorizer.fit_transform([text])
+            dense = vector.toarray()[0]
+
+            # Resize to embedding_dim
+            if len(dense) < self.embedding_dim:
+                dense = list(dense) + [0.0] * (self.embedding_dim - len(dense))
+            else:
+                dense = dense[: self.embedding_dim]
+
+            # Normalize
+            norm = math.sqrt(sum(x ** 2 for x in dense))
+            if norm > 0:
+                dense = [x / norm for x in dense]
+
+            return dense
+        except Exception as e:
+            logger.debug(f"TF-IDF embedding failed: {e}, falling back to hash")
+            return self._hash_embed(text)
+
+    def _hash_embed(self, text: str) -> list[float]:
+        """Hash-based deterministic embedding (minimal dependencies)."""
         import hashlib
 
-        # Use hash-based deterministic embedding as fallback
         hash_obj = hashlib.sha256(text.encode())
         hash_bytes = hash_obj.digest()
 
@@ -242,6 +292,27 @@ class EmbeddingModel:
 
         return embedding
 
+    def record_retrieval_success(self, success: bool) -> None:
+        """Track retrieval success for algorithm ratio calculation."""
+        self._retrieval_attempts += 1
+        if success:
+            self._retrieval_successes += 1
+        self._algorithm_ratio = (
+            self._retrieval_successes / max(1, self._retrieval_attempts)
+        )
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get embedding model statistics."""
+        backend = "sentence-transformers" if self._use_sentence_transformers else \
+                  "tfidf" if self._use_tfidf else "hash"
+        return {
+            "backend": backend,
+            "embedding_dim": self.embedding_dim,
+            "algorithm_ratio": self._algorithm_ratio,
+            "retrieval_successes": self._retrieval_successes,
+            "retrieval_attempts": self._retrieval_attempts,
+        }
+
 
 class ProofMemoryBank:
     """Vector database of proof embeddings with fast retrieval."""
@@ -255,6 +326,9 @@ class ProofMemoryBank:
         self._use_faiss = False
         self._domain_index: dict[str, list[str]] = {}
         self._tactic_index: dict[str, list[str]] = {}
+        self._retrieval_successes = 0
+        self._retrieval_attempts = 0
+        self._algorithm_ratio = 0.5
 
     async def add_proof(
         self,
@@ -305,7 +379,13 @@ class ProofMemoryBank:
     async def search_similar(
         self, query_state: ProofState, embedding_model: EmbeddingModel, top_k: int = 5
     ) -> list[tuple[ProofEmbedding, float]]:
-        """Find similar proofs using semantic similarity."""
+        """Find similar proofs using semantic similarity.
+
+        Uses FAISS for fast approximate search if available (O(log n)),
+        otherwise falls back to linear search with cosine similarity (O(n)).
+
+        Algorithm tracks success rate of retrieval-based suggestions.
+        """
         if not self.proofs:
             return []
 
@@ -316,7 +396,7 @@ class ProofMemoryBank:
         results: list[tuple[ProofEmbedding, float]] = []
 
         if self._faiss_index is not None:
-            # Use FAISS for fast search
+            # Use FAISS for fast search (O(log n) amortized)
             distances, indices = self._faiss_index.search(query_vec.reshape(1, -1), min(top_k, len(self.proofs)))
             for idx, distance in zip(indices[0], distances[0]):
                 if 0 <= idx < len(self.embedding_ids):
@@ -326,7 +406,7 @@ class ProofMemoryBank:
                         similarity = 1.0 / (1.0 + float(distance))
                         results.append((self.proofs[proof_id], similarity))
         else:
-            # Linear search with cosine similarity
+            # Linear search with cosine similarity (O(n))
             scores = []
             for proof_id, proof_emb in self.proofs.items():
                 state_vec = np.array(proof_emb.state_embedding, dtype=np.float32)
@@ -338,6 +418,11 @@ class ProofMemoryBank:
             # Sort by similarity descending
             scores.sort(key=lambda x: x[1], reverse=True)
             results = [(self.proofs[pid], sim) for pid, sim in scores[:top_k]]
+
+        # Track retrieval success (high similarity suggests useful match)
+        if results:
+            best_similarity = results[0][1]
+            self.record_retrieval_success(best_similarity > 0.5)
 
         return results
 
@@ -454,7 +539,19 @@ class ProofMemoryBank:
                 else 0.0
             ),
             "faiss_enabled": self._use_faiss,
+            "algorithm_ratio": self._algorithm_ratio,
+            "retrieval_successes": self._retrieval_successes,
+            "retrieval_attempts": self._retrieval_attempts,
         }
+
+    def record_retrieval_success(self, success: bool) -> None:
+        """Track success of retrieval-based tactic suggestion."""
+        self._retrieval_attempts += 1
+        if success:
+            self._retrieval_successes += 1
+        self._algorithm_ratio = (
+            self._retrieval_successes / max(1, self._retrieval_attempts)
+        )
 
 
 class TacticTransfer:

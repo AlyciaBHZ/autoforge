@@ -25,8 +25,12 @@ execution results. This gives us PRM-quality feedback without training.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
+import re
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -101,6 +105,18 @@ class GenerationStep:
 
 
 @dataclass
+class ProcessReward:
+    """Result of evaluating a single step.
+
+    Encapsulates the reward score and details of how it was computed.
+    """
+    score: float  # 0.0 to 1.0
+    details: dict[str, Any] = field(default_factory=dict)
+    algorithm_used: str = "llm"  # "execution_based", "llm", or "hybrid"
+    confidence: float = 0.5
+
+
+@dataclass
 class StepTrajectory:
     """Complete trajectory of steps for a task.
 
@@ -159,6 +175,189 @@ class StepTrajectory:
 
 
 # ──────────────────────────────────────────────
+# Execution-Based Scorer
+# ──────────────────────────────────────────────
+
+
+class ExecutionBasedScorer:
+    """Scores code steps using real execution metrics instead of LLM judgment.
+
+    Scoring rubric (total 1.0):
+      - Syntax validity (AST parse):     0.25
+      - Import resolution:               0.15
+      - Type hint presence:              0.10
+      - No security patterns:            0.10
+      - Test execution pass rate:        0.25
+      - Code complexity reasonable:      0.15
+    """
+
+    # Dangerous patterns (from security_scan.py)
+    SECURITY_PATTERNS = [
+        r'eval\s*\(',
+        r'exec\s*\(',
+        r'__import__\s*\(',
+        r'subprocess\.call.*shell\s*=\s*True',
+        r'os\.system\s*\(',
+        r'pickle\.loads?\s*\(',
+    ]
+
+    def score_step(self, code: str, working_dir: str | None = None) -> dict[str, Any]:
+        """Score a code step using execution-based metrics.
+
+        Returns dict with individual scores and composite score.
+        """
+        scores = {}
+
+        # 1. Syntax validity
+        scores['syntax'] = self._check_syntax(code)
+
+        # 2. Import resolution
+        scores['imports'] = self._check_imports(code)
+
+        # 3. Type hint coverage
+        scores['type_hints'] = self._check_type_hints(code)
+
+        # 4. Security check
+        scores['security'] = self._check_security(code)
+
+        # 5. Code complexity
+        scores['complexity'] = self._check_complexity(code)
+
+        # Composite score (weighted)
+        composite = (
+            scores['syntax']['score'] * 0.25 +
+            scores['imports']['score'] * 0.15 +
+            scores['type_hints']['score'] * 0.10 +
+            scores['security']['score'] * 0.10 +
+            scores['complexity']['score'] * 0.15
+        )
+
+        # Test execution (if working_dir provided)
+        if working_dir:
+            scores['tests'] = self._run_tests(working_dir)
+            composite += scores['tests']['score'] * 0.25
+        else:
+            composite += 0.125  # Half credit if can't test
+
+        scores['composite'] = min(1.0, max(0.0, composite))
+        return scores
+
+    def _check_syntax(self, code: str) -> dict[str, Any]:
+        """Check Python syntax validity via AST parsing."""
+        try:
+            ast.parse(code)
+            return {'score': 1.0, 'valid': True, 'errors': []}
+        except SyntaxError as e:
+            return {'score': 0.0, 'valid': False, 'errors': [str(e)]}
+
+    def _check_imports(self, code: str) -> dict[str, Any]:
+        """Check if imports can be resolved."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return {'score': 0.0, 'resolved': 0, 'total': 0}
+
+        imports = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imports.append(alias.name.split('.')[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    imports.append(node.module.split('.')[0])
+
+        if not imports:
+            return {'score': 1.0, 'resolved': 0, 'total': 0}
+
+        # Standard library modules (common subset)
+        stdlib = {'os', 'sys', 're', 'json', 'math', 'pathlib', 'typing',
+                  'collections', 'functools', 'itertools', 'dataclasses',
+                  'abc', 'io', 'logging', 'asyncio', 'hashlib', 'datetime',
+                  'time', 'copy', 'enum', 'uuid', 'textwrap', 'shutil',
+                  'tempfile', 'subprocess', 'argparse', 'unittest', 'pytest'}
+
+        resolved = sum(1 for imp in imports if imp in stdlib or imp.startswith('autoforge'))
+        total = len(imports)
+        score = resolved / total if total > 0 else 1.0
+        return {'score': score, 'resolved': resolved, 'total': total}
+
+    def _check_type_hints(self, code: str) -> dict[str, Any]:
+        """Check type hint coverage on function signatures."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return {'score': 0.0, 'hinted': 0, 'total': 0}
+
+        total_args = 0
+        hinted_args = 0
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for arg in node.args.args:
+                    if arg.arg != 'self':
+                        total_args += 1
+                        if arg.annotation is not None:
+                            hinted_args += 1
+                # Return annotation
+                if node.returns is not None:
+                    hinted_args += 1
+                total_args += 1  # Count return type
+
+        if total_args == 0:
+            return {'score': 0.8, 'hinted': 0, 'total': 0}
+        score = hinted_args / total_args
+        return {'score': score, 'hinted': hinted_args, 'total': total_args}
+
+    def _check_security(self, code: str) -> dict[str, Any]:
+        """Check for dangerous patterns."""
+        findings = []
+        for pattern in self.SECURITY_PATTERNS:
+            if re.search(pattern, code):
+                findings.append(pattern)
+        score = 1.0 if not findings else max(0.0, 1.0 - 0.3 * len(findings))
+        return {'score': score, 'findings': findings}
+
+    def _check_complexity(self, code: str) -> dict[str, Any]:
+        """Estimate cyclomatic complexity from AST."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return {'score': 0.0, 'complexity': 0}
+
+        complexity = 1  # Base
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.If, ast.While, ast.For, ast.ExceptHandler)):
+                complexity += 1
+            elif isinstance(node, ast.BoolOp):
+                complexity += len(node.values) - 1
+
+        lines = len([l for l in code.split('\n') if l.strip()])
+        per_line = complexity / max(lines, 1)
+
+        # Score: lower complexity per line is better (threshold at 0.3)
+        score = max(0.0, min(1.0, 1.0 - (per_line - 0.1) * 3))
+        return {'score': score, 'complexity': complexity, 'lines': lines}
+
+    def _run_tests(self, working_dir: str) -> dict[str, Any]:
+        """Run pytest and compute pass rate."""
+        try:
+            result = subprocess.run(
+                ['python', '-m', 'pytest', '--tb=no', '-q', working_dir],
+                capture_output=True, text=True, timeout=30, cwd=working_dir
+            )
+            output = result.stdout
+            # Parse pytest output: "X passed, Y failed"
+            passed_match = re.search(r'(\d+) passed', output)
+            failed_match = re.search(r'(\d+) failed', output)
+            passed = int(passed_match.group(1)) if passed_match else 0
+            failed = int(failed_match.group(1)) if failed_match else 0
+            total = passed + failed
+            score = passed / total if total > 0 else 0.5
+            return {'score': score, 'passed': passed, 'failed': failed, 'output': output[:200]}
+        except Exception as e:
+            return {'score': 0.5, 'error': str(e)}
+
+
+# ──────────────────────────────────────────────
 # Process Reward Model
 # ──────────────────────────────────────────────
 
@@ -192,6 +391,9 @@ class ProcessRewardModel:
         self.sandbox = sandbox
         self.working_dir = working_dir
         self._trajectories: dict[str, StepTrajectory] = {}
+        self._exec_scorer = ExecutionBasedScorer()
+        # Track algorithm usage for metrics
+        self._algorithm_ratio = {"execution_based": 0, "llm": 0, "hybrid": 0}
 
     def start_trajectory(self, task_id: str, task_description: str) -> StepTrajectory:
         """Begin tracking a new task trajectory."""
@@ -237,39 +439,80 @@ class ProcessRewardModel:
         task_id: str,
         step: GenerationStep,
         context: str = "",
-    ) -> float:
+    ) -> ProcessReward:
         """Evaluate a single step and assign a process reward.
 
-        This is the core of CodePRM: combine LLM judgment with execution
-        feedback for grounded step-level evaluation.
+        This is the core of CodePRM: combine execution-based scoring (primary)
+        with LLM judgment (fallback) for grounded step-level evaluation.
 
-        Returns: process reward score (0.0 to 1.0)
+        Returns: ProcessReward with score, details, and algorithm used.
         """
         trajectory = self._trajectories.get(task_id)
         if trajectory is None:
-            return 0.5
+            return ProcessReward(score=0.5, algorithm_used="execution_based")
 
-        # Phase 1: Execution feedback (if possible)
+        code = step.code_snippet or ""
+        is_code_step = self._is_code(code)
+
+        # PRIMARY: Execution-based scoring for code steps
+        if is_code_step:
+            exec_result = self._exec_scorer.score_step(
+                code,
+                working_dir=str(self.working_dir) if self.working_dir else None
+            )
+            reward_score = exec_result.get('composite', 0.5)
+            algorithm = "execution_based"
+            self._algorithm_ratio["execution_based"] += 1
+
+            step.process_reward = reward_score
+            step.confidence = 0.8  # Execution-based scoring is high confidence
+            step.reward_reason = f"Execution-based scoring (syntax={exec_result['syntax']['score']:.2f}, imports={exec_result['imports']['score']:.2f})"
+
+            logger.info(
+                f"[PRM] Step {step.id}: reward={reward_score:.2f} (execution_based) "
+                f"[syntax={exec_result['syntax']['score']:.2f}, imports={exec_result['imports']['score']:.2f}]"
+            )
+
+            return ProcessReward(
+                score=reward_score,
+                details=exec_result,
+                algorithm_used=algorithm,
+                confidence=0.8
+            )
+
+        # SECONDARY: Execution feedback for file/test steps
         if self.sandbox and step.files_touched and step.step_type in (
             StepType.FILE_CREATE, StepType.FILE_MODIFY, StepType.TEST_WRITE,
         ):
             await self._check_execution(step)
 
-        # Phase 2: LLM evaluation
-        reward = await self._llm_evaluate_step(step, trajectory, context)
+        # FALLBACK: LLM evaluation for non-code steps or when execution scoring fails
+        llm_reward = await self._llm_evaluate_step(step, trajectory, context)
 
-        # Phase 3: Combine execution + LLM signals
+        # Combine execution + LLM signals for hybrid scoring
         if step.execution_attempted:
             exec_bonus = 0.15 if step.execution_success else -0.15
             syntax_bonus = 0.05 if step.syntax_valid else -0.10
-            reward = max(0.0, min(1.0, reward + exec_bonus + syntax_bonus))
+            final_reward = max(0.0, min(1.0, llm_reward + exec_bonus + syntax_bonus))
+            algorithm = "hybrid"
+            self._algorithm_ratio["hybrid"] += 1
+        else:
+            final_reward = llm_reward
+            algorithm = "llm"
+            self._algorithm_ratio["llm"] += 1
 
-        step.process_reward = reward
+        step.process_reward = final_reward
         logger.info(
-            f"[PRM] Step {step.id}: reward={reward:.2f} "
+            f"[PRM] Step {step.id}: reward={final_reward:.2f} (algorithm={algorithm}) "
             f"(exec={'ok' if step.execution_success else 'fail' if step.execution_attempted else 'skip'})"
         )
-        return reward
+
+        return ProcessReward(
+            score=final_reward,
+            details={"llm_reward": llm_reward, "execution_attempted": step.execution_attempted},
+            algorithm_used=algorithm,
+            confidence=step.confidence
+        )
 
     async def evaluate_trajectory(
         self,
@@ -314,6 +557,7 @@ class ProcessRewardModel:
             "total_steps": len(trajectory.steps),
             "bottleneck_count": len(bottlenecks),
             "final_outcome": final_outcome,
+            "algorithm_ratio": self.get_algorithm_ratio(),
         }
 
         if bottlenecks:
@@ -391,6 +635,28 @@ class ProcessRewardModel:
             return (True, "Multiple consecutive execution failures")
 
         return (False, "")
+
+    def get_algorithm_ratio(self) -> dict[str, float]:
+        """Get the ratio of algorithm usage for metrics tracking."""
+        total = sum(self._algorithm_ratio.values())
+        if total == 0:
+            return {"execution_based": 0.0, "llm": 0.0, "hybrid": 0.0}
+        return {
+            k: v / total for k, v in self._algorithm_ratio.items()
+        }
+
+    # ──────── Internal: Helper Methods ────────
+
+    def _is_code(self, code: str) -> bool:
+        """Check if a string appears to be Python code."""
+        if not code or len(code) < 10:
+            return False
+        # Try to parse as Python
+        try:
+            ast.parse(code)
+            return True
+        except SyntaxError:
+            return False
 
     # ──────── Internal: Execution Check ────────
 

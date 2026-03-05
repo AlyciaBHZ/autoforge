@@ -47,6 +47,16 @@ except ImportError:
     HAS_NUMPY = False
     logger.debug("NumPy not available; using pure Python for operations")
 
+# Try to import PyTorch; gracefully degrade to LLM fallback if unavailable
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    logger.debug("PyTorch not available; using LLM fallback for policy/value networks")
+
 
 # ── Configuration ──────────────────────────────────────────────────
 
@@ -283,135 +293,355 @@ class ExperienceBuffer:
         logger.debug(f"Loaded {len(self.buffer)} experiences from {path}")
 
 
+# ── Neural Network Implementations ─────────────────────────────────
+
+
+class _ValueMLP(nn.Module if HAS_TORCH else object):
+    """Lightweight MLP for proof state value estimation.
+
+    Architecture: state_dim → 256 → 128 → 1 (sigmoid output in [0,1])
+    Trained on (state_embedding, actual_outcome) pairs from experience buffer.
+    """
+
+    def __init__(self, state_dim: int = 512) -> None:
+        if HAS_TORCH:
+            super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 1),
+            nn.Sigmoid(),
+        ) if HAS_TORCH else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if HAS_TORCH and self.encoder is not None:
+            return self.encoder(x).squeeze(-1)
+        raise RuntimeError("PyTorch not available")
+
+
+class _PolicyMLP(nn.Module if HAS_TORCH else object):
+    """Lightweight MLP for tactic probability estimation.
+
+    Architecture: state_dim + tactic_dim → 256 → 128 → 1 (logit)
+    Trained on (state, tactic, success) triples from experience buffer.
+    """
+
+    def __init__(self, state_dim: int = 512, tactic_dim: int = 256) -> None:
+        if HAS_TORCH:
+            super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(state_dim + tactic_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 1),
+        ) if HAS_TORCH else None
+
+    def forward(self, state: torch.Tensor, tactic: torch.Tensor) -> torch.Tensor:
+        if HAS_TORCH and self.encoder is not None:
+            combined = torch.cat([state, tactic], dim=-1)
+            return self.encoder(combined).squeeze(-1)
+        raise RuntimeError("PyTorch not available")
+
+
+class _StateEncoder:
+    """Encodes proof state strings into fixed-dimensional vectors.
+
+    Uses character-level hashing + TF-IDF-like features for fast,
+    deterministic encoding without requiring a trained tokenizer.
+    """
+
+    def __init__(self, dim: int = 512) -> None:
+        self.dim = dim
+        self._idf: dict[str, float] = {}
+        self._doc_count = 0
+
+    def encode(self, text: str) -> list[float]:
+        """Encode a proof state string into a fixed-size vector."""
+        vec = [0.0] * self.dim
+        tokens = re.findall(r'[a-zA-Z_]\w*|[→∀∃∧∨¬⊢⊣≤≥=<>+\-*/]', text)
+        if not tokens:
+            return vec
+        # Character n-gram hashing (n=3) for positional features
+        for i, token in enumerate(tokens):
+            for n in range(1, min(4, len(token) + 1)):
+                for j in range(len(token) - n + 1):
+                    ngram = token[j:j+n]
+                    h = hash(ngram) % self.dim
+                    vec[h] += 1.0 / (1.0 + i * 0.01)  # Position decay
+        # Normalize
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]
+
+    def encode_tactic(self, tactic: str, dim: int = 256) -> list[float]:
+        """Encode a tactic string into a fixed-size vector."""
+        vec = [0.0] * dim
+        tokens = re.findall(r'[a-zA-Z_]\w*|[.;,()]', tactic)
+        for token in tokens:
+            h = hash(token) % dim
+            vec[h] += 1.0
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]
+
+    def update_idf(self, states: list[str]) -> None:
+        """Update IDF statistics from a batch of states."""
+        self._doc_count += len(states)
+        for state in states:
+            tokens = set(re.findall(r'[a-zA-Z_]\w*', state))
+            for token in tokens:
+                self._idf[token] = self._idf.get(token, 0) + 1
+
+
 # ── Value & Policy Networks ────────────────────────────────────────
 
 
 class ValueEstimator:
     """Estimates V(s) = expected reward from a proof state.
-    
-    Uses LLM to assess proof difficulty and likelihood of completion.
-    Returns values in [0, 1] where 1 = very likely provable.
-    Caches estimates for identical states.
+
+    Primary: Trained MLP on experience data (when PyTorch available + sufficient data).
+    Fallback: LLM-based assessment (cold start or no PyTorch).
+
+    The MLP is trained via TD-lambda updates from MCTS rollout outcomes.
     """
 
-    def __init__(self, llm: Any) -> None:
+    MIN_TRAINING_SAMPLES = 32  # Minimum experiences before using MLP
+
+    def __init__(self, llm: Any, rl_config: RLConfig | None = None) -> None:
         """Initialize the value estimator.
-        
+
         Args:
             llm: LLM interface (supports `await llm.call(prompt, complexity=...)`)
+            rl_config: Optional RLConfig for hyperparameters (learning_rate, etc).
         """
         self.llm = llm
         self._cache: dict[str, float] = {}
-        logger.debug("Initialized ValueEstimator")
+        self._encoder = _StateEncoder(dim=512)
+        self._training_data: list[tuple[list[float], float]] = []
+        self._mlp: Any = None
+        self._optimizer: Any = None
+        self._mlp_ready = False
+        self._llm_calls = 0
+        self._mlp_calls = 0
+
+        if HAS_TORCH:
+            self._mlp = _ValueMLP(state_dim=512)
+            lr = rl_config.learning_rate if rl_config else 1e-4
+            self._optimizer = optim.Adam(self._mlp.parameters(), lr=lr)
+        logger.debug("Initialized ValueEstimator (torch=%s)", HAS_TORCH)
+
+    @property
+    def algorithm_ratio(self) -> float:
+        """Fraction of calls served by MLP vs LLM."""
+        total = self._llm_calls + self._mlp_calls
+        return self._mlp_calls / total if total > 0 else 0.0
 
     async def estimate(self, state: str, context: str = "") -> float:
-        """Estimate the value (likelihood of proof completion) for a state.
-        
-        Uses LLM to assess the proof state on a 0-10 scale, then normalizes
-        to [0, 1].
-        
-        Args:
-            state: Serialized proof state (goals, hypotheses).
-            context: Optional context about the theorem or proof attempt.
-            
-        Returns:
-            A float in [0, 1] indicating proof likelihood.
+        """Estimate proof completion likelihood for a state.
+
+        Uses MLP when trained, falls back to LLM otherwise.
         """
-        # Check cache
         cache_key = state
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        prompt = f"""Assess the likelihood of completing this proof.
+        # Primary path: trained MLP
+        if self._mlp_ready and HAS_TORCH and self._mlp is not None:
+            try:
+                encoded = self._encoder.encode(state)
+                with torch.no_grad():
+                    tensor = torch.tensor([encoded], dtype=torch.float32)
+                    value = self._mlp(tensor).item()
+                self._cache[cache_key] = value
+                self._mlp_calls += 1
+                return value
+            except Exception as e:
+                logger.warning("MLP inference failed, falling back to LLM: %s", e)
 
-Current proof state:
-{state}
+        # Fallback: LLM-based estimation
+        return await self._estimate_llm(state, context)
 
-{f"Context: {context}" if context else ""}
-
-On a scale of 0-10, how likely is this proof to be completed successfully?
-0 = impossible (contradictory goals, stuck)
-10 = nearly proven (almost trivial remaining steps)
-
-Only respond with a number between 0 and 10."""
-
+    async def _estimate_llm(self, state: str, context: str = "") -> float:
+        """LLM fallback for value estimation."""
+        prompt = (
+            f"Assess the likelihood of completing this proof.\n\n"
+            f"Current proof state:\n{state}\n\n"
+            f"{f'Context: {context}' if context else ''}\n\n"
+            f"On a scale of 0-10, how likely is this proof to be completed?\n"
+            f"0 = impossible, 10 = nearly proven.\n"
+            f"Only respond with a number between 0 and 10."
+        )
         try:
             response = await self.llm.call(prompt, complexity=TaskComplexity.HIGH)
             value = self._parse_value_from_llm(response.content)
-            normalized_value = max(0.0, min(1.0, value / 10.0))
-            self._cache[cache_key] = normalized_value
-            return normalized_value
+            normalized = max(0.0, min(1.0, value / 10.0))
+            self._cache[state] = normalized
+            self._llm_calls += 1
+            return normalized
         except Exception as e:
-            logger.warning(f"Error estimating value: {e}")
-            return 0.5  # Default neutral estimate
+            logger.warning("LLM value estimation failed: %s", e)
+            return 0.5
 
     async def estimate_batch(self, states: list[str]) -> list[float]:
-        """Estimate values for multiple states in parallel.
-        
-        Args:
-            states: List of serialized proof states.
-            
-        Returns:
-            List of value estimates corresponding to input states.
-        """
+        """Batch estimation — uses MLP vectorized when possible."""
+        if self._mlp_ready and HAS_TORCH and self._mlp is not None:
+            try:
+                encoded = [self._encoder.encode(s) for s in states]
+                with torch.no_grad():
+                    tensor = torch.tensor(encoded, dtype=torch.float32)
+                    values = self._mlp(tensor).tolist()
+                self._mlp_calls += len(states)
+                return values
+            except Exception as e:
+                logger.warning("Batch MLP failed, falling back: %s", e)
         tasks = [self.estimate(state) for state in states]
         return await asyncio.gather(*tasks)
 
-    def _parse_value_from_llm(self, response: str) -> float:
-        """Parse a numeric value from LLM response.
-        
-        Extracts the first number found in the response.
-        
-        Args:
-            response: LLM response text.
-            
+    def record_outcome(self, state: str, actual_value: float) -> None:
+        """Record a (state, outcome) pair for MLP training."""
+        encoded = self._encoder.encode(state)
+        self._training_data.append((encoded, actual_value))
+        # Auto-train when enough data
+        if len(self._training_data) >= self.MIN_TRAINING_SAMPLES and not self._mlp_ready:
+            self.train()
+
+    def train(self, epochs: int = 10) -> float:
+        """Train the value MLP on accumulated experience data.
+
         Returns:
-            A float between 0 and 10.
+            Final training loss.
         """
-        # Find all numbers in the response
+        if not HAS_TORCH or self._mlp is None or not self._training_data:
+            return float('inf')
+
+        X = torch.tensor([d[0] for d in self._training_data], dtype=torch.float32)
+        y = torch.tensor([d[1] for d in self._training_data], dtype=torch.float32)
+
+        dataset_size = len(X)
+        batch_size = min(32, dataset_size)
+        final_loss = float('inf')
+
+        self._mlp.train()
+        for epoch in range(epochs):
+            # Shuffle
+            perm = torch.randperm(dataset_size)
+            X, y = X[perm], y[perm]
+            epoch_loss = 0.0
+            n_batches = 0
+
+            for i in range(0, dataset_size, batch_size):
+                batch_X = X[i:i+batch_size]
+                batch_y = y[i:i+batch_size]
+
+                self._optimizer.zero_grad()
+                pred = self._mlp(batch_X)
+                loss = nn.functional.mse_loss(pred, batch_y)
+                loss.backward()
+                self._optimizer.step()
+
+                epoch_loss += loss.item()
+                n_batches += 1
+
+            final_loss = epoch_loss / max(n_batches, 1)
+
+        self._mlp.eval()
+        self._mlp_ready = True
+        logger.info("ValueEstimator MLP trained: %d samples, loss=%.4f", dataset_size, final_loss)
+        return final_loss
+
+    def _parse_value_from_llm(self, response: str) -> float:
         numbers = re.findall(r"[-+]?\d*\.?\d+", response)
-        if numbers:
-            return float(numbers[0])
-        return 5.0  # Default neutral estimate
+        return float(numbers[0]) if numbers else 5.0
 
     def clear_cache(self) -> None:
-        """Clear the value estimate cache."""
         self._cache.clear()
 
 
 class PolicyNetwork:
     """Provides P(a|s) = probability distribution over tactics.
-    
-    Uses LLM to rank candidate tactics and generate new ones.
+
+    Primary: Trained MLP on (state, tactic, success) triples.
+    Fallback: LLM-based tactic ranking and generation.
     Returns softmax probabilities for exploration-exploitation tradeoff.
     """
 
-    def __init__(self, llm: Any) -> None:
+    MIN_TRAINING_SAMPLES = 32  # Minimum experiences before using MLP
+
+    def __init__(self, llm: Any, rl_config: RLConfig | None = None) -> None:
         """Initialize the policy network.
-        
+
         Args:
             llm: LLM interface (supports `await llm.call(prompt, complexity=...)`)
+            rl_config: Optional RLConfig for hyperparameters.
         """
         self.llm = llm
-        logger.debug("Initialized PolicyNetwork")
+        self._encoder = _StateEncoder(dim=512)
+        self._training_data: list[tuple[list[float], list[float], float]] = []
+        self._mlp: Any = None
+        self._optimizer: Any = None
+        self._mlp_ready = False
+        self._llm_calls = 0
+        self._mlp_calls = 0
+        self.temperature = 1.0
+
+        if HAS_TORCH:
+            self._mlp = _PolicyMLP(state_dim=512, tactic_dim=256)
+            lr = rl_config.learning_rate if rl_config else 1e-4
+            self._optimizer = optim.Adam(self._mlp.parameters(), lr=lr)
+        logger.debug("Initialized PolicyNetwork (torch=%s)", HAS_TORCH)
+
+    @property
+    def algorithm_ratio(self) -> float:
+        """Fraction of calls served by MLP vs LLM."""
+        total = self._llm_calls + self._mlp_calls
+        return self._mlp_calls / total if total > 0 else 0.0
 
     async def get_action_priors(
         self, state: str, candidate_tactics: list[str]
     ) -> list[float]:
         """Rank candidate tactics and return softmax probabilities.
-        
-        Asks the LLM to score each tactic, then applies softmax.
-        
+
+        Uses MLP when trained, falls back to LLM otherwise.
+
         Args:
             state: Serialized proof state.
             candidate_tactics: List of candidate tactic strings.
-            
+
         Returns:
             List of probabilities (sum to 1.0) corresponding to tactics.
         """
         if not candidate_tactics:
             return []
 
+        # Primary path: trained MLP
+        if self._mlp_ready and HAS_TORCH and self._mlp is not None:
+            try:
+                state_encoded = self._encoder.encode(state)
+                scores = []
+                for tactic in candidate_tactics:
+                    tactic_encoded = self._encoder.encode_tactic(tactic)
+                    with torch.no_grad():
+                        state_tensor = torch.tensor([state_encoded], dtype=torch.float32)
+                        tactic_tensor = torch.tensor([tactic_encoded], dtype=torch.float32)
+                        logit = self._mlp(state_tensor, tactic_tensor).item()
+                        scores.append(logit)
+                self._mlp_calls += len(candidate_tactics)
+                return self._softmax(scores, self.temperature)
+            except Exception as e:
+                logger.warning("MLP ranking failed, falling back to LLM: %s", e)
+
+        # Fallback: LLM-based ranking
+        return await self._get_action_priors_llm(state, candidate_tactics)
+
+    async def _get_action_priors_llm(
+        self, state: str, candidate_tactics: list[str]
+    ) -> list[float]:
+        """LLM fallback for action prior ranking."""
         tactics_text = "\n".join(f"{i+1}. {t}" for i, t in enumerate(candidate_tactics))
         prompt = f"""Given this proof state, rank the following tactics by likelihood of making progress.
 
@@ -429,7 +659,7 @@ Example: "2 1 3" means tactic 2 is best, then tactic 1, then tactic 3."""
             response = await self.llm.call(prompt, complexity=TaskComplexity.HIGH)
             ranking = self._parse_ranking(response.content, len(candidate_tactics))
             scores = [len(candidate_tactics) - i for i in range(len(candidate_tactics))]
-            
+
             # Reorder scores according to ranking
             if ranking:
                 reordered = [0.0] * len(candidate_tactics)
@@ -437,20 +667,21 @@ Example: "2 1 3" means tactic 2 is best, then tactic 1, then tactic 3."""
                     if 0 <= tactic_idx < len(candidate_tactics):
                         reordered[tactic_idx] = scores[rank_pos]
                 scores = reordered
-            
-            return self._softmax(scores, self.temperature if hasattr(self, 'temperature') else 1.0)
+
+            self._llm_calls += 1
+            return self._softmax(scores, self.temperature)
         except Exception as e:
-            logger.warning(f"Error getting action priors: {e}")
+            logger.warning("Error getting action priors: %s", e)
             # Fallback: uniform distribution
             return [1.0 / len(candidate_tactics)] * len(candidate_tactics)
 
     async def suggest_tactics(self, state: str, top_k: int = 10) -> list[tuple[str, float]]:
         """Directly generate top-k tactics with confidence scores.
-        
+
         Args:
             state: Serialized proof state.
             top_k: Number of tactics to generate.
-            
+
         Returns:
             List of (tactic, confidence) tuples.
         """
@@ -472,18 +703,76 @@ Suggest exactly {top_k} tactics."""
 
         try:
             response = await self.llm.call(prompt, complexity=TaskComplexity.HIGH)
+            self._llm_calls += 1
             return self._parse_tactics(response.content, top_k)
         except Exception as e:
-            logger.warning(f"Error suggesting tactics: {e}")
+            logger.warning("Error suggesting tactics: %s", e)
             return []
+
+    def record_outcome(self, state: str, tactic: str, success: bool) -> None:
+        """Record a (state, tactic, outcome) triple for MLP training."""
+        state_encoded = self._encoder.encode(state)
+        tactic_encoded = self._encoder.encode_tactic(tactic)
+        reward = 1.0 if success else 0.0
+        self._training_data.append((state_encoded, tactic_encoded, reward))
+        # Auto-train when enough data
+        if len(self._training_data) >= self.MIN_TRAINING_SAMPLES and not self._mlp_ready:
+            self.train()
+
+    def train(self, epochs: int = 10) -> float:
+        """Train the policy MLP on accumulated experience data.
+
+        Returns:
+            Final training loss.
+        """
+        if not HAS_TORCH or self._mlp is None or not self._training_data:
+            return float('inf')
+
+        states = torch.tensor([d[0] for d in self._training_data], dtype=torch.float32)
+        tactics = torch.tensor([d[1] for d in self._training_data], dtype=torch.float32)
+        rewards = torch.tensor([d[2] for d in self._training_data], dtype=torch.float32)
+
+        dataset_size = len(states)
+        batch_size = min(32, dataset_size)
+        final_loss = float('inf')
+
+        self._mlp.train()
+        for epoch in range(epochs):
+            # Shuffle
+            perm = torch.randperm(dataset_size)
+            states_s, tactics_s, rewards_s = states[perm], tactics[perm], rewards[perm]
+            epoch_loss = 0.0
+            n_batches = 0
+
+            for i in range(0, dataset_size, batch_size):
+                batch_states = states_s[i:i+batch_size]
+                batch_tactics = tactics_s[i:i+batch_size]
+                batch_rewards = rewards_s[i:i+batch_size]
+
+                self._optimizer.zero_grad()
+                logits = self._mlp(batch_states, batch_tactics)
+                # BCE loss: treat rewards as binary labels
+                loss = nn.functional.binary_cross_entropy_with_logits(logits, batch_rewards)
+                loss.backward()
+                self._optimizer.step()
+
+                epoch_loss += loss.item()
+                n_batches += 1
+
+            final_loss = epoch_loss / max(n_batches, 1)
+
+        self._mlp.eval()
+        self._mlp_ready = True
+        logger.info("PolicyNetwork MLP trained: %d samples, loss=%.4f", dataset_size, final_loss)
+        return final_loss
 
     def _parse_ranking(self, response: str, num_tactics: int) -> list[int]:
         """Parse a ranking of tactic indices from response.
-        
+
         Args:
             response: LLM response with space-separated numbers.
             num_tactics: Expected number of tactics.
-            
+
         Returns:
             List of 0-indexed tactic indices in ranked order.
         """
@@ -494,15 +783,15 @@ Suggest exactly {top_k} tactics."""
 
     def _parse_tactics(self, response: str, top_k: int) -> list[tuple[str, float]]:
         """Parse tactics and confidence scores from response.
-        
+
         Expected format:
             tactic1 | 0.95
             tactic2 | 0.87
-        
+
         Args:
             response: LLM response text.
             top_k: Expected number of tactics.
-            
+
         Returns:
             List of (tactic, confidence) tuples.
         """
@@ -522,23 +811,23 @@ Suggest exactly {top_k} tactics."""
     @staticmethod
     def _softmax(scores: list[float], temperature: float = 1.0) -> list[float]:
         """Apply softmax with temperature scaling.
-        
+
         Args:
             scores: Raw score values.
             temperature: Temperature for smoothing (higher = more uniform).
-            
+
         Returns:
             Probability distribution (sums to 1.0).
         """
         if not scores:
             return []
-        
+
         if temperature <= 0:
             temperature = 1.0
-        
+
         # Scale by temperature
         scaled = [s / temperature for s in scores]
-        
+
         if HAS_NUMPY:
             scaled_arr = np.array(scaled)
             # Numerically stable softmax
@@ -1479,69 +1768,178 @@ Respond with only "valid" or "invalid"."""
 
     async def update_policy(self, batch: GRPOBatch) -> dict[str, float]:
         """Update the policy network using the batch.
-        
+
         Implements PPO-style clipped surrogate loss:
             L = min(r_t * A_t, clip(r_t, 1-eps, 1+eps) * A_t) - β * KL(π_new || π_old)
-        
+
+        For neural network MLP: performs actual gradient descent via optimizer.step()
+        For LLM fallback: computes loss metrics only (no backprop).
+
         Args:
             batch: GRPOBatch with computed advantages.
-            
+
         Returns:
             Dictionary with training metrics (loss, kl_divergence, etc.).
         """
         if not batch.samples:
             logger.warning("Empty batch; skipping policy update")
             return {}
-        
+
         metrics = {
             "loss": 0.0,
             "kl_divergence": 0.0,
             "mean_advantage": 0.0,
         }
-        
+
+        # Attempt MLP-based gradient update if available and trained
+        if (HAS_TORCH and
+            self.policy_network._mlp is not None and
+            self.policy_network._optimizer is not None):
+            try:
+                return self._update_policy_mlp(batch, metrics)
+            except Exception as e:
+                logger.warning("MLP policy update failed, using scalar loss fallback: %s", e)
+
+        # Fallback: compute loss scalars only (no gradient updates)
+        return self._update_policy_scalar(batch, metrics)
+
+    def _update_policy_mlp(
+        self, batch: GRPOBatch, metrics: dict[str, float]
+    ) -> dict[str, float]:
+        """Update policy via neural network backpropagation.
+
+        Constructs a batch of (state, tactic, advantage) tuples and performs
+        one gradient descent step on the clipped surrogate loss.
+        """
+        if not batch.samples:
+            return metrics
+
+        state_vecs = []
+        tactic_vecs = []
+        advantages_list = []
+
+        for sample in batch.samples:
+            if sample.generated_tactic:
+                state_encoded = self.policy_network._encoder.encode(sample.state)
+                tactic_encoded = self.policy_network._encoder.encode_tactic(
+                    sample.generated_tactic
+                )
+                state_vecs.append(state_encoded)
+                tactic_vecs.append(tactic_encoded)
+                advantages_list.append(sample.advantage)
+
+        if not state_vecs:
+            logger.warning("No valid samples for MLP update")
+            return metrics
+
+        # Convert to tensors
+        states_tensor = torch.tensor(state_vecs, dtype=torch.float32)
+        tactics_tensor = torch.tensor(tactic_vecs, dtype=torch.float32)
+        advantages_tensor = torch.tensor(advantages_list, dtype=torch.float32)
+
+        # Forward pass
+        self.policy_network._mlp.train()
+        logits = self.policy_network._mlp(states_tensor, tactics_tensor)
+
+        # Compute clipped surrogate loss
+        # Treat logits as log-odds; use sigmoid to convert to probabilities
+        probs = torch.sigmoid(logits)
+        # PPO-style clipping
+        ratio = probs  # Simplified: ratio ≈ exp(log_prob_new)
+        clipped_ratio = torch.clamp(
+            ratio,
+            1.0 - self.config.clip_range,
+            1.0 + self.config.clip_range,
+        )
+        surrogate = -torch.min(
+            ratio * advantages_tensor,
+            clipped_ratio * advantages_tensor,
+        )
+
+        # KL penalty (discourage divergence from uniform)
+        kl_penalty = self.config.kl_penalty_coeff * torch.abs(torch.log(probs + 1e-8))
+
+        # Total loss
+        total_loss = surrogate.mean() + kl_penalty.mean()
+
+        # Backward pass
+        self.policy_network._optimizer.zero_grad()
+        total_loss.backward()
+        self.policy_network._optimizer.step()
+
+        self.policy_network._mlp.eval()
+
+        # Compute metrics
+        n = len(advantages_list)
+        metrics["loss"] = total_loss.item()
+        metrics["kl_divergence"] = kl_penalty.mean().item()
+        metrics["mean_advantage"] = advantages_tensor.mean().item()
+
+        # Record statistics
+        self._stats["kl_divergences"].append(metrics["kl_divergence"])
+        self._stats["policy_updates"] += 1
+
+        logger.info(
+            "Policy MLP update: loss=%.4f, kl=%.4f, advantage=%.4f, n=%d",
+            metrics["loss"],
+            metrics["kl_divergence"],
+            metrics["mean_advantage"],
+            n,
+        )
+
+        return metrics
+
+    def _update_policy_scalar(
+        self, batch: GRPOBatch, metrics: dict[str, float]
+    ) -> dict[str, float]:
+        """Update policy using scalar loss (LLM fallback, no gradients).
+
+        Computes PPO losses as scalars without performing any gradient updates.
+        """
         total_loss = 0.0
         total_kl = 0.0
         total_advantage = 0.0
-        
+
         for sample in batch.samples:
             # Clipped surrogate objective
             advantage = sample.advantage
             log_prob = sample.log_prob
-            
+
             # PPO clip: ratio = exp(log_prob_new - log_prob_old)
             # For simplicity, treat old log_prob as 0 (uniform baseline)
             ratio = math.exp(min(log_prob, 10.0))  # Clamp for numerical stability
-            
+
             # Clipped loss
             clipped_ratio = max(
                 1.0 - self.config.clip_range,
                 min(ratio, 1.0 + self.config.clip_range),
             )
             loss = -min(ratio * advantage, clipped_ratio * advantage)
-            
+
             # KL penalty (discourage large changes from original)
             kl_div = abs(log_prob)  # Simplified KL approximation
             loss_with_kl = loss + self.config.kl_penalty_coeff * kl_div
-            
+
             total_loss += loss_with_kl
             total_kl += kl_div
             total_advantage += advantage
-        
+
         n = len(batch.samples)
         metrics["loss"] = total_loss / n
         metrics["kl_divergence"] = total_kl / n
         metrics["mean_advantage"] = total_advantage / n
-        
+
         # Record statistics
         self._stats["kl_divergences"].append(metrics["kl_divergence"])
         self._stats["policy_updates"] += 1
-        
+
         logger.info(
-            f"Policy update: loss={metrics['loss']:.4f}, "
-            f"kl={metrics['kl_divergence']:.4f}, "
-            f"advantage={metrics['mean_advantage']:.4f}"
+            "Policy scalar update: loss=%.4f, kl=%.4f, advantage=%.4f",
+            metrics["loss"],
+            metrics["kl_divergence"],
+            metrics["mean_advantage"],
         )
-        
+
         return metrics
 
     async def train_step(self, proof_state: str) -> dict[str, Any]:

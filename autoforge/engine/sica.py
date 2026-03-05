@@ -43,6 +43,128 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────
+# A/B Testing for Constitution Edits
+# ──────────────────────────────────────────────
+
+
+class ConstitutionABTester:
+    """A/B test constitution changes using Welch's t-test.
+
+    Tracks quality scores for control (original) vs treatment (edited)
+    constitutions and determines if changes are statistically significant.
+    """
+
+    def __init__(self) -> None:
+        self._results_a: list[float] = []  # Control (original)
+        self._results_b: list[float] = []  # Treatment (edited)
+
+    def record_result(self, variant: str, quality_score: float) -> None:
+        """Record a quality score for variant A or B."""
+        if variant.lower() == "a":
+            self._results_a.append(quality_score)
+        else:
+            self._results_b.append(quality_score)
+
+    def is_improvement(self, confidence: float = 0.95) -> tuple[bool, dict]:
+        """Use Welch's t-test to determine if B > A.
+
+        Returns (is_improved, details_dict).
+        confidence: 0.95 for 95% confidence level (two-tailed).
+        """
+        if len(self._results_a) < 3 or len(self._results_b) < 3:
+            return False, {"reason": "insufficient_data", "n_a": len(self._results_a), "n_b": len(self._results_b)}
+
+        import statistics
+        import math
+
+        mean_a = statistics.mean(self._results_a)
+        mean_b = statistics.mean(self._results_b)
+        var_a = statistics.variance(self._results_a)
+        var_b = statistics.variance(self._results_b)
+        n_a, n_b = len(self._results_a), len(self._results_b)
+
+        # Welch's t-statistic (for unequal variances)
+        se = (var_a / n_a + var_b / n_b) ** 0.5
+        if se == 0:
+            return mean_b > mean_a, {"t": float('inf'), "se": 0, "mean_a": mean_a, "mean_b": mean_b}
+
+        t_stat = (mean_b - mean_a) / se
+
+        # Approximate p-value using normal distribution for large samples
+        p_value = 0.5 * math.erfc(t_stat / math.sqrt(2))
+
+        # One-tailed test: is B > A?
+        is_improved = p_value < (1 - confidence) and mean_b > mean_a
+
+        return is_improved, {
+            "mean_a": mean_a,
+            "mean_b": mean_b,
+            "t_stat": t_stat,
+            "p_value": p_value,
+            "effect_size": (mean_b - mean_a) / max(se, 0.001),
+            "n_a": n_a,
+            "n_b": n_b,
+        }
+
+
+class ConstitutionAnalyzer:
+    """Analyze constitution rules for conflicts and redundancy.
+
+    Uses Jaccard similarity and logical pattern matching to detect
+    contradictions and duplications in a set of rules.
+    """
+
+    def analyze(self, rules: list[str]) -> dict[str, Any]:
+        """Check for conflicts and redundancy in a set of rules.
+
+        Returns dict with:
+        - conflicts: list of (rule_i_idx, rule_j_idx, reason)
+        - redundant: list of (rule_i_idx, rule_j_idx, similarity_score)
+        """
+        conflicts = []
+        redundant = []
+
+        for i, r1 in enumerate(rules):
+            for j, r2 in enumerate(rules[i+1:], i+1):
+                r1_lower = r1.lower()
+                r2_lower = r2.lower()
+
+                # Check for potential contradiction
+                if self._may_conflict(r1_lower, r2_lower):
+                    conflicts.append((i, j, "Potential contradiction"))
+
+                # Check for high similarity (redundancy)
+                sim = self._jaccard_similarity(r1_lower, r2_lower)
+                if sim > 0.7:
+                    redundant.append((i, j, f"Similarity={sim:.2f}"))
+
+        return {"conflicts": conflicts, "redundant": redundant}
+
+    def _may_conflict(self, a: str, b: str) -> bool:
+        """Detect if two rules may contradict."""
+        negators = ['never', 'always', 'must not', 'should not', 'do not', 'cannot']
+
+        a_has_negation = any(neg in a for neg in negators)
+        b_has_negation = any(neg in b for neg in negators)
+
+        # Only flag if one has negation but the other doesn't, and they share key terms
+        if a_has_negation != b_has_negation:
+            shared = set(a.split()) & set(b.split()) - {'the', 'a', 'an', 'is', 'to'}
+            if len(shared) > 3:
+                return True
+
+        return False
+
+    def _jaccard_similarity(self, a: str, b: str) -> float:
+        """Calculate Jaccard similarity between two rule texts."""
+        ta = set(a.split())
+        tb = set(b.split())
+        inter = ta & tb
+        union = ta | tb
+        return len(inter) / len(union) if union else 0.0
+
+
+# ──────────────────────────────────────────────
 # Data Structures
 # ──────────────────────────────────────────────
 
@@ -142,6 +264,8 @@ class SICAEngine:
         self._history: list[ImprovementRecord] = []
         self._file_edit_stack: dict[str, list[str]] = {}  # target_file → list of proposal_ids in apply order
         self._file_base_content: dict[str, str] = {}  # target_file → original content before first SICA edit
+        self._ab_testers: dict[str, ConstitutionABTester] = {}  # proposal_id → A/B tester
+        self._constitution_analyzer = ConstitutionAnalyzer()
         self._load_history()
 
     # ──────── Propose Self-Edits ────────
@@ -301,6 +425,13 @@ class SICAEngine:
         """Validate a self-edit proposal against safety guardrails.
 
         Returns (is_valid, reason).
+
+        Performs:
+        1. Type and file checks
+        2. Content length/validity checks
+        3. Confidence threshold checks
+        4. Rate limiting (cooldown after many edits)
+        5. Constitution conflict analysis (for constitution edits)
         """
         # Check edit type
         if proposal.edit_type not in self.ALLOWED_EDIT_TYPES:
@@ -331,8 +462,32 @@ class SICAEngine:
         if len(recent_applied) >= self.MAX_PROPOSALS_PER_RUN * 2:
             return False, "Too many recent modifications — cooling down"
 
+        # For constitution edits, analyze for conflicts with existing rules
+        if proposal.edit_type == "constitution":
+            # Parse existing rules from original content
+            existing_rules = self._extract_rules_from_markdown(proposal.original_content)
+            proposed_rules = self._extract_rules_from_markdown(proposal.proposed_content)
+
+            if existing_rules and proposed_rules:
+                combined_rules = existing_rules + proposed_rules
+                analysis = self._constitution_analyzer.analyze(combined_rules)
+                if analysis["conflicts"]:
+                    logger.warning(
+                        f"[SICA] Proposal {proposal.id} creates conflicts: {analysis['conflicts'][:2]}"
+                    )
+                    # Don't reject, just warn and lower confidence slightly
+                    proposal.confidence *= 0.8
+
         proposal.status = "validated"
         return True, "OK"
+
+    def _extract_rules_from_markdown(self, markdown_text: str) -> list[str]:
+        """Extract rule text from markdown (lines starting with -, *, or -)."""
+        rules = []
+        for line in markdown_text.split('\n'):
+            if line.strip().startswith(('-', '*', '+')):
+                rules.append(line.strip()[1:].strip())
+        return rules
 
     # ──────── Apply Proposals ────────
 
@@ -440,18 +595,42 @@ class SICAEngine:
         proposal: SelfEditProposal,
         new_fitness: float,
         constitution_dir: Path,
+        control_fitness: float | None = None,
     ) -> bool:
         """Evaluate if an applied proposal improved performance.
 
         If performance degraded beyond threshold, automatically rolls back.
+
+        Optionally uses A/B testing (Welch's t-test) if control_fitness is provided.
+
+        Args:
+            proposal: The proposal to evaluate
+            new_fitness: Fitness after applying proposal
+            constitution_dir: Path to constitution directory
+            control_fitness: Optional baseline fitness for A/B testing
 
         Returns True if the change was kept, False if rolled back.
         """
         proposal.performance_after = new_fitness
         delta = new_fitness - proposal.performance_before
 
+        # Initialize A/B tester for this proposal if needed
+        if proposal.id not in self._ab_testers:
+            self._ab_testers[proposal.id] = ConstitutionABTester()
+
+        ab_tester = self._ab_testers[proposal.id]
+
+        # Record baseline (control) if provided
+        if control_fitness is not None:
+            ab_tester.record_result("a", control_fitness)
+
+        # Record treatment result
+        ab_tester.record_result("b", new_fitness)
+
+        # Use A/B test if we have enough samples
+        ab_improved, ab_details = ab_tester.is_improvement(confidence=0.95)
+
         # Safety check: warn if multiple proposals target the same file
-        # and rollback may affect other proposals
         if proposal.target_file in self._file_edit_stack:
             stack = self._file_edit_stack[proposal.target_file]
             if len(stack) > 1:
@@ -467,13 +646,28 @@ class SICAEngine:
                 record.fitness_after = new_fitness
                 break
 
-        if delta < self.ROLLBACK_THRESHOLD:
-            # Performance degraded — roll back
+        # Decision logic: use A/B test if available, otherwise simple delta threshold
+        should_rollback = False
+        decision_method = "delta_threshold"
+
+        if ab_improved:
+            decision_method = "ab_test_improvement"
+            logger.info(f"[SICA] A/B test shows improvement: {ab_details}")
+        elif ab_details.get("n_a", 0) >= 3:
+            # A/B test completed but no significant improvement
+            decision_method = "ab_test_no_improvement"
+            should_rollback = True
+            logger.info(f"[SICA] A/B test shows no significant improvement: {ab_details}")
+        elif delta < self.ROLLBACK_THRESHOLD:
+            # Fallback to delta threshold if A/B test insufficient
+            should_rollback = True
             logger.info(
                 f"[SICA] Rolling back proposal {proposal.id}: "
                 f"fitness {proposal.performance_before:.2f} → {new_fitness:.2f} "
                 f"(delta={delta:+.2f})"
             )
+
+        if should_rollback:
             self._rollback(proposal, constitution_dir)
             return False
 
@@ -481,7 +675,7 @@ class SICAEngine:
         logger.info(
             f"[SICA] Keeping proposal {proposal.id}: "
             f"fitness {proposal.performance_before:.2f} → {new_fitness:.2f} "
-            f"(delta={delta:+.2f})"
+            f"(delta={delta:+.2f}, method={decision_method})"
         )
 
         for record in reversed(self._history):

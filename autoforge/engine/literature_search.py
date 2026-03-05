@@ -107,6 +107,160 @@ class LiteratureSearchConfig:
     allow_remote_code_models: bool = False
 
 
+class BM25Scorer:
+    """BM25 relevance scoring for papers."""
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        """Initialize BM25 scorer.
+
+        Args:
+            k1: Term saturation parameter (default 1.5)
+            b: Length normalization parameter (default 0.75)
+        """
+        self.k1 = k1
+        self.b = b
+        self._docs: list[list[str]] = []
+        self._doc_lengths: list[int] = []
+        self._idf: dict[str, float] = {}
+        self.algorithm_ratio: float = 1.0
+
+    def build_index(self, papers: list[PaperReference]) -> None:
+        """Build BM25 index from papers."""
+        import math
+
+        self._docs = []
+        self._doc_lengths = []
+        doc_frequencies: dict[str, int] = {}
+
+        for paper in papers:
+            # Tokenize title and abstract
+            text = (paper.title + " " + paper.abstract).lower()
+            tokens = self._tokenize(text)
+            self._docs.append(tokens)
+            self._doc_lengths.append(len(tokens))
+
+            # Count document frequencies
+            for token in set(tokens):
+                doc_frequencies[token] = doc_frequencies.get(token, 0) + 1
+
+        # Compute IDF
+        num_docs = len(papers)
+        for term, freq in doc_frequencies.items():
+            self._idf[term] = math.log(
+                (num_docs - freq + 0.5) / (freq + 0.5) + 1.0
+            )
+
+    def score_query(self, query: str, papers: list[PaperReference]) -> list[tuple[int, float]]:
+        """Score papers for a query using BM25.
+
+        Args:
+            query: Query string
+            papers: List of papers to score
+
+        Returns:
+            List of (paper_index, score) sorted by descending score
+        """
+        query_tokens = self._tokenize(query.lower())
+        avg_doc_length = sum(self._doc_lengths) / len(self._doc_lengths) if self._doc_lengths else 1
+
+        scores = []
+        for i, doc_tokens in enumerate(self._docs):
+            score = 0.0
+            for token in query_tokens:
+                if token not in self._idf:
+                    continue
+
+                tf = doc_tokens.count(token)
+                idf = self._idf[token]
+                doc_len = self._doc_lengths[i]
+
+                # BM25 formula
+                numerator = tf * (self.k1 + 1)
+                denominator = (
+                    tf + self.k1 * (1 - self.b + self.b * doc_len / avg_doc_length)
+                )
+                score += idf * (numerator / denominator)
+
+            scores.append((i, score))
+
+        return sorted(scores, key=lambda x: x[1], reverse=True)
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        """Simple tokenization."""
+        import re
+
+        # Remove punctuation and split
+        tokens = re.findall(r"\b\w+\b", text.lower())
+        # Remove common stop words
+        stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'is', 'are'}
+        return [t for t in tokens if t not in stopwords]
+
+
+class TFIDFScorer:
+    """TF-IDF relevance scoring for papers."""
+
+    def __init__(self):
+        """Initialize TF-IDF scorer."""
+        self._vocab: dict[str, int] = {}
+        self._idf: dict[str, float] = {}
+        self._docs: list[list[str]] = []
+        self.algorithm_ratio: float = 1.0
+
+    def build_index(self, papers: list[PaperReference]) -> None:
+        """Build TF-IDF index from papers."""
+        import math
+
+        self._docs = []
+        doc_frequencies: dict[str, int] = {}
+
+        # Build vocabulary and collect docs
+        for paper in papers:
+            text = (paper.title + " " + paper.abstract).lower()
+            tokens = self._tokenize(text)
+            self._docs.append(tokens)
+
+            # Count document frequencies
+            for token in set(tokens):
+                doc_frequencies[token] = doc_frequencies.get(token, 0) + 1
+                if token not in self._vocab:
+                    self._vocab[token] = len(self._vocab)
+
+        # Compute IDF
+        num_docs = len(papers)
+        for term, freq in doc_frequencies.items():
+            self._idf[term] = math.log(num_docs / freq + 1)
+
+    def score_query(self, query: str, papers: list[PaperReference]) -> list[tuple[int, float]]:
+        """Score papers for a query using TF-IDF."""
+        query_tokens = self._tokenize(query.lower())
+        scores = []
+
+        for i, doc_tokens in enumerate(self._docs):
+            score = 0.0
+            for token in query_tokens:
+                if token not in self._idf:
+                    continue
+
+                # TF: term frequency in document
+                tf = doc_tokens.count(token) / (len(doc_tokens) + 1)
+                idf = self._idf[token]
+                score += tf * idf
+
+            scores.append((i, score))
+
+        return sorted(scores, key=lambda x: x[1], reverse=True)
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        """Simple tokenization."""
+        import re
+
+        tokens = re.findall(r"\b\w+\b", text.lower())
+        stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'is', 'are'}
+        return [t for t in tokens if t not in stopwords]
+
+
 class CitationGraph:
     """
     Build and traverse citation graphs from Semantic Scholar.
@@ -119,10 +273,30 @@ class CitationGraph:
     - Research frontier detection
     """
 
+    _MAX_PAPERS: int = 5000  # Bounded paper cache
+
     def __init__(self) -> None:
         """Initialize the citation graph."""
         self._graph: dict[str, list[str]] = {}  # Adjacency list
         self._papers: dict[str, PaperReference] = {}  # Paper cache
+        self._paper_access: list[str] = []  # LRU tracking for _papers
+
+    def _store_paper(self, paper: PaperReference) -> None:
+        """Store a paper in the bounded cache with LRU eviction."""
+        pid = paper.paper_id
+        if pid in self._papers:
+            # Already cached — refresh access order
+            if pid in self._paper_access:
+                self._paper_access.remove(pid)
+            self._paper_access.append(pid)
+            self._papers[pid] = paper
+            return
+        # Evict oldest if at capacity
+        while len(self._papers) >= self._MAX_PAPERS and self._paper_access:
+            evict_id = self._paper_access.pop(0)
+            self._papers.pop(evict_id, None)
+        self._papers[pid] = paper
+        self._paper_access.append(pid)
 
     async def build_from_paper(
         self, paper_id: str, depth: int = 2
@@ -220,7 +394,7 @@ class CitationGraph:
                 cited = item["citedPaper"]
                 paper = self._parse_semantic_scholar_paper(cited)
                 papers.append(paper)
-                self._papers[paper.paper_id] = paper
+                self._store_paper(paper)
 
             logger.debug(f"Got {len(papers)} references for {paper_id}")
             return papers
@@ -264,7 +438,7 @@ class CitationGraph:
                 citing = item["citingPaper"]
                 paper = self._parse_semantic_scholar_paper(citing)
                 papers.append(paper)
-                self._papers[paper.paper_id] = paper
+                self._store_paper(paper)
 
             logger.debug(f"Got {len(papers)} citations for {paper_id}")
             return papers
@@ -348,7 +522,7 @@ class CitationGraph:
                 paper = self._parse_semantic_scholar_paper(item)
                 if paper.year >= year_min:
                     papers.append(paper)
-                    self._papers[paper.paper_id] = paper
+                    self._store_paper(paper)
 
             # Sort by citation count (most cited first)
             papers.sort(key=lambda p: p.citation_count, reverse=True)
@@ -1041,6 +1215,8 @@ class LiteratureSearchEngine:
         """
         self.config = config or LiteratureSearchConfig()
         self._cache: dict[str, tuple[float, list[PaperReference]]] = {}
+        self._cache_order: list[str] = []  # LRU tracking
+        self._max_cache_entries: int = 500
         self._citation_graph: CitationGraph | None = None
         self._semantic_search: SemanticSearchEngine | None = None
 
@@ -1489,7 +1665,14 @@ class LiteratureSearchEngine:
         return results
 
     def _set_cache(self, query: str, results: list[PaperReference]) -> None:
-        """Cache search results with current timestamp."""
+        """Cache search results with current timestamp (LRU-bounded)."""
+        # Evict oldest entries when at capacity
+        while len(self._cache) >= self._max_cache_entries and self._cache_order:
+            evict_key = self._cache_order.pop(0)
+            self._cache.pop(evict_key, None)
+        if query in self._cache_order:
+            self._cache_order.remove(query)
+        self._cache_order.append(query)
         self._cache[query] = (time.time(), results)
 
 

@@ -571,15 +571,29 @@ Only return valid JSON."""
         }
 
     def _call_vlm_with_image(self, image_path: Path, prompt: str) -> str:
-        """Call VLM with image (implement based on LLM client)."""
-        # This is a placeholder - actual implementation depends on LLM
-        # For Claude/Anthropic, this would use the Messages API with vision
-        return ""
+        """Call VLM with image.
+
+        Raises NotImplementedError so callers get a clear signal rather
+        than silently receiving empty results that propagate downstream.
+        Subclasses or integrators must override with an actual VLM backend
+        (e.g. Claude Messages API with vision, GPT-4V, etc.).
+        """
+        raise NotImplementedError(
+            f"_call_vlm_with_image is not implemented. "
+            f"Provide a VLM backend to analyse {image_path.name}. "
+            f"Override this method in a subclass or set self.llm."
+        )
 
     def _call_llm_text(self, prompt: str) -> str:
-        """Call LLM with text-only prompt."""
-        # Placeholder implementation
-        return ""
+        """Call LLM with text-only prompt.
+
+        Raises NotImplementedError so callers get a clear signal rather
+        than silently receiving empty results.
+        """
+        raise NotImplementedError(
+            "_call_llm_text is not implemented. "
+            "Provide an LLM backend by overriding this method in a subclass."
+        )
 
 
 # ══════════════════════════════════════════════════════════════

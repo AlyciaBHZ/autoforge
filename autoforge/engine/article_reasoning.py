@@ -274,11 +274,23 @@ class ArticlePreprocessor:
 
         text = "\n".join(lines)
 
-        # Normalize common LaTeX commands
-        text = text.replace("\\emph{", "_")
-        text = text.replace("\\textit{", "_")
-        text = text.replace("\\textbf{", "**")
-        text = re.sub(r"\}", "", text)  # Close braces (rough)
+        # Normalize common LaTeX formatting commands while preserving
+        # math braces.  We strip only the *specific* commands + their
+        # matching closing brace, leaving \frac{a}{b} etc. intact.
+        _FMT_CMDS = [
+            (r"\\emph\{", "_"),
+            (r"\\textit\{", "_"),
+            (r"\\textbf\{", "**"),
+            (r"\\texttt\{", "`"),
+            (r"\\underline\{", ""),
+        ]
+        for pattern, replacement in _FMT_CMDS:
+            # Match \cmd{...content...} — non-greedy, no nested braces
+            text = re.sub(
+                pattern + r"([^}]*)\}",
+                replacement + r"\1" + replacement if replacement else r"\1",
+                text,
+            )
 
         return text
 

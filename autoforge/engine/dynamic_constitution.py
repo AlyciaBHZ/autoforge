@@ -27,6 +27,153 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# ──────────────────────────────────────────────
+# Failure Pattern Mining & Bayesian Confidence
+# ──────────────────────────────────────────────
+
+
+class FailurePatternMiner:
+    """Mine frequent failure patterns using association rules.
+
+    Uses Apriori-style algorithm to find common combinations of
+    failure tags (e.g., 'import_error' + 'timeout' may indicate
+    a specific architectural issue).
+    """
+
+    def __init__(self, min_support: float = 0.1, min_confidence: float = 0.5) -> None:
+        """Initialize pattern miner.
+
+        Args:
+            min_support: Minimum support threshold (fraction of failures)
+            min_confidence: Minimum confidence for patterns
+        """
+        self.min_support = min_support
+        self.min_confidence = min_confidence
+        self._failure_log: list[set[str]] = []
+
+    def add_failure(self, tags: set[str]) -> None:
+        """Record a failure with associated tags."""
+        self._failure_log.append(tags)
+
+    def mine_patterns(self) -> list[dict[str, Any]]:
+        """Find frequent failure patterns using Apriori-like algorithm.
+
+        Returns list of patterns with structure:
+        {
+            "pattern": set of tags,
+            "support": fraction of failures containing this pattern,
+            "confidence": conditional probability,
+            "count": number of failures with this pattern,
+        }
+        """
+        if len(self._failure_log) < 5:
+            return []
+
+        total = len(self._failure_log)
+
+        # Count single items
+        item_counts: dict[str, int] = {}
+        for tags in self._failure_log:
+            for tag in tags:
+                item_counts[tag] = item_counts.get(tag, 0) + 1
+
+        # Frequent singles
+        freq_1 = {item for item, count in item_counts.items()
+                  if count / total >= self.min_support}
+
+        # Mine frequent pairs
+        patterns = []
+        items = sorted(list(freq_1))
+
+        for i, a in enumerate(items):
+            for b in items[i+1:]:
+                pair_count = sum(1 for tags in self._failure_log if {a, b} <= tags)
+                support = pair_count / total
+
+                if support >= self.min_support:
+                    # Confidence: P(b|a) or P(a|b), take the max
+                    conf_ab = pair_count / max(item_counts[a], 1)
+                    conf_ba = pair_count / max(item_counts[b], 1)
+                    max_conf = max(conf_ab, conf_ba)
+
+                    if max_conf >= self.min_confidence:
+                        patterns.append({
+                            "pattern": {a, b},
+                            "support": support,
+                            "confidence": max_conf,
+                            "count": pair_count,
+                        })
+
+        # Sort by confidence
+        patterns.sort(key=lambda x: x["confidence"], reverse=True)
+        return patterns
+
+
+class BayesianRuleConfidence:
+    """Track rule confidence using Beta-Binomial model.
+
+    Uses Thompson Sampling for exploration-exploitation and
+    provides credible intervals for uncertainty quantification.
+    """
+
+    def __init__(self, prior_alpha: float = 1.0, prior_beta: float = 1.0) -> None:
+        """Initialize with Beta prior.
+
+        Args:
+            prior_alpha: Alpha parameter of Beta prior
+            prior_beta: Beta parameter of Beta prior
+        """
+        self.alpha = prior_alpha
+        self.beta = prior_beta
+
+    def update(self, success: bool) -> None:
+        """Update posterior with observation."""
+        if success:
+            self.alpha += 1
+        else:
+            self.beta += 1
+
+    @property
+    def mean(self) -> float:
+        """Expected value of the posterior Beta distribution."""
+        return self.alpha / (self.alpha + self.beta)
+
+    @property
+    def confidence_interval(self) -> tuple[float, float]:
+        """95% credible interval via normal approximation.
+
+        For large sample sizes, uses normal approximation to Beta.
+        """
+        n = self.alpha + self.beta
+        p = self.mean
+
+        # Standard error using Beta variance formula
+        se = (p * (1 - p) / n) ** 0.5 if n > 1 else 0.5
+
+        lower = max(0.0, p - 1.96 * se)
+        upper = min(1.0, p + 1.96 * se)
+
+        return (lower, upper)
+
+    def sample(self) -> float:
+        """Thompson Sampling: sample from Beta posterior.
+
+        Useful for exploration-exploitation strategies.
+        """
+        import random
+        return random.betavariate(self.alpha, self.beta)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to dict."""
+        return {
+            "alpha": self.alpha,
+            "beta": self.beta,
+            "mean": self.mean,
+            "ci_lower": self.confidence_interval[0],
+            "ci_upper": self.confidence_interval[1],
+        }
+
+
 @dataclass
 class ConstitutionPatch:
     """A dynamically generated supplement to an agent's constitution."""
@@ -83,6 +230,10 @@ class DynamicConstitution:
         # Track rule performance deltas for causal inference
         # Maps rule_id → list of (score_with_rule, baseline_score) tuples
         self._rule_deltas: dict[str, list[tuple[float, float]]] = {}
+
+        # Algorithmic components for rule discovery
+        self._failure_pattern_miner = FailurePatternMiner(min_support=0.1, min_confidence=0.5)
+        self._rule_confidence_tracker: dict[str, BayesianRuleConfidence] = {}
 
         # Load persisted knowledge if available
         self._load_knowledge_base()
@@ -409,6 +560,87 @@ class DynamicConstitution:
             f"confidence={rule.confidence:.4f}"
         )
 
+    def add_failure(self, failure_tags: set[str]) -> None:
+        """Record a failure with associated tags for pattern mining.
+
+        Args:
+            failure_tags: Set of tags describing the failure
+                          e.g., {'timeout', 'import_error', 'async_issue'}
+        """
+        self._failure_pattern_miner.add_failure(failure_tags)
+
+    def discover_rules_from_patterns(self) -> list[LearnedRule]:
+        """Mine failure patterns and create preventive rules.
+
+        Returns list of newly discovered rules (if any).
+        """
+        patterns = self._failure_pattern_miner.mine_patterns()
+        new_rules = []
+
+        for pattern in patterns:
+            tags = sorted(list(pattern["pattern"]))
+            tag_str = " + ".join(tags)
+
+            # Generate rule text from pattern
+            rule_text = f"Watch for combination of: {tag_str}. "
+            rule_text += f"This pattern occurs in {pattern['support']:.1%} of failures. "
+            rule_text += "Implement targeted prevention steps."
+
+            # Create rule
+            rule = LearnedRule(
+                id=f"pattern-{int(time.time()) % 100000}",
+                pattern=f"Failure pattern: {tag_str}",
+                rule=rule_text,
+                source_role="system",
+                confidence=pattern["confidence"],
+            )
+
+            self._learned_rules.append(rule)
+            new_rules.append(rule)
+
+            logger.info(
+                f"[MetaLearning] Discovered pattern-based rule: {rule.id} "
+                f"(confidence={rule.confidence:.2f})"
+            )
+
+        if new_rules:
+            self._save_knowledge_base()
+
+        return new_rules
+
+    def update_rule_confidence_bayesian(self, rule_id: str, success: bool) -> None:
+        """Update rule confidence using Bayesian model.
+
+        Args:
+            rule_id: ID of the rule
+            success: Whether applying the rule led to success
+        """
+        if rule_id not in self._rule_confidence_tracker:
+            self._rule_confidence_tracker[rule_id] = BayesianRuleConfidence()
+
+        tracker = self._rule_confidence_tracker[rule_id]
+        tracker.update(success)
+
+        # Find and update the rule's confidence
+        for rule in self._learned_rules:
+            if rule.id == rule_id:
+                rule.confidence = tracker.mean
+                ci_lower, ci_upper = tracker.confidence_interval
+                logger.debug(
+                    f"[MetaLearning] Updated {rule_id} confidence: {rule.confidence:.2f} "
+                    f"(95% CI: [{ci_lower:.2f}, {ci_upper:.2f}])"
+                )
+                break
+
+    def get_rule_credible_interval(self, rule_id: str) -> tuple[float, float] | None:
+        """Get 95% credible interval for a rule's effectiveness.
+
+        Returns (lower, upper) or None if rule not tracked.
+        """
+        if rule_id in self._rule_confidence_tracker:
+            return self._rule_confidence_tracker[rule_id].confidence_interval
+        return None
+
     def record_rule_outcome(self, rule_id: str, helped: bool) -> None:
         """Record whether a learned rule helped or not.
 
@@ -549,7 +781,10 @@ class DynamicConstitution:
         Now persists ALL patches (including project_specific ones) with their project_name
         for cross-project learning and knowledge reuse.
 
-        Also persists rule deltas for causal inference analysis across sessions.
+        Also persists:
+        - Rule deltas for causal inference analysis across sessions
+        - Bayesian rule confidence trackers for Thompson Sampling
+        - Failure pattern miner state for continued pattern discovery
         """
         if not self._knowledge_base_path:
             logger.warning("[Constitution] Cannot save knowledge base: no knowledge_base_path configured")
@@ -578,6 +813,11 @@ class DynamicConstitution:
                     ]
                     for rule_id, deltas in self._rule_deltas.items()
                 },
+                "bayesian_confidence": {
+                    rule_id: tracker.to_dict()
+                    for rule_id, tracker in self._rule_confidence_tracker.items()
+                },
+                "failure_log_size": len(self._failure_pattern_miner._failure_log),
             }
             self._knowledge_base_path.write_text(
                 json.dumps(data, indent=2), encoding="utf-8"
@@ -588,8 +828,11 @@ class DynamicConstitution:
     def _load_knowledge_base(self) -> None:
         """Load persisted rules from disk.
 
-        Restores both learned rules and their causal evaluation history (deltas)
-        for continued training and inference across sessions.
+        Restores:
+        - Learned rules with their confidence scores
+        - Causal evaluation history (deltas) for continued training
+        - Bayesian rule confidence trackers (for Thompson Sampling)
+        - Failure pattern counts (for continued pattern discovery)
         """
         if not self._knowledge_base_path or not self._knowledge_base_path.exists():
             return
@@ -614,9 +857,20 @@ class DynamicConstitution:
                     for d in delta_list
                 ]
 
+            # Load Bayesian confidence trackers
+            for rule_id, tracker_data in data.get("bayesian_confidence", {}).items():
+                tracker = BayesianRuleConfidence(
+                    prior_alpha=1.0, prior_beta=1.0
+                )
+                # Restore posterior from persisted state
+                tracker.alpha = tracker_data.get("alpha", 1.0)
+                tracker.beta = tracker_data.get("beta", 1.0)
+                self._rule_confidence_tracker[rule_id] = tracker
+
             logger.info(
-                f"[Constitution] Loaded {len(self._learned_rules)} learned rules "
-                f"and {len(self._rule_deltas)} rule delta histories"
+                f"[Constitution] Loaded {len(self._learned_rules)} learned rules, "
+                f"{len(self._rule_deltas)} rule delta histories, and "
+                f"{len(self._rule_confidence_tracker)} Bayesian confidence trackers"
             )
         except Exception as e:
             logger.debug(f"Could not load knowledge base: {e}")

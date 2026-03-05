@@ -44,10 +44,15 @@ try:
     import sympy as sp
     from sympy import symbols, sympify, simplify, solve, integrate, diff, limit, series
     from sympy import Matrix, Abs, sin, cos, log, exp, sqrt, oo
+    from sympy.parsing.latex import parse_latex as sp_parse_latex
+    from sympy import gcd, factor, apart, roots, eye, diag, svd_solve
+    from sympy.polys.polytools import poly, Poly
+    from sympy.ntheory import factorint, divisors
     SYMPY_AVAILABLE = True
 except ImportError:
     SYMPY_AVAILABLE = False
     sp = None
+    sp_parse_latex = None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -79,6 +84,7 @@ class SymbolicResult:
     computation_time: float = 0.0
     steps: list[str] = field(default_factory=list)
     numeric_approximation: float | None = None
+    algorithm_ratio: float = 0.0  # Ratio of pure algorithm vs LLM fallback (0=fallback, 1=pure)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -91,6 +97,7 @@ class SymbolicResult:
             "computation_time": self.computation_time,
             "steps": self.steps,
             "numeric_approximation": self.numeric_approximation,
+            "algorithm_ratio": self.algorithm_ratio,
         }
 
 
@@ -381,10 +388,200 @@ class SymPyEngine:
                 success=True,
                 computation_time=time.time() - start,
                 steps=[f"Verified: {lhs} {'=' if is_equal else '≠'} {rhs}"],
+                algorithm_ratio=1.0,  # Pure SymPy computation
             )
         except Exception as e:
             return SymbolicResult(
                 expression=f"{lhs} = {rhs}",
+                result="",
+                backend=self.backend,
+                success=False,
+                error=str(e),
+                computation_time=time.time() - start,
+            )
+
+    async def factor_polynomial(self, expr_str: str) -> SymbolicResult:
+        """Factor a polynomial expression."""
+        start = time.time()
+        try:
+            expr = await self._parse_expr(expr_str)
+            result = await asyncio.to_thread(sp.factor, expr)
+            return SymbolicResult(
+                expression=expr_str,
+                result=self._format_result(result),
+                backend=self.backend,
+                success=True,
+                computation_time=time.time() - start,
+                steps=[f"Factorized polynomial"],
+                algorithm_ratio=1.0,
+            )
+        except Exception as e:
+            return SymbolicResult(
+                expression=expr_str,
+                result="",
+                backend=self.backend,
+                success=False,
+                error=str(e),
+                computation_time=time.time() - start,
+            )
+
+    async def partial_fraction_decomposition(self, expr_str: str, var: str = "x") -> SymbolicResult:
+        """Decompose a rational function into partial fractions."""
+        start = time.time()
+        try:
+            var_sym = sp.Symbol(var)
+            expr = await self._parse_expr(expr_str)
+            result = await asyncio.to_thread(sp.apart, expr, var_sym)
+            return SymbolicResult(
+                expression=expr_str,
+                result=self._format_result(result),
+                backend=self.backend,
+                success=True,
+                computation_time=time.time() - start,
+                steps=["Partial fraction decomposition"],
+                algorithm_ratio=1.0,
+            )
+        except Exception as e:
+            return SymbolicResult(
+                expression=expr_str,
+                result="",
+                backend=self.backend,
+                success=False,
+                error=str(e),
+                computation_time=time.time() - start,
+            )
+
+    async def find_roots(self, expr_str: str, var: str = "x") -> SymbolicResult:
+        """Find roots of a polynomial or equation."""
+        start = time.time()
+        try:
+            var_sym = sp.Symbol(var)
+            expr = await self._parse_expr(expr_str)
+            roots_dict = await asyncio.to_thread(sp.roots, expr, var_sym)
+            result_str = ", ".join(
+                f"{r}: multiplicity {m}" for r, m in roots_dict.items()
+            )
+            return SymbolicResult(
+                expression=expr_str,
+                result=result_str if result_str else "No roots found",
+                backend=self.backend,
+                success=True,
+                computation_time=time.time() - start,
+                steps=["Found roots"],
+                algorithm_ratio=1.0,
+            )
+        except Exception as e:
+            return SymbolicResult(
+                expression=expr_str,
+                result="",
+                backend=self.backend,
+                success=False,
+                error=str(e),
+                computation_time=time.time() - start,
+            )
+
+    async def matrix_svd(self, matrix_str: str) -> SymbolicResult:
+        """Compute singular value decomposition of a matrix."""
+        start = time.time()
+        try:
+            matrix_data = json.loads(matrix_str)
+            mat = Matrix(matrix_data)
+            U, S, Vh = await asyncio.to_thread(mat.singular_value_decomposition)
+            result_dict = {
+                "U": str(U),
+                "singular_values": list(S),
+                "Vh": str(Vh),
+            }
+            return SymbolicResult(
+                expression=matrix_str,
+                result=json.dumps(result_dict, default=str),
+                backend=self.backend,
+                success=True,
+                computation_time=time.time() - start,
+                steps=["SVD computed"],
+                algorithm_ratio=1.0,
+            )
+        except Exception as e:
+            return SymbolicResult(
+                expression=matrix_str,
+                result="",
+                backend=self.backend,
+                success=False,
+                error=str(e),
+                computation_time=time.time() - start,
+            )
+
+    async def matrix_nullspace(self, matrix_str: str) -> SymbolicResult:
+        """Compute nullspace of a matrix."""
+        start = time.time()
+        try:
+            matrix_data = json.loads(matrix_str)
+            mat = Matrix(matrix_data)
+            nullspace = await asyncio.to_thread(mat.nullspace)
+            result_str = str(nullspace)
+            return SymbolicResult(
+                expression=matrix_str,
+                result=result_str,
+                backend=self.backend,
+                success=True,
+                computation_time=time.time() - start,
+                steps=["Nullspace computed"],
+                algorithm_ratio=1.0,
+            )
+        except Exception as e:
+            return SymbolicResult(
+                expression=matrix_str,
+                result="",
+                backend=self.backend,
+                success=False,
+                error=str(e),
+                computation_time=time.time() - start,
+            )
+
+    async def number_theory_factorize(self, n_str: str) -> SymbolicResult:
+        """Factorize an integer into prime factors."""
+        start = time.time()
+        try:
+            n = int(n_str)
+            factors = await asyncio.to_thread(sp.factorint, n)
+            result_str = " × ".join(f"{p}^{e}" if e > 1 else str(p) for p, e in sorted(factors.items()))
+            return SymbolicResult(
+                expression=n_str,
+                result=result_str,
+                backend=self.backend,
+                success=True,
+                computation_time=time.time() - start,
+                steps=[f"Prime factorization"],
+                algorithm_ratio=1.0,
+            )
+        except Exception as e:
+            return SymbolicResult(
+                expression=n_str,
+                result="",
+                backend=self.backend,
+                success=False,
+                error=str(e),
+                computation_time=time.time() - start,
+            )
+
+    async def number_theory_gcd(self, a_str: str, b_str: str) -> SymbolicResult:
+        """Compute GCD of two numbers."""
+        start = time.time()
+        try:
+            a, b = int(a_str), int(b_str)
+            gcd_val = await asyncio.to_thread(sp.gcd, a, b)
+            return SymbolicResult(
+                expression=f"gcd({a_str}, {b_str})",
+                result=str(gcd_val),
+                backend=self.backend,
+                success=True,
+                computation_time=time.time() - start,
+                steps=["GCD computed"],
+                algorithm_ratio=1.0,
+            )
+        except Exception as e:
+            return SymbolicResult(
+                expression=f"gcd({a_str}, {b_str})",
                 result="",
                 backend=self.backend,
                 success=False,
@@ -645,28 +842,39 @@ class LaTeXParser:
 
     @staticmethod
     def parse_latex_to_sympy(latex_str: str) -> str:
-        """Convert LaTeX string to SymPy expression string."""
+        """Convert LaTeX string to SymPy expression string using sympy.parsing.latex when available."""
+        if SYMPY_AVAILABLE and sp_parse_latex:
+            try:
+                # Try native SymPy LaTeX parser first
+                expr = sp_parse_latex(latex_str)
+                return str(expr)
+            except Exception as e:
+                logger.debug(f"Native LaTeX parsing failed: {e}, falling back to regex")
+
+        # Fallback to regex-based parsing
         cleaned = LaTeXParser._clean_latex(latex_str)
-        # Simple mappings — comprehensive LaTeX parsing is a research problem
+        # Comprehensive mapping for common LaTeX patterns
         replacements = {
-            r"\frac{([^}]*)}{([^}]*)}": r"(\1)/(\2)",
-            r"\sqrt{([^}]*)}": r"sqrt(\1)",
-            r"\sin": "sin",
-            r"\cos": "cos",
-            r"\tan": "tan",
-            r"\log": "log",
-            r"\ln": "ln",
-            r"\exp": "exp",
-            r"\left(": "(",
-            r"\right)": ")",
-            r"\cdot": "*",
-            r"\times": "*",
-            r"\alpha": "alpha",
-            r"\beta": "beta",
-            r"\gamma": "gamma",
-            r"\pi": "pi",
-            r"\infty": "oo",
-            r"\^": "**",  # Caret to power
+            r"\\frac\{([^}]*)\}\{([^}]*)\}": r"(\1)/(\2)",
+            r"\\sqrt\{([^}]*)\}": r"sqrt(\1)",
+            r"\\sin": "sin",
+            r"\\cos": "cos",
+            r"\\tan": "tan",
+            r"\\log": "log",
+            r"\\ln": "ln",
+            r"\\exp": "exp",
+            r"\\left\(": "(",
+            r"\\right\)": ")",
+            r"\\cdot": "*",
+            r"\\times": "*",
+            r"\\alpha": "alpha",
+            r"\\beta": "beta",
+            r"\\gamma": "gamma",
+            r"\\pi": "pi",
+            r"\\infty": "oo",
+            r"\^": "**",
+            r"\{": "",
+            r"\}": "",
         }
         result = cleaned
         for pattern, replacement in replacements.items():

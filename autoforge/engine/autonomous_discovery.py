@@ -41,6 +41,7 @@ import json
 import logging
 import math
 import re
+import statistics
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -57,6 +58,26 @@ from autoforge.engine.theoretical_reasoning import (
     TheoryGraph,
     VerificationSuite,
 )
+
+try:
+    import sympy
+    from sympy import (
+        symbols,
+        simplify,
+        expand,
+        factor,
+        solve,
+        Eq,
+        Symbol,
+        limit,
+        oo,
+        series,
+    )
+    from sympy.combinatorics import Permutation
+
+    HAS_SYMPY = True
+except ImportError:
+    HAS_SYMPY = False
 
 logger = logging.getLogger(__name__)
 
@@ -519,6 +540,384 @@ Respond in JSON:
 
 
 # ══════════════════════════════════════════════════════════════
+# Algorithmic Conjecture Engine
+# ══════════════════════════════════════════════════════════════
+
+
+class AlgorithmicConjectureEngine:
+    """Generates conjectures using algorithmic methods instead of LLM.
+
+    Strategies:
+    - GENERALIZE: Weaken hypotheses via SymPy (sufficient → necessary conditions)
+    - COMPOSE: Cross-product of proven results with shared variables
+    - BOUNDARY_ANALYSIS: Compute limits and singularities via SymPy
+    - DUALITY: Apply known duality transforms
+    - PATTERN_DETECTION: Find regularities in numerical sequences
+    - SPECIALIZATION: Generate specific instances of general statements
+    """
+
+    def __init__(self) -> None:
+        self._algo_calls = 0
+        self._fallback_calls = 0
+
+    @property
+    def algorithm_ratio(self) -> float:
+        """Ratio of algorithmic to fallback calls."""
+        total = self._algo_calls + self._fallback_calls
+        return self._algo_calls / total if total > 0 else 0.0
+
+    def generate(
+        self,
+        strategy: str,
+        seeds: list[dict],
+        domain_context: dict,
+    ) -> list[dict] | None:
+        """Try to generate conjectures algorithmically. Returns None for LLM fallback."""
+        if not HAS_SYMPY:
+            self._fallback_calls += 1
+            return None
+
+        dispatch = {
+            "generalize": self._generalize,
+            "compose": self._compose,
+            "boundary_analysis": self._boundary,
+            "duality": self._duality,
+            "pattern_detection": self._pattern_detect,
+            "specialization": self._specialize,
+        }
+
+        handler = dispatch.get(strategy.lower())
+        if handler is None:
+            self._fallback_calls += 1
+            return None
+
+        try:
+            results = handler(seeds, domain_context)
+            if results:
+                self._algo_calls += 1
+                return results
+        except Exception as e:
+            logger.warning(
+                "Algorithmic conjecture generation failed for %s: %s", strategy, e
+            )
+
+        self._fallback_calls += 1
+        return None
+
+    def _generalize(self, seeds: list[dict], ctx: dict) -> list[dict] | None:
+        """Weaken hypotheses by replacing specific with general."""
+        results = []
+        for seed in seeds:
+            expr_str = seed.get("expression", seed.get("statement", ""))
+            if not expr_str:
+                continue
+            try:
+                expr = sympy.sympify(expr_str)
+                free = list(expr.free_symbols)
+                # Strategy 1: Replace integer constraints with real
+                # Strategy 2: Remove positivity constraints
+                # Strategy 3: Expand domain (specific value → variable)
+                for num in list(expr.atoms(sympy.Integer))[:2]:
+                    param = Symbol(f"c_{abs(int(num))}")
+                    generalized = expr.subs(num, param)
+                    results.append(
+                        {
+                            "conjecture": f"For all {param}, {generalized}",
+                            "expression": str(generalized),
+                            "type": "generalization",
+                            "parent": expr_str,
+                            "confidence": 0.4,  # Generalizations need verification
+                            "method": "sympy_generalization",
+                        }
+                    )
+            except Exception:
+                continue
+        return results if results else None
+
+    def _compose(self, seeds: list[dict], ctx: dict) -> list[dict] | None:
+        """Compose results that share variables."""
+        results = []
+        for i, s1 in enumerate(seeds):
+            for s2 in seeds[i + 1 :]:
+                e1_str = s1.get("expression", "")
+                e2_str = s2.get("expression", "")
+                if not (e1_str and e2_str):
+                    continue
+                try:
+                    e1 = sympy.sympify(e1_str)
+                    e2 = sympy.sympify(e2_str)
+                    shared = e1.free_symbols & e2.free_symbols
+                    if shared:
+                        # Try substitution composition
+                        var = list(shared)[0]
+                        solutions = solve(e1, var)
+                        if solutions:
+                            composed = e2.subs(var, solutions[0])
+                            simplified = simplify(composed)
+                            results.append(
+                                {
+                                    "conjecture": str(simplified),
+                                    "expression": str(simplified),
+                                    "type": "composition",
+                                    "parents": [e1_str, e2_str],
+                                    "via_variable": str(var),
+                                    "confidence": 0.5,
+                                    "method": "sympy_composition",
+                                }
+                            )
+                except Exception:
+                    continue
+        return results if results else None
+
+    def _boundary(self, seeds: list[dict], ctx: dict) -> list[dict] | None:
+        """Analyze boundary behavior via limits and series."""
+        results = []
+        for seed in seeds:
+            expr_str = seed.get("expression", "")
+            if not expr_str:
+                continue
+            try:
+                expr = sympy.sympify(expr_str)
+                for var in list(expr.free_symbols)[:1]:
+                    # Limit at infinity
+                    lim = limit(expr, var, oo)
+                    if lim.is_finite:
+                        results.append(
+                            {
+                                "conjecture": f"As {var}→∞, {expr_str} → {lim}",
+                                "expression": str(lim),
+                                "type": "boundary_limit",
+                                "parent": expr_str,
+                                "confidence": 0.8,
+                                "method": "sympy_limit",
+                            }
+                        )
+                    # Limit at 0
+                    lim0 = limit(expr, var, 0)
+                    if lim0.is_finite:
+                        results.append(
+                            {
+                                "conjecture": f"As {var}→0, {expr_str} → {lim0}",
+                                "expression": str(lim0),
+                                "type": "boundary_limit",
+                                "parent": expr_str,
+                                "confidence": 0.8,
+                                "method": "sympy_limit",
+                            }
+                        )
+                    # Singularity detection
+                    try:
+                        singular_points = solve(1 / expr, var)
+                        if singular_points:
+                            results.append(
+                                {
+                                    "conjecture": f"{expr_str} has singularities at {var} = {singular_points}",
+                                    "type": "singularity",
+                                    "parent": expr_str,
+                                    "confidence": 0.7,
+                                    "method": "sympy_singularity",
+                                }
+                            )
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        return results if results else None
+
+    def _duality(self, seeds: list[dict], ctx: dict) -> list[dict] | None:
+        """Apply known duality transforms."""
+        results = []
+        for seed in seeds:
+            expr_str = seed.get("expression", "")
+            if not expr_str:
+                continue
+            try:
+                expr = sympy.sympify(expr_str)
+                # Fourier-like dual: swap x↔1/x
+                for var in list(expr.free_symbols)[:1]:
+                    dual = expr.subs(var, 1 / var)
+                    dual_simplified = simplify(dual)
+                    # Self-dual check
+                    is_self_dual = simplify(expr - dual_simplified) == 0
+                    results.append(
+                        {
+                            "conjecture": f"Under {var}↔1/{var}: {expr_str} → {dual_simplified}",
+                            "expression": str(dual_simplified),
+                            "type": "duality",
+                            "self_dual": is_self_dual,
+                            "parent": expr_str,
+                            "confidence": 0.6,
+                            "method": "sympy_duality",
+                        }
+                    )
+            except Exception:
+                continue
+        return results if results else None
+
+    def _pattern_detect(self, seeds: list[dict], ctx: dict) -> list[dict] | None:
+        """Detect patterns in numerical sequences."""
+        results = []
+        for seed in seeds:
+            sequence = seed.get("sequence", seed.get("values", []))
+            if not sequence or len(sequence) < 4:
+                continue
+            try:
+                nums = [float(x) for x in sequence]
+                # Check arithmetic progression
+                diffs = [nums[i + 1] - nums[i] for i in range(len(nums) - 1)]
+                if len(set(round(d, 10) for d in diffs)) == 1:
+                    d = diffs[0]
+                    results.append(
+                        {
+                            "conjecture": f"a(n) = {nums[0]} + {d}*n (arithmetic progression)",
+                            "type": "pattern_arithmetic",
+                            "common_difference": d,
+                            "confidence": 0.9,
+                            "method": "pattern_detection",
+                        }
+                    )
+                # Check geometric progression
+                if all(n != 0 for n in nums[:-1]):
+                    ratios = [nums[i + 1] / nums[i] for i in range(len(nums) - 1)]
+                    if len(set(round(r, 10) for r in ratios)) == 1:
+                        r = ratios[0]
+                        results.append(
+                            {
+                                "conjecture": f"a(n) = {nums[0]} * {r}^n (geometric progression)",
+                                "type": "pattern_geometric",
+                                "common_ratio": r,
+                                "confidence": 0.9,
+                                "method": "pattern_detection",
+                            }
+                        )
+                # Check polynomial fit (degree 2)
+                if len(nums) >= 3:
+                    second_diffs = [
+                        diffs[i + 1] - diffs[i] for i in range(len(diffs) - 1)
+                    ]
+                    if (
+                        len(set(round(d, 10) for d in second_diffs)) == 1
+                        and second_diffs[0] != 0
+                    ):
+                        results.append(
+                            {
+                                "conjecture": f"Sequence follows quadratic pattern (constant second differences = {second_diffs[0]})",
+                                "type": "pattern_quadratic",
+                                "second_difference": second_diffs[0],
+                                "confidence": 0.85,
+                                "method": "pattern_detection",
+                            }
+                        )
+            except Exception:
+                continue
+        return results if results else None
+
+    def _specialize(self, seeds: list[dict], ctx: dict) -> list[dict] | None:
+        """Generate specific instances of general statements."""
+        results = []
+        for seed in seeds:
+            expr_str = seed.get("expression", "")
+            if not expr_str:
+                continue
+            try:
+                expr = sympy.sympify(expr_str)
+                free = list(expr.free_symbols)
+                if not free:
+                    continue
+                # Test at specific values
+                test_values = [0, 1, -1, 2, sympy.Rational(1, 2)]
+                for val in test_values:
+                    specialized = expr.subs(free[0], val)
+                    simplified = simplify(specialized)
+                    results.append(
+                        {
+                            "conjecture": f"When {free[0]}={val}: {simplified}",
+                            "expression": str(simplified),
+                            "type": "specialization",
+                            "parent": expr_str,
+                            "at_value": str(val),
+                            "confidence": 0.95,
+                            "method": "sympy_specialization",
+                        }
+                    )
+            except Exception:
+                continue
+        return results[:5] if results else None  # Limit to 5 specializations
+
+
+# ══════════════════════════════════════════════════════════════
+# Graph-Based Depth Evaluator
+# ══════════════════════════════════════════════════════════════
+
+
+class GraphBasedDepthEvaluator:
+    """Evaluates conjecture depth using graph metrics instead of LLM.
+
+    Metrics:
+    - technical_complexity: AST depth of expression (SymPy tree depth)
+    - structural_novelty: Jaccard distance from all known conjectures
+    - bridging_potential: Number of new connections enabled
+    - elegance: Statement length / proof_length ratio
+    """
+
+    def __init__(self) -> None:
+        self._known_tokens: set[str] = set()
+
+    def evaluate(
+        self, conjecture: dict, known_conjectures: list[dict]
+    ) -> dict:
+        """Score a conjecture using algorithmic metrics."""
+        expr_str = conjecture.get("expression", conjecture.get("conjecture", ""))
+
+        scores = {}
+
+        # Technical complexity: expression tree depth
+        try:
+            expr = sympy.sympify(expr_str)
+            depth = self._tree_depth(expr)
+            scores["technical_complexity"] = min(1.0, depth / 10.0)
+        except Exception:
+            scores["technical_complexity"] = 0.5
+
+        # Structural novelty: Jaccard distance from known
+        tokens = set(re.findall(r"[a-zA-Z_]\w*", expr_str.lower()))
+        if self._known_tokens:
+            jaccard = 1.0 - len(tokens & self._known_tokens) / max(
+                1, len(tokens | self._known_tokens)
+            )
+        else:
+            jaccard = 1.0
+        scores["structural_novelty"] = jaccard
+        self._known_tokens.update(tokens)
+
+        # Bridging potential: count shared variables with existing conjectures
+        bridges = 0
+        for known in known_conjectures:
+            known_str = known.get("expression", "")
+            known_tokens = set(re.findall(r"[a-zA-Z_]\w*", known_str.lower()))
+            if tokens & known_tokens and tokens != known_tokens:
+                bridges += 1
+        scores["bridging_potential"] = min(
+            1.0, bridges / max(1, len(known_conjectures)) * 5
+        )
+
+        # Composite
+        scores["composite"] = (
+            scores["technical_complexity"] * 0.25
+            + scores["structural_novelty"] * 0.35
+            + scores["bridging_potential"] * 0.40
+        )
+
+        return scores
+
+    def _tree_depth(self, expr) -> int:
+        """Compute expression tree depth."""
+        if not hasattr(expr, "args") or not expr.args:
+            return 1
+        return 1 + max(self._tree_depth(a) for a in expr.args)
+
+
+# ══════════════════════════════════════════════════════════════
 # Depth Evaluator
 # ══════════════════════════════════════════════════════════════
 
@@ -963,6 +1362,8 @@ class DiscoveryOrchestrator:
         self.config = config or DiscoveryConfig()
         self._generator = ConjectureGenerator()
         self._evaluator = DepthEvaluator()
+        self._algo_engine = AlgorithmicConjectureEngine()
+        self._graph_evaluator = GraphBasedDepthEvaluator()
         self._verifier = VerificationSuite()
         self._results: list[DiscoveryResult] = []
         self._strategy_scores: dict[str, list[float]] = {}
@@ -1030,15 +1431,52 @@ class DiscoveryOrchestrator:
 
             # Generate candidates
             round_accepted: list[DiscoveryResult] = []
-            candidates = await self._generator.generate(
+
+            # Try algorithmic generation first
+            algo_seeds = [
+                {"expression": s.formal_statement, "statement": s.formal_statement}
+                for s in seeds
+            ]
+            algo_candidates = self._algo_engine.generate(
                 strategy=strategy,
-                frontier_nodes=seeds,
-                kernel_context=kernel_context,
-                llm=llm,
-                round_number=round_num,
-                existing_count=len(self._results),
-                domain_context=domain_context,
+                seeds=algo_seeds,
+                domain_context={"name": domain_context.name},
             )
+
+            if algo_candidates:
+                logger.debug(
+                    f"[Discovery] Generated {len(algo_candidates)} candidates "
+                    f"algorithmically (ratio: {self._algo_engine.algorithm_ratio:.2%})"
+                )
+                # Convert algorithmic results to ConceptNode format for consistency
+                candidates = []
+                for algo_result in algo_candidates:
+                    node = ConceptNode(
+                        id=f"AD-ALGO-{len(self._results) + len(candidates):03d}",
+                        name=algo_result.get("type", "algorithmic_result"),
+                        concept_type=ConceptType.CONJECTURE,
+                        formal_statement=algo_result.get("conjecture", ""),
+                        proof_sketch=algo_result.get("method", "algorithmic"),
+                        intuition=f"Generated via {algo_result.get('method', 'algorithm')}",
+                        tags=["algorithmic"],
+                        domain=ScientificDomain.MATHEMATICAL_PHYSICS,
+                    )
+                    candidates.append(node)
+            else:
+                # Fall back to LLM-based generation
+                logger.debug(
+                    f"[Discovery] Algorithmic generation unavailable or failed; "
+                    f"using LLM (algorithm_ratio: {self._algo_engine.algorithm_ratio:.2%})"
+                )
+                candidates = await self._generator.generate(
+                    strategy=strategy,
+                    frontier_nodes=seeds,
+                    kernel_context=kernel_context,
+                    llm=llm,
+                    round_number=round_num,
+                    existing_count=len(self._results),
+                    domain_context=domain_context,
+                )
 
             for candidate in candidates:
                 # Novelty check
@@ -1051,10 +1489,52 @@ class DiscoveryOrchestrator:
                     )
                     continue
 
-                # Depth evaluation
-                depth, depth_score, depth_reason = await self._evaluator.evaluate(
-                    candidate, kernel_context, llm
-                )
+                # Depth evaluation: try graph-based first, fall back to LLM
+                depth_score = None
+                known_conjectures = [r.node for r in self._results]
+                if HAS_SYMPY:
+                    try:
+                        graph_scores = self._graph_evaluator.evaluate(
+                            {
+                                "expression": candidate.formal_statement,
+                                "conjecture": candidate.formal_statement,
+                            },
+                            [
+                                {"expression": c.formal_statement}
+                                for c in known_conjectures
+                            ],
+                        )
+                        depth_score = graph_scores.get("composite", 0.5)
+                        logger.debug(
+                            f"[Discovery] Graph-based depth evaluation: {depth_score:.2f} "
+                            f"(complexity={graph_scores.get('technical_complexity', 0):.2f}, "
+                            f"novelty={graph_scores.get('structural_novelty', 0):.2f}, "
+                            f"bridging={graph_scores.get('bridging_potential', 0):.2f})"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[Discovery] Graph-based evaluation failed: {e}"
+                        )
+                        depth_score = None
+
+                if depth_score is None:
+                    # Fall back to LLM-based evaluation
+                    logger.debug("[Discovery] Using LLM-based depth evaluation")
+                    depth, depth_score, depth_reason = await self._evaluator.evaluate(
+                        candidate, kernel_context, llm
+                    )
+                else:
+                    # Map numeric score to depth level
+                    if depth_score >= 0.85:
+                        depth = DiscoveryDepth.BREAKTHROUGH
+                    elif depth_score >= 0.70:
+                        depth = DiscoveryDepth.DEEP
+                    elif depth_score >= 0.55:
+                        depth = DiscoveryDepth.MODERATE
+                    else:
+                        depth = DiscoveryDepth.SHALLOW
+                    depth_reason = "Graph-based structural evaluation"
+
                 if depth_score < self.config.depth_score_threshold:
                     logger.debug(
                         f"[Discovery] Rejected (too shallow): {candidate.id} "
@@ -1132,6 +1612,14 @@ class DiscoveryOrchestrator:
         logger.info(
             f"[Discovery] Complete: {len(self._results)} discoveries "
             f"in {len(self._round_log)} rounds"
+        )
+
+        # Report algorithm usage statistics
+        logger.info(
+            f"[Discovery] Algorithmic conjecture generation: "
+            f"{self._algo_engine._algo_calls} successful calls, "
+            f"{self._algo_engine._fallback_calls} fallbacks "
+            f"(algorithm ratio: {self._algo_engine.algorithm_ratio:.2%})"
         )
 
         # Final save

@@ -388,9 +388,12 @@ class SSHServerBackend:
 class ProofCache:
     """Cache proof compilation results to avoid redundant work."""
 
+    _MAX_MEMORY_ENTRIES: int = 2048  # Bounded in-memory cache
+
     def __init__(self, cache_dir: Path | None = None) -> None:
         self._cache_dir = cache_dir
         self._memory_cache: dict[str, ProofJob] = {}
+        self._access_order: list[str] = []  # LRU tracking
 
     def _hash_code(self, lean_code: str) -> str:
         return hashlib.sha256(lean_code.encode("utf-8")).hexdigest()[:16]
@@ -402,6 +405,10 @@ class ProofCache:
         # Memory cache first
         if key in self._memory_cache:
             logger.debug(f"[ProofCache] Memory hit: {key}")
+            # Move to end of access order (most recently used)
+            if key in self._access_order:
+                self._access_order.remove(key)
+            self._access_order.append(key)
             return self._memory_cache[key]
 
         # Disk cache
@@ -429,9 +436,21 @@ class ProofCache:
         return None
 
     def put(self, job: ProofJob) -> None:
-        """Cache a completed job result."""
+        """Cache a completed job result (LRU-bounded)."""
         key = self._hash_code(job.lean_code)
+        # Evict oldest entries when at capacity
+        while len(self._memory_cache) >= self._MAX_MEMORY_ENTRIES:
+            if self._access_order:
+                evict_key = self._access_order.pop(0)
+                self._memory_cache.pop(evict_key, None)
+            else:
+                # Fallback: clear an arbitrary entry
+                self._memory_cache.pop(next(iter(self._memory_cache)), None)
+                break
         self._memory_cache[key] = job
+        if key in self._access_order:
+            self._access_order.remove(key)
+        self._access_order.append(key)
 
         if self._cache_dir:
             self._cache_dir.mkdir(parents=True, exist_ok=True)

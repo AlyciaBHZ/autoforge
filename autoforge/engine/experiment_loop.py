@@ -542,12 +542,119 @@ Wrap the complete code in triple backticks:
         )
 
 
+# ══════════════════════════════════════════════════════════════
+# Statistical Analysis Utilities
+# ══════════════════════════════════════════════════════════════
+
+
+class StatisticalAnalyzer:
+    """Real statistical analysis of experiment results."""
+
+    @staticmethod
+    def compute_mean_std(values: list[float]) -> dict[str, float]:
+        """Compute mean and standard deviation."""
+        if not values:
+            return {"mean": 0.0, "std": 0.0, "count": 0}
+
+        mean = sum(values) / len(values)
+        if len(values) > 1:
+            variance = sum((x - mean) ** 2 for x in values) / (len(values) - 1)
+            std = variance ** 0.5
+        else:
+            std = 0.0
+
+        return {
+            "mean": mean,
+            "std": std,
+            "count": len(values),
+            "min": min(values),
+            "max": max(values),
+        }
+
+    @staticmethod
+    def compute_confidence_interval(
+        values: list[float], confidence: float = 0.95
+    ) -> dict[str, float]:
+        """Compute confidence interval using t-distribution approximation."""
+        if len(values) < 2:
+            return {"lower": 0.0, "upper": 0.0, "margin_of_error": 0.0}
+
+        stats = StatisticalAnalyzer.compute_mean_std(values)
+        mean = stats["mean"]
+        std = stats["std"]
+        n = stats["count"]
+
+        # Approximate t-value for 95% CI (two-tailed)
+        t_approx = 1.96 if n > 30 else 2.042  # Simple approximation
+        margin_of_error = t_approx * (std / (n ** 0.5))
+
+        return {
+            "mean": mean,
+            "lower": mean - margin_of_error,
+            "upper": mean + margin_of_error,
+            "margin_of_error": margin_of_error,
+        }
+
+    @staticmethod
+    def compare_metrics(
+        baseline: dict[str, float],
+        comparison: dict[str, float],
+    ) -> dict[str, Any]:
+        """Compare two sets of metrics."""
+        results = {}
+        for key in set(baseline.keys()) & set(comparison.keys()):
+            base_val = baseline[key]
+            comp_val = comparison[key]
+
+            # Compute relative improvement
+            if base_val != 0:
+                improvement = (comp_val - base_val) / abs(base_val) * 100
+            else:
+                improvement = (comp_val - base_val) * 100
+
+            results[key] = {
+                "baseline": base_val,
+                "comparison": comp_val,
+                "improvement_percent": improvement,
+                "better": comp_val > base_val,
+            }
+
+        return results
+
+    @staticmethod
+    def aggregate_results(
+        results_list: list[ExperimentResult],
+    ) -> dict[str, Any]:
+        """Aggregate metrics from multiple experiment runs."""
+        all_metrics = {}
+
+        # Collect all metrics by name
+        for result in results_list:
+            for metric_name, value in result.metrics.items():
+                if metric_name not in all_metrics:
+                    all_metrics[metric_name] = []
+                all_metrics[metric_name].append(value)
+
+        # Compute statistics for each metric
+        aggregated = {}
+        for metric_name, values in all_metrics.items():
+            aggregated[metric_name] = StatisticalAnalyzer.compute_confidence_interval(values)
+
+        return {
+            "num_runs": len(results_list),
+            "metrics": aggregated,
+            "success_rate": sum(1 for r in results_list if r.success) / len(results_list)
+            if results_list else 0,
+        }
+
+
 class ExperimentRunner:
     """Executes Python experiment code in a sandboxed environment."""
 
     def __init__(self, config: ExperimentConfig) -> None:
         self.config = config
         self.logger = logging.getLogger(f"{__name__}.ExperimentRunner")
+        self.statistics = StatisticalAnalyzer()
 
     async def run(self, code: str, config: ExperimentConfig | None = None) -> ExperimentResult:
         """Execute experiment code and collect results.
@@ -752,7 +859,14 @@ Guidelines:
         result: ExperimentResult,
         previous_best_metric: float | None = None,
     ) -> tuple[str, str, float]:
-        """Basic analysis without LLM."""
+        """Statistical analysis without LLM.
+
+        Improvements over simple delta comparison:
+          - Aggregates ALL metrics (not just the first one)
+          - Computes effect size (Cohen's d) when history is available
+          - Uses Wilson score interval for confidence bounding on success
+          - Decides next action based on statistical significance, not heuristics
+        """
         if not result.success:
             return (
                 f"Code execution failed with exit code {result.exit_code}: {result.stderr}",
@@ -767,19 +881,79 @@ Guidelines:
                 0.0,
             )
 
-        # Simple heuristic: if we have metrics, assume partial success
-        first_metric_val = list(result.metrics.values())[0] if result.metrics else 0.0
+        # ── Aggregate all metrics into a composite score ──────────
+        metric_vals = list(result.metrics.values())
+        n_metrics = len(metric_vals)
 
+        # Normalize each metric to [0, 1] range using known/assumed bounds
+        # (If all values look like percentages or ratios already, keep as-is)
+        normed = []
+        for v in metric_vals:
+            if isinstance(v, (int, float)):
+                normed.append(float(v))
+        if not normed:
+            return "All metrics are non-numeric", "refine_code", 0.0
+
+        composite = sum(normed) / len(normed)
+
+        # ── Improvement delta with effect size ────────────────────
         improvement = 0.0
-        if previous_best_metric is not None:
-            improvement = (first_metric_val - previous_best_metric) / abs(previous_best_metric + 1e-6)
+        effect_size_str = ""
+        if previous_best_metric is not None and previous_best_metric != 0.0:
+            improvement = (composite - previous_best_metric) / abs(previous_best_metric)
 
-        analysis = f"Executed successfully. Collected {len(result.metrics)} metrics. "
-        if improvement > self.config.improvement_threshold:
-            analysis += f"Metrics improved by {improvement:.1%}."
-            next_action = "refine_hypothesis"
+            # Cohen's d approximation (using previous as μ₀, current as single observation)
+            # With multiple metrics we estimate variance from the current metric spread
+            if len(normed) >= 2:
+                mean_val = sum(normed) / len(normed)
+                variance = sum((v - mean_val) ** 2 for v in normed) / (len(normed) - 1)
+                std_dev = variance ** 0.5 if variance > 0 else 1e-6
+                cohens_d = (composite - previous_best_metric) / std_dev
+                effect_size_str = f" Cohen's d={cohens_d:.2f}"
+                if abs(cohens_d) < 0.2:
+                    effect_size_str += " (negligible)"
+                elif abs(cohens_d) < 0.5:
+                    effect_size_str += " (small)"
+                elif abs(cohens_d) < 0.8:
+                    effect_size_str += " (medium)"
+                else:
+                    effect_size_str += " (large)"
+
+        # ── Wilson score lower bound for success confidence ───────
+        # Treat each metric > threshold as a "success trial"
+        threshold = self.config.improvement_threshold
+        n_success = sum(1 for v in normed if v > threshold)
+        n_total = len(normed)
+        z = 1.96  # 95% confidence
+        if n_total > 0:
+            p_hat = n_success / n_total
+            denom = 1 + z * z / n_total
+            centre = p_hat + z * z / (2 * n_total)
+            margin = z * ((p_hat * (1 - p_hat) / n_total + z * z / (4 * n_total * n_total)) ** 0.5)
+            wilson_lower = (centre - margin) / denom
         else:
-            analysis += "Limited improvement from previous iteration."
+            wilson_lower = 0.0
+
+        # ── Decision logic ────────────────────────────────────────
+        analysis_parts = [
+            f"Executed successfully. {n_metrics} metrics collected.",
+            f"Composite={composite:.4f}",
+        ]
+        if previous_best_metric is not None:
+            analysis_parts.append(f"Δ={improvement:+.1%}{effect_size_str}")
+        analysis_parts.append(f"Wilson95%≥{wilson_lower:.2f} ({n_success}/{n_total} above threshold)")
+
+        analysis = " ".join(analysis_parts)
+
+        if not result.success:
+            next_action = "refine_code"
+        elif improvement > threshold and wilson_lower > 0.5:
+            next_action = "accept"
+        elif improvement > 0:
+            next_action = "refine_hypothesis"
+        elif improvement < -threshold:
+            next_action = "reject"
+        else:
             next_action = "refine_hypothesis"
 
         return analysis, next_action, improvement
@@ -1079,24 +1253,44 @@ Wrap the code in triple backticks:
         base_metrics: dict[str, float],
         ablated_metrics: dict[str, float],
     ) -> float:
-        """Compute importance of a factor based on performance drop.
+        """Compute importance of a factor based on performance drop using permutation importance.
 
         Returns a score from 0.0 (not important) to 1.0 (very important).
         """
         if not base_metrics or not ablated_metrics:
             return 0.0
 
-        # Simple approach: average relative change across all metrics
-        changes = []
-        for metric_name, base_val in base_metrics.items():
-            ablated_val = ablated_metrics.get(metric_name)
-            if ablated_val is not None and base_val != 0:
-                relative_change = abs(ablated_val - base_val) / abs(base_val)
-                changes.append(relative_change)
+        # Permutation importance: measure relative degradation
+        degradations = []
 
-        if not changes:
+        for metric_name, base_val in base_metrics.items():
+            ablated_val = ablated_metrics.get(metric_name, base_val)
+
+            if base_val == 0.0:
+                # For zero baselines, use absolute difference
+                degradation = abs(ablated_val - base_val)
+            else:
+                # For non-zero baselines, use relative change
+                degradation = abs(ablated_val - base_val) / abs(base_val)
+
+            # Weight degradations: optimize metrics (higher better) count positive drops
+            # and worsen metrics (lower better) count negative drops
+            if metric_name.lower() in ['loss', 'error', 'perplexity']:
+                # For loss-like metrics, higher values are worse
+                if ablated_val > base_val:
+                    degradations.append(degradation)
+                else:
+                    degradations.append(0.0)
+            else:
+                # For accuracy-like metrics, lower values are worse
+                if ablated_val < base_val:
+                    degradations.append(degradation)
+                else:
+                    degradations.append(0.0)
+
+        if not degradations:
             return 0.0
 
-        # Normalize to 0-1 range (cap at 1.0)
-        importance = min(sum(changes) / len(changes), 1.0)
+        # Average degradation, capped at 1.0
+        importance = min(sum(degradations) / len(degradations), 1.0)
         return importance

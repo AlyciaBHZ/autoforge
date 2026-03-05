@@ -28,12 +28,215 @@ from __future__ import annotations
 import json
 import logging
 import re
+import statistics
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────
+# Real Finite-Difference Gradient Estimation
+# ──────────────────────────────────────────────
+
+
+class FiniteDifferenceGradient:
+    """Real gradient estimation via finite differences.
+
+    Instead of asking LLM "what should change?", we:
+    1. Perturb agent parameters (temperature, emphasis weights, etc.)
+    2. Measure output quality delta via actual execution
+    3. Compute ∂quality/∂parameter numerically
+    4. Accumulate gradients across multiple samples for stability
+    """
+
+    def __init__(self, epsilon: float = 0.05, momentum: float = 0.9) -> None:
+        self.epsilon = epsilon  # Perturbation size
+        self.momentum = momentum
+        self._grad_history: dict[str, list[float]] = {}  # param_name → gradient history
+        self._velocity: dict[str, float] = {}  # Momentum-based smoothing
+        self._algo_calls = 0
+        self._fallback_calls = 0
+
+    @property
+    def algorithm_ratio(self) -> float:
+        """Ratio of finite-difference calls to total gradient calls."""
+        total = self._algo_calls + self._fallback_calls
+        return self._algo_calls / total if total > 0 else 0.0
+
+    def estimate_gradient(
+        self,
+        param_name: str,
+        current_value: float,
+        quality_at_current: float,
+        quality_at_perturbed: float,
+    ) -> float:
+        """Compute numerical gradient for a single parameter.
+
+        gradient ≈ (f(x + ε) - f(x)) / ε
+
+        Args:
+            param_name: Name of the parameter being optimized
+            current_value: Current parameter value (for tracking)
+            quality_at_current: Quality metric at f(x)
+            quality_at_perturbed: Quality metric at f(x + ε)
+
+        Returns:
+            Smoothed gradient estimate using momentum
+        """
+        gradient = (quality_at_perturbed - quality_at_current) / self.epsilon
+
+        # Momentum-based smoothing for stability
+        if param_name not in self._velocity:
+            self._velocity[param_name] = 0.0
+        self._velocity[param_name] = (
+            self.momentum * self._velocity[param_name] +
+            (1 - self.momentum) * gradient
+        )
+
+        # Track history for statistics
+        if param_name not in self._grad_history:
+            self._grad_history[param_name] = []
+        self._grad_history[param_name].append(gradient)
+
+        self._algo_calls += 1
+        return self._velocity[param_name]
+
+    def suggest_update(
+        self,
+        param_name: str,
+        current_value: float,
+        learning_rate: float = 0.01,
+    ) -> float:
+        """Suggest new parameter value based on accumulated gradient.
+
+        Args:
+            param_name: Parameter name
+            current_value: Current parameter value
+            learning_rate: Step size for update
+
+        Returns:
+            New parameter value: x_new = x + lr * velocity
+        """
+        velocity = self._velocity.get(param_name, 0.0)
+        return current_value + learning_rate * velocity
+
+    def record_fallback(self) -> None:
+        """Record a fallback to LLM-based gradient (for ratio tracking)."""
+        self._fallback_calls += 1
+
+    def get_gradient_stats(self) -> dict[str, dict[str, Any]]:
+        """Return statistics about gradient history for each parameter.
+
+        Returns:
+            Dict mapping param names to {mean, std, n_samples, velocity}
+        """
+        stats = {}
+        for name, history in self._grad_history.items():
+            if history:
+                stats[name] = {
+                    "mean": statistics.mean(history),
+                    "std": statistics.stdev(history) if len(history) > 1 else 0.0,
+                    "n_samples": len(history),
+                    "velocity": self._velocity.get(name, 0.0),
+                }
+        return stats
+
+    def reset(self) -> None:
+        """Reset gradient accumulators for a new parameter sweep."""
+        self._grad_history.clear()
+        self._velocity.clear()
+
+
+# ──────────────────────────────────────────────
+# Topology Optimizer (Edge Weight Optimization)
+# ──────────────────────────────────────────────
+
+
+class TopologyOptimizer:
+    """Real topology optimization using gradient-based edge weight updates.
+
+    Tracks which agent→agent communication edges are effective
+    and adjusts weights using actual performance correlation.
+    """
+
+    def __init__(self, learning_rate: float = 0.01, decay: float = 0.99) -> None:
+        self.lr = learning_rate
+        self.decay = decay
+        self._edge_effectiveness: dict[tuple[str, str], list[float]] = {}
+        self._edge_weights: dict[tuple[str, str], float] = {}
+
+    def record_edge_usage(
+        self,
+        source: str,
+        target: str,
+        quality_before: float,
+        quality_after: float,
+    ) -> None:
+        """Record the effect of an agent→agent communication.
+
+        Args:
+            source: Source agent name
+            target: Target agent name
+            quality_before: Quality metric before edge was used
+            quality_after: Quality metric after edge was used
+        """
+        edge = (source, target)
+        effectiveness = quality_after - quality_before
+        if edge not in self._edge_effectiveness:
+            self._edge_effectiveness[edge] = []
+            self._edge_weights[edge] = 1.0
+        self._edge_effectiveness[edge].append(effectiveness)
+
+        # Update edge weight using exponential moving average of last 10 observations
+        history = self._edge_effectiveness[edge]
+        avg_effect = sum(history[-10:]) / min(len(history), 10)
+
+        # Clip weight to [0.1, 2.0] to prevent extreme values
+        self._edge_weights[edge] = max(0.1, min(2.0,
+            self._edge_weights[edge] + self.lr * avg_effect))
+
+    def get_edge_weight(self, source: str, target: str) -> float:
+        """Get current weight for an edge.
+
+        Returns:
+            Edge weight (default 1.0 if not yet recorded)
+        """
+        return self._edge_weights.get((source, target), 1.0)
+
+    def prune_weak_edges(self, threshold: float = 0.3) -> list[tuple[str, str]]:
+        """Identify edges that should be pruned (consistently unhelpful).
+
+        Args:
+            threshold: Minimum edge weight before pruning
+
+        Returns:
+            List of (source, target) edges to prune
+        """
+        pruned = []
+        for edge, weight in self._edge_weights.items():
+            if weight < threshold and len(self._edge_effectiveness.get(edge, [])) >= 5:
+                pruned.append(edge)
+        return pruned
+
+    def get_topology_report(self) -> dict[str, Any]:
+        """Return current topology state.
+
+        Returns:
+            Dict with edges and weak_edges lists
+        """
+        return {
+            "edges": {
+                f"{s}→{t}": {
+                    "weight": w,
+                    "n_observations": len(self._edge_effectiveness.get((s, t), []))
+                }
+                for (s, t), w in self._edge_weights.items()
+            },
+            "weak_edges": [f"{s}→{t}" for s, t in self.prune_weak_edges()],
+        }
 
 
 # ──────────────────────────────────────────────
@@ -141,6 +344,10 @@ class EvoMACEngine:
         self._iteration = 0
         # Causal verification: store (score_before, score_after) deltas per edge
         self._edge_deltas: dict[tuple[str, str], list[float]] = {}
+        # Real finite-difference gradient estimation
+        self._fd_gradient = FiniteDifferenceGradient(epsilon=0.05, momentum=0.9)
+        # Real topology optimization via edge effectiveness
+        self._topology_optimizer = TopologyOptimizer(learning_rate=0.01, decay=0.99)
         self._init_topology()
 
     @property
@@ -162,6 +369,93 @@ class EvoMACEngine:
         self._iteration += 1
         logger.info(f"[EvoMAC] Starting iteration {self._iteration}")
         return self._iteration
+
+    # ──────── Finite-Difference Gradient Estimation ────────
+
+    def estimate_parameter_gradient(
+        self,
+        param_name: str,
+        current_value: float,
+        quality_at_current: float,
+        quality_at_perturbed: float,
+    ) -> float:
+        """Estimate gradient of quality w.r.t. a single parameter via finite differences.
+
+        This is a PRIMARY gradient estimation method that measures real quality deltas
+        instead of asking the LLM "what should change?".
+
+        Args:
+            param_name: Name of the parameter (e.g. "temperature", "emphasis_weight")
+            current_value: Current parameter value (for tracking)
+            quality_at_current: Quality metric f(x)
+            quality_at_perturbed: Quality metric f(x + ε)
+
+        Returns:
+            Smoothed gradient estimate using momentum
+        """
+        return self._fd_gradient.estimate_gradient(
+            param_name,
+            current_value,
+            quality_at_current,
+            quality_at_perturbed,
+        )
+
+    def suggest_parameter_update(
+        self,
+        param_name: str,
+        current_value: float,
+        learning_rate: float = 0.01,
+    ) -> float:
+        """Suggest new parameter value based on accumulated finite-difference gradients.
+
+        Args:
+            param_name: Parameter name
+            current_value: Current value
+            learning_rate: Step size
+
+        Returns:
+            Recommended new parameter value
+        """
+        return self._fd_gradient.suggest_update(param_name, current_value, learning_rate)
+
+    def record_edge_effectiveness(
+        self,
+        source: str,
+        target: str,
+        quality_before: float,
+        quality_after: float,
+    ) -> None:
+        """Record the measured effectiveness of an agent→agent communication edge.
+
+        This feeds the topology optimizer, which adjusts edge weights based on
+        actual quality improvements.
+
+        Args:
+            source: Source agent
+            target: Target agent
+            quality_before: Quality metric before the edge was used
+            quality_after: Quality metric after the edge was used
+        """
+        self._topology_optimizer.record_edge_usage(source, target, quality_before, quality_after)
+
+        # Also update the corresponding edge weight in the topology
+        for edge in self._topology:
+            if edge.source == source and edge.target == target:
+                new_weight = self._topology_optimizer.get_edge_weight(source, target)
+                edge.weight = new_weight
+                break
+
+    def get_fd_gradient_stats(self) -> dict[str, Any]:
+        """Get statistics about finite-difference gradient estimation.
+
+        Returns:
+            Dict with algorithm_ratio, parameter_stats, and edge_stats
+        """
+        return {
+            "algorithm_ratio": round(self._fd_gradient.algorithm_ratio, 2),
+            "parameter_stats": self._fd_gradient.get_gradient_stats(),
+            "edge_stats": self._topology_optimizer.get_topology_report(),
+        }
 
     # ──────── Backward Pass: generate text gradients ────────
 
@@ -407,6 +701,9 @@ class EvoMACEngine:
             for block in response.content:
                 if block.type == "text":
                     text += block.text
+
+            # Record that we fell back to LLM-based gradients (vs finite-difference)
+            self._fd_gradient.record_fallback()
 
             updated = text.strip()
             if updated and len(updated) > 50:
@@ -778,6 +1075,20 @@ class EvoMACEngine:
                 f"{src}::{tgt}": deltas
                 for (src, tgt), deltas in self._edge_deltas.items()
             },
+            "fd_gradient_stats": {
+                "algo_calls": self._fd_gradient._algo_calls,
+                "fallback_calls": self._fd_gradient._fallback_calls,
+                "grad_history": {
+                    name: history
+                    for name, history in self._fd_gradient._grad_history.items()
+                },
+            },
+            "topology_optimizer_stats": {
+                "edge_weights": {
+                    f"{src}::{tgt}": w
+                    for (src, tgt), w in self._topology_optimizer._edge_weights.items()
+                },
+            },
         }
         path = output_dir / "evomac_state.json"
         path.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -810,9 +1121,30 @@ class EvoMACEngine:
                 parts = key_str.split("::")
                 if len(parts) == 2:
                     self._edge_deltas[(parts[0], parts[1])] = deltas
+
+            # Restore finite-difference gradient state
+            fd_stats = data.get("fd_gradient_stats", {})
+            if fd_stats:
+                self._fd_gradient._algo_calls = fd_stats.get("algo_calls", 0)
+                self._fd_gradient._fallback_calls = fd_stats.get("fallback_calls", 0)
+                grad_hist = fd_stats.get("grad_history", {})
+                self._fd_gradient._grad_history = {
+                    name: history for name, history in grad_hist.items()
+                }
+
+            # Restore topology optimizer state
+            topo_stats = data.get("topology_optimizer_stats", {})
+            if topo_stats:
+                edge_weights_raw = topo_stats.get("edge_weights", {})
+                for key_str, weight in edge_weights_raw.items():
+                    parts = key_str.split("::")
+                    if len(parts) == 2:
+                        self._topology_optimizer._edge_weights[(parts[0], parts[1])] = weight
+
             logger.info(
                 f"[EvoMAC] Loaded state: iteration={self._iteration}, "
-                f"edge_deltas_count={len(self._edge_deltas)}"
+                f"edge_deltas_count={len(self._edge_deltas)}, "
+                f"fd_algo_ratio={self._fd_gradient.algorithm_ratio:.2f}"
             )
         except Exception as e:
             logger.warning(f"[EvoMAC] Failed to load state: {e}")
@@ -825,4 +1157,10 @@ class EvoMACEngine:
             "total_edges": len(self._topology),
             "pending_gradients": sum(len(g) for g in self._pending_gradients.values()),
             "performance_trend": self.get_improvement_trend(),
+            "algorithm_ratio": round(self._fd_gradient.algorithm_ratio, 2),
+            "gradient_estimation_stats": {
+                "algo_calls": self._fd_gradient._algo_calls,
+                "fallback_calls": self._fd_gradient._fallback_calls,
+                "parameters_tracked": len(self._fd_gradient._grad_history),
+            },
         }

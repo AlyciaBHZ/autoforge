@@ -182,6 +182,271 @@ class MetaReview:
 
 
 # ══════════════════════════════════════════════════════════════
+# Scoring Aggregation & Inter-Reviewer Agreement
+# ══════════════════════════════════════════════════════════════
+
+
+class ScoringAggregator:
+    """Aggregate scores using confidence-weighted Bayesian estimation,
+    reviewer bias detection, and Fleiss' kappa inter-rater agreement.
+
+    Key improvements over simple averaging:
+      - Confidence-weighted: a reviewer with confidence=5 counts more than
+        one with confidence=2.
+      - Reviewer bias detection: flags outlier reviewers (> 2 MAD from
+        median) so downstream consumers can investigate.
+      - Fleiss' kappa: proper inter-rater reliability statistic instead of
+        ad-hoc "proportion within 1 point of mean".
+      - Decision aggregation uses confidence-weighted scoring, not raw mean.
+    """
+
+    # Weighted criteria for meta-review consensus
+    CRITERIA_WEIGHTS = {
+        "soundness": 0.25,
+        "presentation": 0.15,
+        "contribution": 0.25,
+        "novelty": 0.20,
+        "reproducibility": 0.15,
+    }
+
+    _SCORE_FIELDS = [
+        "soundness", "presentation", "contribution",
+        "novelty", "reproducibility",
+    ]
+
+    # ── confidence-weighted aggregation ─────────────────────────
+
+    @staticmethod
+    def _confidence_weighted_mean(values: list[float], weights: list[float]) -> float:
+        """Weighted mean where each reviewer's confidence acts as weight.
+
+        Falls back to equal weighting when all weights are zero.
+        """
+        total_w = sum(weights)
+        if total_w <= 0:
+            return sum(values) / len(values) if values else 0.0
+        return sum(v * w for v, w in zip(values, weights)) / total_w
+
+    @staticmethod
+    def aggregate_scores(reviews: list[PeerReview]) -> ReviewScore:
+        """Confidence-weighted consensus scores from multiple reviews.
+
+        Each reviewer's self-reported confidence (1-5) is used as a weight,
+        giving more influence to reviewers who are sure of their assessment.
+        """
+        if not reviews:
+            return ReviewScore(3, 3, 3, 3, 3, 6, 3, "borderline")
+
+        confidences = [float(r.scores.confidence) for r in reviews]
+
+        agg: dict[str, int] = {}
+        for fld in ScoringAggregator._SCORE_FIELDS:
+            vals = [float(getattr(r.scores, fld)) for r in reviews]
+            agg[fld] = round(ScoringAggregator._confidence_weighted_mean(vals, confidences))
+
+        overall_vals = [float(r.scores.overall) for r in reviews]
+        overall = round(ScoringAggregator._confidence_weighted_mean(overall_vals, confidences))
+        confidence = round(sum(confidences) / len(confidences))
+
+        decisions = [r.scores.decision for r in reviews]
+        decision = ScoringAggregator._aggregate_decisions(decisions, confidences)
+
+        return ReviewScore(
+            soundness=agg["soundness"],
+            presentation=agg["presentation"],
+            contribution=agg["contribution"],
+            novelty=agg["novelty"],
+            reproducibility=agg["reproducibility"],
+            overall=overall,
+            confidence=confidence,
+            decision=decision,
+        )
+
+    # ── decision aggregation ────────────────────────────────────
+
+    _DECISION_WEIGHTS = {
+        "strong_accept": 2.0,
+        "accept": 1.0,
+        "weak_accept": 0.5,
+        "borderline": 0.0,
+        "weak_reject": -0.5,
+        "reject": -1.0,
+        "strong_reject": -2.0,
+    }
+
+    @staticmethod
+    def _aggregate_decisions(
+        decisions: list[str],
+        confidences: list[float] | None = None,
+    ) -> str:
+        """Confidence-weighted decision aggregation.
+
+        When *confidences* is provided each decision is weighted by the
+        reviewer's confidence; otherwise falls back to equal weights.
+        """
+        dw = ScoringAggregator._DECISION_WEIGHTS
+        if confidences and len(confidences) == len(decisions):
+            total_c = sum(confidences) or 1.0
+            avg = sum(dw.get(d, 0.0) * c for d, c in zip(decisions, confidences)) / total_c
+        else:
+            avg = sum(dw.get(d, 0.0) for d in decisions) / max(len(decisions), 1)
+
+        # Map continuous score back to discrete decision
+        thresholds = [
+            (1.5, "strong_accept"),
+            (0.5, "accept"),
+            (0.0, "weak_accept"),
+            (-0.5, "borderline"),
+            (-1.5, "weak_reject"),
+            (-2.0, "reject"),
+        ]
+        for threshold, label in thresholds:
+            if avg >= threshold:
+                return label
+        return "strong_reject"
+
+    # ── reviewer bias / outlier detection ───────────────────────
+
+    @staticmethod
+    def detect_reviewer_bias(reviews: list[PeerReview]) -> list[dict[str, Any]]:
+        """Detect reviewers whose scores deviate significantly from peers.
+
+        Uses Median Absolute Deviation (MAD) — more robust than std-dev
+        for small samples.  A reviewer is flagged if their mean deviation
+        from the per-criterion median exceeds 2 × MAD across criteria.
+
+        Returns:
+            List of dicts ``{reviewer_id, mean_deviation, flagged}``
+        """
+        if len(reviews) < 3:
+            return []
+
+        n_fields = len(ScoringAggregator._SCORE_FIELDS)
+        # Per-criterion medians
+        medians: dict[str, float] = {}
+        for fld in ScoringAggregator._SCORE_FIELDS:
+            vals = sorted(float(getattr(r.scores, fld)) for r in reviews)
+            mid = len(vals) // 2
+            medians[fld] = (vals[mid] + vals[~mid]) / 2  # works for even/odd
+
+        # Per-reviewer absolute deviation from median, averaged over criteria
+        deviations: list[float] = []
+        for r in reviews:
+            dev = sum(abs(float(getattr(r.scores, fld)) - medians[fld])
+                      for fld in ScoringAggregator._SCORE_FIELDS) / n_fields
+            deviations.append(dev)
+
+        # MAD of the deviations
+        med_dev = sorted(deviations)[len(deviations) // 2]
+        abs_devs = sorted(abs(d - med_dev) for d in deviations)
+        mad = abs_devs[len(abs_devs) // 2] if abs_devs else 0.0
+        threshold = med_dev + 2.0 * (mad if mad > 0 else 0.5)
+
+        results = []
+        for i, r in enumerate(reviews):
+            results.append({
+                "reviewer_id": getattr(r, "reviewer_id", f"reviewer_{i}"),
+                "mean_deviation": round(deviations[i], 3),
+                "flagged": deviations[i] > threshold,
+            })
+        return results
+
+    # ── Fleiss' kappa (proper inter-rater agreement) ────────────
+
+    @staticmethod
+    def compute_inter_rater_agreement(reviews: list[PeerReview]) -> dict[str, float]:
+        """Compute Fleiss' kappa for each criterion.
+
+        Fleiss' kappa is the standard multi-rater reliability metric.  It
+        measures the degree of agreement above what would be expected by
+        chance.  Interpretation:
+
+            κ < 0.00 — poor (less than chance)
+            0.00-0.20 — slight
+            0.21-0.40 — fair
+            0.41-0.60 — moderate
+            0.61-0.80 — substantial
+            0.81-1.00 — near-perfect
+
+        Scores are binned into 5 categories (1-2, 3-4, 5-6, 7-8, 9-10)
+        because ordinal scores on a 1-10 scale rarely achieve exact
+        agreement; binning reflects the resolution of subjective review.
+        """
+        if len(reviews) < 2:
+            return {}
+
+        n_raters = len(reviews)
+        n_categories = 5  # bins
+
+        def _bin(score: float) -> int:
+            """Map 1-10 score to one of 5 bins."""
+            return min(int((score - 1) / 2), n_categories - 1)
+
+        agreement: dict[str, float] = {}
+        for fld in ScoringAggregator._SCORE_FIELDS:
+            scores = [float(getattr(r.scores, fld)) for r in reviews]
+            # Fleiss' kappa for a single "item" (this paper) rated by n raters
+            # Build the count vector: how many raters assigned each category
+            counts = [0] * n_categories
+            for s in scores:
+                counts[_bin(s)] += 1
+
+            # P_i = (1 / n(n-1)) * (sum(n_ij^2) - n)
+            p_i = (sum(c * c for c in counts) - n_raters) / (n_raters * (n_raters - 1)) if n_raters > 1 else 0.0
+
+            # P_e = sum(p_j^2), where p_j = proportion of assignments to category j
+            p_j = [c / n_raters for c in counts]
+            p_e = sum(pj * pj for pj in p_j)
+
+            # kappa = (P_bar - P_e) / (1 - P_e)
+            if abs(1.0 - p_e) < 1e-10:
+                kappa = 1.0  # perfect agreement
+            else:
+                kappa = (p_i - p_e) / (1.0 - p_e)
+
+            agreement[fld] = round(kappa, 4)
+
+        return agreement
+
+    # ── weighted overall score ──────────────────────────────────
+
+    @staticmethod
+    def weighted_overall_score(
+        reviews: list[PeerReview],
+        use_weighted: bool = True,
+    ) -> float:
+        """Confidence-weighted overall score from criteria.
+
+        Uses each reviewer's confidence as a weight so that tentative
+        assessments carry less influence.
+        """
+        if not reviews:
+            return 5.0
+
+        confidences = [float(r.scores.confidence) for r in reviews]
+
+        if not use_weighted:
+            overalls = [float(r.scores.overall) for r in reviews]
+            return ScoringAggregator._confidence_weighted_mean(overalls, confidences)
+
+        cw = ScoringAggregator._confidence_weighted_mean
+        avg_s = cw([float(r.scores.soundness) for r in reviews], confidences) / 5 * 10
+        avg_p = cw([float(r.scores.presentation) for r in reviews], confidences) / 5 * 10
+        avg_c = cw([float(r.scores.contribution) for r in reviews], confidences) / 5 * 10
+        avg_n = cw([float(r.scores.novelty) for r in reviews], confidences) / 5 * 10
+        avg_r = cw([float(r.scores.reproducibility) for r in reviews], confidences) / 5 * 10
+
+        w = ScoringAggregator.CRITERIA_WEIGHTS
+        weighted = (
+            avg_s * w["soundness"] + avg_p * w["presentation"] +
+            avg_c * w["contribution"] + avg_n * w["novelty"] +
+            avg_r * w["reproducibility"]
+        )
+
+        return min(10.0, max(0.0, weighted))
+
+
+# ══════════════════════════════════════════════════════════════
 # Reviewer Agent
 # ══════════════════════════════════════════════════════════════
 
@@ -842,7 +1107,7 @@ class PeerReviewPipeline:
             Dictionary with reviews, rebuttal, meta_review, and report
         """
         logger.info(
-            f"[PeerReview] Starting review for {self.venue}: {num_reviewers} reviewers"
+            f"[PeerReview] Starting review for {self.venue}: {self.num_reviewers} reviewers"
         )
 
         # Step 1: Generate individual reviews

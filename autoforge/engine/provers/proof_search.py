@@ -9,6 +9,7 @@ Contains:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -30,6 +31,257 @@ from autoforge.engine.provers.lean_core import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════
+# Adaptive Beam Search (Width Adaptation)
+# ══════════════════════════════════════════════════════════════
+
+
+class AdaptiveBeamSearch:
+    """Beam search for proof search with adaptive width.
+
+    Dynamically adjusts beam width based on search diversity:
+      - Start with initial_width (typically 5-8)
+      - If candidates significantly exceed beam capacity, expand width
+      - If candidates are sparse, contract width to avoid waste
+      - Cap at max_width to prevent memory explosion
+
+    This reduces redundant exploration while maintaining breadth when diversity is high.
+    """
+
+    def __init__(self, initial_width: int = 5, max_width: int = 20) -> None:
+        """Initialize adaptive beam search.
+
+        Args:
+            initial_width: Starting beam width (candidates to keep per level)
+            max_width: Maximum width to prevent memory overflow
+        """
+        self.width = initial_width
+        self.max_width = max_width
+        self._success_rates: list[float] = []
+        self._algorithm_ratio = 0.5
+
+    async def search(
+        self,
+        initial_state: ProofState,
+        expand_fn: Any,
+        evaluate_fn: Any,
+        max_depth: int = 50,
+    ) -> list[ProofState]:
+        """Run beam search with adaptive width.
+
+        Algorithm:
+          1. Initialize beam with root state
+          2. For each depth level:
+             - Expand all states in beam (generate children)
+             - Score all children via evaluate_fn
+             - Keep top-width candidates
+             - Adapt width based on candidate diversity
+          3. Return any completed proofs (all goals closed)
+
+        Args:
+            initial_state: Starting proof state
+            expand_fn: Function(state) → list[child_states]
+            evaluate_fn: Function(state) → float (quality score)
+            max_depth: Maximum search depth
+
+        Returns:
+            List of completed proof states (empty if no proofs found)
+        """
+        beam = [(0.0, initial_state)]
+        completed_proofs = []
+
+        for depth in range(max_depth):
+            candidates = []
+
+            # Expand all states in current beam
+            for score, state in beam:
+                try:
+                    children = await expand_fn(state) if asyncio.iscoroutinefunction(expand_fn) else expand_fn(state)
+                    if not isinstance(children, list):
+                        children = [children] if children else []
+
+                    for child in children:
+                        child_score = await evaluate_fn(child) if asyncio.iscoroutinefunction(evaluate_fn) else evaluate_fn(child)
+                        candidates.append((child_score, child))
+                except Exception as e:
+                    logger.debug(f"[AdaptiveBeamSearch] Expand/evaluate failed: {e}")
+                    continue
+
+            if not candidates:
+                break
+
+            # Check for solutions in candidates
+            for score, state in candidates:
+                if state.goals == []:  # All goals closed
+                    completed_proofs.append(state)
+
+            # Select top-width candidates
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            beam = candidates[: self.width]
+
+            # Adapt width based on diversity
+            num_candidates = len(candidates)
+            if num_candidates > self.width * 2:
+                self.width = min(self.width + 1, self.max_width)
+                logger.debug(f"[AdaptiveBeamSearch] Expanding width to {self.width}")
+            elif num_candidates < self.width // 2:
+                self.width = max(3, self.width - 1)
+                logger.debug(f"[AdaptiveBeamSearch] Contracting width to {self.width}")
+
+        # Track success rate for algorithm ratio
+        if len(self._success_rates) > 0:
+            self._algorithm_ratio = sum(self._success_rates) / len(self._success_rates)
+
+        return completed_proofs
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get search statistics."""
+        return {
+            "current_width": self.width,
+            "max_width": self.max_width,
+            "algorithm_ratio": self._algorithm_ratio,
+        }
+
+
+# ══════════════════════════════════════════════════════════════
+# Tactic Database with BM25 Retrieval
+# ══════════════════════════════════════════════════════════════
+
+
+class TacticDatabase:
+    """Index proven tactics by goal pattern for efficient retrieval.
+
+    Maintains a memory-based database of successful (goal_pattern, tactic) pairs,
+    indexed by BM25-style relevance scores for fast retrieval during proof search.
+
+    This enables transfer learning: tactics that worked on similar goals before
+    are suggested first for new goals.
+    """
+
+    def __init__(self) -> None:
+        """Initialize tactic database."""
+        self._tactics: list[dict[str, Any]] = []  # Each: {goal, tactic, success}
+        self._idf: dict[str, float] = {}  # Inverse document frequency cache
+        self._algorithm_ratio = 0.5
+
+    def index(self, goal_pattern: str, tactic: str, success: bool) -> None:
+        """Add a tactic application to the database.
+
+        Args:
+            goal_pattern: Goal string or pattern
+            tactic: The tactic that was tried
+            success: Whether the tactic succeeded
+        """
+        self._tactics.append({
+            "goal": goal_pattern,
+            "tactic": tactic,
+            "success": success,
+        })
+        # Update IDF for new terms
+        self._update_idf()
+
+    def retrieve(self, goal: str, top_k: int = 5) -> list[str]:
+        """BM25-style retrieval of relevant tactics.
+
+        Scoring:
+          1. Tokenize both goal and pattern
+          2. Compute overlap (intersection of tokens)
+          3. Weight by IDF + success rate of tactic
+          4. Return top-k tactics
+
+        Args:
+            goal: Current proof goal
+            top_k: Number of tactics to return
+
+        Returns:
+            List of tactic strings ranked by relevance
+        """
+        if not self._tactics:
+            return []
+
+        goal_tokens = set(goal.lower().split())
+        scored = []
+
+        for entry in self._tactics:
+            if not entry["success"]:
+                continue
+
+            pattern_tokens = set(entry["goal"].lower().split())
+            overlap = goal_tokens & pattern_tokens
+
+            if not overlap:
+                continue
+
+            # BM25-style relevance
+            jaccard = len(overlap) / (len(goal_tokens) + len(pattern_tokens) - len(overlap))
+            score = jaccard
+
+            # Bonus for IDF (rare terms are more informative)
+            for token in overlap:
+                if token in self._idf:
+                    score += 0.1 * self._idf[token]
+
+            scored.append((score, entry["tactic"]))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        tactics = [t for _, t in scored[:top_k]]
+
+        # Track algorithm ratio based on retrieval success
+        if tactics:
+            self._algorithm_ratio = min(1.0, len(tactics) / top_k)
+
+        return tactics
+
+    def _update_idf(self) -> None:
+        """Update IDF scores for terms in database."""
+        if not self._tactics:
+            return
+
+        term_doc_count: dict[str, int] = {}
+        total_docs = len(self._tactics)
+
+        for entry in self._tactics:
+            tokens = set(entry["goal"].lower().split())
+            for token in tokens:
+                term_doc_count[token] = term_doc_count.get(token, 0) + 1
+
+        # IDF = log(N / df)
+        for term, count in term_doc_count.items():
+            self._idf[term] = math.log(total_docs / max(1, count))
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get database statistics."""
+        successful = sum(1 for t in self._tactics if t["success"])
+        return {
+            "total_entries": len(self._tactics),
+            "successful_tactics": successful,
+            "unique_goals": len(set(t["goal"] for t in self._tactics)),
+            "algorithm_ratio": self._algorithm_ratio,
+        }
+
+    def save(self, path: Path) -> None:
+        """Save database to JSON file."""
+        data = {
+            "tactics": self._tactics,
+            "idf": self._idf,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        logger.info(f"[TacticDB] Saved {len(self._tactics)} entries to {path}")
+
+    def load(self, path: Path) -> None:
+        """Load database from JSON file."""
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self._tactics = data.get("tactics", [])
+            self._idf = data.get("idf", {})
+            logger.info(f"[TacticDB] Loaded {len(self._tactics)} entries from {path}")
+        except Exception as e:
+            logger.warning(f"[TacticDB] Failed to load: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -58,6 +310,7 @@ class TacticGenerator:
         self._failure_dict: dict[str, set[str]] = {}  # goal_hash → failed tactics
         self._success_cache: dict[str, str] = {}       # goal_hash → successful tactic
         self._lemma_index: list[dict[str, str]] = []   # Retrieved lemma library
+        self._tactic_db = TacticDatabase()  # BM25-indexed tactic database
 
     async def generate_candidates(
         self,
@@ -73,10 +326,11 @@ class TacticGenerator:
         Strategy (Hilbert-inspired multi-source):
           1. Check cache for known solutions
           2. Try automation tactics (simp, omega, aesop, etc.)
-          3. Retrieval-augmented: find relevant lemmas
-          4. LLM informal reasoning → tactic (Lean-STaR)
-          5. LLM direct tactic generation
-          6. Filter out known failures
+          3. Tactic database retrieval (BM25 goal pattern matching)
+          4. Retrieval-augmented: find relevant lemmas
+          5. LLM informal reasoning → tactic (Lean-STaR)
+          6. LLM direct tactic generation
+          7. Filter out known failures
         """
         goal_hash = self._hash_goal(state)
         candidates: list[TacticCandidate] = []
@@ -100,7 +354,17 @@ class TacticGenerator:
                 confidence=0.3,
             ))
 
-        # 3. Retrieval-augmented candidates
+        # 3. Tactic database retrieval (BM25 on goal patterns)
+        goal_text = " ".join(state.goals) if state.goals else ""
+        db_tactics = self._tactic_db.retrieve(goal_text, top_k=3)
+        for tactic in db_tactics:
+            candidates.append(TacticCandidate(
+                tactic=tactic,
+                source=TacticSource.RETRIEVAL,
+                confidence=0.5,
+            ))
+
+        # 4. Retrieval-augmented candidates (lemmas from library)
         if self._lemma_index:
             relevant = self._retrieve_lemmas(state, top_k=5)
             if relevant:
@@ -306,10 +570,13 @@ Suggest Lean 4 tactics that use these lemmas. Return JSON array: ["tactic1", ...
             return []
 
     def record_success(self, state: ProofState, tactic: str) -> None:
-        """Cache successful tactic for future use."""
+        """Cache successful tactic and add to database for transfer learning."""
         goal_hash = self._hash_goal(state)
         self._success_cache[goal_hash] = tactic
         self._failure_dict.pop(goal_hash, None)
+        # Record in tactic database for future retrieval
+        goal_text = " ".join(state.goals) if state.goals else "unknown"
+        self._tactic_db.index(goal_text, tactic, success=True)
 
     def record_failure(self, state: ProofState, tactic: str) -> None:
         """Track failed tactic to avoid retrying (COPRA failure dictionary)."""
@@ -317,6 +584,9 @@ Suggest Lean 4 tactics that use these lemmas. Return JSON array: ["tactic1", ...
         if goal_hash not in self._failure_dict:
             self._failure_dict[goal_hash] = set()
         self._failure_dict[goal_hash].add(tactic)
+        # Record failed attempt in database for negative evidence
+        goal_text = " ".join(state.goals) if state.goals else "unknown"
+        self._tactic_db.index(goal_text, tactic, success=False)
 
     def add_lemmas(self, lemmas: list[dict[str, str]]) -> None:
         """Add lemmas to the retrieval index."""

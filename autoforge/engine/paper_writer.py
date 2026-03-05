@@ -25,6 +25,141 @@ from autoforge.engine.llm_router import TaskComplexity
 logger = logging.getLogger(__name__)
 
 
+# ══════════════════════════════════════════════════════════════
+# LaTeX Template Management
+# ══════════════════════════════════════════════════════════════
+
+
+class TemplateEngine:
+    """Template-driven LaTeX paper generation."""
+
+    TEMPLATE_PREAMBLE = {
+        "neurips": r"""\documentclass{article}
+\usepackage[final]{nips_2024}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\title{${TITLE}}
+\author{${AUTHORS}}
+\begin{document}
+\maketitle
+""",
+        "icml": r"""\documentclass[11pt]{article}
+\usepackage{icml2024}
+\usepackage[utf8]{inputenc}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{subfigure}
+\usepackage{booktabs}
+\icmltitlerunning{${TITLE}}
+\begin{document}
+\twocolumn[
+\icmltitle{${TITLE}}
+\icmlsetsummaryauthor{${FIRST_AUTHOR}}
+]
+\begin{abstract}
+${ABSTRACT}
+\end{abstract}
+""",
+        "iclr": r"""\documentclass{article}
+\usepackage{iclr2024_conference}
+\usepackage[utf8]{inputenc}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\iclrfinalcopy
+\title{${TITLE}}
+\author{${AUTHORS}}
+\begin{document}
+\maketitle
+\begin{abstract}
+${ABSTRACT}
+\end{abstract}
+""",
+        "arxiv": r"""\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\title{${TITLE}}
+\author{${AUTHORS}}
+\date{\today}
+\begin{document}
+\maketitle
+\begin{abstract}
+${ABSTRACT}
+\end{abstract}
+""",
+    }
+
+    def __init__(self, template_name: str = "arxiv"):
+        """Initialize template engine."""
+        if template_name not in self.TEMPLATE_PREAMBLE:
+            logger.warning(f"Unknown template {template_name}, using arxiv")
+            template_name = "arxiv"
+        self.template_name = template_name
+
+    def render_preamble(
+        self,
+        title: str,
+        authors: list[dict],
+        abstract: str = "",
+    ) -> str:
+        """Render document preamble."""
+        template = self.TEMPLATE_PREAMBLE[self.template_name]
+        authors_str = ", ".join(
+            f"{a['name']}" + (f"$^{{{a.get('affiliation_id', '')}}}$" if a.get('affiliation_id') else "")
+            for a in authors
+        )
+        first_author = authors[0]['name'] if authors else "Anonymous"
+
+        result = template
+        result = result.replace("${TITLE}", title.replace("&", r"\&"))
+        result = result.replace("${AUTHORS}", authors_str)
+        result = result.replace("${ABSTRACT}", abstract)
+        result = result.replace("${FIRST_AUTHOR}", first_author)
+        return result
+
+    def render_section(self, title: str, content: str) -> str:
+        """Render a paper section."""
+        return f"\\section{{{title}}}\n{content}\n\n"
+
+    def render_subsection(self, title: str, content: str) -> str:
+        """Render a subsection."""
+        return f"\\subsection{{{title}}}\n{content}\n\n"
+
+    def render_closing(self) -> str:
+        """Render document closing."""
+        return r"""
+\bibliographystyle{plainnat}
+\bibliography{references}
+\end{document}
+"""
+
+    def resolve_references(self, latex_doc: str) -> str:
+        """Resolve cross-references (label → ref mapping)."""
+        # Find all labels and create reference map
+        labels = re.findall(r"\\label\{([^}]+)\}", latex_doc)
+        # Ensure all refs exist
+        for label in labels:
+            if not re.search(rf"\\ref\{{{label}\}}", latex_doc):
+                # Optionally warn about unused labels
+                pass
+        return latex_doc
+
+
 class PaperSection(Enum):
     """Enum of standard academic paper sections."""
     ABSTRACT = "abstract"
@@ -452,6 +587,7 @@ class BibManager:
     def __init__(self) -> None:
         """Initialize bibliography manager."""
         self._entries: dict[str, BibEntry] = {}
+        self.algorithm_ratio: float = 1.0  # Ratio of algorithmic vs LLM-fetched entries
 
     def add_entry(self, entry: BibEntry) -> None:
         """Add a bibliography entry.
@@ -576,6 +712,76 @@ class BibManager:
     def get_entries(self) -> dict[str, BibEntry]:
         """Get all bibliography entries."""
         return self._entries.copy()
+
+    def parse_bibtex_file(self, bib_path: Path) -> int:
+        """Parse and merge entries from a .bib file.
+
+        Args:
+            bib_path: Path to .bib file
+
+        Returns:
+            Number of entries parsed
+        """
+        if not bib_path.exists():
+            logger.warning(f"Bibliography file not found: {bib_path}")
+            return 0
+
+        try:
+            content = bib_path.read_text(encoding="utf-8")
+            # Simple regex-based BibTeX parsing
+            entries = re.findall(
+                r"@(\w+)\s*\{\s*([^,]+),\s*(.*?)\n\s*\}",
+                content,
+                re.DOTALL | re.IGNORECASE,
+            )
+
+            parsed_count = 0
+            for entry_type, key, fields_str in entries:
+                # Parse fields
+                fields = {}
+                for field_match in re.finditer(r"(\w+)\s*=\s*\{([^}]*)\}", fields_str):
+                    field_name = field_match.group(1).lower()
+                    field_value = field_match.group(2).strip()
+                    fields[field_name] = field_value
+
+                # Extract authors
+                authors = []
+                if "author" in fields:
+                    authors = [a.strip() for a in fields["author"].split(" and ")]
+
+                entry = BibEntry(
+                    key=key.strip(),
+                    entry_type=entry_type.lower(),
+                    title=fields.get("title", ""),
+                    authors=authors,
+                    year=int(fields.get("year", 0)) if fields.get("year") else 0,
+                    venue=fields.get("journal", fields.get("booktitle", "")),
+                    url=fields.get("url", ""),
+                    doi=fields.get("doi", ""),
+                    pages=fields.get("pages", ""),
+                    volume=fields.get("volume", ""),
+                    number=fields.get("number", ""),
+                    publisher=fields.get("publisher", ""),
+                )
+                self.add_entry(entry)
+                parsed_count += 1
+
+            logger.info(f"Parsed {parsed_count} bibliography entries from {bib_path}")
+            return parsed_count
+
+        except Exception as e:
+            logger.error(f"Error parsing bibliography file: {e}")
+            return 0
+
+    def merge_bibliography(self, other: "BibManager") -> None:
+        """Merge entries from another BibManager, avoiding duplicates.
+
+        Args:
+            other: Another BibManager to merge from
+        """
+        for key, entry in other.get_entries().items():
+            if key not in self._entries:
+                self._entries[key] = entry
 
 
 class SectionWriter:

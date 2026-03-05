@@ -38,6 +38,142 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# ──────────────────────────────────────────────
+# Algorithmic Argument Ranking
+# ──────────────────────────────────────────────
+
+
+class EloArgumentRanker:
+    """Elo-based ranking system for debate arguments.
+
+    Tracks argument quality using the Elo rating system, allowing
+    arguments to be objectively ranked and compared across debates.
+    """
+    K_FACTOR = 32
+
+    def __init__(self) -> None:
+        self._ratings: dict[str, float] = {}  # argument_id → Elo rating
+
+    def expected_score(self, rating_a: float, rating_b: float) -> float:
+        """Calculate expected score for rating_a vs rating_b."""
+        return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400))
+
+    def update(self, winner_id: str, loser_id: str) -> None:
+        """Update ratings after a debate outcome."""
+        ra = self._ratings.get(winner_id, 1500)
+        rb = self._ratings.get(loser_id, 1500)
+        ea = self.expected_score(ra, rb)
+        self._ratings[winner_id] = ra + self.K_FACTOR * (1 - ea)
+        self._ratings[loser_id] = rb + self.K_FACTOR * (0 - (1 - ea))
+
+    def get_rating(self, arg_id: str) -> float:
+        """Get current Elo rating for an argument."""
+        return self._ratings.get(arg_id, 1500)
+
+
+class ArgumentQualityScorer:
+    """Score argument quality using text metrics (non-LLM).
+
+    Evaluates arguments based on:
+    - Evidence density: presence of evidence indicators
+    - Specificity: unique terminology
+    - Length adequacy: not too short or verbose
+    """
+
+    def score(self, argument: str, context: str = "") -> dict[str, float]:
+        """Score argument quality metrics.
+
+        Returns a dict with individual metrics and composite score [0, 1].
+        """
+        words = argument.lower().split()
+
+        # Evidence density: ratio of evidence-indicating words
+        evidence_words = {
+            'because', 'therefore', 'since', 'given', 'evidence', 'data',
+            'shows', 'demonstrates', 'proves', 'according', 'research',
+            'study', 'result', 'evidence', 'test', 'validation'
+        }
+        evidence_count = sum(1 for w in words if w in evidence_words)
+        evidence_density = evidence_count / max(len(words), 1)
+
+        # Specificity: unique terms / total terms
+        specificity = len(set(words)) / max(len(words), 1)
+
+        # Length adequacy: penalize too short or too long
+        # Optimal around 50 words; acceptable 30-200
+        length_score = min(1.0, len(words) / 50) * min(1.0, 200 / max(len(words), 1))
+
+        # Composite: weighted combination
+        composite = (
+            evidence_density * 0.4 +
+            specificity * 0.3 +
+            length_score * 0.3
+        )
+
+        return {
+            "evidence_density": evidence_density,
+            "specificity": specificity,
+            "length_adequacy": length_score,
+            "composite": composite,
+        }
+
+
+class LogicalConsistencyChecker:
+    """Check logical consistency of arguments.
+
+    Uses propositional logic patterns and term analysis to detect
+    contradictions and inconsistencies.
+    """
+
+    def check_consistency(self, arguments: list[str]) -> dict[str, Any]:
+        """Check consistency across a set of arguments.
+
+        Returns dict with:
+        - consistent: bool
+        - conflicts: list of (arg_i, arg_j, reason)
+        - confidence: float [0, 1]
+        """
+        if len(arguments) < 2:
+            return {"consistent": True, "conflicts": [], "confidence": 1.0}
+
+        conflicts = []
+
+        # Check each pair for potential contradiction
+        for i, arg_a in enumerate(arguments):
+            for j, arg_b in enumerate(arguments[i+1:], i+1):
+                if self._may_contradict(arg_a, arg_b):
+                    conflicts.append((i, j, "Potential contradiction detected"))
+
+        consistent = len(conflicts) == 0
+        # Confidence: 1.0 if consistent, decreases with conflict severity
+        confidence = max(0.1, 1.0 - len(conflicts) * 0.2)
+
+        return {
+            "consistent": consistent,
+            "conflicts": conflicts,
+            "confidence": confidence,
+        }
+
+    def _may_contradict(self, a: str, b: str) -> bool:
+        """Check if two arguments may contradict."""
+        a_lower, b_lower = a.lower(), b.lower()
+
+        # Simple pattern: negation indicators
+        negators = ['never', 'always', 'must not', 'should not', 'do not', 'cannot']
+        a_has_neg = any(neg in a_lower for neg in negators)
+        b_has_neg = any(neg in b_lower for neg in negators)
+
+        # If one has negation and the other doesn't, check for shared key terms
+        if a_has_neg != b_has_neg:
+            a_terms = set(a_lower.split()) - {'the', 'a', 'an', 'is', 'to', 'and', 'or'}
+            b_terms = set(b_lower.split()) - {'the', 'a', 'an', 'is', 'to', 'and', 'or'}
+            shared = a_terms & b_terms
+            if len(shared) > 3:
+                return True
+
+        return False
+
+
 def _extract_json(text: str) -> dict[str, Any] | None:
     """Robustly extract JSON object from LLM response text."""
     from autoforge.engine.utils import extract_json_from_text
@@ -133,6 +269,10 @@ class ConditionalDebateEngine:
 
     def __init__(self) -> None:
         self._debate_history: list[DebateOutcome] = []
+        self._elo_ranker = EloArgumentRanker()
+        self._quality_scorer = ArgumentQualityScorer()
+        self._consistency_checker = LogicalConsistencyChecker()
+        self._algorithm_ratio = 0.0  # Track fraction of decisions using algorithms vs LLM
 
     # ──────── Conditional Trigger ────────
 
@@ -277,19 +417,38 @@ class ConditionalDebateEngine:
                 topic, arguments, context, round_num, llm,
             )
 
-            # Score arguments with reward function
+            # Score arguments: try algorithms first, LLM as fallback
             for arg in new_arguments:
+                # Primary: algorithmic scoring (deterministic, fast)
+                quality_metrics = self._quality_scorer.score(arg.position, arg.reasoning)
+                algo_score = quality_metrics["composite"]
+                used_algo = True
+
+                # Fallback: reward function or LLM if available
                 if reward_fn:
                     try:
-                        score = await reward_fn(arg.position, arg.reasoning)
-                        arg.reward_score = score
+                        reward_score = await reward_fn(arg.position, arg.reasoning)
+                        # Blend algorithmic + reward scores
+                        arg.reward_score = 0.6 * algo_score + 0.4 * reward_score
+                        used_algo = False
                     except Exception:
-                        arg.reward_score = 0.5
+                        arg.reward_score = algo_score
                 else:
-                    # Use LLM as evaluator
-                    arg.reward_score = await self._evaluate_argument(
-                        arg, topic, context, llm,
-                    )
+                    # Last resort: LLM evaluator
+                    try:
+                        llm_score = await self._evaluate_argument(
+                            arg, topic, context, llm,
+                        )
+                        arg.reward_score = 0.6 * algo_score + 0.4 * llm_score
+                        used_algo = False
+                    except Exception:
+                        arg.reward_score = algo_score
+
+                # Track algorithm usage ratio
+                if used_algo:
+                    self._algorithm_ratio = (self._algorithm_ratio * 0.9) + 0.1
+                else:
+                    self._algorithm_ratio = self._algorithm_ratio * 0.9
 
             # Prune low-scoring arguments
             surviving = [
@@ -434,6 +593,8 @@ class ConditionalDebateEngine:
         """Check if the debate has converged.
 
         Returns (converged, reason).
+
+        Uses both score-based and logical consistency checks.
         """
         if len(arguments) <= 1:
             return True, "single_position"
@@ -449,6 +610,11 @@ class ConditionalDebateEngine:
         positions = [a.position for a in arguments]
         if len(set(positions)) == 1:
             return True, "consensus"
+
+        # Check logical consistency of remaining arguments
+        consistency = self._consistency_checker.check_consistency(positions)
+        if consistency["consistent"] and consistency["confidence"] > 0.8:
+            return True, "logical_consistency"
 
         return False, ""
 
@@ -546,4 +712,6 @@ class ConditionalDebateEngine:
                 reason: sum(1 for d in self._debate_history if d.convergence_reason == reason)
                 for reason in set(d.convergence_reason for d in self._debate_history)
             },
+            "algorithm_ratio": self._algorithm_ratio,
+            "elo_ranker_ratings": self._elo_ranker._ratings,
         }
