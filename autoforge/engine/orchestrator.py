@@ -12,6 +12,7 @@ task scheduling, and state persistence.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -36,7 +37,7 @@ from autoforge.engine.agents import AGENT_REGISTRY
 # startup time when features are disabled.  Only the types actually needed
 # at runtime are imported; everything else stays behind the config gate.
 from autoforge.engine.dynamic_constitution import DynamicConstitution
-from autoforge.engine.evolution import EvolutionEngine, WorkflowGenome
+from autoforge.engine.evolution import EvolutionEngine, FitnessScore, WorkflowGenome
 from autoforge.engine.process_reward import ProcessRewardModel, StepType
 from autoforge.engine.prompt_optimizer import PromptOptimizer
 
@@ -373,7 +374,7 @@ class Orchestrator:
 
             # Reasoning extension: save state
             if self._reasoning_extension is not None:
-                ext_dir = Path(".autoforge") / "reasoning_extension"
+                ext_dir = self._forge_dir / "reasoning_extension"
                 self._reasoning_extension.save(ext_dir)
 
             # Theoretical reasoning: save theory graphs (project-level + global)
@@ -1222,29 +1223,29 @@ class Orchestrator:
                 pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
                 scripts = pkg.get("scripts", {})
                 if "test" in scripts:
-                    return "npm test -- --passWithNoTests 2>&1 || true"
+                    return "npm test -- --passWithNoTests 2>&1"
             except (json.JSONDecodeError, OSError):
                 pass
 
         # Python / pytest
         if (work_dir / "pytest.ini").exists() or (work_dir / "setup.cfg").exists():
-            return "python -m pytest --tb=short -q 2>&1 || true"
+            return "python -m pytest --tb=short -q 2>&1"
         pyproject = work_dir / "pyproject.toml"
         if pyproject.exists():
             try:
                 content = pyproject.read_text(encoding="utf-8")
                 if "pytest" in content or "tool.pytest" in content:
-                    return "python -m pytest --tb=short -q 2>&1 || true"
+                    return "python -m pytest --tb=short -q 2>&1"
             except OSError:
                 pass
 
         # Rust / cargo
         if (work_dir / "Cargo.toml").exists():
-            return "cargo test 2>&1 || true"
+            return "cargo test 2>&1"
 
         # Go
         if (work_dir / "go.mod").exists():
-            return "go test ./... 2>&1 || true"
+            return "go test ./... 2>&1"
 
         return None
 
@@ -1461,7 +1462,7 @@ class Orchestrator:
             # Director creates fix tasks
             fix_director = self._agent("director_fix", self.config, self.llm)
             for failure in failures[:3]:  # Limit fixes per attempt
-                failure_id = f"fix-{hash(str(failure)) % 10000}"
+                failure_id = f"fix-{int(hashlib.sha256(str(failure).encode()).hexdigest()[:8], 16) % 10000}"
                 failure_msg = failure if isinstance(failure, str) else str(failure)
 
                 # LDB: block-level fault localization
@@ -1497,8 +1498,8 @@ class Orchestrator:
                     fix_task = fix_director.parse_fix_task(fix_result.output)
 
                     # Builder executes fix (with LDB + Reflexion context)
-                    builder = BuilderAgent(
-                        self.config, self.llm,
+                    builder = self._agent(
+                        "builder", self.config, self.llm,
                         working_dir=self.project_dir,
                         sandbox=sandbox,
                     )
@@ -1528,7 +1529,7 @@ class Orchestrator:
                 # Reflexion: mark as resolved
                 if self.config.reflexion_enabled:
                     for failure in failures[:3]:
-                        fid = f"fix-{hash(str(failure)) % 10000}"
+                        fid = f"fix-{int(hashlib.sha256(str(failure).encode()).hexdigest()[:8], 16) % 10000}"
                         self._reflexion.mark_success(fid)
                 return
 
@@ -1536,7 +1537,7 @@ class Orchestrator:
             if self.config.reflexion_enabled:
                 for failure in failures[:3]:
                     failure_msg = failure if isinstance(failure, str) else str(failure)
-                    fid = f"fix-{hash(str(failure)) % 10000}"
+                    fid = f"fix-{int(hashlib.sha256(str(failure).encode()).hexdigest()[:8], 16) % 10000}"
                     try:
                         await self._reflexion.reflect_on_failure(
                             task_id=fid,
@@ -1551,7 +1552,7 @@ class Orchestrator:
         # Mark persistent failures
         if self.config.reflexion_enabled:
             for failure in (test_results.failures or [])[:3]:
-                fid = f"fix-{hash(str(failure)) % 10000}"
+                fid = f"fix-{int(hashlib.sha256(str(failure).encode()).hexdigest()[:8], 16) % 10000}"
                 self._reflexion.mark_persistent(fid)
 
         console.print("  [yellow]Some issues remain after fix attempts[/yellow]")
@@ -1569,7 +1570,7 @@ class Orchestrator:
         })
         review = reviewer.parse_review(review_result.output)
 
-        if review.score >= int(self.config.quality_threshold * 10):
+        if review.score >= round(self.config.quality_threshold * 10):
             console.print(f"  [green]Quality score: {review.score}/10 — no refactoring needed[/green]")
             return
 
@@ -1643,7 +1644,7 @@ class Orchestrator:
             # Phase 3: REFACTOR (developer mode only)
             if (
                 self.config.mode == "developer"
-                and review.score < int(self.config.quality_threshold * 10)
+                and review.score < round(self.config.quality_threshold * 10)
                 and review.issues
             ):
                 console.print("\n[bold blue]Phase 3: REFACTOR[/bold blue] — Applying fixes...")
@@ -1993,7 +1994,7 @@ class Orchestrator:
             return architect.parse_architecture(arch_result.output)
 
         # Step 2: Set up search tree
-        from autoforge.engine.search_tree import SearchTree
+        from autoforge.engine.search_tree import SearchTree, evaluate_candidate
         self._search_tree = SearchTree()
         root = self._search_tree.create_root(
             description="Architecture exploration",

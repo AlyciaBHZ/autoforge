@@ -22,8 +22,8 @@ PROVIDERS = {
     "anthropic": {
         "name": "Anthropic (Claude)",
         "key_hint": "Get your key at https://console.anthropic.com/settings/keys",
-        "validate": lambda x: x.startswith("sk-ant-") and len(x) > 20,
-        "invalid_msg": "Must start with 'sk-ant-' and be at least 20 characters",
+        "validate": lambda x: len(x.strip()) > 20,
+        "invalid_msg": "API key must be at least 20 characters",
         "models_strong": [
             {"name": "Claude Opus 4.6 (best quality, higher cost)", "value": "claude-opus-4-6"},
             {"name": "Claude Sonnet 4.5 (good balance)", "value": "claude-sonnet-4-5-20250929"},
@@ -787,7 +787,7 @@ def load_global_config() -> dict:
             import tomli as tomllib
 
         data = tomllib.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except (ImportError, Exception):
+    except (ImportError, ValueError, OSError):
         # Manual parse fallback for simple TOML
         return _parse_toml_simple(CONFIG_FILE)
 
