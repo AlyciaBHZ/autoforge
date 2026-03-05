@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 name = "autoforgeai"
 
-version = "2.7.6"
+version = "2.7.7"
 description = "AutoForge AI-powered multi-agent development platform"
 
 readme = "README.md"
@@ -134,4 +134,3 @@ include = ["autoforge*"]
 [tool.setuptools.package-data]
 
 autoforge = ["data/**/*", "contracts/*.json"]
-
