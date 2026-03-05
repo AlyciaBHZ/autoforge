@@ -385,17 +385,45 @@ class LLMRouter:
             return self.config.model_strong, self.config.max_tokens_strong
         return self.config.model_fast, self.config.max_tokens_fast
 
+    async def generate(
+        self,
+        prompt: str,
+        *,
+        complexity: TaskComplexity = TaskComplexity.HIGH,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Convenience alias: ``await llm.generate(prompt, ...)``
+
+        Maps to :meth:`call` with the prompt wrapped as a single user
+        message.  Extra kwargs (``max_tokens``, ``temperature``, etc.) are
+        accepted for call-site compatibility but do not affect routing —
+        model selection is governed solely by *complexity*.
+        """
+        return await self.call(
+            prompt,
+            complexity=complexity,
+        )
+
     async def call(
         self,
+        prompt_or_nothing: str | None = None,
         *,
         complexity: TaskComplexity,
-        system: str,
-        messages: list[dict[str, Any]],
+        system: str = "",
+        messages: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         """Make an LLM call with automatic provider routing.
 
+        Supports two calling conventions:
+          - Full:   ``await llm.call(complexity=..., system=..., messages=[...])``
+          - Short:  ``await llm.call(prompt, complexity=...)``
+            (auto-wrapped into ``messages=[{"role": "user", "content": prompt}]``)
+
         Args:
+            prompt_or_nothing: Optional positional prompt string (short form).
             complexity: Determines which model to use.
             system: System prompt.
             messages: Message history (normalized format).
@@ -404,6 +432,15 @@ class LLMRouter:
         Returns:
             LLMResponse with normalized content blocks.
         """
+        # ── short-form compat: llm.call(prompt, complexity=...) ──
+        if prompt_or_nothing is not None:
+            if messages is not None:
+                raise ValueError(
+                    "Cannot pass both a positional prompt and messages=",
+                )
+            messages = [{"role": "user", "content": prompt_or_nothing}]
+        elif messages is None:
+            raise ValueError("Either a positional prompt or messages= is required")
         model, max_tokens = self._select_model(complexity)
         reservation = self._estimate_call_cost_usd(
             model=model,

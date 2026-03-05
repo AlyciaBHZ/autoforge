@@ -303,7 +303,7 @@ class ElanManager:
                 timeout=120,
             )
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(stdout), timeout=120
+                proc.communicate(input=stdout), timeout=120
             )
 
             success = proc.returncode == 0

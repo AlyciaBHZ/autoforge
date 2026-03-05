@@ -1618,7 +1618,7 @@ Return ONLY the complete hybrid code in a markdown block."""
                 return False
 
             # Apply with SICA
-            applied = await self.sica_engine.apply_proposal(
+            applied = self.sica_engine.apply_proposal(
                 proposal, constitution_dir
             )
             if applied:

@@ -640,7 +640,9 @@ class PromptOptimizer:
         Uses the regularized incomplete beta function approximation.
         For practical prompt optimization, this is more than accurate enough.
         """
-        if t <= 0:
+        if t == 0:
+            return 0.5
+        if t < 0:
             return 1.0 - PromptOptimizer._t_cdf_complement(-t, df)
 
         # Convert t-statistic to beta function form
