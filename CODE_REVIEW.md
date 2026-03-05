@@ -67,6 +67,49 @@ by reconstructing a shell-like string.
 **`engine/sandbox.py:118-186 vs 188-246`** — Nearly identical timeout handling,
 process group killing, and exception handling duplicated.
 
+### BUG-7: JSON extraction regex duplicated 7 times across agents
+
+The same JSON-from-LLM-output extraction pattern is copy-pasted across
+`director.py:114-135`, `director.py:175-192`, `architect.py:158-167`,
+`reviewer.py:159-184`, `tester.py:169-193`, `gardener.py:196-212`,
+`scanner.py:223-240`. If the regex needs updating, 7 places must change.
+
+### BUG-8: `UnicodeDecodeError` not caught in 4 of 5 agents' `read_file`
+
+`builder.py:194`, `reviewer.py:84`, `tester.py:110`, `gardener.py:143` all
+call `read_text(encoding="utf-8")` without catching `UnicodeDecodeError`.
+Reading any binary file crashes the agent. Only `scanner.py:121-128` handles
+this correctly. **Severity: Major.**
+
+### BUG-9: Path traversal errors not caught in builder/gardener write handlers
+
+`builder.py:183` and `gardener.py:132` — `_validate_path()` raises
+`ValueError` on traversal, but no try/except wraps it. The raw exception
+propagates instead of returning a structured JSON error. `reviewer.py:78-81`
+and `scanner.py:133-135` handle it correctly — inconsistent security behavior.
+
+### BUG-10: `DirectorFixAgent` loads wrong constitution file
+
+`director.py:145` — `DirectorFixAgent` sets `ROLE = "director"` (same as
+`DirectorAgent` on line 25). Both load `constitution/agents/director.md`.
+`DirectorFixAgent` has a completely different purpose (fix task generation)
+but gets the generic director prompt.
+
+### BUG-11: Scanner command blocklist trivially bypassable
+
+`scanner.py:158-159` — Substring matching blocklist:
+```python
+blocked = ["rm ", "mv ", "cp ", "write", "install", "npm ", "pip ", "delete", "> ", ">> "]
+```
+Bypassed by: `/bin/rm`, `$(rm -rf /)`, backtick expansion, `python -c "..."`,
+pipes, semicolons. The string `"write"` blocks `grep write` false positives.
+
+### BUG-12: `parse_architecture` raises raw exceptions unlike all sibling methods
+
+`architect.py:156-167` — Raises raw `json.JSONDecodeError` instead of returning
+a structured error object. All other agents' parse methods (`reviewer.py:173-177`,
+`tester.py`, etc.) catch `JSONDecodeError` and return a default failure object.
+
 ---
 
 ## Design Smells
@@ -114,6 +157,29 @@ Same if-try-import-assign-except template, never abstracted.
 
 Could use `dataclasses.asdict()`.
 
+### DUP-4: `_handle_list_files` copied verbatim across 4 agents
+
+`builder.py:197-213`, `reviewer.py:86-105`, `gardener.py:145-161`,
+`scanner.py:130-149` — all do the same rglob + filter .git + symlink check.
+Only difference: scanner also filters `node_modules` and caps at 500.
+
+### DUP-5: `_handle_read_file` duplicated across 5 agents
+
+`builder.py:189-195`, `reviewer.py:76-84`, `tester.py:102-110`,
+`gardener.py:138-143`, `scanner.py:113-128`. Scanner adds truncation and
+`UnicodeDecodeError` handling that all others are missing.
+
+### DUP-6: Web/GitHub tool registration duplicated across 4 agents
+
+`director.py:32-92`, `architect.py:63-125`, `builder.py:134-167`,
+`gardener.py:101-116` — same conditional import, same env var read, same
+ToolDefinition construction with slightly different descriptions. Should be
+a `_register_web_tools()` helper on AgentBase.
+
+### DUP-7: `MAX_FILE_SIZE = 2 * 1024 * 1024` defined identically in 2 files
+
+`builder.py:174` and `gardener.py:119` — same constant, defined twice.
+
 ---
 
 ## Inconsistencies
@@ -124,6 +190,35 @@ Lines 120-156: failures crash the program. Lines 161-273: failures silently
 swallowed. No documented rationale.
 
 ### INCON-2: Agent constructor signatures vary without interface contract
+
+| Agent | Extra params |
+|-------|-------------|
+| DirectorAgent | none |
+| ArchitectAgent | `templates_dir` |
+| BuilderAgent | `working_dir`, `sandbox`, `agent_id` |
+| ReviewerAgent | `working_dir` |
+| TesterAgent | `working_dir`, `sandbox` |
+| GardenerAgent | `working_dir` |
+| ScannerAgent | `working_dir` |
+
+Makes `AGENT_REGISTRY` unusable for generic instantiation.
+
+### INCON-4: Missing type hints on agent `__init__` parameters
+
+All agents take `config` and `llm` without type hints (`config: ForgeConfig`,
+`llm: LLMRouter`), violating the project's own "type hints on all function
+signatures" convention.
+
+### INCON-5: No abstract `parse_output` interface
+
+Most agents have `parse_spec`, `parse_architecture`, `parse_review`, etc. but
+this is not an abstract method on AgentBase. Director has two parse methods,
+Builder has zero. No generic orchestration possible.
+
+### INCON-6: `_handle_write_file` response format differs between agents
+
+`builder.py:187` returns `"bytes": len(content)`. `gardener.py:136` returns
+only `"status": "ok", "path": rel_path` with no size info.
 
 ### INCON-3: Log levels inconsistent across error paths
 
@@ -171,3 +266,8 @@ swallowed. No documented rationale.
 2. Add `logger.warning` to silent `except Exception:` blocks in `_init_engines`
 3. Pre-initialize all engine attributes to `None` in `__init__`
 4. Replace sandbox blacklist with whitelist or proper sandboxing
+5. Add `UnicodeDecodeError` handling to all agents' `_handle_read_file`
+6. Extract shared tool handlers (`read_file`, `write_file`, `list_files`) into AgentBase or mixin
+7. Extract JSON-from-LLM regex into a single shared utility
+8. Give `DirectorFixAgent` its own ROLE and constitution file
+9. Add type hints to all agent `__init__` parameters
