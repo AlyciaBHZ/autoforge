@@ -35,6 +35,9 @@ class ProofStatus(str, Enum):
     UNPROVEN = "unproven"
     PROVING = "proving"
     PROVED = "proved"
+    FORMALIZED = "formalized"
+    COMPILES = "compiles"
+    VERIFIED_WITH_SORRY = "verified_with_sorry"
     FAILED = "failed"
     DECOMPOSED = "decomposed"  # Broken into subgoals
     SORRY = "sorry"            # Has 'sorry' placeholder
@@ -446,13 +449,26 @@ class PantographREPL:
         self._session_active = False
 
     async def _simulate_tactic(self, tactic: str) -> ProofState:
-        """LLM-simulated tactic application (fallback)."""
-        # In practice, this would call an LLM to simulate proof state change
-        logger.debug(f"[Pantograph] Simulating tactic: {tactic}")
-        return ProofState(
-            goals=[],
-            hypotheses=[],
+        """Conservative fallback tactic application.
+
+        Never returns solved goals; this prevents false positives when Lean
+        session is unavailable.
+        """
+        logger.debug(f"[Pantograph] Simulating tactic without formal backend: {tactic}")
+
+        prior_goals = self._current_state.goals if self._current_state else []
+        prior_hyps = self._current_state.hypotheses if self._current_state else []
+        goals = prior_goals or ["[unknown_goal_state] formal tactic execution unavailable"]
+
+        simulated = ProofState(
+            goals=goals,
+            hypotheses=prior_hyps,
+            context="[simulated] Lean backend unavailable",
+            parent_tactic=tactic,
         )
+        self._current_state = simulated
+        self._history.append((tactic, simulated))
+        return simulated
 
 
 # ══════════════════════════════════════════════════════════════
@@ -478,6 +494,7 @@ class LeanProver:
         from autoforge.engine.provers.proof_search import (
             ConjectureEngine,
             MCTSProofSearch,
+            PantographExecutor,
             RecursiveProofDecomposer,
             TacticGenerator,
         )
@@ -492,8 +509,15 @@ class LeanProver:
         self._workspace = workspace or Path(".")
         self._lean_env = LeanEnvironment(workspace)
         self._tactic_gen = TacticGenerator()
-        self._mcts = MCTSProofSearch(self._tactic_gen)
-        self._decomposer = RecursiveProofDecomposer(self._tactic_gen, self._mcts)
+        self._mcts = MCTSProofSearch(
+            self._tactic_gen,
+            executor=PantographExecutor(self._lean_env),
+        )
+        self._decomposer = RecursiveProofDecomposer(
+            self._tactic_gen,
+            self._mcts,
+            lean_env=self._lean_env,
+        )
         self._conjecture_engine = ConjectureEngine()
         self._foundation = FoundationBuilder()
         self._formalizer = ArticleFormalizer(self._decomposer, self._lean_env)

@@ -1,9 +1,9 @@
-"""Academic Module Tests — 28 offline tests for the academic reasoning stack.
+﻿"""Academic Module Tests â€” 28 offline tests for the academic reasoning stack.
 
 Covers: TheoryGraph (8), DiscoveryOrchestrator components (6),
 PaperFormalizer (5), CloudProver (5), ConceptNode (4).
 
-All tests are offline — no API keys, no LLM calls, no Docker/SSH.
+All tests are offline â€” no API keys, no LLM calls, no Docker/SSH.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import time
 import unittest
 from pathlib import Path
 
-# ── Imports from theoretical_reasoning ──────────────────────
+# â”€â”€ Imports from theoretical_reasoning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from autoforge.engine.theoretical_reasoning import (
     ConceptNode,
     ConceptRelation,
@@ -26,17 +26,21 @@ from autoforge.engine.theoretical_reasoning import (
     VerificationMode,
 )
 
-# ── Imports from autonomous_discovery ───────────────────────
+# â”€â”€ Imports from autonomous_discovery â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from autoforge.engine.autonomous_discovery import (
     DiscoveryConfig,
     DiscoveryDepth,
     EloTournament,
+    Hypothesis,
+    HypothesisTournament,
     MatchResult,
     NoveltyFilter,
     PaperKernel,
 )
+from autoforge.engine.provers.lean_core import LeanEnvironment, PantographREPL, ProofState, ProofStatus
+from autoforge.engine.provers.proof_search import HeuristicExecutor, MCTSProofSearch, RecursiveProofDecomposer, TacticGenerator
 
-# ── Imports from paper_formalizer ───────────────────────────
+# â”€â”€ Imports from paper_formalizer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from autoforge.engine.paper_formalizer import (
     FormalizationReport,
     FormalizationStatus,
@@ -44,7 +48,7 @@ from autoforge.engine.paper_formalizer import (
     LeanCodeGenerator,
 )
 
-# ── Imports from cloud_prover ──────────────────────────────
+# â”€â”€ Imports from cloud_prover â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 from autoforge.engine.cloud_prover import (
     CloudBackend,
     CloudProver,
@@ -55,9 +59,9 @@ from autoforge.engine.cloud_prover import (
 )
 
 
-# ╔═══════════════════════════════════════════════════════════╗
-# ║  Helpers                                                  ║
-# ╚═══════════════════════════════════════════════════════════╝
+# â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+# â•‘  Helpers                                                  â•‘
+# â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 
 def _make_node(
@@ -80,11 +84,11 @@ def _build_sample_graph() -> TheoryGraph:
     """Build a small theory graph for testing.
 
     Structure:
-        def1 (DEFINITION) ──depends_on──▶ thm1 (THEOREM)
-        def2 (DEFINITION) ──depends_on──▶ thm1
-        thm1 ──generalizes──▶ thm2 (THEOREM)
-        thm1 ──analogous_to──▶ phys1 (THEOREM, physics domain)
-        conj1 (CONJECTURE) — leaf, no dependents
+        def1 (DEFINITION) â”€â”€depends_onâ”€â”€â–¶ thm1 (THEOREM)
+        def2 (DEFINITION) â”€â”€depends_onâ”€â”€â–¶ thm1
+        thm1 â”€â”€generalizesâ”€â”€â–¶ thm2 (THEOREM)
+        thm1 â”€â”€analogous_toâ”€â”€â–¶ phys1 (THEOREM, physics domain)
+        conj1 (CONJECTURE) â€” leaf, no dependents
     """
     g = TheoryGraph(title="Test Theory", source="test_paper.pdf")
 
@@ -131,9 +135,9 @@ class _DummyJudgeLLM:
             "confidence": 0.9,
         })
 
-# ╔═══════════════════════════════════════════════════════════╗
-# ║  1. TheoryGraph Tests (8)                                 ║
-# ╚═══════════════════════════════════════════════════════════╝
+# â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+# â•‘  1. TheoryGraph Tests (8)                                 â•‘
+# â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 
 class TestTheoryGraph(unittest.TestCase):
@@ -172,7 +176,7 @@ class TestTheoryGraph(unittest.TestCase):
         self.assertEqual(tgt.domain, ScientificDomain.THEORETICAL_PHYSICS)
 
     def test_save_load_roundtrip(self):
-        """save → load produces identical graph."""
+        """save â†’ load produces identical graph."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
             self.g.save(path)
@@ -210,9 +214,9 @@ class TestTheoryGraph(unittest.TestCase):
         self.assertEqual(empty.get_stats()["total_concepts"], 0)
 
 
-# ╔═══════════════════════════════════════════════════════════╗
-# ║  2. DiscoveryOrchestrator Components (6)                  ║
-# ╚═══════════════════════════════════════════════════════════╝
+# â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+# â•‘  2. DiscoveryOrchestrator Components (6)                  â•‘
+# â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 
 class TestDiscoveryComponents(unittest.TestCase):
@@ -232,7 +236,7 @@ class TestDiscoveryComponents(unittest.TestCase):
         # Definitions go to kernel
         self.assertIn("def1", kernel_ids)
         self.assertIn("def2", kernel_ids)
-        # thm1 has ≥2 dependents (def1, def2 depend on it) — goes to kernel
+        # thm1 has â‰¥2 dependents (def1, def2 depend on it) â€” goes to kernel
         self.assertIn("thm1", kernel_ids)
         # Cross-domain bridge nodes also go to kernel
         self.assertIn("phys1", kernel_ids)
@@ -294,9 +298,9 @@ class TestDiscoveryComponents(unittest.TestCase):
         self.assertGreater(dc.depth_score_threshold, 0)
 
 
-# ╔═══════════════════════════════════════════════════════════╗
-# ║  2b. Elo Tournament Tests (3)                             ║
-# ╚═══════════════════════════════════════════════════════════╝
+# â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+# â•‘  2b. Elo Tournament Tests (3)                             â•‘
+# â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 
 class TestEloTournament(unittest.TestCase):
@@ -339,9 +343,157 @@ class TestEloTournament(unittest.TestCase):
         self.assertEqual(len(single["rankings"]), 1)
 
 
-# ╔═══════════════════════════════════════════════════════════╗
-# ║  3. PaperFormalizer Tests (5)                             ║
-# ╚═══════════════════════════════════════════════════════════╝
+# â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+# â•‘  2c. Proof Pipeline P0 Tests (3)                          â•‘
+# â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+
+class _TinyLLM:
+    async def call(self, *args, **kwargs):
+        class R:
+            content = []
+        return R()
+
+
+class TestProofPipelineP0(unittest.TestCase):
+    """Regression tests for real proof-chain safety guarantees."""
+
+    def test_mcts_expands_root(self):
+        tactic_gen = TacticGenerator()
+        mcts = MCTSProofSearch(tactic_gen, executor=HeuristicExecutor())
+
+        async def fake_generate(*args, **kwargs):
+            return [
+                type("C", (), {"tactic": "simp"})(),
+                type("C", (), {"tactic": "intro h"})(),
+            ]
+
+        tactic_gen.generate_candidates = fake_generate  # type: ignore[assignment]
+        root = ProofState(goals=["True"], hypotheses=[])
+        proof = asyncio.run(mcts.search(root, "theorem t : True", _TinyLLM(), max_iterations=2))
+        stats = mcts.get_stats()
+
+        self.assertGreaterEqual(stats["nodes_explored"], 1)
+        self.assertIsNotNone(proof)
+
+    def test_mcts_does_not_only_evaluate_first_child(self):
+        tactic_gen = TacticGenerator()
+        mcts = MCTSProofSearch(tactic_gen, executor=HeuristicExecutor())
+
+        async def fake_generate(*args, **kwargs):
+            return [
+                type("C", (), {"tactic": "intro h1"})(),
+                type("C", (), {"tactic": "intro h2"})(),
+                type("C", (), {"tactic": "intro h3"})(),
+            ]
+
+        seen: list[str] = []
+
+        async def fake_eval(state, llm=None):
+            seen.append(state.parent_tactic)
+            return 0.4
+
+        tactic_gen.generate_candidates = fake_generate  # type: ignore[assignment]
+        mcts._evaluate_state = fake_eval  # type: ignore[assignment]
+
+        root = ProofState(goals=["Goal"], hypotheses=[])
+        asyncio.run(mcts.search(root, "theorem t : True", _TinyLLM(), max_iterations=1))
+
+        self.assertGreaterEqual(len(set(seen)), 2)
+
+    def test_pantograph_fallback_does_not_auto_solve(self):
+        repl = PantographREPL(LeanEnvironment())
+        state = asyncio.run(repl.send_tactic("simp"))
+        self.assertNotEqual(state.goals, [])
+        self.assertIn("unknown_goal_state", state.goals[0])
+
+    def test_direct_proof_branch_requires_verification(self):
+        tactic_gen = TacticGenerator()
+        mcts = MCTSProofSearch(tactic_gen, executor=HeuristicExecutor())
+        decomposer = RecursiveProofDecomposer(tactic_gen, mcts, lean_env=LeanEnvironment())
+
+        async def fake_informal(*args, **kwargs):
+            return "By trivial reasoning."
+
+        async def fake_formal(*args, **kwargs):
+            return "exact trivial"
+
+        async def no_decompose(*args, **kwargs):
+            return []
+
+        decomposer._generate_informal_proof = fake_informal  # type: ignore[assignment]
+        decomposer._informal_to_formal = fake_formal  # type: ignore[assignment]
+        decomposer._decompose = no_decompose  # type: ignore[assignment]
+
+        attempt = asyncio.run(decomposer.prove("theorem t : True", "", _TinyLLM()))
+        self.assertNotEqual(attempt.status, ProofStatus.PROVED)
+
+    def test_mcts_proof_branch_requires_formal_backend(self):
+        tactic_gen = TacticGenerator()
+        mcts = MCTSProofSearch(tactic_gen, executor=HeuristicExecutor())
+        decomposer = RecursiveProofDecomposer(tactic_gen, mcts, lean_env=LeanEnvironment())
+
+        async def fake_informal(*args, **kwargs):
+            return "By search."
+
+        async def no_formal(*args, **kwargs):
+            return ""
+
+        async def fake_search(*args, **kwargs):
+            s0 = ProofState(goals=["G"], hypotheses=[])
+            s1 = ProofState(goals=[], hypotheses=[], parent_tactic="simp")
+            return [type("Step", (), {"tactic_applied": "simp", "state_before": s0, "state_after": s1})()]
+
+        async def no_decompose(*args, **kwargs):
+            return []
+
+        decomposer._generate_informal_proof = fake_informal  # type: ignore[assignment]
+        decomposer._informal_to_formal = no_formal  # type: ignore[assignment]
+        decomposer._decompose = no_decompose  # type: ignore[assignment]
+        mcts.search = fake_search  # type: ignore[assignment]
+
+        attempt = asyncio.run(decomposer.prove("theorem t : True", "", _TinyLLM()))
+        self.assertNotEqual(attempt.status, ProofStatus.PROVED)
+
+
+
+
+class TestHypothesisTournament(unittest.TestCase):
+    def test_empty_and_single_inputs(self):
+        tour = HypothesisTournament()
+        empty = asyncio.run(tour.run(rounds=2))
+        self.assertEqual(empty["rankings"], [])
+
+        tour.register(Hypothesis(id="h1", statement="A"))
+        one = asyncio.run(tour.run(rounds=2))
+        self.assertEqual(len(one["rankings"]), 1)
+        self.assertEqual(one["match_history"], [])
+
+    def test_register_is_idempotent(self):
+        tour = HypothesisTournament()
+        h = Hypothesis(id="h1", statement="A")
+        tour.register(h)
+        tour.register(h)
+        self.assertEqual(len(tour.rankings()), 1)
+
+    def test_deterministic_pairing_and_history(self):
+        tour = HypothesisTournament()
+        tour.register(Hypothesis(id="h1", statement="A", novelty=0.9, depth=0.9, verification_confidence=0.8))
+        tour.register(Hypothesis(id="h2", statement="B", novelty=0.4, depth=0.5, verification_confidence=0.4))
+        tour.register(Hypothesis(id="h3", statement="C", novelty=0.8, depth=0.7, verification_confidence=0.6))
+        tour.register(Hypothesis(id="h4", statement="D", novelty=0.2, depth=0.2, verification_confidence=0.2))
+
+        out = asyncio.run(tour.run(rounds=2))
+        self.assertGreaterEqual(len(out["match_history"]), 2)
+        top = out["rankings"][0]
+        self.assertIn("rating", top)
+        self.assertIn("wins", top)
+        self.assertIn("losses", top)
+
+
+# â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+# â•‘  3. PaperFormalizer Tests (5)                             â•‘
+# â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 
 class TestPaperFormalizer(unittest.TestCase):
@@ -387,7 +539,7 @@ class TestPaperFormalizer(unittest.TestCase):
         self.assertAlmostEqual(report.overall_score, expected, places=6)
 
     def test_formalization_report_roundtrip(self):
-        """FormalizationReport → to_dict → JSON → reload → compute_score matches."""
+        """FormalizationReport â†’ to_dict â†’ JSON â†’ reload â†’ compute_score matches."""
         report = FormalizationReport(
             paper_title="Test Paper",
             paper_source="test.pdf",
@@ -454,9 +606,9 @@ class TestPaperFormalizer(unittest.TestCase):
         self.assertTrue(all(u.lean_status == FormalizationStatus.PENDING for u in units))
 
 
-# ╔═══════════════════════════════════════════════════════════╗
-# ║  4. CloudProver Tests (5)                                 ║
-# ╚═══════════════════════════════════════════════════════════╝
+# â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+# â•‘  4. CloudProver Tests (5)                                 â•‘
+# â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 
 class TestCloudProver(unittest.TestCase):
@@ -535,9 +687,9 @@ class TestCloudProver(unittest.TestCase):
             self.assertEqual(prover2._jobs[0].status, JobStatus.COMPLETED)
 
 
-# ╔═══════════════════════════════════════════════════════════╗
-# ║  5. ConceptNode Tests (4)                                 ║
-# ╚═══════════════════════════════════════════════════════════╝
+# â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+# â•‘  5. ConceptNode Tests (4)                                 â•‘
+# â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 
 class TestConceptNode(unittest.TestCase):
@@ -564,7 +716,7 @@ class TestConceptNode(unittest.TestCase):
         conf = node.update_confidence()
         # With only one mode: raw = (0.45 * 1.0) / 0.45 = 1.0, bonus = 0.03
         # Result = min(0.99, 1.0 + 0.03) = 0.99
-        # But wait, that's single-mode: raw = 1.0, bonus = 0.03 → 0.99 (capped)
+        # But wait, that's single-mode: raw = 1.0, bonus = 0.03 â†’ 0.99 (capped)
         # Actually with single mode at confidence 1.0:
         # raw = (0.45 * 1.0) / 0.45 = 1.0
         # mode_count (>0.5) = 1, bonus = 0.03
@@ -572,7 +724,7 @@ class TestConceptNode(unittest.TestCase):
         self.assertGreater(conf, 0.0)
         self.assertLessEqual(conf, 0.99)
 
-        # Now check VLM at half confidence — raw should equal 0.5
+        # Now check VLM at half confidence â€” raw should equal 0.5
         node2 = _make_node("n2b")
         node2.verification_status = {"vlm_visual": 0.5}
         conf2 = node2.update_confidence()
@@ -585,7 +737,7 @@ class TestConceptNode(unittest.TestCase):
         """Multiple verification modes combine properly."""
         node = _make_node("n3")
         node.verification_status = {
-            "formal_proof": 0.99,  # Triggers shortcut → confidence = 1.0
+            "formal_proof": 0.99,  # Triggers shortcut â†’ confidence = 1.0
         }
         conf = node.update_confidence()
         self.assertEqual(conf, 1.0)
@@ -623,9 +775,9 @@ class TestConceptNode(unittest.TestCase):
         self.assertAlmostEqual(node2.overall_confidence, 0.78)
 
 
-# ╔═══════════════════════════════════════════════════════════╗
-# ║  Runner                                                   ║
-# ╚═══════════════════════════════════════════════════════════╝
+# â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+# â•‘  Runner                                                   â•‘
+# â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
