@@ -105,6 +105,11 @@ class SubprocessSandbox(SandboxBase):
         r"\bos\.remove\s*\(\s*['\"]\/",     # Python os.remove('/')
         r"\bos\.system\s*\(",           # Python os.system()
         r"\b__import__\s*\(",           # Python __import__()
+        # Supply-chain hardening for dynamic dependency installation
+        r"\bpip\s+install\b[^\n]*(--extra-index-url|--index-url|git\+|https?://|file://)",
+        r"\bnpm\s+install\b[^\n]*(https?://|git\+|github:|file:)",
+        r"\byarn\s+add\b[^\n]*(https?://|git\+|github:|file:)",
+        r"\bpnpm\s+add\b[^\n]*(https?://|git\+|github:|file:)",
     ]
 
     def __init__(self, working_dir: Path, env: dict[str, str] | None = None) -> None:
