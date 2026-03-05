@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "forgeai"
+name = "autoforgeai"
 version = "2.7.0"
 description = "AutoForge — AI-powered multi-agent development platform"
 readme = "README.md"
