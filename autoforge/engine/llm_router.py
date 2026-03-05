@@ -117,7 +117,7 @@ _RETRY_BASE_DELAY = 1.0  # seconds — base delay for exponential backoff
 
 # Known OpenAI model prefixes/names
 _OPENAI_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo",
-                  "codex-5.3", "o3", "o3-mini", "o4-mini", "o1", "o1-mini", "o1-preview"}
+                  "codex-5.3", "o3", "o3-mini", "o4", "o4-mini", "o1", "o1-mini", "o1-preview"}
 
 
 def detect_provider(model: str) -> str:
@@ -180,6 +180,7 @@ class LLMRouter:
         self._clients: dict[str, Any] = {}
         self._auth_providers: dict[str, Any] = {}  # Cached AuthProvider per provider
         self._budget_lock: asyncio.Lock | None = None
+        self._client_lock: asyncio.Lock | None = None
         self._reserved_budget_usd: float = 0.0
 
     async def close(self) -> None:
@@ -228,12 +229,22 @@ class LLMRouter:
             + estimated_output_tokens * pricing["output"] / 1_000_000
         )
 
+    def _get_client_lock(self) -> asyncio.Lock:
+        """Lazily create client lock to avoid cross-event-loop lock reuse."""
+        if self._client_lock is None:
+            self._client_lock = asyncio.Lock()
+        return self._client_lock
+
     def _get_client(self, provider: str) -> Any:
         """Get or create an async client for the given provider.
 
         Uses the auth module to determine authentication method (API key,
         OAuth bearer, OAuth2 client_credentials, Google ADC/service account,
         AWS Bedrock, Google Vertex AI, Codex OAuth, Device Code).
+
+        Note: Callers should use _get_or_create_client() for async-safe access.
+        This sync method is kept for backward compatibility but may race under
+        concurrent calls.
         """
         if provider in self._clients:
             return self._clients[provider]
@@ -385,17 +396,45 @@ class LLMRouter:
             return self.config.model_strong, self.config.max_tokens_strong
         return self.config.model_fast, self.config.max_tokens_fast
 
+    async def generate(
+        self,
+        prompt: str,
+        *,
+        complexity: TaskComplexity = TaskComplexity.HIGH,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Convenience alias: ``await llm.generate(prompt, ...)``
+
+        Maps to :meth:`call` with the prompt wrapped as a single user
+        message.  Extra kwargs (``max_tokens``, ``temperature``, etc.) are
+        accepted for call-site compatibility but do not affect routing —
+        model selection is governed solely by *complexity*.
+        """
+        return await self.call(
+            prompt,
+            complexity=complexity,
+        )
+
     async def call(
         self,
+        prompt_or_nothing: str | None = None,
         *,
         complexity: TaskComplexity,
-        system: str,
-        messages: list[dict[str, Any]],
+        system: str = "",
+        messages: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         """Make an LLM call with automatic provider routing.
 
+        Supports two calling conventions:
+          - Full:   ``await llm.call(complexity=..., system=..., messages=[...])``
+          - Short:  ``await llm.call(prompt, complexity=...)``
+            (auto-wrapped into ``messages=[{"role": "user", "content": prompt}]``)
+
         Args:
+            prompt_or_nothing: Optional positional prompt string (short form).
             complexity: Determines which model to use.
             system: System prompt.
             messages: Message history (normalized format).
@@ -404,6 +443,15 @@ class LLMRouter:
         Returns:
             LLMResponse with normalized content blocks.
         """
+        # ── short-form compat: llm.call(prompt, complexity=...) ──
+        if prompt_or_nothing is not None:
+            if messages is not None:
+                raise ValueError(
+                    "Cannot pass both a positional prompt and messages=",
+                )
+            messages = [{"role": "user", "content": prompt_or_nothing}]
+        elif messages is None:
+            raise ValueError("Either a positional prompt or messages= is required")
         model, max_tokens = self._select_model(complexity)
         reservation = self._estimate_call_cost_usd(
             model=model,
@@ -430,6 +478,9 @@ class LLMRouter:
             self._reserved_budget_usd += reservation
 
         provider = detect_provider(model)
+        # Async-safe client initialization — prevent duplicate creation
+        async with self._get_client_lock():
+            self._get_client(provider)
         await self._ensure_fresh_token(provider)
         self._call_count += 1
         call_id = self._call_count
@@ -441,7 +492,14 @@ class LLMRouter:
 
         response: LLMResponse | None = None
         try:
-            if provider == "anthropic":
+            # Check custom providers first
+            if provider in self._custom_providers:
+                custom = self._custom_providers[provider]
+                client = self._get_client(provider)
+                response = await self._retry_with_backoff(
+                    lambda: custom.call(client, model, system, messages, tools, max_tokens)
+                )
+            elif provider == "anthropic":
                 response = await self._call_anthropic(model, max_tokens, system, messages, tools)
             elif provider == "openai":
                 response = await self._call_openai(model, max_tokens, system, messages, tools)
@@ -563,13 +621,13 @@ class LLMRouter:
         """Call OpenAI API and normalize the response."""
         client = self._get_client("openai")
 
-        # Convert messages to OpenAI format
-        oai_messages = self._messages_to_openai(system, messages)
-
         # OpenAI reasoning/codex models use max_completion_tokens
         model_lower = model.lower()
         is_reasoning = model_lower.startswith(("o1", "o3", "o4", "codex-"))
         token_key = "max_completion_tokens" if is_reasoning else "max_tokens"
+
+        # Convert messages to OpenAI format
+        oai_messages = self._messages_to_openai(system, messages, is_reasoning=is_reasoning)
 
         kwargs: dict[str, Any] = {
             "model": model,
@@ -617,10 +675,16 @@ class LLMRouter:
         return LLMResponse(content=content, stop_reason=stop_reason, usage=usage)
 
     def _messages_to_openai(
-        self, system: str, messages: list[dict[str, Any]]
+        self, system: str, messages: list[dict[str, Any]], *,
+        is_reasoning: bool = False,
     ) -> list[dict[str, Any]]:
         """Convert normalized messages to OpenAI format."""
-        result: list[dict[str, Any]] = [{"role": "system", "content": system}]
+        result: list[dict[str, Any]] = []
+        if is_reasoning:
+            # o1/o3/o4/codex models use "developer" role instead of "system"
+            result.append({"role": "developer", "content": system})
+        else:
+            result.append({"role": "system", "content": system})
 
         for msg in messages:
             role = msg["role"]

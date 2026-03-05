@@ -423,6 +423,9 @@ class CurriculumScheduler:
             'time_taken': time.time(),
             'round': round_number,
         })
+        # Cap history to prevent unbounded memory growth
+        if len(self._attempt_history) > 2000:
+            self._attempt_history = self._attempt_history[-2000:]
 
         if success:
             self._proved_set.add(concept_id)

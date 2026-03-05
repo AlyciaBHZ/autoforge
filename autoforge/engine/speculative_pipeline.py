@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shlex
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -255,7 +256,7 @@ class SpeculativePipeline:
             if sandbox:
                 try:
                     lint_result = await sandbox.exec(
-                        f"cd {project_dir} && python -m py_compile *.py 2>&1 || true",
+                        f"cd {shlex.quote(str(project_dir))} && python -m py_compile *.py 2>&1 || true",
                         timeout=15,
                     )
                     result.scaffolding["syntax_check"] = lint_result.stdout[:2000]
