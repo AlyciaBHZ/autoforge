@@ -37,6 +37,7 @@ class ConstitutionPatch:
     priority: int = 0          # Higher = more important (injected earlier in prompt)
     project_specific: bool = True  # Only applies to current project
     created_at: float = field(default_factory=time.time)
+    project_name: str = ""     # Project that generated this patch (for grouping)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +47,7 @@ class ConstitutionPatch:
             "source": self.source,
             "priority": self.priority,
             "project_specific": self.project_specific,
+            "project_name": self.project_name,
         }
 
 
@@ -77,6 +79,10 @@ class DynamicConstitution:
         self._learned_rules: list[LearnedRule] = []
         self.project_dir = project_dir
         self._knowledge_base_path = project_dir / ".autoforge" / "knowledge_base.json" if project_dir else None
+
+        # Track rule performance deltas for causal inference
+        # Maps rule_id → list of (score_with_rule, baseline_score) tuples
+        self._rule_deltas: dict[str, list[tuple[float, float]]] = {}
 
         # Load persisted knowledge if available
         self._load_knowledge_base()
@@ -179,12 +185,16 @@ class DynamicConstitution:
             patches = []
             for i, item in enumerate(raw):
                 if isinstance(item, dict):
+                    # Priority formula: 10 - i means first LLM outputs get highest priority.
+                    # LLMs typically front-load the most important guidance, so this ordering
+                    # ensures critical instructions are injected early in agent prompts.
                     patch = ConstitutionPatch(
                         id=f"spec-{project_name}-{i:02d}",
                         target_role=item.get("role", "builder"),
                         content=item.get("instruction", ""),
                         source="director",
-                        priority=10 - i,  # Earlier items are higher priority
+                        priority=10 - i,
+                        project_name=project_name,
                     )
                     self.add_patch(patch)
                     patches.append(patch)
@@ -253,50 +263,296 @@ class DynamicConstitution:
             match = re.search(r"\{.*?\}", text, re.DOTALL)
             if match:
                 data = json.loads(match.group())
-                rule = LearnedRule(
-                    id=f"rule-{int(time.time()) % 100000}",
-                    pattern=data.get("pattern", ""),
-                    rule=data.get("rule", ""),
-                    confidence=float(data.get("confidence", 0.5)),
-                )
-                self._learned_rules.append(rule)
-                self._save_knowledge_base()
+                new_pattern = data.get("pattern", "")
+                new_rule = data.get("rule", "")
+                new_confidence = float(data.get("confidence", 0.5))
+                source_role = failure_context.get("agent_role", "")
 
-                logger.info(f"[MetaLearning] New rule '{rule.id}': {rule.rule[:80]}...")
-                return rule
+                # Check for duplicate rules with >70% word overlap in pattern
+                existing_rule = self._find_similar_rule(
+                    new_pattern, source_role, similarity_threshold=0.7
+                )
+
+                if existing_rule:
+                    # Update confidence of existing rule instead of creating duplicate
+                    old_confidence = existing_rule.confidence
+                    existing_rule.confidence = (old_confidence + new_confidence) / 2
+                    self._save_knowledge_base()
+                    logger.info(
+                        f"[MetaLearning] Updated existing rule '{existing_rule.id}': "
+                        f"confidence {old_confidence:.2f} → {existing_rule.confidence:.2f}"
+                    )
+                    return existing_rule
+                else:
+                    # Create new rule
+                    rule = LearnedRule(
+                        id=f"rule-{int(time.time()) % 100000}",
+                        pattern=new_pattern,
+                        rule=new_rule,
+                        source_role=source_role,
+                        confidence=new_confidence,
+                    )
+                    self._learned_rules.append(rule)
+                    self._save_knowledge_base()
+                    logger.info(f"[MetaLearning] New rule '{rule.id}': {rule.rule[:80]}...")
+                    return rule
 
         except Exception as e:
             logger.warning(f"[MetaLearning] Failed to learn from failure: {e}")
 
         return None
 
+    @staticmethod
+    def _wilson_score_lower(successes: int, total: int, z: float = 1.96) -> float:
+        """Wilson score interval lower bound for binomial proportion.
+
+        Computes a more conservative confidence interval than simple success ratio,
+        especially valuable for small sample sizes. Uses the Wilson score interval
+        (also known as the score-based confidence interval) which is more accurate
+        than the normal approximation.
+
+        Args:
+            successes: Number of successes (wins)
+            total: Total number of trials
+            z: Z-score for desired confidence level (1.96 for 95% CI)
+
+        Returns:
+            Lower bound of the Wilson confidence interval [0, 1]
+        """
+        if total == 0:
+            return 0.0
+
+        p_hat = successes / total
+        denominator = 1 + (z * z) / total
+
+        centre_adjusted_success = p_hat + (z * z) / (2 * total)
+        adjusted_standard_error = (
+            (p_hat * (1 - p_hat) + z * z / (4 * total)) / total
+        ) ** 0.5
+
+        lower_bound = (
+            (centre_adjusted_success - z * adjusted_standard_error) / denominator
+        )
+
+        return max(0.0, lower_bound)
+
+    def record_rule_outcome_with_metrics(
+        self, rule_id: str, score_with_rule: float, baseline_score: float,
+    ) -> None:
+        """Record rule outcome with actual causal metrics.
+
+        Instead of binary helped/not-helped, this tracks the actual performance delta:
+        score_with_rule - baseline_score. Uses Wilson score interval for confidence
+        estimation, which accounts for sample size and is more statistically rigorous
+        than naive success ratios.
+
+        Args:
+            rule_id: ID of the learned rule
+            score_with_rule: Performance metric with the rule applied (e.g., test pass rate)
+            baseline_score: Performance metric without the rule (baseline for comparison)
+        """
+        # Initialize delta tracking if not present
+        if rule_id not in self._rule_deltas:
+            self._rule_deltas[rule_id] = []
+
+        # Record the delta observation (cap at 50 to prevent unbounded growth)
+        self._rule_deltas[rule_id].append((score_with_rule, baseline_score))
+        if len(self._rule_deltas[rule_id]) > 50:
+            self._rule_deltas[rule_id] = self._rule_deltas[rule_id][-50:]
+
+        # Find and update the rule
+        for rule in self._learned_rules:
+            if rule.id == rule_id:
+                rule.times_applied += 1
+
+                # Calculate whether this observation was "helpful"
+                delta = score_with_rule - baseline_score
+                if delta > 0:
+                    rule.times_helped += 1
+
+                # Update confidence using delta-based causal inference
+                self._update_rule_confidence_from_deltas(rule)
+                self._save_knowledge_base()
+                break
+
+    def _update_rule_confidence_from_deltas(self, rule: LearnedRule) -> None:
+        """Update a rule's confidence based on recorded performance deltas.
+
+        Uses the average delta and Wilson score interval to compute a confidence
+        that reflects both the magnitude of improvement and the statistical certainty.
+        """
+        rule_id = rule.id
+        if rule_id not in self._rule_deltas or not self._rule_deltas[rule_id]:
+            return
+
+        deltas = [score_with - baseline for score_with, baseline in self._rule_deltas[rule_id]]
+        avg_delta = sum(deltas) / len(deltas)
+
+        # Count how many observations had positive delta (helped)
+        successes = sum(1 for d in deltas if d > 0)
+        total = len(deltas)
+
+        # Use Wilson score for statistically sound confidence
+        wilson_lower = self._wilson_score_lower(successes, total)
+
+        # Confidence = (delta > 0) AND (statistical significance via Wilson)
+        # If avg_delta is negative, confidence should be low
+        if avg_delta <= 0:
+            rule.confidence = max(0.0, wilson_lower * 0.5)  # Penalize negative deltas
+        else:
+            # For positive deltas, use Wilson lower bound as confidence
+            rule.confidence = wilson_lower
+
+        logger.debug(
+            f"[MetaLearning] Updated confidence for rule {rule.id}: "
+            f"avg_delta={avg_delta:.4f}, wilson_lower={wilson_lower:.4f}, "
+            f"confidence={rule.confidence:.4f}"
+        )
+
     def record_rule_outcome(self, rule_id: str, helped: bool) -> None:
         """Record whether a learned rule helped or not.
 
         This feedback loop improves rule quality over time.
+
+        For backward compatibility, this accepts a binary flag. Internally,
+        it converts the boolean to moderate synthetic deltas (±0.1 around 0.5
+        baseline) so that binary feedback doesn't swamp real metric deltas
+        when both are used for the same rule.
+
+        Prefer using record_rule_outcome_with_metrics() for more accurate
+        causal inference with real performance metrics.
         """
+        if helped:
+            # Moderate positive delta (+0.1)
+            self.record_rule_outcome_with_metrics(rule_id, score_with_rule=0.6, baseline_score=0.5)
+        else:
+            # Moderate negative delta (-0.1)
+            self.record_rule_outcome_with_metrics(rule_id, score_with_rule=0.4, baseline_score=0.5)
+
+    def get_rule_causal_evidence(self, rule_id: str) -> dict[str, Any]:
+        """Get causal evidence summary for a rule.
+
+        Returns a dictionary summarizing the causal evidence that a rule is effective:
+        - avg_delta: Average improvement from applying the rule
+        - n_observations: Number of times the rule has been evaluated
+        - wilson_lower: Wilson score interval lower bound (statistically conservative estimate)
+        - is_causal: Boolean indicating if the rule meets causal evidence threshold
+
+        A rule is considered "causal" if:
+        1. avg_delta > 0 (positive average effect)
+        2. wilson_lower > 0 (statistically significant at 95% confidence)
+        3. n_observations >= 3 (minimum sample size for reliability)
+
+        Returns empty dict if rule not found or no delta data available.
+        """
+        if rule_id not in self._rule_deltas or not self._rule_deltas[rule_id]:
+            return {}
+
+        deltas = [score_with - baseline for score_with, baseline in self._rule_deltas[rule_id]]
+        avg_delta = sum(deltas) / len(deltas)
+        n_observations = len(deltas)
+
+        # Count successes for Wilson score
+        successes = sum(1 for d in deltas if d > 0)
+        wilson_lower = self._wilson_score_lower(successes, n_observations)
+
+        # Threshold for causality: positive delta, statistically significant success
+        # rate (Wilson lower bound > 0.25 means we're 95% confident the true success
+        # rate exceeds 25%, a conservative gate), and minimum sample size.
+        is_causal = (avg_delta > 0) and (wilson_lower > 0.25) and (n_observations >= 3)
+
+        return {
+            "rule_id": rule_id,
+            "avg_delta": avg_delta,
+            "n_observations": n_observations,
+            "wilson_lower": wilson_lower,
+            "is_causal": is_causal,
+            "successes": successes,
+        }
+
+    def _find_similar_rule(
+        self, pattern: str, source_role: str, similarity_threshold: float = 0.7
+    ) -> LearnedRule | None:
+        """Find an existing rule with similar pattern and source_role.
+
+        Uses word overlap to detect duplicates: if >similarity_threshold of words
+        match between patterns, returns the existing rule. Otherwise returns None.
+        """
+        if not pattern:
+            return None
+
+        pattern_words = set(pattern.lower().split())
+        if not pattern_words:
+            return None
+
         for rule in self._learned_rules:
-            if rule.id == rule_id:
-                rule.times_applied += 1
-                if helped:
-                    rule.times_helped += 1
-                # Update confidence based on success rate
-                if rule.times_applied > 0:
-                    rule.confidence = rule.times_helped / rule.times_applied
-                self._save_knowledge_base()
-                break
+            if rule.source_role != source_role:
+                continue
+
+            rule_words = set(rule.pattern.lower().split())
+            if not rule_words:
+                continue
+
+            # Calculate word overlap ratio
+            overlap = len(pattern_words & rule_words)
+            max_len = max(len(pattern_words), len(rule_words))
+            if max_len == 0:
+                continue
+
+            overlap_ratio = overlap / max_len
+            if overlap_ratio >= similarity_threshold:
+                return rule
+
+        return None
 
     def _get_applicable_rules(self, role: str) -> list[LearnedRule]:
-        """Get learned rules applicable to a role, with confidence above threshold."""
-        return [
-            r for r in self._learned_rules
-            if r.confidence >= 0.3  # Only include rules that have shown some value
-            and (not r.source_role or r.source_role == role)
-        ]
+        """Get learned rules applicable to a role, with confidence above threshold.
+
+        Applies temporal decay: rules older than 30 days have their effective
+        confidence reduced by 50% to prevent stale rules from dominating.
+
+        Prefers delta-based confidence (from causal metrics) over binary confidence
+        when available. Falls back to traditional confidence ratio for backward
+        compatibility.
+        """
+        current_time = time.time()
+        applicable_rules = []
+
+        for r in self._learned_rules:
+            # Check role applicability
+            if r.source_role and r.source_role != role:
+                continue
+
+            # Prefer delta-based confidence if available
+            if r.id in self._rule_deltas and self._rule_deltas[r.id]:
+                # Use the causal evidence as confidence
+                causal_evidence = self.get_rule_causal_evidence(r.id)
+                base_confidence = causal_evidence.get("wilson_lower", r.confidence)
+            else:
+                # Fall back to traditional ratio-based confidence
+                base_confidence = r.confidence
+
+            # Apply temporal decay: rules >30 days old get 50% confidence reduction
+            days_since_created = (current_time - r.created_at) / (24 * 3600)
+            decay_factor = 0.5 if days_since_created > 30 else 1.0
+            effective_confidence = base_confidence * decay_factor
+
+            # Only include rules that meet the confidence threshold after decay
+            if effective_confidence >= 0.3:
+                applicable_rules.append(r)
+
+        return applicable_rules
 
     def _save_knowledge_base(self) -> None:
-        """Persist learned rules to disk."""
+        """Persist learned rules to disk.
+
+        Now persists ALL patches (including project_specific ones) with their project_name
+        for cross-project learning and knowledge reuse.
+
+        Also persists rule deltas for causal inference analysis across sessions.
+        """
         if not self._knowledge_base_path:
+            logger.warning("[Constitution] Cannot save knowledge base: no knowledge_base_path configured")
             return
         try:
             self._knowledge_base_path.parent.mkdir(parents=True, exist_ok=True)
@@ -314,7 +570,14 @@ class DynamicConstitution:
                     }
                     for r in self._learned_rules
                 ],
-                "patches": [p.to_dict() for p in self._patches if not p.project_specific],
+                "patches": [p.to_dict() for p in self._patches],  # Now includes ALL patches with project_name
+                "rule_deltas": {
+                    rule_id: [
+                        {"score_with_rule": sw, "baseline_score": bs}
+                        for sw, bs in deltas
+                    ]
+                    for rule_id, deltas in self._rule_deltas.items()
+                },
             }
             self._knowledge_base_path.write_text(
                 json.dumps(data, indent=2), encoding="utf-8"
@@ -323,7 +586,11 @@ class DynamicConstitution:
             logger.debug(f"Could not save knowledge base: {e}")
 
     def _load_knowledge_base(self) -> None:
-        """Load persisted rules from disk."""
+        """Load persisted rules from disk.
+
+        Restores both learned rules and their causal evaluation history (deltas)
+        for continued training and inference across sessions.
+        """
         if not self._knowledge_base_path or not self._knowledge_base_path.exists():
             return
         try:
@@ -339,6 +606,17 @@ class DynamicConstitution:
                     times_helped=r.get("times_helped", 0),
                     created_at=r.get("created_at", 0),
                 ))
-            logger.info(f"[Constitution] Loaded {len(self._learned_rules)} learned rules")
+
+            # Load rule deltas for causal inference
+            for rule_id, delta_list in data.get("rule_deltas", {}).items():
+                self._rule_deltas[rule_id] = [
+                    (d["score_with_rule"], d["baseline_score"])
+                    for d in delta_list
+                ]
+
+            logger.info(
+                f"[Constitution] Loaded {len(self._learned_rules)} learned rules "
+                f"and {len(self._rule_deltas)} rule delta histories"
+            )
         except Exception as e:
             logger.debug(f"Could not load knowledge base: {e}")

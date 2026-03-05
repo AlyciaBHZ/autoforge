@@ -27,11 +27,14 @@ References:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
+import random
 import re
 import time
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -137,6 +140,8 @@ class SICAEngine:
         self.base_dir = base_dir
         self._proposals: list[SelfEditProposal] = []
         self._history: list[ImprovementRecord] = []
+        self._file_edit_stack: dict[str, list[str]] = {}  # target_file → list of proposal_ids in apply order
+        self._file_base_content: dict[str, str] = {}  # target_file → original content before first SICA edit
         self._load_history()
 
     # ──────── Propose Self-Edits ────────
@@ -339,7 +344,8 @@ class SICAEngine:
     ) -> bool:
         """Apply a validated proposal by modifying the target file.
 
-        The original content is preserved for potential rollback.
+        The original content is preserved for potential rollback. Proposals are
+        tracked in a per-file stack to support multi-proposal rollback awareness.
         """
         if proposal.status != "validated":
             logger.warning(f"[SICA] Cannot apply unvalidated proposal {proposal.id}")
@@ -347,10 +353,31 @@ class SICAEngine:
 
         target_path = constitution_dir / proposal.target_file
         try:
+            # Read current file content
+            if target_path.exists():
+                proposal.original_content = target_path.read_text(encoding="utf-8")
+            else:
+                proposal.original_content = ""
+
+            # On first edit to this file, store the pristine base content
+            # so _replay_proposals_without has a reliable starting point
+            if proposal.target_file not in self._file_base_content:
+                self._file_base_content[proposal.target_file] = proposal.original_content
+
             if proposal.edit_type == "constitution":
-                # Constitution edits: append to existing file
+                # Constitution edits: append to existing file, cleanup old SICA sections
                 if target_path.exists():
                     current = target_path.read_text(encoding="utf-8")
+
+                    # Count existing SICA sections marked with "## Self-Improvement:"
+                    sica_sections = re.findall(r'## Self-Improvement:', current)
+
+                    # If there are already more than 3 SICA sections, remove the oldest one
+                    if len(sica_sections) > 3:
+                        # Find and remove the first SICA section (oldest)
+                        pattern = r'\n\n## Self-Improvement:.*?(?=\n\n## Self-Improvement:|$)'
+                        current = re.sub(pattern, '', current, count=1, flags=re.DOTALL)
+
                     updated = current + (
                         f"\n\n## Self-Improvement: {proposal.description}\n"
                         f"<!-- SICA proposal {proposal.id} -->\n"
@@ -381,6 +408,11 @@ class SICAEngine:
                 logger.warning(f"[SICA] Unknown edit type '{proposal.edit_type}' for proposal {proposal.id}")
                 proposal.status = "failed"
                 return False
+
+            # Track this proposal in the edit stack for its target file
+            if proposal.target_file not in self._file_edit_stack:
+                self._file_edit_stack[proposal.target_file] = []
+            self._file_edit_stack[proposal.target_file].append(proposal.id)
 
             proposal.status = "applied"
             proposal.applied_at = time.time()
@@ -418,6 +450,17 @@ class SICAEngine:
         proposal.performance_after = new_fitness
         delta = new_fitness - proposal.performance_before
 
+        # Safety check: warn if multiple proposals target the same file
+        # and rollback may affect other proposals
+        if proposal.target_file in self._file_edit_stack:
+            stack = self._file_edit_stack[proposal.target_file]
+            if len(stack) > 1:
+                logger.warning(
+                    f"[SICA] Multiple proposals ({len(stack)}) target file "
+                    f"{proposal.target_file}. Rolling back {proposal.id} may "
+                    f"affect other proposals: {stack}"
+                )
+
         # Update history record
         for record in reversed(self._history):
             if record.proposal_id == proposal.id:
@@ -449,20 +492,124 @@ class SICAEngine:
         self._save_history()
         return True
 
+    def _replay_proposals_without(
+        self,
+        target_file: str,
+        exclude_id: str,
+        constitution_dir: Path,
+    ) -> None:
+        """Reconstruct a file by replaying all applied proposals except the excluded one.
+
+        This handles intermediate rollbacks where other proposals have been applied
+        after the one being rolled back. Instead of simply restoring original_content,
+        we replay all other proposals in order to preserve their changes.
+
+        Args:
+            target_file: The target file path (relative)
+            exclude_id: The proposal ID to skip during replay
+            constitution_dir: Path to the constitution directory
+        """
+        target_path = constitution_dir / target_file
+        stack = self._file_edit_stack.get(target_file, [])
+
+        if not stack:
+            logger.warning(f"[SICA] No edit stack for {target_file} during replay")
+            return
+
+        # Use the stored base content (pristine state before any SICA edits)
+        base_content = self._file_base_content.get(target_file, "")
+
+        # Fallback: if base content not stored (e.g. after restart), try the
+        # first proposal's original_content, then current disk state
+        if not base_content:
+            for proposal_id in stack:
+                for p in self._proposals:
+                    if p.id == proposal_id:
+                        base_content = p.original_content
+                        break
+                if base_content:
+                    break
+        if not base_content and target_path.exists():
+            logger.warning(f"[SICA] Using current disk content as replay base for {target_file}")
+            base_content = target_path.read_text(encoding="utf-8")
+
+        # Replay all proposals except the excluded one
+        current_content = base_content
+        for proposal_id in stack:
+            if proposal_id == exclude_id:
+                continue
+
+            # Find the proposal and apply its content changes
+            proposal = None
+            for p in self._proposals:
+                if p.id == proposal_id:
+                    proposal = p
+                    break
+
+            if not proposal:
+                logger.warning(f"[SICA] Could not find proposal {proposal_id} for replay")
+                continue
+
+            if proposal.edit_type == "constitution":
+                # For constitution edits, append the SICA section again
+                current_content += (
+                    f"\n\n## Self-Improvement: {proposal.description}\n"
+                    f"<!-- SICA proposal {proposal.id} -->\n"
+                    f"{proposal.proposed_content}\n"
+                )
+
+        # Write the reconstructed content
+        try:
+            target_path.write_text(current_content, encoding="utf-8")
+            logger.info(f"[SICA] Replayed proposals for {target_file} (excluded {exclude_id})")
+        except Exception as e:
+            logger.error(f"[SICA] Failed to replay proposals for {target_file}: {e}")
+
     def _rollback(
         self,
         proposal: SelfEditProposal,
         constitution_dir: Path,
     ) -> None:
-        """Roll back a proposal by restoring original content."""
+        """Roll back a proposal by restoring original content or replaying other proposals.
+
+        If the proposal being rolled back is the last one in the stack for its target file,
+        restore the original_content. Otherwise, replay all proposals except this one to
+        preserve changes from other proposals that came after it.
+        """
         target_path = constitution_dir / proposal.target_file
+        stack = self._file_edit_stack.get(proposal.target_file, [])
+
         try:
-            if proposal.original_content:
-                target_path.write_text(proposal.original_content, encoding="utf-8")
-                proposal.status = "rolled_back"
-                logger.info(f"[SICA] Rolled back {proposal.id}")
+            if proposal.target_file in self._file_edit_stack and proposal.id in stack:
+                is_last = stack[-1] == proposal.id
+
+                if is_last:
+                    # Simple case: just restore original content
+                    if proposal.original_content:
+                        target_path.write_text(proposal.original_content, encoding="utf-8")
+                        proposal.status = "rolled_back"
+                        logger.info(f"[SICA] Rolled back {proposal.id} (was last in stack)")
+                    else:
+                        logger.warning(f"[SICA] No original content to restore for {proposal.id}")
+                else:
+                    # Complex case: replay all proposals except this one
+                    logger.info(
+                        f"[SICA] Rolling back {proposal.id} (intermediate in stack); "
+                        f"replaying {len(stack) - 1} other proposals"
+                    )
+                    self._replay_proposals_without(proposal.target_file, proposal.id, constitution_dir)
+                    proposal.status = "rolled_back"
+
+                # Remove from stack
+                self._file_edit_stack[proposal.target_file].remove(proposal.id)
             else:
-                logger.warning(f"[SICA] No original content to restore for {proposal.id}")
+                # Fallback: file not in stack (shouldn't happen, but be safe)
+                if proposal.original_content:
+                    target_path.write_text(proposal.original_content, encoding="utf-8")
+                    proposal.status = "rolled_back"
+                    logger.info(f"[SICA] Rolled back {proposal.id} (not in stack)")
+                else:
+                    logger.warning(f"[SICA] No original content to restore for {proposal.id}")
         except Exception as e:
             logger.error(f"[SICA] Rollback failed for {proposal.id}: {e}")
 
@@ -621,10 +768,20 @@ class RewriteCandidate:
     parent_id: str = ""     # Parent candidate ID (empty for generation 0)
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize candidate to dict."""
+        """Serialize candidate to dict, compressing code with zlib+base64."""
+        # Compress code to save space
+        original_compressed = base64.b64encode(
+            zlib.compress(self.original_code.encode('utf-8'))
+        ).decode('utf-8')
+        rewritten_compressed = base64.b64encode(
+            zlib.compress(self.rewritten_code.encode('utf-8'))
+        ).decode('utf-8')
+
         return {
             "candidate_id": self.candidate_id,
             "target_module": self.target_module,
+            "original_code": original_compressed,
+            "rewritten_code": rewritten_compressed,
             "test_results": self.test_results,
             "fitness_delta": self.fitness_delta,
             "generation": self.generation,
@@ -882,7 +1039,9 @@ Do NOT include explanations or markdown outside the code block."""
             return results
 
         # Heuristic 2: Code quality checks
-        results['has_docstrings'] = '"""' in candidate.rewritten_code or "'''" in candidate.rewritten_code
+        has_triple_double = '"""' in candidate.rewritten_code
+        has_triple_single = "'''" in candidate.rewritten_code
+        results['has_docstrings'] = has_triple_double or has_triple_single
         results['has_error_handling'] = 'except' in candidate.rewritten_code or 'try' in candidate.rewritten_code
         results['has_logging'] = 'logger' in candidate.rewritten_code
         results['maintains_api'] = self._check_api_compatibility(candidate)
@@ -929,7 +1088,7 @@ Do NOT include explanations or markdown outside the code block."""
                 "optimize_loops",
                 "simplify_logic",
             ]
-            mutation_type = mutation_types[hash(candidate.candidate_id) % len(mutation_types)]
+            mutation_type = random.choice(mutation_types)
 
             prompt = f"""You are optimizing code through mutation.
 
@@ -1340,7 +1499,7 @@ Return ONLY the complete hybrid code in a markdown block."""
             logger.warning(f"[Darwin] Could not save evolution state: {e}")
 
     def _load_evolution_state(self) -> None:
-        """Load evolution history from disk."""
+        """Load evolution history from disk, decompressing code."""
         if not self._evolution_state_file.exists():
             return
         try:
@@ -1348,11 +1507,31 @@ Return ONLY the complete hybrid code in a markdown block."""
             for gen_data in data.get("generation_history", []):
                 generation = []
                 for candidate_dict in gen_data:
+                    # Decompress code if it exists
+                    original_code = ""
+                    rewritten_code = ""
+
+                    if "original_code" in candidate_dict and candidate_dict["original_code"]:
+                        try:
+                            original_code = zlib.decompress(
+                                base64.b64decode(candidate_dict["original_code"])
+                            ).decode('utf-8')
+                        except Exception as e:
+                            logger.warning(f"[Darwin] Failed to decompress original_code: {e}")
+
+                    if "rewritten_code" in candidate_dict and candidate_dict["rewritten_code"]:
+                        try:
+                            rewritten_code = zlib.decompress(
+                                base64.b64decode(candidate_dict["rewritten_code"])
+                            ).decode('utf-8')
+                        except Exception as e:
+                            logger.warning(f"[Darwin] Failed to decompress rewritten_code: {e}")
+
                     candidate = RewriteCandidate(
                         candidate_id=candidate_dict["candidate_id"],
                         target_module=candidate_dict["target_module"],
-                        original_code="",  # Not persisted for size reasons
-                        rewritten_code="",
+                        original_code=original_code,
+                        rewritten_code=rewritten_code,
                         test_results=candidate_dict.get("test_results", {}),
                         fitness_delta=candidate_dict["fitness_delta"],
                         generation=candidate_dict["generation"],

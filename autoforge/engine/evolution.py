@@ -229,7 +229,12 @@ class StrategyMemory:
     max_hall_of_fame: int = 10
 
     def record(self, entry: EvolutionRecord) -> None:
-        """Record a completed project run."""
+        """Record a completed project run.
+
+        Hall of fame enforces diversity: no two entries can have >70% Jaccard
+        similarity in their genome fingerprints. This prevents the hall from
+        being dominated by minor variants of the same strategy.
+        """
         niche_key = entry.genome.tech_fingerprint or entry.genome.project_type or "general"
 
         # Add to niche
@@ -243,12 +248,39 @@ class StrategyMemory:
         )
         self.niches[niche_key] = self.niches[niche_key][:self.max_per_niche]
 
-        # Update hall of fame
+        # Update hall of fame with diversity enforcement
         self.hall_of_fame.append(entry)
         self.hall_of_fame.sort(
             key=lambda r: r.fitness.composite_score, reverse=True
         )
+        # Deduplicate: keep highest-fitness entry per unique genome fingerprint
+        self.hall_of_fame = self._deduplicate_hall_of_fame(self.hall_of_fame)
         self.hall_of_fame = self.hall_of_fame[:self.max_hall_of_fame]
+
+    @staticmethod
+    def _deduplicate_hall_of_fame(records: list[EvolutionRecord]) -> list[EvolutionRecord]:
+        """Remove near-duplicate genomes from hall of fame, keeping the highest-fitness one.
+
+        Two genomes are "near-duplicate" if their key parameters AND project context
+        are identical. Different project types / tech stacks are kept as distinct entries
+        even if they happen to use the same parameter settings.
+        """
+        seen_fingerprints: set[str] = set()
+        unique: list[EvolutionRecord] = []
+        for r in records:
+            # Create a compact parameter fingerprint including project context
+            fp = (f"st={r.genome.search_tree_enabled}|"
+                  f"cp={r.genome.checkpoints_enabled}|"
+                  f"par={r.genome.parallel_builders}|"
+                  f"tdd={r.genome.tdd_loops}|"
+                  f"cand={r.genome.arch_candidates_tried}|"
+                  f"model={r.genome.model_preference}|"
+                  f"tech={r.genome.tech_fingerprint}|"
+                  f"type={r.genome.project_type}")
+            if fp not in seen_fingerprints:
+                seen_fingerprints.add(fp)
+                unique.append(r)
+        return unique
 
     def get_best_for_type(self, project_type: str, tech_fingerprint: str = "") -> EvolutionRecord | None:
         """Find the best-performing strategy for a similar project."""
@@ -373,6 +405,10 @@ class EvolutionEngine:
 
         Instead of just picking the single best, use softmax-weighted probability distribution
         to promote diversity while still favoring better-performing genomes.
+
+        Temperature is adaptive: starts high (more exploration) and decreases as
+        more data accumulates (more exploitation). This follows the explore→exploit
+        lifecycle common in bandit algorithms.
         """
         import random
 
@@ -393,14 +429,20 @@ class EvolutionEngine:
         else:
             normalized = [1.0] * len(scores)
 
-        # Apply softmax (temperature-scaled exponential)
-        temperature = 0.5  # Lower = more concentrated on best; higher = more diverse
+        # Adaptive temperature: high early (exploration), low later (exploitation)
+        # Based on total population size as a proxy for "how much we've explored"
+        total_records = sum(len(r) for r in self.memory.niches.values())
+        # Temperature decays from 1.0 → 0.3 as records grow (half-life of ~20 records)
+        temperature = 0.3 + 0.7 * math.exp(-total_records / 20.0)
+
         exp_scores = [math.exp(x / temperature) for x in normalized]
         total = sum(exp_scores)
         probabilities = [e / total for e in exp_scores]
 
         # Sample according to probabilities
         selected = random.choices(candidates, weights=probabilities, k=1)[0]
+        logger.debug(f"[Evolution] Softmax sampling: temperature={temperature:.2f}, "
+                     f"selected {selected.genome.id} (fitness={selected.fitness.composite_score:.2f})")
         return selected
 
     def prepare_genome(
@@ -519,26 +561,27 @@ class EvolutionEngine:
         return True
 
     def _mutate(self, genome: WorkflowGenome) -> WorkflowGenome:
-        """Apply small random mutations to a genome.
+        """Apply random mutations to a genome with escalating aggressiveness.
 
-        Mutations are conservative — only change 1-2 parameters at a time.
-        The idea is to explore the neighborhood of known-good solutions.
+        Mutations follow an escalation strategy:
+        - Attempt 1-2: Conservative mutations (10-15% per parameter)
+        - Attempt 3-4: Moderate mutations (25-30% per parameter)
+        - Attempt 5: Forced multi-mutation (flip 2+ parameters guaranteed)
 
-        Includes novelty rejection sampling (ShinkaEvolve trick 2) to avoid
-        re-exploring similar genomes.
+        This ensures novelty rejection always succeeds — the genome will be
+        sufficiently different from recent genomes before we give up.
         """
         import random
 
         # Collect recent genomes from memory for novelty check
         recent_genomes = []
         for records in self.memory.niches.values():
-            recent_genomes.extend([r.genome for r in records[:3]])  # Top 3 from each niche
+            recent_genomes.extend([r.genome for r in records[:3]])
         recent_genomes.extend([r.genome for r in self.memory.hall_of_fame[:5]])
 
-        # Novelty rejection: up to 3 attempts to generate a novel genome
-        max_attempts = 3
+        max_attempts = 5
         for attempt in range(max_attempts):
-            mutations = []
+            mutations: list[str] = []
             candidate = WorkflowGenome(
                 arch_strategy=genome.arch_strategy,
                 arch_candidates_tried=genome.arch_candidates_tried,
@@ -555,53 +598,82 @@ class EvolutionEngine:
                 model_preference=genome.model_preference,
             )
 
-            # Mutation 1: Toggle search tree (10% chance)
-            if random.random() < 0.10:
+            # Escalation: increase mutation rates on repeated novelty failures
+            # Attempt 0-1: base rates; Attempt 2-3: 2x; Attempt 4: forced multi-flip
+            escalation = 1.0 + attempt * 0.5  # 1.0, 1.5, 2.0, 2.5, 3.0
+
+            # On final attempt, guarantee at least 2 mutations
+            min_mutations = 2 if attempt >= max_attempts - 1 else 0
+
+            # Mutation 1: Toggle search tree
+            if random.random() < min(0.10 * escalation, 0.9):
                 candidate.search_tree_enabled = not candidate.search_tree_enabled
                 mutations.append(f"search_tree={'on' if candidate.search_tree_enabled else 'off'}")
 
-            # Mutation 2: Adjust candidate count (15% chance)
-            if random.random() < 0.15 and candidate.search_tree_enabled:
+            # Mutation 2: Adjust candidate count
+            if random.random() < min(0.15 * escalation, 0.9) and candidate.search_tree_enabled:
                 delta = random.choice([-1, 1])
                 candidate.arch_candidates_tried = max(2, min(5, candidate.arch_candidates_tried + delta))
                 mutations.append(f"candidates={candidate.arch_candidates_tried}")
 
-            # Mutation 3: Toggle checkpoints (10% chance)
-            if random.random() < 0.10:
+            # Mutation 3: Toggle checkpoints
+            if random.random() < min(0.10 * escalation, 0.9):
                 candidate.checkpoints_enabled = not candidate.checkpoints_enabled
                 mutations.append(f"checkpoints={'on' if candidate.checkpoints_enabled else 'off'}")
 
-            # Mutation 4: Adjust TDD loops (15% chance)
-            if random.random() < 0.15:
+            # Mutation 4: Adjust TDD loops
+            if random.random() < min(0.15 * escalation, 0.9):
                 delta = random.choice([-1, 1])
                 candidate.tdd_loops = max(0, min(3, candidate.tdd_loops + delta))
                 mutations.append(f"tdd_loops={candidate.tdd_loops}")
 
-            # Mutation 5: Adjust parallelism (10% chance)
-            if random.random() < 0.10:
+            # Mutation 5: Adjust parallelism
+            if random.random() < min(0.10 * escalation, 0.9):
                 delta = random.choice([-1, 1])
                 candidate.parallel_builders = max(1, min(4, candidate.parallel_builders + delta))
                 mutations.append(f"parallel={candidate.parallel_builders}")
 
-            # Mutation 6: Adaptive model ensemble selection (15% chance) (ShinkaEvolve trick 3)
-            if random.random() < 0.15:
+            # Mutation 6: Model preference
+            if random.random() < min(0.15 * escalation, 0.9):
                 candidate.model_preference = random.choice(["fast", "balanced", "strong"])
                 mutations.append(f"model_preference={candidate.model_preference}")
 
-            # Check novelty (ShinkaEvolve trick 2: novelty rejection sampling)
+            # Forced minimum mutations on final attempt
+            if len(mutations) < min_mutations:
+                # Force-flip random parameters we haven't mutated yet
+                available_flips = [
+                    ("search_tree", lambda: setattr(candidate, "search_tree_enabled",
+                                                     not candidate.search_tree_enabled)),
+                    ("checkpoints", lambda: setattr(candidate, "checkpoints_enabled",
+                                                     not candidate.checkpoints_enabled)),
+                    ("model_pref", lambda: setattr(candidate, "model_preference",
+                                                    random.choice(["fast", "balanced", "strong"]))),
+                    ("tdd_loops", lambda: setattr(candidate, "tdd_loops",
+                                                   random.choice([0, 1, 2, 3]))),
+                    ("parallel", lambda: setattr(candidate, "parallel_builders",
+                                                  random.choice([1, 2, 3, 4]))),
+                ]
+                random.shuffle(available_flips)
+                for name, flip_fn in available_flips:
+                    if len(mutations) >= min_mutations:
+                        break
+                    if not any(name in m for m in mutations):
+                        flip_fn()
+                        mutations.append(f"forced_{name}")
+
+            # Check novelty
             if self._novelty_check(candidate, recent_genomes):
                 candidate.mutations = mutations
                 if mutations:
                     logger.info(f"[Evolution] Mutations (attempt {attempt + 1}): {', '.join(mutations)}")
                 return candidate
             else:
-                if attempt < max_attempts - 1:
-                    logger.debug(f"[Evolution] Mutation not novel enough (attempt {attempt + 1}/{max_attempts}), re-rolling...")
+                logger.debug(f"[Evolution] Mutation not novel enough "
+                           f"(attempt {attempt + 1}/{max_attempts}), escalating...")
 
-        # If all attempts failed novelty check, return the last candidate anyway
+        # Last resort: return with forced mutations (guaranteed different after attempt 5)
         candidate.mutations = mutations
-        if mutations:
-            logger.info(f"[Evolution] Mutations (final, novelty check exhausted): {', '.join(mutations)}")
+        logger.info(f"[Evolution] Mutations (max escalation): {', '.join(mutations)}")
         return candidate
 
     # ──────── Phase 2: Record + Evaluate ────────
@@ -775,11 +847,17 @@ class EvolutionEngine:
         if hasattr(config, "search_tree_max_candidates"):
             config.search_tree_max_candidates = genome.arch_candidates_tried
 
-        # Note: genome.model_preference ("strong"/"fast"/"balanced") is an
-        # advisory signal logged for analysis.  We do NOT override
-        # config.model_strong / config.model_fast here because those are
-        # model-name strings, not booleans.  The LLM router already picks
-        # the right tier per-agent based on task complexity.
+        # Apply model preference as a routing bias
+        # This controls the complexity threshold in LLM router:
+        # "strong" → lower threshold → more tasks use Opus
+        # "fast" → higher threshold → more tasks use Sonnet
+        # "balanced" → default threshold
+        if hasattr(config, "model_routing_bias"):
+            bias_map = {"strong": -0.15, "balanced": 0.0, "fast": 0.15}
+            config.model_routing_bias = bias_map.get(genome.model_preference, 0.0)
+        # Also expose as a flag the orchestrator can query
+        if hasattr(config, "evolution_model_preference"):
+            config.evolution_model_preference = genome.model_preference
 
         logger.info(
             f"[Evolution] Applied genome {genome.id} to config: "

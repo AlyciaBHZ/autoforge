@@ -57,6 +57,7 @@ class PromptVariant:
     # Performance tracking
     times_used: int = 0
     total_fitness: float = 0.0
+    fitness_sq_sum: float = 0.0       # Sum of squared fitness (for variance)
     best_fitness: float = 0.0
     worst_fitness: float = float("inf")
     # Metadata
@@ -69,10 +70,21 @@ class PromptVariant:
             return 0.0
         return self.total_fitness / self.times_used
 
+    @property
+    def fitness_variance(self) -> float:
+        """Compute sample variance of fitness observations."""
+        if self.times_used < 2:
+            return 0.25  # High-uncertainty prior for untested/single-test
+        mean = self.avg_fitness
+        # Var = E[X²] - E[X]²  (Welford-safe with Bessel correction)
+        return max(0.0, (self.fitness_sq_sum / self.times_used - mean * mean)
+                   * self.times_used / (self.times_used - 1))
+
     def record_fitness(self, fitness: float) -> None:
         """Record a fitness observation."""
         self.times_used += 1
         self.total_fitness += fitness
+        self.fitness_sq_sum += fitness * fitness
         self.best_fitness = max(self.best_fitness, fitness)
         if self.worst_fitness == float("inf"):
             self.worst_fitness = fitness
@@ -89,6 +101,7 @@ class PromptVariant:
             "generation": self.generation,
             "times_used": self.times_used,
             "total_fitness": self.total_fitness,
+            "fitness_sq_sum": self.fitness_sq_sum,
             "best_fitness": self.best_fitness,
             "worst_fitness": self.worst_fitness if self.worst_fitness != float("inf") else 0.0,
             "created_at": self.created_at,
@@ -106,6 +119,7 @@ class PromptVariant:
             generation=data.get("generation", 0),
             times_used=data.get("times_used", 0),
             total_fitness=data.get("total_fitness", 0.0),
+            fitness_sq_sum=data.get("fitness_sq_sum", 0.0),
             best_fitness=data.get("best_fitness", 0.0),
             worst_fitness=data.get("worst_fitness", float("inf")),
             created_at=data.get("created_at", time.time()),
@@ -183,7 +197,7 @@ class PromptOptimizer:
     _OPT_DIR = "prompt_optimization"
     _MIN_RUNS_FOR_OPTIMIZATION = 3  # Need at least N runs before optimizing
     _MAX_VARIANTS_PER_ROLE = 5      # Keep top N variants per role
-    _EXPLORATION_BONUS = 0.1        # Bonus for under-explored variants
+    _SIGNIFICANCE_THRESHOLD = 0.10  # Welch's t-test p-value to accept improvement
 
     def __init__(self, base_dir: Path | None = None) -> None:
         if base_dir is None:
@@ -205,30 +219,42 @@ class PromptOptimizer:
     def get_active_prompt(self, role: str) -> tuple[str, str]:
         """Get the best prompt variant for a role.
 
-        Uses Thompson Sampling: balance exploitation (use best-known)
-        with exploration (try under-sampled variants).
+        Uses proper Thompson Sampling with Beta distribution:
+        - Model each variant's fitness as a Beta(alpha, beta) distribution
+        - alpha = successes (sum of fitness) + 1 (prior)
+        - beta = failures (sum of 1-fitness) + 1 (prior)
+        - Draw a sample from each variant's Beta distribution
+        - Select the variant with the highest sample
+
+        This naturally balances exploration vs exploitation:
+        - Untested variants have wide distributions (high exploration)
+        - Well-tested high-fitness variants have narrow, high distributions
+        - Well-tested low-fitness variants have narrow, low distributions
 
         Returns: (variant_id, prompt_content)
         """
+        import random
+
         variants = self._variants.get(role, [])
         if not variants:
             return ("", "")
 
-        # Thompson Sampling with exploration bonus
         best_score = -1.0
         best_variant = variants[0]
 
-        import random
         for v in variants:
             if v.times_used == 0:
-                # Untested variant gets high exploration priority
-                score = 1.0 + random.random() * 0.5
+                # Uninformative Beta(1, 1) = Uniform(0, 1) prior
+                score = random.betavariate(1.0, 1.0)
             else:
-                # Score = average fitness + exploration bonus for less-tested variants
-                avg = v.avg_fitness
-                exploration = self._EXPLORATION_BONUS / math.sqrt(v.times_used)
-                noise = random.gauss(0, 0.05)  # Small random perturbation
-                score = avg + exploration + noise
+                # Beta distribution parameterized from observed fitness
+                # fitness is in [0, 1], so alpha ~ sum of successes, beta ~ sum of failures
+                alpha = v.total_fitness + 1.0          # sum of fitness scores + prior
+                beta_param = (v.times_used - v.total_fitness) + 1.0  # sum of (1-fitness) + prior
+                # Clamp to valid Beta parameters (must be > 0)
+                alpha = max(alpha, 0.01)
+                beta_param = max(beta_param, 0.01)
+                score = random.betavariate(alpha, beta_param)
 
             if score > best_score:
                 best_score = score
@@ -272,6 +298,10 @@ class PromptOptimizer:
     def record_result(self, role: str, variant_id: str, fitness: float) -> None:
         """Record fitness for a variant after a project run.
 
+        Also checks pending optimization rounds for statistical significance —
+        if a candidate variant now has enough data to confirm improvement,
+        the round is marked as accepted/rejected.
+
         Args:
             role: Agent role ("builder", "architect", etc.)
             variant_id: Which variant was used
@@ -283,12 +313,49 @@ class PromptOptimizer:
                 v.record_fitness(fitness)
                 logger.info(
                     f"[PromptOpt] {role}/{variant_id}: fitness={fitness:.3f} "
-                    f"(avg={v.avg_fitness:.3f}, n={v.times_used})"
+                    f"(avg={v.avg_fitness:.3f}, n={v.times_used}, "
+                    f"var={v.fitness_variance:.4f})"
                 )
+
+                # Check if any pending optimization round can be resolved
+                self._resolve_pending_rounds(role)
                 self._save_state()
                 return
 
         logger.warning(f"[PromptOpt] Variant {variant_id} not found for {role}")
+
+    def _resolve_pending_rounds(self, role: str) -> None:
+        """Check pending optimization rounds for statistical significance."""
+        for rnd in self._history:
+            if rnd.role != role or rnd.accepted:
+                continue
+            if rnd.candidate_fitness > 0:
+                continue  # Already resolved
+
+            candidate = self.get_variant(role, rnd.candidate_id)
+            baseline = self.get_variant(role, rnd.baseline_id)
+            if not candidate or not baseline:
+                continue
+            if candidate.times_used < 2 or baseline.times_used < 2:
+                continue  # Need more data
+
+            p_value = self.welch_t_test(candidate, baseline)
+            if p_value < self._SIGNIFICANCE_THRESHOLD:
+                rnd.accepted = True
+                rnd.candidate_fitness = candidate.avg_fitness
+                rnd.reason += f" [ACCEPTED: p={p_value:.4f}, Δ={candidate.avg_fitness - baseline.avg_fitness:+.3f}]"
+                logger.info(
+                    f"[PromptOpt] Round {rnd.round_id}: candidate {rnd.candidate_id} "
+                    f"significantly better (p={p_value:.4f})"
+                )
+            elif candidate.times_used >= 5 and candidate.avg_fitness < baseline.avg_fitness:
+                # Enough data to reject
+                rnd.candidate_fitness = candidate.avg_fitness
+                rnd.reason += f" [REJECTED: p={p_value:.4f}, candidate underperforms]"
+                logger.info(
+                    f"[PromptOpt] Round {rnd.round_id}: candidate {rnd.candidate_id} "
+                    f"rejected (avg={candidate.avg_fitness:.3f} < baseline {baseline.avg_fitness:.3f})"
+                )
 
     # ──────── Optimization (OPRO-style) ────────
 
@@ -533,21 +600,138 @@ class PromptOptimizer:
             logger.warning(f"[PromptOpt] Mutation failed for {role}: {e}")
             return None
 
+    # ──────── Statistical Testing ────────
+
+    @staticmethod
+    def welch_t_test(v_a: PromptVariant, v_b: PromptVariant) -> float:
+        """Welch's t-test p-value for v_a being better than v_b (one-tailed).
+
+        Returns approximate p-value using the t-distribution.
+        Lower p = stronger evidence that v_a > v_b.
+        """
+        n_a, n_b = v_a.times_used, v_b.times_used
+        if n_a < 2 or n_b < 2:
+            return 1.0  # Not enough data
+
+        mean_a, mean_b = v_a.avg_fitness, v_b.avg_fitness
+        var_a, var_b = v_a.fitness_variance, v_b.fitness_variance
+
+        se_a = var_a / n_a
+        se_b = var_b / n_b
+        se_total = se_a + se_b
+        if se_total < 1e-12:
+            return 0.0 if mean_a > mean_b else 1.0
+
+        t_stat = (mean_a - mean_b) / math.sqrt(se_total)
+
+        # Welch–Satterthwaite degrees of freedom
+        df_num = se_total ** 2
+        df_den = (se_a ** 2 / (n_a - 1) + se_b ** 2 / (n_b - 1)) if (n_a > 1 and n_b > 1) else 1.0
+        df = max(1.0, df_num / df_den) if df_den > 0 else 1.0
+
+        # Approximate one-tailed p-value using the incomplete beta function
+        # For t > 0 (candidate better), p = P(T > t) under H0
+        return PromptOptimizer._t_cdf_complement(t_stat, df)
+
+    @staticmethod
+    def _t_cdf_complement(t: float, df: float) -> float:
+        """Approximate 1 - CDF of t-distribution (one-tailed upper p-value).
+
+        Uses the regularized incomplete beta function approximation.
+        For practical prompt optimization, this is more than accurate enough.
+        """
+        if t <= 0:
+            return 1.0 - PromptOptimizer._t_cdf_complement(-t, df)
+
+        # Convert t-statistic to beta function form
+        x = df / (df + t * t)
+        # Regularized incomplete beta: I_x(df/2, 1/2)
+        # Use continued fraction approximation
+        a, b = df / 2.0, 0.5
+        p = 0.5 * PromptOptimizer._regularized_incomplete_beta(x, a, b)
+        return max(0.0, min(1.0, p))
+
+    @staticmethod
+    def _regularized_incomplete_beta(x: float, a: float, b: float) -> float:
+        """Regularized incomplete beta function via Lentz continued fraction."""
+        if x <= 0:
+            return 0.0
+        if x >= 1:
+            return 1.0
+
+        # Use the series expansion for small x, continued fraction otherwise
+        # This is a simplified implementation sufficient for our use case
+        # Prefactor: x^a * (1-x)^b / (a * Beta(a,b))
+        try:
+            ln_prefactor = (a * math.log(x) + b * math.log(1 - x)
+                           + math.lgamma(a + b)
+                           - math.lgamma(a) - math.lgamma(b)
+                           - math.log(a))
+            prefactor = math.exp(ln_prefactor)
+        except (ValueError, OverflowError):
+            return 0.5  # Fallback
+
+        # Lentz's continued fraction for I_x(a, b)
+        cf = 1.0
+        c, d = 1.0, 1.0 - (a + b) * x / (a + 1.0)
+        if abs(d) < 1e-30:
+            d = 1e-30
+        d = 1.0 / d
+        cf = d
+
+        for m in range(1, 100):
+            # Even step
+            num = m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m))
+            d = 1.0 + num * d
+            if abs(d) < 1e-30:
+                d = 1e-30
+            c = 1.0 + num / c
+            if abs(c) < 1e-30:
+                c = 1e-30
+            d = 1.0 / d
+            cf *= d * c
+
+            # Odd step
+            num = -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1))
+            d = 1.0 + num * d
+            if abs(d) < 1e-30:
+                d = 1e-30
+            c = 1.0 + num / c
+            if abs(c) < 1e-30:
+                c = 1e-30
+            d = 1.0 / d
+            delta = d * c
+            cf *= delta
+
+            if abs(delta - 1.0) < 1e-8:
+                break
+
+        return min(1.0, prefactor * cf * a)
+
     # ──────── Variant Management ────────
 
     def _add_variant(self, role: str, variant: PromptVariant) -> None:
-        """Add a variant, evicting the worst performer if at capacity."""
+        """Add a variant, evicting the worst performer if at capacity.
+
+        Unlike the old version, baselines CAN be evicted if they have enough
+        data showing they underperform (>= 5 runs AND statistically worse).
+        """
         variants = self._variants.setdefault(role, [])
         variants.append(variant)
 
         if len(variants) > self._MAX_VARIANTS_PER_ROLE:
-            # Evict the worst-performing variant (but never the baseline)
-            candidates_for_eviction = [
-                v for v in variants
-                if v.source != "baseline" and v.times_used > 0
-            ]
-            if candidates_for_eviction:
-                worst = min(candidates_for_eviction, key=lambda v: v.avg_fitness)
+            # All tested variants are candidates for eviction
+            candidates = [v for v in variants if v.times_used > 0]
+            if candidates:
+                worst = min(candidates, key=lambda v: v.avg_fitness)
+                # Protect baseline unless we have strong evidence it's worse
+                if worst.source == "baseline" and worst.times_used < 5:
+                    # Not enough data to evict baseline — evict next worst non-baseline
+                    non_base = [c for c in candidates if c.source != "baseline"]
+                    if non_base:
+                        worst = min(non_base, key=lambda v: v.avg_fitness)
+                    else:
+                        return  # Can't evict anything
                 variants.remove(worst)
                 logger.info(f"[PromptOpt] Evicted variant {worst.id} (avg={worst.avg_fitness:.3f})")
 

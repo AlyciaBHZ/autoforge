@@ -78,43 +78,140 @@ class ReflectionMemory:
     def add(self, reflection: Reflection) -> None:
         self.reflections.append(reflection)
         if len(self.reflections) > self.max_total:
-            # Evict oldest resolved reflections first
-            resolved = [r for r in self.reflections if r.outcome == "resolved"]
-            if resolved:
-                self.reflections.remove(resolved[0])
-            else:
-                self.reflections.pop(0)
+            self._evict_one()
+
+    def _evict_one(self) -> None:
+        """Smart eviction: remove the least useful reflection.
+
+        Priority for eviction (highest priority = evicted first):
+        1. Resolved reflections older than 30 days
+        2. Oldest resolved reflections
+        3. Persistent (gave up) reflections older than 14 days
+        4. Oldest pending reflections
+        """
+        now = time.time()
+        day_30 = 30 * 86400
+        day_14 = 14 * 86400
+
+        # Priority 1: old resolved
+        for r in self.reflections:
+            if r.outcome == "resolved" and (now - r.timestamp) > day_30:
+                self.reflections.remove(r)
+                return
+
+        # Priority 2: any resolved (oldest first)
+        for r in self.reflections:
+            if r.outcome == "resolved":
+                self.reflections.remove(r)
+                return
+
+        # Priority 3: old persistent failures
+        for r in self.reflections:
+            if r.outcome == "persistent" and (now - r.timestamp) > day_14:
+                self.reflections.remove(r)
+                return
+
+        # Priority 4: oldest anything
+        self.reflections.pop(0)
 
     def get_relevant(
         self, task_description: str, project: str = "", top_k: int = 0,
     ) -> list[Reflection]:
-        """Retrieve reflections relevant to a task, most recent first."""
+        """Retrieve reflections relevant to a task using TF-IDF-weighted scoring.
+
+        Scoring combines:
+        1. TF-IDF weighted word overlap (discriminating vs common words)
+        2. Tag overlap (failure category matching)
+        3. Same-project boost
+        4. Recency decay (newer reflections weighted higher)
+        """
+        import math as _math
+
         if top_k <= 0:
             top_k = self.max_context_reflections
 
-        candidates: list[Reflection] = []
+        if not self.reflections:
+            return []
+
+        # Build IDF (inverse document frequency) from all reflections
+        doc_count = len(self.reflections) + 1  # +1 for the query
+        word_doc_freq: dict[str, int] = {}
+        for r in self.reflections:
+            words = set(r.task_description.lower().split())
+            for w in words:
+                word_doc_freq[w] = word_doc_freq.get(w, 0) + 1
+
         task_words = set(task_description.lower().split())
+        for w in task_words:
+            word_doc_freq[w] = word_doc_freq.get(w, 0) + 1
 
-        for r in reversed(self.reflections):
-            # Relevance: word overlap between task descriptions
+        # IDF: log(N / df) — rare words get higher weight
+        idf: dict[str, float] = {}
+        for w, df in word_doc_freq.items():
+            idf[w] = _math.log(doc_count / df) if df > 0 else 0.0
+
+        # Extract tags from current task for tag matching
+        task_tags = set()
+        lower_desc = task_description.lower()
+        tag_keywords = {
+            "import": "import_error", "syntax": "syntax_error",
+            "type": "type_error", "attribute": "attribute_error",
+            "timeout": "timeout", "assert": "assertion_failure",
+            "connection": "network_error", "permission": "permission_error",
+            "not found": "not_found", "undefined": "undefined_reference",
+        }
+        for keyword, tag in tag_keywords.items():
+            if keyword in lower_desc:
+                task_tags.add(tag)
+
+        now = time.time()
+        scored_candidates: list[tuple[float, Reflection]] = []
+
+        for r in self.reflections:
             ref_words = set(r.task_description.lower().split())
-            overlap = len(task_words & ref_words) / max(len(task_words | ref_words), 1)
 
-            # Boost same-project reflections
-            same_project = r.project == project if project else False
+            # TF-IDF weighted overlap
+            common = task_words & ref_words
+            if not common and not (r.project == project if project else False):
+                # No word overlap and different project — skip
+                if not (task_tags and set(r.tags) & task_tags):
+                    continue
 
-            if overlap > 0.15 or same_project:
-                candidates.append(r)
+            tfidf_score = sum(idf.get(w, 0) for w in common)
+            max_possible = sum(idf.get(w, 0) for w in task_words) if task_words else 1.0
+            normalized_tfidf = tfidf_score / max(max_possible, 1e-6)
 
-        # Prioritize: unresolved > recent > high overlap
-        candidates.sort(
-            key=lambda r: (
-                r.outcome != "resolved",  # Unresolved first
-                r.timestamp,  # Then most recent
-            ),
-            reverse=True,
-        )
-        return candidates[:top_k]
+            # Tag overlap bonus (failure category matching)
+            tag_score = 0.0
+            if task_tags and r.tags:
+                tag_overlap = len(task_tags & set(r.tags))
+                tag_score = tag_overlap / max(len(task_tags | set(r.tags)), 1)
+
+            # Same-project boost
+            project_boost = 0.3 if (project and r.project == project) else 0.0
+
+            # Recency decay: half-life of 7 days
+            age_hours = (now - r.timestamp) / 3600.0
+            recency = _math.exp(-age_hours / (7 * 24))
+
+            # Composite score
+            score = (
+                normalized_tfidf * 0.4
+                + tag_score * 0.2
+                + project_boost
+                + recency * 0.1
+            )
+
+            # Unresolved reflections get a priority boost
+            if r.outcome != "resolved":
+                score += 0.15
+
+            if score > 0.1:  # Minimum relevance threshold
+                scored_candidates.append((score, r))
+
+        # Sort by score descending
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        return [r for _, r in scored_candidates[:top_k]]
 
     def mark_resolved(self, reflection_id: str) -> None:
         for r in self.reflections:
