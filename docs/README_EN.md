@@ -94,16 +94,18 @@ AutoForge orchestrates 6 specialized AI agents through a 5-phase pipeline to tur
 
 ## Supported LLM Providers
 
-| Provider | Environment Variable | Recommended Models |
-|----------|---------------------|--------------------|
-| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4 (strong), Claude Sonnet 4 (fast) |
-| **OpenAI** | `OPENAI_API_KEY` | GPT-4o / o3 (strong), GPT-4o-mini (fast) |
-| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro (strong), Gemini 2.5 Flash (fast) |
+| Provider | Environment Variable | Strong Models | Fast Models |
+|----------|---------------------|---------------|-------------|
+| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4.6 | Claude Sonnet 4.5 |
+| **OpenAI** | `OPENAI_API_KEY` | o3, GPT-4o | o4-mini, GPT-4o-mini |
+| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro | Gemini 2.5 Flash, Gemini 2.0 Flash |
+
+**Auth methods:** API Key, Codex OAuth (browser login, uses ChatGPT subscription), Device Code (headless/SSH), OAuth2 Client Credentials, Azure/LiteLLM Bearer Token, Google ADC/Service Account, AWS Bedrock, and Google Vertex AI are all supported.
 
 Keys can also be stored in `~/.autoforge/config.toml`. Cross-provider example:
 
 ```bash
-export FORGE_MODEL_STRONG=gpt-4o          # Strong model from OpenAI
+export FORGE_MODEL_STRONG=o3              # Strong model from OpenAI
 export FORGE_MODEL_FAST=gemini-2.5-flash  # Fast model from Google
 ```
 

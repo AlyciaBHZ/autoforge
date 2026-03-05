@@ -94,16 +94,18 @@ AutoForge 通过 6 个专业化 AI 智能体协作，经过 5 阶段流水线，
 
 ## 支持的 LLM 提供商
 
-| 提供商 | 环境变量 | 推荐模型 |
-|--------|----------|----------|
-| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4（强）、Claude Sonnet 4（快） |
-| **OpenAI** | `OPENAI_API_KEY` | GPT-4o / o3（强）、GPT-4o-mini（快） |
-| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro（强）、Gemini 2.5 Flash（快） |
+| 提供商 | 环境变量 | 强模型 | 快模型 |
+|--------|----------|--------|--------|
+| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4.6 | Claude Sonnet 4.5 |
+| **OpenAI** | `OPENAI_API_KEY` | o3、GPT-4o | o4-mini、GPT-4o-mini |
+| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro | Gemini 2.5 Flash、Gemini 2.0 Flash |
+
+**认证方式：** API Key、Codex OAuth（浏览器登录，使用 ChatGPT 订阅）、Device Code（无头/SSH 环境）、OAuth2 客户端凭证、Azure/LiteLLM Bearer Token、Google ADC/Service Account、AWS Bedrock、Google Vertex AI 均受支持。
 
 也可以通过 `~/.autoforge/config.toml` 统一管理密钥。支持跨厂商混搭：
 
 ```bash
-export FORGE_MODEL_STRONG=gpt-4o          # 强模型用 OpenAI
+export FORGE_MODEL_STRONG=o3              # 强模型用 OpenAI
 export FORGE_MODEL_FAST=gemini-2.5-flash  # 快模型用 Google
 ```
 
