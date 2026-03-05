@@ -257,3 +257,47 @@ Scope: Full project review — configuration, installation, runtime, security
 - **File**: `autoforge/engine/security_scan.py:164-171`
 - Secret detection regex only matches 8+ character values in quotes. Shorter secrets, escaped quotes, and unquoted values are missed.
 - **Severity**: High
+
+### Daemon: Concurrent Build Limit Race Condition
+
+- **File**: `autoforge/engine/daemon.py:161-190`
+- `_active_builds` dict is checked for length then modified — not atomic. Two concurrent dequeue loops can exceed `max_concurrent_projects`.
+- **Severity**: High
+
+### Daemon: PID File Race Condition
+
+- **File**: `autoforge/engine/daemon.py:44-60`
+- Between reading PID file and unlinking it, another daemon instance could overwrite it. No atomic locking (O_EXCL or lock file pattern) is used.
+- **Impact**: Multiple daemons can run simultaneously, both thinking they're the sole instance.
+- **Severity**: High
+
+### Project Registry: Dequeue Race Condition
+
+- **File**: `autoforge/engine/project_registry.py:283-303`
+- Between the UPDATE+RETURNING and the commit, another daemon instance could dequeue the same project. SQLite WAL mode provides some isolation but the explicit commit introduces a race window.
+- **Impact**: Same project built by multiple instances simultaneously.
+- **Severity**: High
+
+### Request Intake: Rate Limit Bypass via Concurrent Requests
+
+- **File**: `autoforge/engine/request_intake.py:147-158`
+- Idempotency check and rate limit enforcement are not atomic. Concurrent requests can bypass rate limits.
+- **Severity**: Medium
+
+### Task DAG: Recursive DFS Stack Overflow Risk
+
+- **File**: `autoforge/engine/task_dag.py:166-185`
+- Cycle detection uses recursive DFS with no depth limit. Deep DAGs (100+ levels) can hit Python's recursion limit, crashing with a misleading `RecursionError`.
+- **Severity**: Medium
+
+### Task DAG: Retry Count Not Reset on Task Reset
+
+- **File**: `autoforge/engine/task_dag.py:145-155`
+- `reset_failed()` doesn't reset `retry_count`. After reset, a task can immediately jump to BLOCKED on the first retry.
+- **Severity**: Medium
+
+### SQLite NULL Idempotency: Duplicate Queue Entries
+
+- **File**: `autoforge/engine/project_registry.py:150-166`
+- The unique index on `(requested_by, idempotency_key)` allows multiple NULL idempotency keys (SQLite NULL != NULL). Requests without an idempotency key bypass deduplication.
+- **Severity**: Medium
