@@ -222,7 +222,7 @@ class TestReproContractFailCases(unittest.TestCase):
 
 
 class TestReproContractIntegration(unittest.TestCase):
-    def test_reproduce_strict_contract_no_key_generates_all_artifacts(self) -> None:
+    def test_reproduce_strict_contract_no_key_marks_run_as_non_pass(self) -> None:
         from autoforge.cli.app import _run_paper_reproduce
 
         paper = PaperRecord(
@@ -265,11 +265,14 @@ class TestReproContractIntegration(unittest.TestCase):
                 ):
                     exit_code = asyncio.run(_run_paper_reproduce(config, args))
 
-            self.assertEqual(exit_code, 0)
+            self.assertEqual(exit_code, 2)
             for name in REQUIRED_ARTIFACT_FILES:
                 self.assertTrue((out_dir / name).exists(), f"missing {name}")
             self.assertTrue((out_dir / "simulated_pipeline_feedback.json").exists())
             self.assertTrue(validate_contract_artifacts(out_dir).ok)
+            report = json.loads((out_dir / "repro_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report.get("mode"), "simulated_no_api_key")
+            self.assertEqual(report.get("pass_fail"), "fail")
 
     def test_reproduce_strict_contract_stops_with_exit_2_on_validation_error(self) -> None:
         from autoforge.cli.app import _run_paper_reproduce

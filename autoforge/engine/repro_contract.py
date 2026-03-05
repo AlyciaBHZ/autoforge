@@ -137,7 +137,22 @@ def build_repro_report(
         seen.add(text)
         dedup_failures.append(text)
 
-    pass_fail = "pass" if artifacts_complete and not dedup_failures else "fail"
+    # Contract semantics: only full generated runs can pass reproducibility.
+    if mode == "simulated_no_api_key":
+        simulation_reason = (
+            "Simulated run without API key cannot satisfy full closed-loop reproduction."
+        )
+        if simulation_reason not in seen:
+            dedup_failures.append(simulation_reason)
+            seen.add(simulation_reason)
+    elif mode == "generation_failed":
+        generation_reason = "Generation failed; reproduction run incomplete."
+        if generation_reason not in seen:
+            dedup_failures.append(generation_reason)
+            seen.add(generation_reason)
+
+    mode_can_pass = mode == "generated_with_api_key"
+    pass_fail = "pass" if (artifacts_complete and not dedup_failures and mode_can_pass) else "fail"
     return {
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "run_id": run_id,
@@ -383,6 +398,19 @@ def validate_contract_artifacts(output_dir: Path) -> ContractValidationResult:
                 "repro_report.json artifacts_complete mismatch "
                 f"(reported={reported_complete}, actual={actual_complete})"
             )
+
+        pass_fail = report_payload.get("pass_fail")
+        mode = report_payload.get("mode")
+        if pass_fail == "pass":
+            if mode != "generated_with_api_key":
+                errors.append(
+                    "repro_report.json pass_fail=pass requires mode=generated_with_api_key"
+                )
+            reasons = report_payload.get("failure_reasons", [])
+            if isinstance(reasons, list) and reasons:
+                errors.append(
+                    "repro_report.json pass_fail=pass requires empty failure_reasons"
+                )
 
     return ContractValidationResult(
         ok=(len(errors) == 0),

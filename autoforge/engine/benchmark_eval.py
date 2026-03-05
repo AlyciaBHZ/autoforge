@@ -202,17 +202,22 @@ class PassAtKEstimator:
         Returns:
             Pass@k probability (0 to 1)
         """
-        if n < k:
-            return 0.0 if c == 0 else 1.0
+        if n <= 0 or k <= 0 or c <= 0:
+            return 0.0
 
-        if c > k:
+        # k cannot exceed available samples for a problem.
+        k_eff = min(k, n)
+        c_eff = min(c, n)
+
+        # If failures are fewer than draws, at least one success is guaranteed.
+        if (n - c_eff) < k_eff:
             return 1.0
 
         # Use unbiased estimator: 1 - comb(n-c, k) / comb(n, k)
         try:
-            return max(0.0, 1.0 - comb(n - c, k) / comb(n, k))
+            return max(0.0, 1.0 - comb(n - c_eff, k_eff) / comb(n, k_eff))
         except (ValueError, OverflowError):
-            return 1.0 if c > 0 else 0.0
+            return 1.0 if c_eff > 0 else 0.0
 
     @staticmethod
     def compute_from_results(
@@ -818,7 +823,13 @@ class BenchmarkRunner:
                 all_results.extend(res_list)
                 success_by_sample.append([r.success for r in res_list])
 
-        pass_at_1 = solved / total if total > 0 else 0.0
+        # pass@1 must use first sample only (not "any of n samples").
+        first_sample_successes = sum(
+            1
+            for res_list in results.values()
+            if res_list and res_list[0].success
+        )
+        pass_at_1 = first_sample_successes / total if total > 0 else 0.0
 
         # Compute pass@k
         pass_at_k = {}

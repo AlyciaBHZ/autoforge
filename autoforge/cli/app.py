@@ -1064,6 +1064,14 @@ async def _run_paper_reproduce(config, args: argparse.Namespace) -> int:
         if strict_contract:
             return 2
         console.print("[yellow]Continuing because --strict-contract is not enabled.[/yellow]")
+    elif strict_contract and report.get("pass_fail") != "pass":
+        console.print(
+            "[red]Strict contract failed:[/red] run artifacts are valid, "
+            "but reproduction outcome is not marked PASS."
+        )
+        for reason in report.get("failure_reasons", []):
+            console.print(f"  - {reason}")
+        return 2
 
     expected = ", ".join(REQUIRED_ARTIFACT_FILES)
     console.print(f"[dim]contract artifacts:[/dim] {expected}")

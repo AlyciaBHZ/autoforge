@@ -164,9 +164,15 @@ class TFIDFProvider(EmbeddingProvider):
         self._tfidf_matrix = None
         self._svd = None
         self._corpus = []
+        self._use_sklearn = False
+        self._token_to_id: dict[str, int] = {}
+        self._idf_values: np.ndarray | None = None
 
-    def _build_tfidf_matrix(self, texts: list[str]) -> np.ndarray:
-        """Build TF-IDF matrix using pure Python or sklearn."""
+    def _fit_tfidf(self, texts: list[str]) -> np.ndarray:
+        """Fit TF-IDF model on a corpus and return corpus embeddings."""
+        if not texts:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32)
+
         try:
             from sklearn.feature_extraction.text import TfidfVectorizer
             from sklearn.decomposition import TruncatedSVD
@@ -179,92 +185,133 @@ class TFIDFProvider(EmbeddingProvider):
                 ngram_range=(1, 2),
                 token_pattern=r"\b\w{2,}\b",
             )
-            tfidf = self._vectorizer.fit_transform(texts)
-            tfidf_array = tfidf.toarray()
+            tfidf_matrix = self._vectorizer.fit_transform(texts)
+            self._use_sklearn = True
 
-            if tfidf_array.shape[1] > self.embedding_dim:
-                logger.info(f"Reducing dimensions from {tfidf_array.shape[1]} to {self.embedding_dim}")
+            feature_dim = tfidf_matrix.shape[1]
+            if feature_dim > self.embedding_dim:
+                logger.info(
+                    "Reducing dimensions from %d to %d",
+                    feature_dim,
+                    self.embedding_dim,
+                )
                 self._svd = TruncatedSVD(n_components=self.embedding_dim)
-                return self._svd.fit_transform(tfidf_array).astype(np.float32)
+                reduced = self._svd.fit_transform(tfidf_matrix)
+                return reduced.astype(np.float32)
 
-            # Pad with zeros if dimension is smaller
-            if tfidf_array.shape[1] < self.embedding_dim:
-                padded = np.zeros((tfidf_array.shape[0], self.embedding_dim), dtype=np.float32)
-                padded[:, :tfidf_array.shape[1]] = tfidf_array
-                return padded
-
-            return tfidf_array.astype(np.float32)
+            dense = tfidf_matrix.toarray().astype(np.float32)
+            return self._pad_to_embedding_dim(dense)
         except ImportError:
             logger.warning("sklearn not available. Using pure Python TF-IDF.")
-            return self._pure_python_tfidf(texts)
+            self._use_sklearn = False
+            return self._fit_pure_python_tfidf(texts)
 
-    def _pure_python_tfidf(self, texts: list[str]) -> np.ndarray:
-        """Pure Python TF-IDF implementation without sklearn."""
-        # Simple tokenization
-        corpus_tokens = []
-        vocab = {}
-        for text in texts:
-            tokens = re.findall(r"\b\w{2,}\b", text.lower())
-            corpus_tokens.append(tokens)
+    def _fit_pure_python_tfidf(self, texts: list[str]) -> np.ndarray:
+        """Fit a pure-Python TF-IDF model and return corpus embeddings."""
+        tokenized = [self._tokenize(text) for text in texts]
+        n_docs = len(tokenized)
+        if n_docs == 0:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32)
+
+        # Document frequency per token.
+        df: dict[str, int] = {}
+        for doc_tokens in tokenized:
+            for token in set(doc_tokens):
+                df[token] = df.get(token, 0) + 1
+
+        min_df = max(1, n_docs // 100)
+        max_df = int(n_docs * 0.95)
+        filtered = {
+            token: freq
+            for token, freq in df.items()
+            if min_df <= freq <= max_df
+        }
+        sorted_tokens = sorted(
+            filtered.keys(),
+            key=lambda token: (-filtered[token], token),
+        )[: self.embedding_dim]
+
+        self._token_to_id = {token: idx for idx, token in enumerate(sorted_tokens)}
+        self._idf_values = np.array(
+            [
+                math.log((1 + n_docs) / (1 + filtered[token])) + 1.0
+                for token in sorted_tokens
+            ],
+            dtype=np.float32,
+        )
+
+        matrix = self._transform_pure_python_tfidf(texts)
+        return matrix
+
+    def _transform_tfidf(self, texts: list[str]) -> np.ndarray:
+        """Transform texts into the already-fitted embedding space."""
+        if not texts:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32)
+
+        if self._use_sklearn and self._vectorizer is not None:
+            transformed = self._vectorizer.transform(texts)
+            if self._svd is not None:
+                return self._svd.transform(transformed).astype(np.float32)
+            dense = transformed.toarray().astype(np.float32)
+            return self._pad_to_embedding_dim(dense)
+
+        return self._transform_pure_python_tfidf(texts)
+
+    def _transform_pure_python_tfidf(self, texts: list[str]) -> np.ndarray:
+        """Transform texts with pure-Python TF-IDF in a fixed vocabulary."""
+        if not self._token_to_id:
+            return np.zeros((len(texts), self.embedding_dim), dtype=np.float32)
+
+        matrix = np.zeros((len(texts), self.embedding_dim), dtype=np.float32)
+        for doc_idx, text in enumerate(texts):
+            tokens = self._tokenize(text)
+            if not tokens:
+                continue
+
+            tf: dict[int, int] = {}
             for token in tokens:
-                vocab[token] = vocab.get(token, 0) + 1
+                token_id = self._token_to_id.get(token)
+                if token_id is None:
+                    continue
+                tf[token_id] = tf.get(token_id, 0) + 1
 
-        # Remove low-frequency tokens
-        min_df = max(1, len(texts) // 100)
-        vocab = {k: v for k, v in vocab.items() if v >= min_df and v <= len(texts) * 0.95}
-        token_to_id = {token: i for i, token in enumerate(sorted(vocab.keys()))}
+            if not tf:
+                continue
 
-        # Build TF-IDF matrix
-        n_docs = len(texts)
-        vocab_size = len(token_to_id)
-        embeddings = np.zeros((n_docs, min(vocab_size, self.embedding_dim)), dtype=np.float32)
+            token_count = max(len(tokens), 1)
+            for token_id, count in tf.items():
+                idf = float(self._idf_values[token_id]) if self._idf_values is not None else 1.0
+                matrix[doc_idx, token_id] = (count / token_count) * idf
 
-        for doc_id, tokens in enumerate(corpus_tokens):
-            # Term frequency
-            tf = {}
-            for token in tokens:
-                if token in token_to_id:
-                    tf[token] = tf.get(token, 0) + 1
+        # Normalize rows.
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        matrix = matrix / norms
+        return matrix.astype(np.float32)
 
-            # TF-IDF calculation
-            for token, count in tf.items():
-                token_id = token_to_id[token]
-                if token_id < self.embedding_dim:
-                    # IDF: log(total_docs / docs_with_token)
-                    docs_with_token = sum(1 for t in corpus_tokens if token in t)
-                    idf = math.log(n_docs / (1 + docs_with_token))
-                    embeddings[doc_id, token_id] = (count / len(tokens)) * idf
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        return re.findall(r"\b\w{2,}\b", text.lower())
 
-        # Normalize rows
-        for i in range(embeddings.shape[0]):
-            norm = np.linalg.norm(embeddings[i])
-            if norm > 0:
-                embeddings[i] /= norm
-
-        # Pad if necessary
-        if embeddings.shape[1] < self.embedding_dim:
-            padded = np.zeros((n_docs, self.embedding_dim), dtype=np.float32)
-            padded[:, :embeddings.shape[1]] = embeddings
-            embeddings = padded
-
-        return embeddings
+    def _pad_to_embedding_dim(self, matrix: np.ndarray) -> np.ndarray:
+        if matrix.shape[1] >= self.embedding_dim:
+            return matrix[:, : self.embedding_dim].astype(np.float32)
+        padded = np.zeros((matrix.shape[0], self.embedding_dim), dtype=np.float32)
+        padded[:, : matrix.shape[1]] = matrix
+        return padded
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Embed batch of texts using TF-IDF."""
         if not texts:
             return []
+        if self._tfidf_matrix is None:
+            matrix = await asyncio.to_thread(self._fit_tfidf, texts)
+            self._corpus = texts.copy()
+            self._tfidf_matrix = matrix
+            return matrix.tolist()
 
-        # For batches, we need to update the corpus and recompute
-        loop = asyncio.get_event_loop()
-
-        async def _compute():
-            # Combine with existing corpus for consistency
-            all_texts = self._corpus + texts
-            matrix = self._build_tfidf_matrix(all_texts)
-            # Return only the new embeddings
-            return matrix[-len(texts):].tolist()
-
-        return await loop.run_in_executor(None, lambda: asyncio.run(_compute()))
+        matrix = await asyncio.to_thread(self._transform_tfidf, texts)
+        return matrix.tolist()
 
     async def embed_single(self, text: str) -> list[float]:
         """Embed a single text."""
@@ -273,13 +320,8 @@ class TFIDFProvider(EmbeddingProvider):
 
     async def initialize_corpus(self, texts: list[str]) -> None:
         """Initialize with full corpus for consistent embeddings."""
-        loop = asyncio.get_event_loop()
         self._corpus = texts.copy()
-
-        async def _build():
-            self._tfidf_matrix = self._build_tfidf_matrix(texts)
-
-        await loop.run_in_executor(None, lambda: asyncio.run(_build()))
+        self._tfidf_matrix = await asyncio.to_thread(self._fit_tfidf, texts)
 
     async def get_corpus_embeddings(self) -> list[list[float]]:
         """Get embeddings for the entire corpus."""
@@ -582,10 +624,30 @@ class MathlibPremiseLoader:
             logger.warning(f"Mathlib build directory not found: {olean_dir}")
             return premises
 
-        # In practice, this would parse .olean files or .lean source files
-        # For now, return empty list as a placeholder
         logger.info(f"Scanning Mathlib at {mathlib_path}")
+        lean_files = list((mathlib_path / "Mathlib").rglob("*.lean"))
+        if not lean_files:
+            # Fallback: scan the whole project path for .lean declarations.
+            lean_files = list(mathlib_path.rglob("*.lean"))
 
+        # Keep offline scan bounded.
+        max_files = 200
+        for file_path in lean_files[:max_files]:
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+
+            module_path = str(file_path.relative_to(mathlib_path)).replace("\\", "/")
+            for line in text.splitlines():
+                parsed = MathlibPremiseLoader._parse_lean_declaration(line.strip())
+                if parsed is None:
+                    continue
+                parsed.module_path = module_path
+                parsed.id = f"{module_path}:{parsed.name}"
+                premises.append(parsed)
+
+        logger.info("Extracted %d declaration premises from %d files", len(premises), min(len(lean_files), max_files))
         return premises
 
     @staticmethod
@@ -616,9 +678,46 @@ class MathlibPremiseLoader:
     @staticmethod
     async def load_from_lean_repl(lean_project: Any) -> list[PremiseEntry]:
         """Use Lean REPL to enumerate available declarations."""
-        # This would require a running Lean REPL instance
-        logger.warning("load_from_lean_repl not yet implemented")
-        return []
+        if lean_project is None:
+            return []
+
+        declarations: list[Any] = []
+        try:
+            if hasattr(lean_project, "list_declarations_async"):
+                declarations = await lean_project.list_declarations_async()
+            elif hasattr(lean_project, "list_declarations"):
+                declarations = await asyncio.to_thread(lean_project.list_declarations)
+            else:
+                logger.warning("Lean project does not expose declaration listing APIs")
+                return []
+        except Exception as exc:
+            logger.warning("Failed to enumerate declarations via Lean REPL: %s", exc)
+            return []
+
+        premises: list[PremiseEntry] = []
+        for item in declarations:
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                statement = str(item.get("type", item.get("statement", ""))).strip()
+                module_path = str(item.get("module", item.get("file", "")))
+                premises.append(
+                    PremiseEntry(
+                        id=name,
+                        name=name,
+                        statement=statement,
+                        module_path=module_path,
+                        docstring=str(item.get("doc", item.get("docstring", ""))),
+                    )
+                )
+            elif isinstance(item, str):
+                parsed = MathlibPremiseLoader._parse_lean_declaration(item.strip())
+                if parsed is not None:
+                    premises.append(parsed)
+
+        logger.info("Loaded %d declarations from Lean REPL", len(premises))
+        return premises
 
     @staticmethod
     def _parse_lean_declaration(text: str) -> PremiseEntry | None:
