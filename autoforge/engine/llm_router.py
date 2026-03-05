@@ -136,6 +136,12 @@ def detect_provider(model: str) -> str:
         return "google"
 
     # Default: Anthropic (claude-* and anything else)
+    if not model_lower.startswith("claude"):
+        logger.warning(
+            "Unknown model %r does not match any known provider pattern. "
+            "Defaulting to Anthropic — verify this is correct.",
+            model,
+        )
     return "anthropic"
 
 

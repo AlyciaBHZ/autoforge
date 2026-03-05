@@ -161,28 +161,39 @@ class TaskDAG:
         task = self._tasks[task_id]
         if task.status == TaskStatus.FAILED:
             task.status = TaskStatus.TODO
+            task.retry_count = 0
             task.claimed_by = None
 
     def validate_acyclic(self) -> None:
-        """Check for cycles in the DAG. Raises ValueError if a cycle exists."""
+        """Check for cycles in the DAG. Raises ValueError if a cycle exists.
+
+        Uses iterative DFS to avoid stack overflow on deep DAGs.
+        """
         visited: set[str] = set()
         path: set[str] = set()
 
-        def _dfs(task_id: str) -> None:
-            if task_id in path:
-                raise ValueError(f"Cycle detected in task DAG involving task: {task_id}")
-            if task_id in visited:
-                return
-            path.add(task_id)
-            task = self._tasks.get(task_id)
-            if task:
-                for dep in task.depends_on:
-                    _dfs(dep)
-            path.discard(task_id)
-            visited.add(task_id)
-
-        for tid in self._tasks:
-            _dfs(tid)
+        for start_tid in self._tasks:
+            if start_tid in visited:
+                continue
+            # Iterative DFS using explicit stack: (task_id, is_backtrack)
+            stack: list[tuple[str, bool]] = [(start_tid, False)]
+            while stack:
+                task_id, is_backtrack = stack.pop()
+                if is_backtrack:
+                    path.discard(task_id)
+                    visited.add(task_id)
+                    continue
+                if task_id in path:
+                    raise ValueError(f"Cycle detected in task DAG involving task: {task_id}")
+                if task_id in visited:
+                    continue
+                path.add(task_id)
+                # Push backtrack marker first (processed after children)
+                stack.append((task_id, True))
+                task = self._tasks.get(task_id)
+                if task:
+                    for dep in task.depends_on:
+                        stack.append((dep, False))
 
     def validate(self) -> list[str]:
         """Full DAG validation: cycles + dangling dependencies.

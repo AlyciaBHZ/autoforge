@@ -46,7 +46,24 @@ class ForgeDaemon:
         if pid_file is None:
             return
         pid_file.parent.mkdir(parents=True, exist_ok=True)
-        pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        # Use O_EXCL to detect if another daemon is already running
+        try:
+            fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+        except FileExistsError:
+            # PID file exists — check if the process is still alive
+            try:
+                existing_pid = int(pid_file.read_text(encoding="utf-8").strip())
+                os.kill(existing_pid, 0)  # Check if process exists
+                raise RuntimeError(
+                    f"Another daemon is already running (PID {existing_pid}). "
+                    f"Stop it first or remove {pid_file}"
+                )
+            except (OSError, ValueError):
+                # Process is dead or PID file is corrupt — safe to overwrite
+                logger.warning("Stale PID file found, overwriting")
+                pid_file.write_text(str(os.getpid()), encoding="utf-8")
 
     def _clear_pid_file(self) -> None:
         pid_file = self.config.daemon_pid_file
@@ -67,7 +84,7 @@ class ForgeDaemon:
             try:
                 t.result()
             except Exception as exc:
-                logger.debug("%s failed: %s", label, exc, exc_info=True)
+                logger.warning("%s failed: %s", label, exc, exc_info=True)
 
         task.add_done_callback(_done)
 

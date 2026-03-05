@@ -147,17 +147,24 @@ class LockManager:
             return None
 
     def _read_owner(self, lock_path: Path) -> str | None:
-        """Read the owner from a lock file (symlink or regular file)."""
+        """Read the owner from a lock file (symlink or regular file).
+
+        On POSIX, only reads symlink targets (never follows symlinks to
+        read file contents, preventing symlink-based path traversal).
+        """
         if _IS_WINDOWS:
+            # On Windows, refuse to read symlinks to prevent traversal
+            if lock_path.is_symlink():
+                logger.warning("Ignoring symlink lock file: %s", lock_path)
+                return None
             if lock_path.exists():
                 return lock_path.read_text(encoding="utf-8").strip()
         else:
             # Check symlink first (primary POSIX mechanism)
             if lock_path.is_symlink():
                 return os.readlink(lock_path)
-            # Also handle regular files (e.g. created by a different
-            # code-path, manual intervention, or cross-platform copies)
-            if lock_path.exists():
+            # Regular files: only read if NOT a symlink (defense-in-depth)
+            if lock_path.exists() and not lock_path.is_symlink():
                 return lock_path.read_text(encoding="utf-8").strip()
         return None
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -321,6 +322,9 @@ class ForgeConfig:
     # Run identity
     run_id: str = ""
 
+    # Thread-safe usage tracking lock (not a dataclass field)
+    _usage_lock: threading.Lock = threading.Lock()
+
     # Docker
     sandbox_image: str = "autoforge-sandbox:latest"
     docker_enabled: bool = False
@@ -618,11 +622,12 @@ class ForgeConfig:
         return config
 
     def record_usage(self, model: str, input_tokens: int, output_tokens: int) -> None:
-        """Record token usage for a model."""
-        if model not in self.token_usage:
-            self.token_usage[model] = {"input": 0, "output": 0}
-        self.token_usage[model]["input"] += input_tokens
-        self.token_usage[model]["output"] += output_tokens
+        """Record token usage for a model (thread-safe)."""
+        with self._usage_lock:
+            if model not in self.token_usage:
+                self.token_usage[model] = {"input": 0, "output": 0}
+            self.token_usage[model]["input"] += input_tokens
+            self.token_usage[model]["output"] += output_tokens
 
     @property
     def total_input_tokens(self) -> int:
@@ -669,7 +674,9 @@ def _ForgeConfig_compat_init(self: ForgeConfig, **kwargs: Any) -> None:
             try:
                 setattr(self, k, v)
             except AttributeError:
-                pass
+                logging.getLogger(__name__).warning(
+                    "Unknown ForgeConfig parameter %r=%r ignored", k, v
+                )
 
 
 ForgeConfig.__init__ = _ForgeConfig_compat_init  # type: ignore[assignment]

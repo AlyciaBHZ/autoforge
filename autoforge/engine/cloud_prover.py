@@ -289,7 +289,7 @@ class SSHServerBackend:
 
             result = subprocess.run(
                 ["ssh", "-o", "ConnectTimeout=5",
-                 "-o", "StrictHostKeyChecking=no",
+                 "-o", "StrictHostKeyChecking=accept-new",
                  f"{self.config.ssh_user}@{self.config.ssh_host}",
                  "echo ok"],
                 capture_output=True, text=True, timeout=10,
@@ -303,6 +303,7 @@ class SSHServerBackend:
         job.status = JobStatus.RUNNING
         job.submitted_at = time.time()
 
+        local_file: str | None = None
         try:
             # Write to temp file locally
             with tempfile.NamedTemporaryFile(
@@ -315,7 +316,7 @@ class SSHServerBackend:
             host = f"{self.config.ssh_user}@{self.config.ssh_host}"
 
             # SCP file to remote
-            scp_cmd = ["scp", "-o", "StrictHostKeyChecking=no"]
+            scp_cmd = ["scp", "-o", "StrictHostKeyChecking=accept-new"]
             if self.config.ssh_key_path:
                 scp_cmd.extend(["-i", self.config.ssh_key_path])
             scp_cmd.extend([local_file, f"{host}:{remote_file}"])
@@ -328,7 +329,7 @@ class SSHServerBackend:
             await scp_proc.communicate()
 
             # Run lean on remote
-            ssh_cmd = ["ssh", "-o", "StrictHostKeyChecking=no"]
+            ssh_cmd = ["ssh", "-o", "StrictHostKeyChecking=accept-new"]
             if self.config.ssh_key_path:
                 ssh_cmd.extend(["-i", self.config.ssh_key_path])
             import shlex
@@ -365,11 +366,15 @@ class SSHServerBackend:
                 lean_proc.kill()
                 job.status = JobStatus.TIMEOUT
 
-            os.unlink(local_file)
-
         except Exception as e:
             job.status = JobStatus.FAILED
             job.errors.append(str(e))
+        finally:
+            if local_file is not None:
+                try:
+                    os.unlink(local_file)
+                except OSError:
+                    pass
 
         return job
 
