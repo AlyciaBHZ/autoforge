@@ -16,6 +16,7 @@ import math
 from pathlib import Path
 import random
 import re
+import sys
 from typing import Any
 from urllib import parse, request
 
@@ -942,7 +943,7 @@ class ReproductionConfig:
     execution_timeout: int = 600
     workspace_dir: Path = field(default_factory=lambda: Path("workspace/reproductions"))
     include_pdf: bool = True
-    python_executable: str = "python3"
+    python_executable: str = sys.executable
     auto_install_deps: bool = True
 
 

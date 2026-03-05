@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -190,7 +191,7 @@ class ExperimentConfig:
     sandbox_enabled: bool = True
     """Whether to run code in sandboxed environment."""
 
-    python_executable: str = "python3"
+    python_executable: str = field(default_factory=lambda: sys.executable)
     """Path to Python executable."""
 
     metrics_prefix: str = "METRIC:"
@@ -577,8 +578,14 @@ class ExperimentRunner:
             sandbox = SubprocessSandbox(work_dir)
             await sandbox.start()
 
-            command = f"{exec_config.python_executable} experiment.py"
-            result = await sandbox.exec(command, timeout=exec_config.execution_timeout)
+            if hasattr(sandbox, "exec_args"):
+                result = await sandbox.exec_args(
+                    [exec_config.python_executable, "experiment.py"],
+                    timeout=exec_config.execution_timeout,
+                )
+            else:
+                command = f"{exec_config.python_executable} experiment.py"
+                result = await sandbox.exec(command, timeout=exec_config.execution_timeout)
             await sandbox.stop()
 
             execution_time = time.time() - start_time

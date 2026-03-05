@@ -185,6 +185,66 @@ class SubprocessSandbox(SandboxBase):
                 exit_code=-1, stdout="", stderr=str(e)
             )
 
+    async def exec_args(self, args: list[str], timeout: int = 120) -> SandboxResult:
+        """Execute an argument-vector command without invoking a shell."""
+        if not args:
+            return SandboxResult(exit_code=-1, stdout="", stderr="No command provided")
+
+        joined = " ".join(args)
+        logger.debug(f"[sandbox] exec_args: {joined[:100]}")
+
+        try:
+            self._sanitize_command(joined)
+        except ValueError as e:
+            logger.warning(f"[sandbox] Command blocked: {e}")
+            return SandboxResult(
+                exit_code=-1,
+                stdout="",
+                stderr=f"Command blocked by security filter: {e}",
+            )
+
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            kwargs: dict = {}
+            if sys.platform != "win32":
+                kwargs["preexec_fn"] = os.setsid
+
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=self.working_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self.env,
+                **kwargs,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return SandboxResult(
+                exit_code=proc.returncode if proc.returncode is not None else -1,
+                stdout=stdout.decode(errors="replace"),
+                stderr=stderr.decode(errors="replace"),
+            )
+        except asyncio.TimeoutError:
+            if proc is not None:
+                try:
+                    if sys.platform != "win32" and proc.pid is not None:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    await proc.communicate()
+                except Exception:
+                    pass
+            return SandboxResult(
+                exit_code=-1,
+                stdout="",
+                stderr=f"Command timed out after {timeout}s",
+                timed_out=True,
+            )
+        except Exception as e:
+            return SandboxResult(exit_code=-1, stdout="", stderr=str(e))
+
     async def stop(self) -> None:
         logger.debug("SubprocessSandbox stopped")
 

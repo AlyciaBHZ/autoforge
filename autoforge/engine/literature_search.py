@@ -104,6 +104,7 @@ class LiteratureSearchConfig:
     max_results_per_query: int = 10
     min_relevance_threshold: float = 0.3
     cache_ttl_hours: int = 24
+    allow_remote_code_models: bool = False
 
 
 class CitationGraph:
@@ -323,13 +324,17 @@ class CitationGraph:
             List of frontier papers, sorted by citation count and recency
         """
         # Search for topic papers
-        url = (
-            f"https://api.semanticscholar.org/graph/v1/paper/search"
-            f"?query={topic}"
-            f"&limit=100"
-            f"&fields=paperId,title,authors,year,abstract,url,externalIds,"
-            f"citationCount,referenceCount,influentialCitationCount,embedding"
+        params = urlencode(
+            {
+                "query": topic,
+                "limit": 100,
+                "fields": (
+                    "paperId,title,authors,year,abstract,url,externalIds,"
+                    "citationCount,referenceCount,influentialCitationCount,embedding"
+                ),
+            }
         )
+        url = f"https://api.semanticscholar.org/graph/v1/paper/search?{params}"
 
         try:
             response_text = await self._http_get(url)
@@ -427,11 +432,12 @@ class SemanticSearchEngine:
     - Cosine similarity computation
     """
 
-    def __init__(self) -> None:
+    def __init__(self, allow_remote_code_models: bool = False) -> None:
         """Initialize semantic search engine."""
         self._embedder: Any = None
         self._tfidf_vectorizer: Any = None
         self._use_embeddings = False
+        self._allow_remote_code_models = allow_remote_code_models
         self._init_embedder()
 
     def _init_embedder(self) -> None:
@@ -441,7 +447,8 @@ class SemanticSearchEngine:
             from sentence_transformers import SentenceTransformer
 
             self._embedder = SentenceTransformer(
-                "allenai/specter2_base", trust_remote_code=True
+                "allenai/specter2_base",
+                trust_remote_code=self._allow_remote_code_models,
             )
             self._use_embeddings = True
             logger.debug("Initialized SPECTER2 embeddings")
@@ -846,18 +853,62 @@ Method Comparison:
         return summary.strip()
 
     async def _download_pdf(self, pdf_url: str) -> str:
-        """Download PDF and extract text (stub implementation)."""
+        """Download PDF and extract text with available parser backends."""
         try:
             import urllib.request
+            import tempfile
 
             def _fetch() -> bytes:
                 with urllib.request.urlopen(pdf_url, timeout=10) as response:
                     return response.read()
 
             content = await asyncio.to_thread(_fetch)
-            # In production, use PyPDF2 or pdfplumber to extract text
             logger.debug(f"Downloaded {len(content)} bytes from {pdf_url}")
-            return f"[PDF Content - {len(content)} bytes]"
+
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(content)
+                tmp_path = Path(tmp.name)
+
+            try:
+                # Preferred backend: pypdf
+                try:
+                    from pypdf import PdfReader
+
+                    reader = await asyncio.to_thread(PdfReader, str(tmp_path))
+                    pages: list[str] = []
+                    for page in reader.pages[:12]:
+                        page_text = page.extract_text() or ""
+                        if page_text.strip():
+                            pages.append(page_text)
+                    text = "\n".join(pages).strip()
+                    if text:
+                        return text[:120_000]
+                except Exception:
+                    pass
+
+                # Fallback backend: PyPDF2
+                try:
+                    import PyPDF2
+
+                    with tmp_path.open("rb") as fh:
+                        reader = PyPDF2.PdfReader(fh)
+                        pages = []
+                        for page in reader.pages[:12]:
+                            page_text = page.extract_text() or ""
+                            if page_text.strip():
+                                pages.append(page_text)
+                    text = "\n".join(pages).strip()
+                    if text:
+                        return text[:120_000]
+                except Exception:
+                    pass
+            finally:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            return ""
         except Exception as e:
             logger.warning(f"PDF download failed for {pdf_url}: {e}")
             return ""
@@ -1004,7 +1055,9 @@ class LiteratureSearchEngine:
     def semantic_search(self) -> SemanticSearchEngine:
         """Lazy-initialize semantic search engine."""
         if self._semantic_search is None:
-            self._semantic_search = SemanticSearchEngine()
+            self._semantic_search = SemanticSearchEngine(
+                allow_remote_code_models=self.config.allow_remote_code_models
+            )
         return self._semantic_search
 
     async def search(

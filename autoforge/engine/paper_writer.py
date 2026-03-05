@@ -12,6 +12,7 @@ import asyncio
 import logging
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -277,7 +278,7 @@ class FigureGenerator:
             width="0.85\\linewidth",
         )
 
-    async def generate_from_code(self, code: str, output_path: Path) -> FigureSpec:
+    async def generate_from_code(self, code: str, output_path: Path) -> FigureSpec | None:
         """Execute matplotlib code to generate a figure.
         
         Args:
@@ -304,7 +305,7 @@ plt.savefig('{output_path}', dpi=300, bbox_inches='tight')
         try:
             result = await asyncio.to_thread(
                 subprocess.run,
-                ["python", "-c", full_code],
+                [sys.executable, "-c", full_code],
                 capture_output=True,
                 text=True,
                 timeout=30,
