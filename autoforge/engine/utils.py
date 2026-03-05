@@ -141,15 +141,15 @@ def _iter_candidate_json_snippets(
 
     # 2) any fenced block that looks like raw JSON (all language markers)
     if len(candidates) < 10:
-    for match in re.finditer(r"```[^\n]*\n(.*?)```", text, re.DOTALL):
-        snippet = match.group(1).strip()
-        if snippet in seen:
-            continue
-        if snippet.startswith("{") or snippet.startswith("["):
-            candidates.append(snippet)
-            seen.add(snippet)
-            if len(candidates) >= 10:
-                break
+        for match in re.finditer(r"```[^\n]*\n(.*?)```", text, re.DOTALL):
+            snippet = match.group(1).strip()
+            if snippet in seen:
+                continue
+            if snippet.startswith("{") or snippet.startswith("["):
+                candidates.append(snippet)
+                seen.add(snippet)
+                if len(candidates) >= 10:
+                    break
 
     # 3) raw scanner from brace / bracket starts (JSONDecoder boundary-based)
     decoder = json.JSONDecoder()

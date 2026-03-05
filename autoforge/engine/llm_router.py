@@ -946,7 +946,7 @@ class LLMRouter:
                 last_error = None
                 continue
             except Exception as exc:  # pragma: no cover - API compatibility boundary
-            if response_format is not None and self._is_openai_schema_unsupported_error(exc):
+                if response_format is not None and self._is_openai_schema_unsupported_error(exc):
                     last_error = exc
                     continue
                 raise

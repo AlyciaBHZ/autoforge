@@ -173,7 +173,56 @@ class ArchitectAgent(AgentBase):
         try:
             return extract_json_from_text(output, schema=self._OUTPUT_SCHEMA_ARCHITECTURE, strict=True)
         except (ValueError, json.JSONDecodeError) as e:
-            raise ValueError(f"Could not extract architecture from Architect output: {e}") from e
+            # Lenient fallback so minor schema drift doesn't break BUILD phase.
+            payload = extract_json_from_text(output)
+            if not isinstance(payload, dict):
+                raise ValueError(f"Could not extract architecture from Architect output: {e}") from e
+
+            architecture = payload.get("architecture")
+            if not isinstance(architecture, dict):
+                architecture = {}
+
+            tasks = payload.get("tasks")
+            if not isinstance(tasks, list):
+                tasks = []
+            else:
+                normalized_tasks = []
+                for idx, task in enumerate(tasks, 1):
+                    if not isinstance(task, dict):
+                        continue
+                    task_id = task.get("id")
+                    if not isinstance(task_id, str) or not task_id:
+                        task_id = f"TASK-{idx:03d}"
+                    files = task.get("files")
+                    if not isinstance(files, list):
+                        files = []
+                    else:
+                        files = [str(f) for f in files if str(f)]
+                    depends_on = task.get("depends_on")
+                    if not isinstance(depends_on, list):
+                        depends_on = []
+                    else:
+                        depends_on = [str(d) for d in depends_on if str(d)]
+                    normalized_tasks.append({
+                        "id": task_id,
+                        "description": str(task.get("description", f"Task for {task_id}")),
+                        "owner": str(task.get("owner", "builder")),
+                        "phase": str(task.get("phase", "build")),
+                        "files": files,
+                        "depends_on": depends_on,
+                        "acceptance_criteria": str(task.get("acceptance_criteria", "")),
+                    })
+                tasks = normalized_tasks
+
+            deliverables = payload.get("deliverables")
+            if not isinstance(deliverables, list):
+                deliverables = []
+
+            return {
+                "architecture": architecture,
+                "tasks": tasks,
+                "deliverables": deliverables,
+            }
 
     async def generate_diverse_architectures(
         self,

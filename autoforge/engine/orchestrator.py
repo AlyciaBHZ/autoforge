@@ -1730,7 +1730,8 @@ class Orchestrator:
         except OSError:
             return False
 
-    def _detect_test_command(self, work_dir: Path) -> str | None:
+    @staticmethod
+    def _detect_test_command(work_dir: Path) -> str | None:
         """Detect appropriate test command based on project type."""
         # Node.js / npm
         package_json = work_dir / "package.json"
