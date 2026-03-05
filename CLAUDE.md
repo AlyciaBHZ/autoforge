@@ -79,6 +79,14 @@ engine/paper_formalizer.py      Paper-specific Lean 4 formalization — real Lea
 engine/cloud_prover.py          Cloud Lean 4 compilation — Docker, SSH, GitHub Codespaces backends with proof caching
 engine/capability_dag.py        CapabilityDAG — self-growing universal knowledge graph, community-mergeable
 engine/theoretical_reasoning.py Cross-domain scientific reasoning — TheoryGraph, multi-modal verification, theory evolution & article generation
+engine/experiment_loop.py       Closed-loop experiment pipeline — AI Scientist v2-style hypothesis→code→run→analyze→iterate with ablation studies
+engine/paper_writer.py          Automated paper writing — LaTeX generation, BibTeX management, figure generation, NeurIPS/ICML/ICLR templates
+engine/dense_retrieval.py       Dense embedding premise selection — ReProver/LeanDojo-style retrieval replacing Jaccard, FAISS support
+engine/benchmark_eval.py        Standard benchmark evaluation — miniF2F, PutnamBench, LeanWorkbook, ProofNet harnesses with Pass@k
+engine/rl_proof_search.py       RL proof search — AlphaProof/DeepSeek-Prover-V2 style PUCT-MCTS with policy/value networks, expert iteration
+engine/literature_search.py     Enhanced literature search — citation graph traversal, SPECTER2 embedding search, full-text analysis, gap detection
+engine/paper_repro.py           Enhanced paper reproduction — full pipeline: goal→paper→signals→code→execute→compare→report
+engine/provers/lean_lake.py     Real Lean 4 Lake integration — proper Mathlib project scaffolding, Lake build, project pool, 32 import mappings
 engine/task_dag.py           TaskDAG — dependency graph, scheduling, persistence
 engine/lock_manager.py      Cross-platform atomic task locking (symlink on POSIX, O_CREAT|O_EXCL on Windows)
 engine/git_manager.py       Git worktree isolation for parallel builders

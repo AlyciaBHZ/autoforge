@@ -886,3 +886,684 @@ def run_goal_inference_benchmark(
         cases=cases,
         gaps=gaps,
     )
+
+
+# ============================================================================
+
+
+# ============================================================================
+# Reproduction Pipeline: Full orchestrator for paper reproduction
+# ============================================================================
+
+import asyncio
+import logging
+import subprocess
+import time
+from enum import Enum
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+
+class ReproductionStatus(str, Enum):
+    """Status of a reproduction attempt."""
+    PENDING = "pending"
+    PAPER_FOUND = "paper_found"
+    SIGNALS_EXTRACTED = "signals_extracted"
+    CODE_GENERATED = "code_generated"
+    RUNNING = "running"
+    EVALUATING = "evaluating"
+    COMPARING = "comparing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass
+class ReproductionResult:
+    """Result of a paper reproduction attempt."""
+    paper: PaperRecord
+    signals: PaperSignals
+    status: ReproductionStatus
+    generated_code: str = ""
+    execution_output: str = ""
+    reproduced_metrics: list[dict] = field(default_factory=list)
+    match_rate: float = 0.0
+    figures: list[Path] = field(default_factory=list)
+    report_path: Path | None = None
+    total_time: float = 0.0
+    error: str = ""
+
+
+@dataclass
+class ReproductionConfig:
+    """Configuration for reproduction pipeline."""
+    metric_tolerance: float = 0.05
+    max_code_attempts: int = 3
+    execution_timeout: int = 600
+    workspace_dir: Path = field(default_factory=lambda: Path("workspace/reproductions"))
+    include_pdf: bool = True
+    python_executable: str = "python3"
+    auto_install_deps: bool = True
+
+
+class CodeGenerator:
+    """Generates Python reproduction code from paper signals."""
+
+    async def generate_reproduction_code(
+        self,
+        paper: PaperRecord,
+        signals: PaperSignals,
+        brief: str,
+        llm: Any,
+    ) -> str:
+        """Generate a self-contained Python reproduction script.
+
+        Args:
+            paper: The paper to reproduce.
+            signals: Extracted paper signals.
+            brief: Brief description of the paper and methodology.
+            llm: LLM callable that takes a prompt and returns a response.
+
+        Returns:
+            Generated Python code as a string.
+        """
+        prompt = self._build_generation_prompt(paper, signals, brief)
+        logger.info(f"Generating reproduction code for '{paper.title}'")
+        response = await llm(prompt)
+        return response
+
+    async def fix_code(
+        self,
+        code: str,
+        error: str,
+        llm: Any,
+    ) -> str:
+        """Fix code based on execution errors.
+
+        Args:
+            code: The original code that failed.
+            error: The error message from execution.
+            llm: LLM callable.
+
+        Returns:
+            Fixed Python code.
+        """
+        prompt = f"""The following reproduction code failed with an error.
+Please fix it and return only the corrected Python code.
+
+Original code:
+```python
+{code}
+```
+
+Error:
+{error}
+
+Return the complete fixed code, nothing else."""
+        logger.info("Fixing code based on execution error")
+        response = await llm(prompt)
+        return response
+
+    def _build_generation_prompt(
+        self,
+        paper: PaperRecord,
+        signals: PaperSignals,
+        brief: str,
+    ) -> str:
+        """Build the LLM prompt for code generation."""
+        return f"""You are an expert at reproducing machine learning papers.
+
+Paper: {paper.title}
+Authors: {', '.join(paper.authors[:3])}
+Year: {paper.year}
+Venue: {paper.venue}
+
+Abstract:
+{paper.abstract}
+
+Methodology Summary:
+{brief}
+
+Claimed Metrics:
+{json.dumps(signals.metrics, indent=2)}
+
+Your task: Generate a complete, self-contained Python script that reproduces the paper's main results.
+
+Requirements:
+1. The script must be runnable end-to-end
+2. Include all necessary imports and data preparation
+3. Output metrics in the format: METRIC: <name> = <value>
+4. Save any generated figures as PNG files
+5. Use common datasets or synthetic data if the original is unavailable
+6. Include comments explaining key steps
+
+Return ONLY the Python code, nothing else."""
+
+
+class MetricComparator:
+    """Compares claimed vs reproduced metrics."""
+
+    @staticmethod
+    def compare(
+        claimed: list[dict],
+        reproduced: dict[str, float],
+        tolerance: float = 0.05,
+    ) -> list[dict]:
+        """Compare claimed metrics against reproduced metrics.
+
+        Args:
+            claimed: List of claimed metrics with 'name' and 'value' keys.
+            reproduced: Dict mapping metric names to reproduced values.
+            tolerance: Relative tolerance for matching (default 0.05 = 5%).
+
+        Returns:
+            List of comparison dicts with keys:
+            - metric: str
+            - paper_claim: float
+            - reproduced: float | None
+            - delta: float | None (absolute difference)
+            - status: str ("matched", "partial", or "failed")
+        """
+        comparisons = []
+        for claim in claimed:
+            metric_name = claim.get("name", "unknown")
+            paper_value = claim.get("value")
+
+            reproduced_value = reproduced.get(metric_name)
+
+            if reproduced_value is None:
+                comparisons.append({
+                    "metric": metric_name,
+                    "paper_claim": paper_value,
+                    "reproduced": None,
+                    "delta": None,
+                    "status": "failed",
+                })
+                continue
+
+            # Compute relative error
+            if paper_value == 0:
+                if reproduced_value == 0:
+                    status = "matched"
+                    delta = 0.0
+                else:
+                    status = "failed"
+                    delta = abs(reproduced_value - paper_value)
+            else:
+                delta = abs(reproduced_value - paper_value)
+                relative_error = delta / abs(paper_value)
+
+                if relative_error <= tolerance:
+                    status = "matched"
+                elif relative_error <= 2 * tolerance:
+                    status = "partial"
+                else:
+                    status = "failed"
+
+            comparisons.append({
+                "metric": metric_name,
+                "paper_claim": paper_value,
+                "reproduced": reproduced_value,
+                "delta": delta,
+                "status": status,
+            })
+
+        return comparisons
+
+    @staticmethod
+    def compute_match_rate(comparisons: list[dict]) -> float:
+        """Compute fraction of metrics that matched.
+
+        Args:
+            comparisons: List of comparison dicts.
+
+        Returns:
+            Float between 0 and 1.
+        """
+        if not comparisons:
+            return 0.0
+        matched = sum(1 for c in comparisons if c["status"] == "matched")
+        return matched / len(comparisons)
+
+
+class ReproductionReportGenerator:
+    """Generates reproduction reports in multiple formats."""
+
+    @staticmethod
+    def generate_markdown(result: ReproductionResult) -> str:
+        """Generate a detailed markdown reproduction report.
+
+        Args:
+            result: Reproduction result.
+
+        Returns:
+            Markdown report as string.
+        """
+        paper = result.paper
+        signals = result.signals
+
+        # Determine verdict
+        if result.status == ReproductionStatus.COMPLETED:
+            if result.match_rate >= 0.8:
+                verdict = "Successfully Reproduced"
+            elif result.match_rate >= 0.5:
+                verdict = "Partially Reproduced"
+            else:
+                verdict = "Failed to Reproduce"
+        else:
+            verdict = f"Failed ({result.status.value})"
+
+        # Build metrics table
+        metrics_table = "| Metric | Paper Claim | Reproduced | Delta | Status |\n"
+        metrics_table += "|--------|-------------|-----------|-------|--------|\n"
+        for comp in result.reproduced_metrics:
+            metric = comp.get("metric", "N/A")
+            claim = comp.get("paper_claim", "N/A")
+            repro = comp.get("reproduced", "N/A")
+            delta = comp.get("delta", "N/A")
+            status = comp.get("status", "N/A")
+
+            if isinstance(delta, float):
+                delta = f"{delta:.4f}"
+            if isinstance(repro, float):
+                repro = f"{repro:.4f}"
+            if isinstance(claim, float):
+                claim = f"{claim:.4f}"
+
+            metrics_table += f"| {metric} | {claim} | {repro} | {delta} | {status} |\n"
+
+        # Build figures section
+        figures_section = ""
+        if result.figures:
+            figures_section = "\n## Generated Figures\n\n"
+            for fig_path in result.figures:
+                figures_section += f"- {fig_path.name}\n"
+
+        # Build error section
+        error_section = ""
+        if result.error:
+            error_section = f"\n### Error\n{result.error}\n"
+
+        # Build report
+        report = f"""# Paper Reproduction Report
+
+## Paper Metadata
+- **Title:** {paper.title}
+- **Authors:** {', '.join(paper.authors)}
+- **Year:** {paper.year}
+- **Venue:** {paper.venue}
+- **OpenReview ID:** {paper.note_id}
+
+## Verdict
+**{verdict}** (Match Rate: {result.match_rate:.1%})
+
+## Methodology Summary
+{signals.methodology}
+
+## Claimed Metrics
+{json.dumps(signals.metrics, indent=2)}
+
+## Reproduced Metrics
+
+{metrics_table}
+
+## Deviations from Paper Setup
+{signals.deviations or 'None identified.'}
+
+{figures_section}
+
+## Execution Summary
+- **Status:** {result.status.value}
+- **Time Taken:** {result.total_time:.2f}s
+- **Match Rate:** {result.match_rate:.1%}
+
+{error_section}
+
+---
+*Report generated for AutoForge reproduction pipeline*
+"""
+        return report
+
+    @staticmethod
+    async def generate_latex(
+        result: ReproductionResult,
+        llm: Any,
+    ) -> str:
+        """Generate a LaTeX reproduction report.
+
+        Args:
+            result: Reproduction result.
+            llm: LLM callable for formatting.
+
+        Returns:
+            LaTeX code as string.
+        """
+        paper = result.paper
+        markdown = ReproductionReportGenerator.generate_markdown(result)
+
+        prompt = f"""Convert the following markdown reproduction report into LaTeX format.
+Use the article document class with appropriate sections, tables, and formatting.
+
+Markdown:
+{markdown}
+
+Return only the LaTeX code."""
+        logger.info("Generating LaTeX report via LLM")
+        latex_code = await llm(prompt)
+        return latex_code
+
+
+class ReproductionPipeline:
+    """Main orchestrator for paper reproduction."""
+
+    def __init__(self, config: ReproductionConfig) -> None:
+        """Initialize reproduction pipeline.
+
+        Args:
+            config: Reproduction configuration.
+        """
+        self.config = config
+        self.config.workspace_dir.mkdir(parents=True, exist_ok=True)
+        self.code_gen = CodeGenerator()
+        self.comparator = MetricComparator()
+        self.report_gen = ReproductionReportGenerator()
+        logger.info(f"Initialized ReproductionPipeline with workspace: {config.workspace_dir}")
+
+    async def reproduce(
+        self,
+        goal: str,
+        llm: Any,
+        *,
+        year: int = 2025,
+        corpus_size: int = 200,
+    ) -> ReproductionResult:
+        """Full reproduction pipeline from goal description.
+
+        Args:
+            goal: High-level description of the paper/goal.
+            llm: LLM callable for code generation and refinement.
+            year: Filter papers from this year and later.
+            corpus_size: Number of papers to search within.
+
+        Returns:
+            ReproductionResult with all details.
+        """
+        start_time = time.time()
+        result = ReproductionResult(
+            paper=PaperRecord(
+                note_id="",
+                title="",
+                authors=[],
+                abstract="",
+                year=0,
+                venue="",
+                pdf_url="",
+            ),
+            signals=PaperSignals(
+                methodology="",
+                metrics=[],
+                deviations="",
+            ),
+            status=ReproductionStatus.PENDING,
+        )
+
+        try:
+            # a. Fetch papers and find best match
+            logger.info(f"Fetching ICLR papers from {year} onward (corpus_size={corpus_size})")
+            papers = await asyncio.to_thread(
+                fetch_iclr_papers,
+                year_min=year,
+                limit=corpus_size,
+            )
+            if not papers:
+                result.error = "No papers found in corpus"
+                result.status = ReproductionStatus.FAILED
+                result.total_time = time.time() - start_time
+                return result
+
+            ranked = infer_papers_from_goal(goal, papers, top_k=1)
+            if not ranked:
+                result.error = "Could not infer paper from goal"
+                result.status = ReproductionStatus.FAILED
+                result.total_time = time.time() - start_time
+                return result
+
+            paper = ranked[0].paper
+            result.paper = paper
+            result.status = ReproductionStatus.PAPER_FOUND
+            logger.info(f"Selected paper: {paper.title}")
+
+            # b. Extract signals
+            logger.info("Extracting paper signals")
+            signals = extract_paper_signals(paper)
+            result.signals = signals
+            result.status = ReproductionStatus.SIGNALS_EXTRACTED
+
+            # c. Build reproduction brief
+            brief = build_reproduction_brief(paper, signals)
+
+            # d. Generate code
+            logger.info("Generating reproduction code")
+            code = await self.code_gen.generate_reproduction_code(paper, signals, brief, llm)
+            result.generated_code = code
+            result.status = ReproductionStatus.CODE_GENERATED
+
+            # e. Execute code (with retry logic)
+            workspace = self.config.workspace_dir / _hash_text(paper.note_id)
+            workspace.mkdir(parents=True, exist_ok=True)
+            result.status = ReproductionStatus.RUNNING
+
+            attempt = 0
+            stdout, stderr, exit_code = "", "", 1
+            while attempt < self.config.max_code_attempts and exit_code != 0:
+                attempt += 1
+                logger.info(f"Execution attempt {attempt}/{self.config.max_code_attempts}")
+                stdout, stderr, exit_code = await self._execute_code(code, workspace)
+
+                if exit_code != 0 and attempt < self.config.max_code_attempts:
+                    logger.warning(f"Execution failed: {stderr}")
+                    code = await self.code_gen.fix_code(code, stderr, llm)
+
+            if exit_code != 0:
+                result.error = f"Code execution failed after {self.config.max_code_attempts} attempts"
+                result.status = ReproductionStatus.FAILED
+                result.total_time = time.time() - start_time
+                return result
+
+            result.execution_output = stdout
+
+            # f. Parse metrics
+            logger.info("Evaluating reproduced metrics")
+            result.status = ReproductionStatus.EVALUATING
+            reproduced_metrics = await self._parse_metrics(stdout)
+
+            # g. Compare metrics
+            logger.info("Comparing metrics against paper claims")
+            result.status = ReproductionStatus.COMPARING
+            comparisons = self.comparator.compare(
+                signals.metrics,
+                reproduced_metrics,
+                tolerance=self.config.metric_tolerance,
+            )
+            result.reproduced_metrics = comparisons
+            result.match_rate = self.comparator.compute_match_rate(comparisons)
+
+            # h. Collect figures
+            result.figures = self._collect_figures(workspace)
+
+            # i. Generate report
+            logger.info("Generating reproduction report")
+            report_markdown = self.report_gen.generate_markdown(result)
+            report_path = workspace / "REPRODUCTION_REPORT.md"
+            report_path.write_text(report_markdown, encoding="utf-8")
+            result.report_path = report_path
+
+            result.status = ReproductionStatus.COMPLETED
+            result.total_time = time.time() - start_time
+            logger.info(f"Reproduction completed in {result.total_time:.2f}s")
+
+        except Exception as e:
+            logger.exception(f"Reproduction pipeline failed: {e}")
+            result.error = str(e)
+            result.status = ReproductionStatus.FAILED
+            result.total_time = time.time() - start_time
+
+        return result
+
+    async def reproduce_paper(
+        self,
+        paper: PaperRecord,
+        llm: Any,
+    ) -> ReproductionResult:
+        """Reproduce from a known PaperRecord directly.
+
+        Args:
+            paper: The paper to reproduce.
+            llm: LLM callable.
+
+        Returns:
+            ReproductionResult.
+        """
+        start_time = time.time()
+        result = ReproductionResult(
+            paper=paper,
+            signals=extract_paper_signals(paper),
+            status=ReproductionStatus.SIGNALS_EXTRACTED,
+        )
+
+        try:
+            signals = result.signals
+            brief = build_reproduction_brief(paper, signals)
+
+            logger.info(f"Generating code for paper: {paper.title}")
+            code = await self.code_gen.generate_reproduction_code(paper, signals, brief, llm)
+            result.generated_code = code
+            result.status = ReproductionStatus.CODE_GENERATED
+
+            workspace = self.config.workspace_dir / _hash_text(paper.note_id)
+            workspace.mkdir(parents=True, exist_ok=True)
+            result.status = ReproductionStatus.RUNNING
+
+            attempt = 0
+            stdout, stderr, exit_code = "", "", 1
+            while attempt < self.config.max_code_attempts and exit_code != 0:
+                attempt += 1
+                stdout, stderr, exit_code = await self._execute_code(code, workspace)
+
+                if exit_code != 0 and attempt < self.config.max_code_attempts:
+                    code = await self.code_gen.fix_code(code, stderr, llm)
+
+            if exit_code != 0:
+                result.error = f"Code execution failed after {self.config.max_code_attempts} attempts"
+                result.status = ReproductionStatus.FAILED
+                result.total_time = time.time() - start_time
+                return result
+
+            result.execution_output = stdout
+            result.status = ReproductionStatus.EVALUATING
+
+            reproduced_metrics = await self._parse_metrics(stdout)
+            result.status = ReproductionStatus.COMPARING
+
+            comparisons = self.comparator.compare(
+                signals.metrics,
+                reproduced_metrics,
+                tolerance=self.config.metric_tolerance,
+            )
+            result.reproduced_metrics = comparisons
+            result.match_rate = self.comparator.compute_match_rate(comparisons)
+
+            result.figures = self._collect_figures(workspace)
+
+            report_markdown = self.report_gen.generate_markdown(result)
+            report_path = workspace / "REPRODUCTION_REPORT.md"
+            report_path.write_text(report_markdown, encoding="utf-8")
+            result.report_path = report_path
+
+            result.status = ReproductionStatus.COMPLETED
+            result.total_time = time.time() - start_time
+
+        except Exception as e:
+            logger.exception(f"Reproduction failed: {e}")
+            result.error = str(e)
+            result.status = ReproductionStatus.FAILED
+            result.total_time = time.time() - start_time
+
+        return result
+
+    async def _execute_code(
+        self,
+        code: str,
+        workspace: Path,
+    ) -> tuple[str, str, int]:
+        """Execute code in subprocess.
+
+        Args:
+            code: Python code to execute.
+            workspace: Directory to run code in.
+
+        Returns:
+            Tuple of (stdout, stderr, exit_code).
+        """
+        code_file = workspace / "reproduce.py"
+        code_file.write_text(code, encoding="utf-8")
+
+        logger.debug(f"Running code in {workspace}")
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    subprocess.run,
+                    [self.config.python_executable, str(code_file)],
+                    cwd=str(workspace),
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.execution_timeout,
+                ),
+                timeout=self.config.execution_timeout + 5,
+            )
+            return result.stdout, result.stderr, result.returncode
+        except asyncio.TimeoutError:
+            return "", f"Execution timeout after {self.config.execution_timeout}s", 1
+        except Exception as e:
+            return "", str(e), 1
+
+    async def _parse_metrics(self, stdout: str) -> dict[str, float]:
+        """Parse metrics from stdout.
+
+        Expects lines like: METRIC: name = value
+
+        Args:
+            stdout: Output from reproduction code.
+
+        Returns:
+            Dict mapping metric names to values.
+        """
+        metrics = {}
+        for line in stdout.split("\n"):
+            line = line.strip()
+            if line.startswith("METRIC:"):
+                # Format: METRIC: accuracy = 0.95
+                parts = line[7:].strip().split("=")
+                if len(parts) == 2:
+                    name = parts[0].strip()
+                    try:
+                        value = float(parts[1].strip())
+                        metrics[name] = value
+                    except ValueError:
+                        pass
+        return metrics
+
+    @staticmethod
+    def _collect_figures(workspace: Path) -> list[Path]:
+        """Collect generated figures from workspace.
+
+        Args:
+            workspace: Directory to search for figures.
+
+        Returns:
+            List of figure paths (*.png, *.pdf, *.jpg).
+        """
+        figures = []
+        for ext in ["png", "pdf", "jpg", "jpeg"]:
+            figures.extend(workspace.glob(f"*.{ext}"))
+        return sorted(figures)
