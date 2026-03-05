@@ -148,6 +148,15 @@ def test_cli_parse_subcommands():
     args = parser.parse_args(["status"])
     assert args.command == "status"
 
+    # Test doctor / healthcheck / smoke
+    args = parser.parse_args(["doctor"])
+    assert args.command == "doctor"
+    args = parser.parse_args(["healthcheck"])
+    assert args.command == "healthcheck"
+    args = parser.parse_args(["smoke", "proof"])
+    assert args.command == "smoke"
+    assert args.target == "proof"
+
     # Test daemon
     args = parser.parse_args(["daemon", "start"])
     assert args.command == "daemon"
@@ -217,6 +226,9 @@ def test_cli_legacy_compat():
     assert "Build a todo app" not in _KNOWN_COMMANDS
     assert "generate" in _KNOWN_COMMANDS
     assert "daemon" in _KNOWN_COMMANDS
+    assert "doctor" in _KNOWN_COMMANDS
+    assert "healthcheck" in _KNOWN_COMMANDS
+    assert "smoke" in _KNOWN_COMMANDS
     assert "queue" in _KNOWN_COMMANDS
     assert "paper" in _KNOWN_COMMANDS
 

@@ -10,6 +10,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass
+import json
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,73 @@ class ProjectStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class RunStage(str, Enum):
+    PLANNED = "planned"
+    RUNNING = "running"
+    ARTIFACT_GENERATED = "artifact_generated"
+    COMPILED = "compiled"
+    TESTED = "tested"
+    RUNTIME_VERIFIED = "runtime_verified"
+    FORMALIZED = "formalized"
+    VERIFIED_WITH_SORRY = "verified_with_sorry"
+    PROVED = "proved"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class RunRecord:
+    run_id: str
+    project_id: str
+    stage: RunStage
+    created_at: str
+
+
+@dataclass
+class TaskRecord:
+    id: str
+    run_id: str
+    task_id: str
+    status: str
+    retry_count: int
+    updated_at: str
+
+
+@dataclass
+class TaskLease:
+    task_id: str
+    holder: str
+    lease_until: str
+
+
+@dataclass
+class ArtifactRecord:
+    id: str
+    run_id: str
+    kind: str
+    path: str
+    created_at: str
+
+
+@dataclass
+class ExecutionEvent:
+    id: str
+    run_id: str
+    event_type: str
+    payload: dict[str, Any]
+    created_at: str
+
+
+@dataclass
+class VerificationRecord:
+    id: str
+    run_id: str
+    verification_type: str
+    status: str
+    details: str
+    created_at: str
 
 
 @dataclass
@@ -81,6 +149,52 @@ CREATE TABLE IF NOT EXISTS projects (
     completed_at TEXT,
     error TEXT,
     idempotency_key TEXT
+);
+
+CREATE TABLE IF NOT EXISTS run_records (
+    run_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS execution_events (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS artifact_records (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    path TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS verification_records (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    verification_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    details TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_leases (
+    task_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    lease_until TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS request_nonces (
+    requester TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (requester, nonce)
 );
 """
 
@@ -164,6 +278,114 @@ class ProjectRegistry:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_requester_idempotency "
             "ON projects(requested_by, idempotency_key)"
         )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_run_created ON execution_events(run_id, created_at)"
+        )
+
+
+    async def enqueue_run(
+        self,
+        *,
+        description: str,
+        requested_by: str = "cli",
+        budget_usd: float = 10.0,
+        idempotency_key: str | None = None,
+    ) -> Project:
+        """Unified durable entrypoint for all channels."""
+        project = await self.enqueue(
+            description=description,
+            requested_by=requested_by,
+            budget_usd=budget_usd,
+            idempotency_key=idempotency_key,
+        )
+        run_id = f"run_{project.id}"
+        now = datetime.now(timezone.utc).isoformat()
+        db = self._ensure_db()
+        await db.execute(
+            "INSERT OR IGNORE INTO run_records (run_id, project_id, stage, created_at) VALUES (?, ?, ?, ?)",
+            (run_id, project.id, RunStage.PLANNED.value, now),
+        )
+        await self.append_event(run_id, "RunEnqueued", {"project_id": project.id, "requested_by": requested_by})
+        return project
+
+    async def set_run_stage(self, run_id: str, stage: RunStage) -> None:
+        db = self._ensure_db()
+        await db.execute("UPDATE run_records SET stage = ? WHERE run_id = ?", (stage.value, run_id))
+        await db.commit()
+
+    async def append_event(self, run_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        db = self._ensure_db()
+        now = datetime.now(timezone.utc).isoformat()
+        event_id = uuid.uuid4().hex
+        await db.execute(
+            "INSERT INTO execution_events (id, run_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+            (event_id, run_id, event_type, json.dumps(payload, ensure_ascii=False), now),
+        )
+        await db.commit()
+
+    async def acquire_task_lease(self, task_id: str, holder: str, ttl_seconds: int = 60) -> bool:
+        db = self._ensure_db()
+        now_dt = datetime.now(timezone.utc)
+        lease_until = (now_dt.timestamp() + ttl_seconds)
+        now = now_dt.isoformat()
+        until_iso = datetime.fromtimestamp(lease_until, timezone.utc).isoformat()
+        await db.execute(
+            "DELETE FROM task_leases WHERE task_id = ? AND lease_until < ?",
+            (task_id, now),
+        )
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO task_leases (task_id, holder, lease_until, heartbeat_at) VALUES (?, ?, ?, ?)",
+            (task_id, holder, until_iso, now),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+    async def heartbeat_task_lease(self, task_id: str, holder: str, ttl_seconds: int = 60) -> bool:
+        db = self._ensure_db()
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        until_iso = datetime.fromtimestamp(now_dt.timestamp() + ttl_seconds, timezone.utc).isoformat()
+        cur = await db.execute(
+            "UPDATE task_leases SET lease_until = ?, heartbeat_at = ? WHERE task_id = ? AND holder = ?",
+            (until_iso, now, task_id, holder),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+    async def release_task_lease(self, task_id: str, holder: str) -> None:
+        db = self._ensure_db()
+        await db.execute("DELETE FROM task_leases WHERE task_id = ? AND holder = ?", (task_id, holder))
+        await db.commit()
+
+    async def requeue_stale_builds(self, max_age_seconds: int = 600) -> int:
+        """Move stale BUILDING projects back to QUEUED for crash recovery."""
+        db = self._ensure_db()
+        threshold = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - max_age_seconds, timezone.utc).isoformat()
+        cur = await db.execute(
+            "UPDATE projects SET status = ?, phase = 'requeued' WHERE status = ? AND started_at IS NOT NULL AND started_at < ?",
+            (ProjectStatus.QUEUED.value, ProjectStatus.BUILDING.value, threshold),
+        )
+        await db.commit()
+        return cur.rowcount
+
+
+    async def register_request_nonce(self, requester: str, nonce: str) -> bool:
+        """Register nonce for replay protection; False if already seen."""
+        db = self._ensure_db()
+        now = datetime.now(timezone.utc).isoformat()
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO request_nonces (requester, nonce, created_at) VALUES (?, ?, ?)",
+            (requester, nonce, now),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+    async def purge_old_nonces(self, older_than_seconds: int = 3600) -> int:
+        db = self._ensure_db()
+        threshold = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - older_than_seconds, timezone.utc).isoformat()
+        cur = await db.execute("DELETE FROM request_nonces WHERE created_at < ?", (threshold,))
+        await db.commit()
+        return cur.rowcount
 
     async def enqueue(
         self,
