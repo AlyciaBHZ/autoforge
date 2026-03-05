@@ -891,9 +891,15 @@ def load_global_config() -> dict:
 
     defaults = data.get("defaults", {})
     if "budget" in defaults:
-        result["budget_limit_usd"] = float(defaults["budget"])
+        try:
+            result["budget_limit_usd"] = float(defaults["budget"])
+        except (ValueError, TypeError):
+            pass  # Skip malformed budget value
     if "max_agents" in defaults:
-        result["max_agents"] = int(defaults["max_agents"])
+        try:
+            result["max_agents"] = int(defaults["max_agents"])
+        except (ValueError, TypeError):
+            pass  # Skip malformed max_agents value
     if "docker" in defaults:
         result["docker_enabled"] = bool(defaults["docker"])
     if "mode" in defaults:
@@ -967,9 +973,15 @@ def _parse_toml_simple(path: Path) -> dict:
         config_key = key_map.get(key)
         if config_key:
             if config_key in ("budget_limit_usd",):
-                result[config_key] = float(value)
+                try:
+                    result[config_key] = float(value)
+                except (ValueError, TypeError):
+                    continue  # Skip malformed value
             elif config_key in ("max_agents",):
-                result[config_key] = int(value)
+                try:
+                    result[config_key] = int(value)
+                except (ValueError, TypeError):
+                    continue  # Skip malformed value
             elif config_key in ("docker_enabled",):
                 result[config_key] = value.lower() in ("true", "1", "yes")
             else:

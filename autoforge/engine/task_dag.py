@@ -244,7 +244,14 @@ class TaskDAG:
             logger.error(f"Total tasks skipped due to errors: {skipped}/{len(tasks_data)}")
 
         # Full validation: cycles + dangling dependencies
-        dag.validate()
+        warnings = dag.validate()
+        if warnings:
+            # Auto-fix dangling deps by removing references to non-existent tasks
+            known_ids = set(dag._tasks.keys())
+            for task in dag._tasks.values():
+                task.depends_on = [d for d in task.depends_on if d in known_ids]
+            for w in warnings:
+                logger.warning(f"Fixed dangling dependency: {w}")
         return dag
 
     def save(self, path: Path) -> None:

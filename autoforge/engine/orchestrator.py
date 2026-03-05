@@ -3316,7 +3316,11 @@ class Orchestrator:
     # ──────────────────────────────────────────────
 
     def _save_state(self, phase: str) -> None:
-        """Save orchestrator state for resume capability."""
+        """Save orchestrator state for resume capability.
+
+        Uses atomic write (temp file + rename) to prevent corruption
+        from crashes or power loss mid-write.
+        """
         if not self._state_file:
             return
 
@@ -3328,11 +3332,17 @@ class Orchestrator:
             "cost_usd": self.config.estimated_cost_usd,
             "total_input_tokens": self.config.total_input_tokens,
             "total_output_tokens": self.config.total_output_tokens,
+            "token_usage": dict(self.config.token_usage),
             "elapsed_seconds": time.time() - self._wall_start,
         }
-        self._state_file.write_text(
-            json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        state_json = json.dumps(state, indent=2, ensure_ascii=False)
+        try:
+            # Atomic write: temp file in same dir → rename
+            tmp = self._state_file.parent / f".{self._state_file.name}.tmp"
+            tmp.write_text(state_json, encoding="utf-8")
+            tmp.replace(self._state_file)
+        except OSError as exc:
+            logger.error("Failed to save state to %s: %s", self._state_file, exc)
 
     def _list_project_files(self) -> list[str]:
         """List all source files in the project directory."""
@@ -3356,6 +3366,11 @@ class Orchestrator:
         if workspace_path is None:
             # Find the most recent project in workspace
             workspace = self.config.workspace_dir
+            if not workspace.exists():
+                raise RuntimeError(
+                    f"Workspace directory does not exist: {workspace}. "
+                    f"Check FORGE_WORKSPACE env var or --workspace flag."
+                )
             projects = [d for d in workspace.iterdir() if d.is_dir() and (d / ".forge_state.json").exists()]
             if not projects:
                 raise RuntimeError("No previous runs found to resume")
@@ -3363,14 +3378,29 @@ class Orchestrator:
 
         self.project_dir = workspace_path
         self._state_file = workspace_path / ".forge_state.json"
-        state = json.loads(self._state_file.read_text(encoding="utf-8"))
+        try:
+            state = json.loads(self._state_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RuntimeError(
+                f"Failed to load state from {self._state_file}: {exc}. "
+                f"The state file may be corrupted — delete it and re-run."
+            ) from exc
 
         self.spec = state.get("spec", {})
         self.architecture = state.get("architecture", {})
         phase = state.get("phase", "")
 
+        # Restore token usage so budget tracking is accurate across resumes
+        if "token_usage" in state and isinstance(state["token_usage"], dict):
+            for model, usage in state["token_usage"].items():
+                if isinstance(usage, dict) and "input" in usage and "output" in usage:
+                    self.config.token_usage[model] = usage
+
         # Restore wall-clock start so elapsed time accumulates across resumes
-        self._wall_start = time.time() - state.get("elapsed_seconds", 0)
+        elapsed = state.get("elapsed_seconds", 0)
+        if not isinstance(elapsed, (int, float)):
+            elapsed = 0
+        self._wall_start = time.time() - elapsed
         self._start_time = time.monotonic()
 
         console.print(f"Resuming from phase: {phase}")
@@ -3419,12 +3449,15 @@ class Orchestrator:
         for project_dir in sorted(projects):
             state_file = project_dir / ".forge_state.json"
             if state_file.exists():
-                state = json.loads(state_file.read_text(encoding="utf-8"))
-                table.add_row(
-                    project_dir.name,
-                    state.get("phase", "unknown"),
-                    f"${state.get('cost_usd', 0):.4f}",
-                )
+                try:
+                    state = json.loads(state_file.read_text(encoding="utf-8"))
+                    table.add_row(
+                        project_dir.name,
+                        state.get("phase", "unknown"),
+                        f"${state.get('cost_usd', 0):.4f}",
+                    )
+                except (json.JSONDecodeError, OSError):
+                    table.add_row(project_dir.name, "[red]corrupted[/red]", "—")
             elif project_dir.name != ".locks":
                 table.add_row(project_dir.name, "unknown", "—")
 
@@ -3438,7 +3471,12 @@ class Orchestrator:
         console.print("=" * 56)
         console.print("[bold green]Project complete![/bold green]")
         console.print(f"  Location:  {self.project_dir}")
-        console.print(f"  Cost:      ${self.config.estimated_cost_usd:.4f}")
+        cost = self.config.estimated_cost_usd
+        remaining = self.config.budget_remaining
+        cost_str = f"${cost:.4f}"
+        if remaining < 0:
+            cost_str += f" [red](over budget by ${abs(remaining):.4f})[/red]"
+        console.print(f"  Cost:      {cost_str}")
         console.print(f"  Tokens:    {self.config.total_input_tokens:,} in / {self.config.total_output_tokens:,} out")
         console.print(f"  Duration:  {elapsed:.1f}s")
         console.print(f"  LLM calls: {self.llm.call_count}")

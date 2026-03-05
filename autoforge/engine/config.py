@@ -644,7 +644,7 @@ class ForgeConfig:
 
     @property
     def budget_remaining(self) -> float:
-        return max(0.0, self.budget_limit_usd - self.estimated_cost_usd)
+        return self.budget_limit_usd - self.estimated_cost_usd
 
     def check_budget(self) -> bool:
         """Return True if there is budget remaining."""

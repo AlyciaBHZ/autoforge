@@ -310,8 +310,8 @@ class DockerSandbox(SandboxBase):
                 except (ProcessLookupError, OSError):
                     pass
                 try:
-                    await proc.communicate()
-                except Exception:
+                    await asyncio.wait_for(proc.communicate(), timeout=3)
+                except (asyncio.TimeoutError, Exception):
                     pass
             try:
                 kill_cmd = [
