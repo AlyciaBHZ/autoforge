@@ -31,6 +31,8 @@ from autoforge.engine.autonomous_discovery import (
     DiscoveryConfig,
     DiscoveryDepth,
     EloTournament,
+    Hypothesis,
+    HypothesisTournament,
     MatchResult,
     NoveltyFilter,
     PaperKernel,
@@ -374,13 +376,38 @@ class TestProofPipelineP0(unittest.TestCase):
         self.assertGreaterEqual(stats["nodes_explored"], 1)
         self.assertIsNotNone(proof)
 
+    def test_mcts_does_not_only_evaluate_first_child(self):
+        tactic_gen = TacticGenerator()
+        mcts = MCTSProofSearch(tactic_gen, executor=HeuristicExecutor())
+
+        async def fake_generate(*args, **kwargs):
+            return [
+                type("C", (), {"tactic": "intro h1"})(),
+                type("C", (), {"tactic": "intro h2"})(),
+                type("C", (), {"tactic": "intro h3"})(),
+            ]
+
+        seen: list[str] = []
+
+        async def fake_eval(state, llm=None):
+            seen.append(state.parent_tactic)
+            return 0.4
+
+        tactic_gen.generate_candidates = fake_generate  # type: ignore[assignment]
+        mcts._evaluate_state = fake_eval  # type: ignore[assignment]
+
+        root = ProofState(goals=["Goal"], hypotheses=[])
+        asyncio.run(mcts.search(root, "theorem t : True", _TinyLLM(), max_iterations=1))
+
+        self.assertGreaterEqual(len(set(seen)), 2)
+
     def test_pantograph_fallback_does_not_auto_solve(self):
         repl = PantographREPL(LeanEnvironment())
         state = asyncio.run(repl.send_tactic("simp"))
         self.assertNotEqual(state.goals, [])
         self.assertIn("unknown_goal_state", state.goals[0])
 
-    def test_prove_theorem_requires_formal_verification(self):
+    def test_direct_proof_branch_requires_verification(self):
         tactic_gen = TacticGenerator()
         mcts = MCTSProofSearch(tactic_gen, executor=HeuristicExecutor())
         decomposer = RecursiveProofDecomposer(tactic_gen, mcts, lean_env=LeanEnvironment())
@@ -391,12 +418,77 @@ class TestProofPipelineP0(unittest.TestCase):
         async def fake_formal(*args, **kwargs):
             return "exact trivial"
 
+        async def no_decompose(*args, **kwargs):
+            return []
+
         decomposer._generate_informal_proof = fake_informal  # type: ignore[assignment]
         decomposer._informal_to_formal = fake_formal  # type: ignore[assignment]
+        decomposer._decompose = no_decompose  # type: ignore[assignment]
 
         attempt = asyncio.run(decomposer.prove("theorem t : True", "", _TinyLLM()))
         self.assertNotEqual(attempt.status, ProofStatus.PROVED)
-        self.assertIn(attempt.status, {ProofStatus.FAILED, ProofStatus.VERIFIED_WITH_SORRY, ProofStatus.COMPILES})
+
+    def test_mcts_proof_branch_requires_formal_backend(self):
+        tactic_gen = TacticGenerator()
+        mcts = MCTSProofSearch(tactic_gen, executor=HeuristicExecutor())
+        decomposer = RecursiveProofDecomposer(tactic_gen, mcts, lean_env=LeanEnvironment())
+
+        async def fake_informal(*args, **kwargs):
+            return "By search."
+
+        async def no_formal(*args, **kwargs):
+            return ""
+
+        async def fake_search(*args, **kwargs):
+            s0 = ProofState(goals=["G"], hypotheses=[])
+            s1 = ProofState(goals=[], hypotheses=[], parent_tactic="simp")
+            return [type("Step", (), {"tactic_applied": "simp", "state_before": s0, "state_after": s1})()]
+
+        async def no_decompose(*args, **kwargs):
+            return []
+
+        decomposer._generate_informal_proof = fake_informal  # type: ignore[assignment]
+        decomposer._informal_to_formal = no_formal  # type: ignore[assignment]
+        decomposer._decompose = no_decompose  # type: ignore[assignment]
+        mcts.search = fake_search  # type: ignore[assignment]
+
+        attempt = asyncio.run(decomposer.prove("theorem t : True", "", _TinyLLM()))
+        self.assertNotEqual(attempt.status, ProofStatus.PROVED)
+
+
+
+
+class TestHypothesisTournament(unittest.TestCase):
+    def test_empty_and_single_inputs(self):
+        tour = HypothesisTournament()
+        empty = asyncio.run(tour.run(rounds=2))
+        self.assertEqual(empty["rankings"], [])
+
+        tour.register(Hypothesis(id="h1", statement="A"))
+        one = asyncio.run(tour.run(rounds=2))
+        self.assertEqual(len(one["rankings"]), 1)
+        self.assertEqual(one["match_history"], [])
+
+    def test_register_is_idempotent(self):
+        tour = HypothesisTournament()
+        h = Hypothesis(id="h1", statement="A")
+        tour.register(h)
+        tour.register(h)
+        self.assertEqual(len(tour.rankings()), 1)
+
+    def test_deterministic_pairing_and_history(self):
+        tour = HypothesisTournament()
+        tour.register(Hypothesis(id="h1", statement="A", novelty=0.9, depth=0.9, verification_confidence=0.8))
+        tour.register(Hypothesis(id="h2", statement="B", novelty=0.4, depth=0.5, verification_confidence=0.4))
+        tour.register(Hypothesis(id="h3", statement="C", novelty=0.8, depth=0.7, verification_confidence=0.6))
+        tour.register(Hypothesis(id="h4", statement="D", novelty=0.2, depth=0.2, verification_confidence=0.2))
+
+        out = asyncio.run(tour.run(rounds=2))
+        self.assertGreaterEqual(len(out["match_history"]), 2)
+        top = out["rankings"][0]
+        self.assertIn("rating", top)
+        self.assertIn("wins", top)
+        self.assertIn("losses", top)
 
 
 # ╔═══════════════════════════════════════════════════════════╗

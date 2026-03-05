@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -1167,11 +1168,22 @@ class RecursiveProofDecomposer:
             attempt.error = "Lean toolchain unavailable; cannot grant formal PROVED status"
             return
 
-        proof_file = self._lean_env._workspace / f".autoforge_proof_{attempt.theorem_id}.lean"
-        proof_file.parent.mkdir(parents=True, exist_ok=True)
-        proof_file.write_text(f"{theorem_context} := by\n{attempt.lean_proof}\n", encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".lean",
+            prefix=f"autoforge_proof_{attempt.theorem_id}_",
+            dir=self._lean_env._workspace,
+            delete=False,
+            encoding="utf-8",
+        ) as tmp:
+            tmp.write(f"{theorem_context} := by\n{attempt.lean_proof}\n")
+            proof_file = Path(tmp.name)
 
-        verification = await self._lean_env.verify_file(proof_file)
+        try:
+            verification = await self._lean_env.verify_file(proof_file)
+        finally:
+            proof_file.unlink(missing_ok=True)
+
         attempt.verification_time = verification.execution_time
 
         if verification.success and verification.sorry_count == 0:
