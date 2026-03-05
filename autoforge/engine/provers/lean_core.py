@@ -452,7 +452,6 @@ class PantographREPL:
         return ProofState(
             goals=[],
             hypotheses=[],
-            remaining_sorries=0,
         )
 
 
