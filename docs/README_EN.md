@@ -393,6 +393,9 @@ autoforgeai deploy <project_id>                # Show deployment guide
 
 Supports systemd (Linux) and launchd (macOS) service installation — see `services/` directory.
 
+Message handling follows a unified async bridge event model (normal response / timeout / late response).
+Even responses that arrive after timeout are still delivered to upper layers for policy-driven handling.
+
 ---
 
 ## License
