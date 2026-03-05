@@ -336,11 +336,12 @@ Generate the conjectures now:"""
             for i, conj in enumerate(conjectures_json):
                 node = ConceptNode(
                     id=f"conj_{int(time.time())}_{i}",
-                    label=conj.get("title", f"Conjecture {i}"),
-                    description=conj.get("statement", ""),
+                    formal_statement=conj.get("statement", ""),
+                    informal_statement=conj.get("reason", ""),
                     concept_type=ConceptType.CONJECTURE,
-                    domain=ScientificDomain.MATHEMATICS,
+                    domain=ScientificDomain.PURE_MATHEMATICS,
                     metadata={
+                        "legacy_label": conj.get("title", f"Conjecture {i}"),
                         "reason": conj.get("reason", ""),
                         "hint": conj.get("hint", ""),
                         "difficulty_target": difficulty.value,
@@ -604,11 +605,12 @@ Provide your alternative proof attempt:"""
             # Create new theorem node
             theorem = ConceptNode(
                 id=f"thm_{attempt.conjecture.id}",
-                label=f"Theorem: {attempt.conjecture.label}",
-                description=attempt.conjecture.description,
+                formal_statement=attempt.conjecture.formal_statement,
+                informal_statement=attempt.conjecture.informal_statement,
                 concept_type=ConceptType.THEOREM,
                 domain=attempt.conjecture.domain,
                 metadata={
+                    "legacy_label": f"Theorem: {attempt.conjecture.label}",
                     "proof_sketch": attempt.proof_sketch,
                     "derived_from_conjecture": attempt.conjecture.id,
                     "difficulty": attempt.difficulty_actual.value,

@@ -23,6 +23,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from urllib.parse import quote_plus, urlencode
 from typing import Any
 
 from pathlib import Path
@@ -1212,13 +1213,17 @@ class LiteratureSearchEngine:
         Returns:
             List of PaperReference objects
         """
-        url = (
-            f"https://api.semanticscholar.org/graph/v1/paper/search"
-            f"?query={query}"
-            f"&limit={limit}"
-            f"&fields=title,authors,year,abstract,url,externalIds,"
-            f"citationCount,referenceCount,influentialCitationCount,embedding"
+        params = urlencode(
+            {
+                "query": query,
+                "limit": limit,
+                "fields": (
+                    "title,authors,year,abstract,url,externalIds,"
+                    "citationCount,referenceCount,influentialCitationCount,embedding"
+                ),
+            }
         )
+        url = f"https://api.semanticscholar.org/graph/v1/paper/search?{params}"
 
         try:
             response_text = await self._http_get(url)
@@ -1272,7 +1277,11 @@ class LiteratureSearchEngine:
         Returns:
             List of PaperReference objects
         """
-        url = f"http://export.arxiv.org/api/query?search_query=all:{query}&max_results={limit}"
+        encoded_query = quote_plus(f"all:{query}")
+        url = (
+            "https://export.arxiv.org/api/query"
+            f"?search_query={encoded_query}&max_results={limit}"
+        )
 
         try:
             response_text = await self._http_get(url)

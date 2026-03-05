@@ -81,6 +81,7 @@ logger = logging.getLogger(__name__)
 class ScientificDomain(str, Enum):
     """Scientific domains — not exhaustive, extensible via GENERAL."""
     PURE_MATHEMATICS = "pure_mathematics"
+    MATHEMATICS = "pure_mathematics"  # Legacy alias
     APPLIED_MATHEMATICS = "applied_mathematics"
     THEORETICAL_PHYSICS = "theoretical_physics"
     MATHEMATICAL_PHYSICS = "mathematical_physics"
@@ -246,6 +247,68 @@ class ConceptNode:
         self.overall_confidence = min(0.99, raw + bonus)
         return self.overall_confidence
 
+    # Backward-compatible aliases for legacy modules.
+    @property
+    def statement(self) -> str:
+        return self.formal_statement
+
+    @statement.setter
+    def statement(self, value: str) -> None:
+        self.formal_statement = value
+
+    @property
+    def description(self) -> str:
+        return self.formal_statement or self.informal_statement
+
+    @description.setter
+    def description(self, value: str) -> None:
+        self.formal_statement = value
+
+    @property
+    def label(self) -> str:
+        legacy = str(self.metadata.get("legacy_label", "")).strip()
+        if legacy:
+            return legacy
+        text = (self.informal_statement or self.formal_statement).strip()
+        if not text:
+            return self.id
+        first_line = text.splitlines()[0].strip()
+        return first_line[:120] if first_line else self.id
+
+    @label.setter
+    def label(self, value: str) -> None:
+        self.metadata["legacy_label"] = value
+
+    @property
+    def name(self) -> str:
+        return self.label
+
+    @name.setter
+    def name(self, value: str) -> None:
+        self.label = value
+
+    @property
+    def type(self) -> ConceptType:
+        return self.concept_type
+
+    @type.setter
+    def type(self, value: ConceptType | str) -> None:
+        if isinstance(value, ConceptType):
+            self.concept_type = value
+            return
+        try:
+            self.concept_type = ConceptType(value)
+        except ValueError:
+            logger.debug("[ConceptNode] Unknown legacy type '%s', keeping current", value)
+
+    @property
+    def confidence(self) -> float:
+        return self.overall_confidence
+
+    @confidence.setter
+    def confidence(self, value: float) -> None:
+        self.overall_confidence = max(0.0, min(1.0, float(value)))
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -323,6 +386,24 @@ class ConceptRelation:
             bridging_insight=data.get("bridging_insight", ""),
         )
 
+    @property
+    def id(self) -> str:
+        return f"{self.source_id}:{self.relation_type.value}:{self.target_id}"
+
+    @property
+    def type(self) -> RelationType:
+        return self.relation_type
+
+    @type.setter
+    def type(self, value: RelationType | str) -> None:
+        if isinstance(value, RelationType):
+            self.relation_type = value
+            return
+        try:
+            self.relation_type = RelationType(value)
+        except ValueError:
+            logger.debug("[ConceptRelation] Unknown legacy type '%s', keeping current", value)
+
 
 # ══════════════════════════════════════════════════════════════
 # Theory Graph
@@ -349,8 +430,36 @@ class TheoryGraph:
         self._domain_index: dict[str, set[str]] = {}
         self._type_index: dict[str, set[str]] = {}
 
+    @property
+    def nodes(self) -> dict[str, ConceptNode]:
+        """Legacy alias for concept dictionary."""
+        return self._nodes
+
+    @property
+    def concepts(self) -> dict[str, ConceptNode]:
+        """Legacy alias for concept dictionary."""
+        return self._nodes
+
+    @property
+    def relations(self) -> list[ConceptRelation]:
+        """Legacy alias for relation list."""
+        return self._relations
+
     def add_concept(self, node: ConceptNode) -> None:
         """Add a concept to the theory."""
+        previous = self._nodes.get(node.id)
+        if previous is not None:
+            old_domain = previous.domain.value
+            old_type = previous.concept_type.value
+            if old_domain in self._domain_index:
+                self._domain_index[old_domain].discard(previous.id)
+                if not self._domain_index[old_domain]:
+                    self._domain_index.pop(old_domain, None)
+            if old_type in self._type_index:
+                self._type_index[old_type].discard(previous.id)
+                if not self._type_index[old_type]:
+                    self._type_index.pop(old_type, None)
+
         self._nodes[node.id] = node
         # Index by domain
         dk = node.domain.value
@@ -372,8 +481,16 @@ class TheoryGraph:
         self._forward.setdefault(rel.source_id, []).append(rel.target_id)
         self._backward.setdefault(rel.target_id, []).append(rel.source_id)
 
+    def add_node(self, node: ConceptNode) -> None:
+        """Legacy alias for add_concept."""
+        self.add_concept(node)
+
     def get_concept(self, node_id: str) -> ConceptNode | None:
         return self._nodes.get(node_id)
+
+    def get_node(self, node_id: str) -> ConceptNode | None:
+        """Legacy alias for get_concept."""
+        return self.get_concept(node_id)
 
     def get_concepts_by_type(self, ctype: ConceptType) -> list[ConceptNode]:
         ids = self._type_index.get(ctype.value, set())
