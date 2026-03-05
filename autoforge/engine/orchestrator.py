@@ -295,7 +295,7 @@ class Orchestrator:
 
             # Phase 3: VERIFY
             console.print("\n[bold blue]Phase 3: VERIFY[/bold blue] — Verifying project...")
-            await self._phase_verify()
+            verify_passed = await self._phase_verify()
 
             # Formal verification: static analysis + LLM formal checks
             if self.config.formal_verify_enabled:
@@ -334,8 +334,19 @@ class Orchestrator:
             if self.config.evomac_enabled:
                 await self._evomac_backward_pass()
 
+            # Quality gate: if tests still fail after VERIFY, attempt security-informed fixes
+            if not verify_passed and self.config.security_scan_enabled:
+                console.print("  [yellow]VERIFY→REFACTOR gate: feeding scan findings back for fixing[/yellow]")
+                await self._fix_from_security_scan()
+
             # Phase 4: REFACTOR
-            console.print("\n[bold blue]Phase 4: REFACTOR[/bold blue] — Improving quality...")
+            if verify_passed:
+                console.print("\n[bold blue]Phase 4: REFACTOR[/bold blue] — Improving quality...")
+            else:
+                console.print(
+                    "\n[bold yellow]Phase 4: REFACTOR[/bold yellow] — "
+                    "Improving quality (some tests still failing, proceeding with best-effort)..."
+                )
             await self._phase_refactor()
             self._save_state("refactor_complete")
 
@@ -696,13 +707,18 @@ class Orchestrator:
             # Reduce decomp (less structured planning needed for test fixes)
             shares["reflexion"] = 0.30
             shares["decomp"] = 0.15
-            logger.debug(f"[ContextShares] Testing task detected — boosted reflexion, reduced decomp")
+            logger.debug("[ContextShares] Testing task detected — boosted reflexion, reduced decomp")
         elif is_creation:
             # Boost decomp (structured planning helps new implementations)
             # Reduce reflexion (fewer failure patterns for brand new code)
             shares["decomp"] = 0.35
             shares["reflexion"] = 0.12
-            logger.debug(f"[ContextShares] Creation task detected — boosted decomp, reduced reflexion")
+            logger.debug("[ContextShares] Creation task detected — boosted decomp, reduced reflexion")
+
+        # Normalize shares so they sum to 1.0 (prevents over-allocation)
+        total = sum(shares.values())
+        if total > 0:
+            shares = {k: v / total for k, v in shares.items()}
 
         return shares
 
@@ -754,8 +770,10 @@ class Orchestrator:
         # Track which files are being written by active tasks (Section F)
         active_files: set[str] = set()
         overlap_files = file_overlaps or {}
-        max_resets = 3
+        max_resets = getattr(self.config, "max_build_resets", 3)
         reset_count = 0
+        # Track which task IDs have failed repeatedly for fail-fast
+        task_fail_counts: dict[str, int] = {}
 
         while self.dag.has_pending_tasks(TaskPhase.BUILD):
             ready = self.dag.get_ready_tasks()
@@ -771,10 +789,26 @@ class Orchestrator:
                             max_resets,
                         )
                         break
-                    # Retry failed tasks
+
+                    # Fail-fast: skip tasks that have failed every reset
+                    all_salvageable = False
                     for task in self.dag.get_tasks_by_phase(TaskPhase.BUILD):
                         if task.status == TaskStatus.FAILED:
-                            self.dag.reset_failed(task.id)
+                            task_fail_counts[task.id] = task_fail_counts.get(task.id, 0) + 1
+                            if task_fail_counts[task.id] >= max_resets:
+                                logger.warning(
+                                    f"Task {task.id} failed {task_fail_counts[task.id]} times — "
+                                    f"marking as permanently blocked"
+                                )
+                                task.status = TaskStatus.BLOCKED
+                            else:
+                                self.dag.reset_failed(task.id)
+                                all_salvageable = True
+
+                    if not all_salvageable:
+                        logger.error("All remaining failed tasks are unsalvageable — stopping build")
+                        break
+
                     reset_count += 1
                     continue
                 break
@@ -1212,8 +1246,10 @@ class Orchestrator:
                 "existing_files": self._list_project_files(),
             })
             if not fix_result.success:
-                logger.info(f"[{agent_id}] TDD fix failed, moving to review")
-                return  # Builder can't fix — move on to reviewer
+                logger.info(f"[{agent_id}] TDD fix attempt failed (iter {iteration + 1}/{loops})")
+                # Continue to next iteration instead of bailing — builder may
+                # succeed on the next try with fresh context
+                continue
 
             if use_git and git:
                 await git.commit_worktree(
@@ -1599,7 +1635,8 @@ class Orchestrator:
     # Phase 3: VERIFY
     # ──────────────────────────────────────────────
 
-    async def _phase_verify(self) -> None:
+    async def _phase_verify(self) -> bool:
+        """Run tests and attempt to fix failures. Returns True if all tests pass."""
         sandbox = create_sandbox(self.config, self.project_dir)
         async with sandbox:
             tester = self._agent("tester", self.config, self.llm, self.project_dir, sandbox)
@@ -1618,9 +1655,33 @@ class Orchestrator:
 
             if test_results.all_passed:
                 console.print("  [green]All tests passed[/green]")
+                return True
+
+            console.print(f"  [yellow]Some tests failed — attempting fixes[/yellow]")
+            await self._fix_failures(test_results, sandbox)
+
+            # Re-check: did fixes resolve all failures?
+            re_result = await tester.run({"spec": self.spec})
+            final_results = tester.parse_results(re_result.output)
+
+            # Update saved results
+            (self.project_dir / "test_results.json").write_text(
+                json.dumps({
+                    "all_passed": final_results.all_passed,
+                    "results": final_results.results,
+                    "summary": final_results.summary,
+                }, indent=2),
+                encoding="utf-8",
+            )
+
+            if final_results.all_passed:
+                console.print("  [green]All tests pass after fixes[/green]")
             else:
-                console.print(f"  [yellow]Some tests failed — attempting fixes[/yellow]")
-                await self._fix_failures(test_results, sandbox)
+                n_fail = len(final_results.failures)
+                console.print(
+                    f"  [yellow]VERIFY gate: {n_fail} test(s) still failing[/yellow]"
+                )
+            return final_results.all_passed
 
     async def _fix_failures(self, test_results, sandbox: SandboxBase) -> None:
         """Attempt to fix test failures using Director + Builder + Reflexion + LDB.
@@ -2503,6 +2564,44 @@ class Orchestrator:
                 console.print(f"  [green]Security scan passed[/green] ({report.low_count} low issues)")
         except Exception as e:
             logger.warning(f"Security scan failed: {e}")
+
+    async def _fix_from_security_scan(self) -> None:
+        """Read security_report.json and ask builder to fix critical/high issues."""
+        report_path = self._forge_dir / "security_report.json"
+        if not report_path.exists():
+            return
+        try:
+            report_data = json.loads(report_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+
+        # Only fix critical and high severity findings
+        findings = [
+            f for f in report_data.get("findings", [])
+            if f.get("severity") in ("critical", "high")
+        ]
+        if not findings:
+            return
+
+        console.print(f"  Fixing {len(findings)} critical/high security issue(s)...")
+        sandbox = create_sandbox(self.config, self.project_dir)
+        async with sandbox:
+            builder = self._agent("builder", self.config, self.llm, self.project_dir, sandbox)
+            for finding in findings[:5]:  # Cap at 5 fixes per pass
+                fix_prompt = (
+                    f"Fix this security vulnerability:\n"
+                    f"  File: {finding.get('file', 'unknown')}\n"
+                    f"  Line: {finding.get('line', '?')}\n"
+                    f"  Severity: {finding.get('severity')}\n"
+                    f"  Issue: {finding.get('description', '')}\n"
+                    f"  Suggestion: {finding.get('suggestion', '')}\n\n"
+                    f"Read the file, understand the context, and apply the minimal fix."
+                )
+                await builder.run({
+                    "task": {"id": f"sec-fix-{finding.get('file', 'unknown')}", "description": fix_prompt, "files": [finding.get("file", "")]},
+                    "spec": self.spec,
+                    "existing_files": self._list_project_files(),
+                })
 
     # ──────────────────────────────────────────────
     # CapabilityDAG — Knowledge Ingestion
