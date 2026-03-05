@@ -8,6 +8,7 @@ All tests are offline — no API keys, no LLM calls, no Docker/SSH.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import time
@@ -29,6 +30,8 @@ from autoforge.engine.theoretical_reasoning import (
 from autoforge.engine.autonomous_discovery import (
     DiscoveryConfig,
     DiscoveryDepth,
+    EloTournament,
+    MatchResult,
     NoveltyFilter,
     PaperKernel,
 )
@@ -110,6 +113,23 @@ def _build_sample_graph() -> TheoryGraph:
 
     return g
 
+
+
+
+class _DummyJudgeLLM:
+    """Deterministic async judge stub for Elo tournament tests."""
+
+    def __init__(self, winner: str = "A", is_draw: bool = False) -> None:
+        self.winner = winner
+        self.is_draw = is_draw
+
+    async def __call__(self, prompt: str) -> str:
+        return json.dumps({
+            "winner": self.winner,
+            "is_draw": self.is_draw,
+            "reasoning": "Deterministic test judge",
+            "confidence": 0.9,
+        })
 
 # ╔═══════════════════════════════════════════════════════════╗
 # ║  1. TheoryGraph Tests (8)                                 ║
@@ -272,6 +292,51 @@ class TestDiscoveryComponents(unittest.TestCase):
         self.assertEqual(dc.max_consecutive_shallow_rounds, 3)
         self.assertEqual(dc.max_total_results, 100)
         self.assertGreater(dc.depth_score_threshold, 0)
+
+
+# ╔═══════════════════════════════════════════════════════════╗
+# ║  2b. Elo Tournament Tests (3)                             ║
+# ╚═══════════════════════════════════════════════════════════╝
+
+
+class TestEloTournament(unittest.TestCase):
+    """Coverage for pairwise hypothesis Elo ranking behavior."""
+
+    def test_register_hypothesis_idempotent(self):
+        tournament = EloTournament()
+        tournament.register_hypothesis("h1")
+        tournament._ratings["h1"].rating = 1666.0
+
+        # Re-register should not clobber accumulated rating/statistics.
+        tournament.register_hypothesis("h1")
+        self.assertEqual(tournament._ratings["h1"].rating, 1666.0)
+
+    def test_update_ratings_win_and_draw(self):
+        tournament = EloTournament(k_factor=32)
+        tournament.register_hypothesis("a")
+        tournament.register_hypothesis("b")
+
+        win_match = MatchResult("a", "b", False, "a stronger", 0.9)
+        tournament._update_ratings(win_match)
+        self.assertGreater(tournament._ratings["a"].rating, 1500.0)
+        self.assertLess(tournament._ratings["b"].rating, 1500.0)
+
+        draw_match = MatchResult("a", "b", True, "equal", 0.8)
+        tournament._update_ratings(draw_match)
+        self.assertEqual(tournament._ratings["a"].matches_played, 2)
+        self.assertEqual(tournament._ratings["b"].matches_played, 2)
+        self.assertGreater(tournament._ratings["a"].confidence_interval, 0.0)
+
+    def test_run_tournament_handles_small_population(self):
+        tournament = EloTournament()
+
+        empty = asyncio.run(tournament.run_tournament({}, _DummyJudgeLLM()))
+        self.assertEqual(empty["total_matches"], 0)
+        self.assertEqual(empty["rankings"], [])
+
+        single = asyncio.run(tournament.run_tournament({"h1": "x"}, _DummyJudgeLLM()))
+        self.assertEqual(single["total_matches"], 0)
+        self.assertEqual(len(single["rankings"]), 1)
 
 
 # ╔═══════════════════════════════════════════════════════════╗
