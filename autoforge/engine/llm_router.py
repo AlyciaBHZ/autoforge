@@ -1,4 +1,4 @@
-"""LLM Router — multi-provider model selection, API calls, and budget enforcement.
+"""LLM Router - multi-provider model selection, API calls, and budget enforcement.
 
 Supports Anthropic (Claude), OpenAI (GPT/o-series), and Google (Gemini).
 All responses are normalized to a common format so agents don't need
@@ -67,7 +67,7 @@ class ContentBlock:
     id: str = ""
     name: str = ""
     input: dict[str, Any] = field(default_factory=dict)
-    # Vision fields — used when type == "image"
+    # Vision fields - used when type == "image"
     media_type: str = ""  # e.g. "image/png", "image/jpeg"
     image_data: str = ""  # base64-encoded image bytes
 
@@ -82,7 +82,7 @@ class Usage:
 
 @dataclass
 class LLMResponse:
-    """Normalized LLM response — same attribute interface as Anthropic's Message."""
+    """Normalized LLM response - same attribute interface as Anthropic's Message."""
 
     content: list[ContentBlock] = field(default_factory=list)
     stop_reason: str = "end_turn"  # "end_turn" or "tool_use"
@@ -111,7 +111,7 @@ class BudgetExceededError(Exception):
 MAX_RETRIES = 3
 """Maximum number of retry attempts for transient API errors."""
 
-_RETRY_BASE_DELAY = 1.0  # seconds — base delay for exponential backoff
+_RETRY_BASE_DELAY = 1.0  # seconds - base delay for exponential backoff
 
 
 # ── Provider detection ─────────────────────────────────────────────
@@ -143,13 +143,14 @@ _OPENAI_MODELS = {
 
 _OPENAI_MODEL_ALIASES = {
     # Historical alias from older AutoForge releases.
-    "codex-5.3": "gpt-5.3-codex",
+    "codex-5.3": "gpt-4o",
 }
 
 _OPENAI_MODEL_FALLBACKS = [
     "gpt-5.2-codex",
     "gpt-5.1-codex-mini",
     "gpt-5-mini",
+    "gpt-4o",
     "gpt-4o-mini",
     "o4-mini",
 ]
@@ -174,7 +175,7 @@ def detect_provider(model: str) -> str:
     if not model_lower.startswith("claude"):
         logger.warning(
             "Unknown model %r does not match any known provider pattern. "
-            "Defaulting to Anthropic — verify this is correct.",
+            "Defaulting to Anthropic - verify this is correct.",
             model,
         )
     return "anthropic"
@@ -191,7 +192,7 @@ class LLMRouter:
     budget enforcement, and usage logging.
     """
 
-    # Custom provider registry — populated via register_provider()
+    # Custom provider registry - populated via register_provider()
     # NOTE: class-level registry is intentionally shared so providers
     # registered once are available to all router instances.
     _custom_providers: dict[str, LLMProvider] = {}
@@ -220,6 +221,9 @@ class LLMRouter:
         self._call_count = 0
         self._clients: dict[str, Any] = {}
         self._auth_providers: dict[str, Any] = {}  # Cached AuthProvider per provider
+        # Per-run cache: if a configured OpenAI model is unavailable (404),
+        # remember the first working fallback to avoid repeated retries.
+        self._openai_model_overrides: dict[str, str] = {}
         self._budget_lock: asyncio.Lock | None = None
         self._client_lock: asyncio.Lock | None = None
         self._reserved_budget_usd: float = 0.0
@@ -474,7 +478,7 @@ class LLMRouter:
                 delay = max(0, delay + jitter)
 
                 logger.warning(
-                    "Transient error on attempt %d/%d (status=%s): %s — "
+                    "Transient error on attempt %d/%d (status=%s): %s - "
                     "retrying in %.1fs",
                     attempt, max_retries, status, exc, delay,
                 )
@@ -503,7 +507,7 @@ class LLMRouter:
 
         Maps to :meth:`call` with the prompt wrapped as a single user
         message.  Extra kwargs (``max_tokens``, ``temperature``, etc.) are
-        accepted for call-site compatibility but do not affect routing —
+        accepted for call-site compatibility but do not affect routing -
         model selection is governed solely by *complexity*.
         """
         return await self.call(
@@ -617,7 +621,7 @@ class LLMRouter:
                     )
                 self._reserved_budget_usd += reservation
 
-        # Async-safe client initialization — prevent duplicate creation
+        # Async-safe client initialization - prevent duplicate creation
         async with self._get_client_lock():
             self._get_client(provider)
         await self._ensure_fresh_token(provider)
@@ -857,12 +861,18 @@ class LLMRouter:
         temperature: float | None = None,
     ) -> LLMResponse:
         """Call OpenAI API and normalize the response with model fallback."""
+        requested_key = model.lower()
+        override = self._openai_model_overrides.get(requested_key)
+
         candidates = self._openai_model_candidates(model)
+        if override:
+            # Try the last known-good model first to avoid repeated 404 retries.
+            candidates = [override] + [c for c in candidates if c != override]
         last_exc: Exception | None = None
 
         for idx, candidate in enumerate(candidates):
             try:
-                return await self._call_openai_once(
+                resp = await self._call_openai_once(
                     candidate,
                     max_tokens,
                     system,
@@ -870,6 +880,9 @@ class LLMRouter:
                     tools,
                     temperature=temperature,
                 )
+                if candidate.lower() != requested_key and self._openai_model_overrides.get(requested_key) != candidate:
+                    self._openai_model_overrides[requested_key] = candidate
+                return resp
             except Exception as exc:
                 last_exc = exc
                 if idx == len(candidates) - 1 or not self._is_openai_model_access_error(exc):
@@ -1046,7 +1059,7 @@ class LLMRouter:
             elif role == "user":
                 # May contain tool_result items, images, or plain text.
                 # Collect tool results and user content separately to avoid
-                # interleaving — OpenAI expects all tool messages grouped
+                # interleaving - OpenAI expects all tool messages grouped
                 # right after the assistant tool_calls message.
                 if isinstance(content, list):
                     tool_msgs: list[dict[str, Any]] = []

@@ -430,7 +430,10 @@ class ForgeConfig:
             self.run_id = uuid.uuid4().hex[:12]
 
         # Normalize legacy OpenAI aliases from older config files.
-        legacy_aliases = {"codex-5.3": "gpt-5.3-codex"}
+        #
+        # NOTE: `codex-5.3` was an early placeholder in the setup wizard.
+        # Map it to a broadly available OpenAI model to avoid repeated 404s.
+        legacy_aliases = {"codex-5.3": "gpt-4o"}
         for attr in ("model_strong", "model_fast"):
             model_name = str(getattr(self, attr, "")).strip()
             canonical = legacy_aliases.get(model_name.lower())

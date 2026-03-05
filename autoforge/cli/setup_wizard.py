@@ -46,17 +46,17 @@ PROVIDERS = {
         "validate": lambda x: x.startswith("sk-") and len(x) > 20,
         "invalid_msg": "Must start with 'sk-' and be at least 20 characters",
         "models_strong": [
-            {"name": "GPT-5.2-Codex (recommended stable code model)", "value": "gpt-5.2-codex"},
-            {"name": "GPT-5.3-Codex (latest, access may vary)", "value": "gpt-5.3-codex"},
-            {"name": "GPT-5.2 (latest general model)", "value": "gpt-5.2"},
-            {"name": "o3 (strongest reasoning)", "value": "o3"},
-            {"name": "GPT-4o (legacy fallback)", "value": "gpt-4o"},
+            {"name": "GPT-4o (recommended, broadly available)", "value": "gpt-4o"},
+            {"name": "o3 (strongest reasoning, access may vary)", "value": "o3"},
+            {"name": "GPT-5.2-Codex (code, access may vary)", "value": "gpt-5.2-codex"},
+            {"name": "GPT-5.3-Codex (code, latest, access may vary)", "value": "gpt-5.3-codex"},
+            {"name": "GPT-5.2 (general, access may vary)", "value": "gpt-5.2"},
         ],
         "models_fast": [
-            {"name": "GPT-5 mini (recommended)", "value": "gpt-5-mini"},
-            {"name": "GPT-5.1-Codex-mini (lightweight coding)", "value": "gpt-5.1-codex-mini"},
-            {"name": "GPT-4o-mini (legacy fallback)", "value": "gpt-4o-mini"},
-            {"name": "o4-mini (reasoning, cheaper)", "value": "o4-mini"},
+            {"name": "GPT-4o-mini (recommended)", "value": "gpt-4o-mini"},
+            {"name": "o4-mini (reasoning, access may vary)", "value": "o4-mini"},
+            {"name": "GPT-5 mini (access may vary)", "value": "gpt-5-mini"},
+            {"name": "GPT-5.1-Codex-mini (code, access may vary)", "value": "gpt-5.1-codex-mini"},
         ],
         "auth_methods": [
             {"name": "API Key", "value": "api_key"},
@@ -139,7 +139,7 @@ def needs_setup() -> bool:
 def run_setup_wizard() -> None:
     """Run the interactive setup wizard.
 
-    All steps are optional — users can skip everything and configure later.
+    All steps are optional - users can skip everything and configure later.
     The wizard always completes with a summary of what AutoForge can do.
     """
     from InquirerPy import inquirer
@@ -217,7 +217,7 @@ def run_setup_wizard() -> None:
                         default=fast_choices[0]["value"],
                     ).execute()
 
-                # Validate model → provider mapping
+                # Validate model -> provider mapping
                 _validate_model_provider(inquirer, api_keys, auth_configs, model_strong, "strong")
                 _validate_model_provider(inquirer, api_keys, auth_configs, model_fast, "fast")
 
@@ -262,7 +262,7 @@ def run_setup_wizard() -> None:
         github_config = _setup_github(inquirer)
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]Setup interrupted — saving what we have.[/yellow]")
+        console.print("\n[yellow]Setup interrupted - saving what we have.[/yellow]")
 
     # Always write config (even with defaults / no API keys)
     _write_config(
@@ -375,7 +375,7 @@ def _collect_provider_credentials(
     if len(auth_methods) > 1:
         default_auth = _default_auth_method(pid)
         auth_method = inquirer.select(
-            message=f"{info['name']} — authentication method:",
+            message=f"{info['name']} - authentication method:",
             choices=auth_methods,
             default=default_auth,
         ).execute()
@@ -438,7 +438,7 @@ def _collect_provider_credentials(
             default="",
         ).execute()
         base_url = inquirer.text(
-            message="Base URL (optional, for proxy — press Enter to skip):",
+            message="Base URL (optional, for proxy - press Enter to skip):",
             default="",
         ).execute()
         auth_configs[pid] = {
@@ -471,7 +471,7 @@ def _collect_provider_credentials(
         }
 
     elif auth_method == "bedrock":
-        console.print("[dim]Amazon Bedrock — Claude via AWS[/dim]")
+        console.print("[dim]Amazon Bedrock - Claude via AWS[/dim]")
         aws_region = inquirer.text(
             message="AWS Region:",
             default="us-east-1",
@@ -522,7 +522,7 @@ def _collect_provider_credentials(
             )
 
     elif auth_method == "vertex_ai":
-        console.print("[dim]Google Vertex AI — Claude via Google Cloud[/dim]")
+        console.print("[dim]Google Vertex AI - Claude via Google Cloud[/dim]")
         project_id = inquirer.text(
             message="GCP Project ID:",
             validate=lambda x: len(x) > 0,
@@ -544,7 +544,7 @@ def _collect_provider_credentials(
 
     elif auth_method == "codex_oauth":
         console.print(
-            "[dim]Codex OAuth — will open browser for ChatGPT login.\n"
+            "[dim]Codex OAuth - will open browser for ChatGPT login.\n"
             "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.\n"
             "Uses subscription quota (not API billing).[/dim]"
         )
@@ -553,7 +553,7 @@ def _collect_provider_credentials(
 
     elif auth_method == "device_code":
         console.print(
-            "[dim]Device Code Flow — for headless/SSH environments.\n"
+            "[dim]Device Code Flow - for headless/SSH environments.\n"
             "Will display a URL and code to enter on another device.\n"
             "Requires ChatGPT Plus/Pro/Business/Edu/Enterprise subscription.[/dim]"
         )
@@ -628,7 +628,7 @@ def _setup_github(inquirer: Any) -> dict[str, Any]:
             console.print("  [yellow]GitHub CLI detected but status check failed[/yellow]")
             result["gh_authenticated"] = False
     else:
-        console.print("  [dim]GitHub CLI (gh) not found — optional but enables auto-push.[/dim]")
+        console.print("  [dim]GitHub CLI (gh) not found - optional but enables auto-push.[/dim]")
         console.print("  [dim]Install: https://cli.github.com[/dim]")
         result["gh_authenticated"] = False
 
@@ -683,7 +683,7 @@ def _validate_model_provider(
         if len(auth_methods) > 1:
             default_auth = _default_auth_method(required_provider)
             auth_method = inquirer.select(
-                message=f"{info['name']} — authentication method:",
+            message=f"{info['name']} - authentication method:",
                 choices=auth_methods,
                 default=default_auth,
             ).execute()
