@@ -2179,3 +2179,302 @@ def _extract_json(text: str) -> dict[str, Any] | None:
             except json.JSONDecodeError:
                 pass
     return None
+
+
+# ══════════════════════════════════════════════════════════════
+# HyperEdge & HyperGraph — N-ary Relationships for TheoryGraph
+# ══════════════════════════════════════════════════════════════
+# SciAgents-style hyperedges to model n-ary relationships (≥2 nodes)
+# in addition to the standard binary ConceptRelations. Enables discovery
+# of complex multi-concept interactions and structures.
+
+
+@dataclass
+class HyperEdge:
+    """N-ary relationship connecting 2+ nodes in the theory graph.
+
+    Unlike binary ConceptRelation, HyperEdge can connect any number of
+    nodes with a single unified relationship. Example: a mathematical
+    structure (e.g., "commutative monoid") connects the concepts
+    commutativity, associativity, identity, and closure.
+    """
+
+    edge_id: str
+    node_ids: list[str]  # ≥2 node IDs
+    relation_type: str  # E.g., "structural_analogy", "mutual_constraint"
+    weight: float = 1.0  # Importance / strength
+    metadata: dict[str, Any] = field(default_factory=dict)
+    description: str = ""
+
+
+class HyperGraph:
+    """Hypergraph extension for TheoryGraph.
+
+    Maintains n-ary relationships alongside the binary graph structure.
+    Useful for discovering complex multi-concept patterns, cliques, and
+    structural analogies across the theory.
+    """
+
+    def __init__(self, theory_graph: TheoryGraph):
+        """Initialize HyperGraph on top of a TheoryGraph.
+
+        Args:
+            theory_graph: The underlying TheoryGraph to extend.
+        """
+        self.theory_graph = theory_graph
+        self._hyperedges: dict[str, HyperEdge] = {}
+        self._node_to_edges: dict[str, list[str]] = {}  # node_id → edge_ids
+
+    def add_hyperedge(
+        self,
+        node_ids: list[str],
+        relation_type: str,
+        weight: float = 1.0,
+        description: str = "",
+    ) -> str:
+        """Add a new hyperedge to the graph.
+
+        Args:
+            node_ids: List of ≥2 node IDs to connect.
+            relation_type: Type of n-ary relationship.
+            weight: Importance of this relationship.
+            description: Human-readable description.
+
+        Returns:
+            The generated edge_id.
+
+        Raises:
+            ValueError: If fewer than 2 nodes specified.
+        """
+        if len(node_ids) < 2:
+            raise ValueError(f"HyperEdge requires ≥2 nodes; got {len(node_ids)}")
+
+        # Verify all nodes exist in the theory graph
+        for node_id in node_ids:
+            if node_id not in self.theory_graph.nodes:
+                logging.warning(f"Node {node_id} not in theory graph; proceeding anyway")
+
+        # Generate edge ID
+        edge_id = hashlib.md5(
+            f"{relation_type}:{','.join(sorted(node_ids))}".encode()
+        ).hexdigest()[:16]
+
+        edge = HyperEdge(
+            edge_id=edge_id,
+            node_ids=sorted(node_ids),  # Canonical order
+            relation_type=relation_type,
+            weight=weight,
+            description=description,
+        )
+
+        self._hyperedges[edge_id] = edge
+
+        # Update reverse index
+        for node_id in node_ids:
+            if node_id not in self._node_to_edges:
+                self._node_to_edges[node_id] = []
+            if edge_id not in self._node_to_edges[node_id]:
+                self._node_to_edges[node_id].append(edge_id)
+
+        return edge_id
+
+    def get_edges_for_node(self, node_id: str) -> list[HyperEdge]:
+        """Get all hyperedges involving a given node.
+
+        Args:
+            node_id: The node ID.
+
+        Returns:
+            List of HyperEdge objects.
+        """
+        edge_ids = self._node_to_edges.get(node_id, [])
+        return [self._hyperedges[eid] for eid in edge_ids if eid in self._hyperedges]
+
+    def get_shared_edges(self, node_ids: list[str]) -> list[HyperEdge]:
+        """Find hyperedges connecting all specified nodes.
+
+        Args:
+            node_ids: Nodes that must all be in the edge.
+
+        Returns:
+            List of HyperEdges containing all specified nodes.
+        """
+        if not node_ids:
+            return []
+
+        # Start with edges of first node
+        candidate_ids = set(self._node_to_edges.get(node_ids[0], []))
+
+        # Intersect with edges of remaining nodes
+        for node_id in node_ids[1:]:
+            candidate_ids &= set(self._node_to_edges.get(node_id, []))
+
+        return [
+            edge
+            for edge in [self._hyperedges.get(eid) for eid in candidate_ids]
+            if edge is not None
+        ]
+
+    def find_cliques(self, min_size: int = 3) -> list[list[str]]:
+        """Find groups of nodes densely connected by hyperedges.
+
+        A clique is a subset of nodes where every pair is connected by
+        at least one hyperedge (including edges connecting both).
+
+        Args:
+            min_size: Minimum clique size.
+
+        Returns:
+            List of node_id lists forming cliques.
+        """
+        cliques = []
+
+        # Simple greedy approach: for each hyperedge, check if it forms
+        # or extends a clique
+        for edge in self._hyperedges.values():
+            if len(edge.node_ids) >= min_size:
+                cliques.append(edge.node_ids)
+
+        # Optionally find larger cliques by merging edges
+        # (more sophisticated algorithm could use Bron-Kerbosch)
+        return cliques
+
+    async def discover_hyperedges(self, llm: Any) -> list[str]:
+        """Use LLM to discover n-ary relationships in the graph.
+
+        Samples connected components of the graph and asks the LLM to
+        identify structural, conceptual, or logical relationships spanning
+        3+ concepts.
+
+        Args:
+            llm: LLM instance with async __call__.
+
+        Returns:
+            List of newly discovered edge_ids.
+        """
+        new_edges = []
+
+        # Sample a few nodes and their neighborhoods
+        node_ids = list(self.theory_graph.nodes.keys())
+        if not node_ids:
+            return []
+
+        sample_size = min(5, len(node_ids))
+        sampled_nodes = node_ids[:sample_size]
+
+        for node_id in sampled_nodes:
+            node = self.theory_graph.nodes[node_id]
+
+            # Get neighbors (nodes connected by binary relations)
+            neighbor_ids = set()
+            for rel in self.theory_graph.relations:
+                if rel.source == node_id:
+                    neighbor_ids.add(rel.target)
+                elif rel.target == node_id:
+                    neighbor_ids.add(rel.source)
+
+            if len(neighbor_ids) < 2:
+                continue
+
+            neighbor_ids = list(neighbor_ids)[:4]  # Limit to 4 neighbors
+
+            # Build context
+            neighbor_docs = [
+                f"- {nid}: {self.theory_graph.nodes[nid].description}"
+                for nid in neighbor_ids
+            ]
+
+            prompt = f"""Analyze these interconnected concepts and identify 
+n-ary relationships (structures, patterns, or logical constraints connecting 
+3+ concepts):
+
+Central concept: {node_id}
+{node.description}
+
+Connected concepts:
+{chr(10).join(neighbor_docs)}
+
+List 1-2 n-ary relationships as JSON:
+[{{"relation_type": "...", "node_ids": [...], "description": "..."}}]"""
+
+            try:
+                response = await llm(prompt)
+                # Extract JSON list
+                if "[" in response and "{" in response:
+                    json_str = response[
+                        response.index("[") : response.rindex("]") + 1
+                    ]
+                    discovered = json.loads(json_str)
+                    for item in discovered:
+                        edge_id = self.add_hyperedge(
+                            node_ids=item.get("node_ids", [neighbor_ids[:2]]),
+                            relation_type=item.get("relation_type", "unknown"),
+                            description=item.get("description", ""),
+                        )
+                        new_edges.append(edge_id)
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                logging.debug(f"Failed to parse hyperedge discovery: {e}")
+                continue
+
+        return new_edges
+
+    def to_ontology_dict(self) -> dict[str, Any]:
+        """Export hypergraph as an ontology dictionary.
+
+        Suitable for serialization, knowledge graph conversion, or
+        external tools.
+
+        Returns:
+            Dict representation with nodes and hyperedges.
+        """
+        return {
+            "nodes": [
+                {
+                    "id": node_id,
+                    "concept_type": node.concept_type.value,
+                    "description": node.description,
+                }
+                for node_id, node in self.theory_graph.nodes.items()
+            ],
+            "hyperedges": [
+                {
+                    "id": edge.edge_id,
+                    "node_ids": edge.node_ids,
+                    "relation_type": edge.relation_type,
+                    "weight": edge.weight,
+                    "description": edge.description,
+                }
+                for edge in self._hyperedges.values()
+            ],
+        }
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get statistics about the hypergraph.
+
+        Returns:
+            Dict with counts and metrics.
+        """
+        edges_by_type: dict[str, int] = {}
+        size_distribution: dict[int, int] = {}
+
+        for edge in self._hyperedges.values():
+            edges_by_type[edge.relation_type] = (
+                edges_by_type.get(edge.relation_type, 0) + 1
+            )
+            size = len(edge.node_ids)
+            size_distribution[size] = size_distribution.get(size, 0) + 1
+
+        return {
+            "total_hyperedges": len(self._hyperedges),
+            "edges_by_type": edges_by_type,
+            "size_distribution": size_distribution,
+            "avg_edge_size": (
+                sum(len(e.node_ids) for e in self._hyperedges.values())
+                / max(len(self._hyperedges), 1)
+            ),
+            "avg_weight": (
+                sum(e.weight for e in self._hyperedges.values())
+                / max(len(self._hyperedges), 1)
+            ),
+            "nodes_with_hyperedges": len(self._node_to_edges),
+        }

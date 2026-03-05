@@ -88,6 +88,7 @@ engine/rl_proof_search.py       RL proof search — AlphaProof/DeepSeek-Prover-V
 engine/literature_search.py     Enhanced literature search — citation graph traversal, SPECTER2 embedding search, full-text analysis, gap detection
 engine/paper_repro.py           Enhanced paper reproduction — full pipeline: goal→paper→signals→code→execute→compare→report
 engine/provers/lean_lake.py     Real Lean 4 Lake integration — proper Mathlib project scaffolding, Lake build, project pool, 32 import mappings
+engine/provers/pantograph_repl.py Pantograph REPL client — machine-to-machine Lean 4 interaction, incremental tactic application, BFS/DFS proof search
 engine/article_reasoning.py     End-to-end article reasoning orchestrator — unified pipeline: ingest→parse→verify→formalize→discover→extend→generate
 engine/vlm_figure.py            VLM-powered figure analysis — extraction, analysis, reproduction, verification of paper figures
 engine/symbolic_compute.py      Symbolic computation backend — SymPy/SageMath integration, LaTeX↔SymPy, algebraic verification

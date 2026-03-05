@@ -1299,3 +1299,320 @@ class DiscoveryOrchestrator:
                 sum(r.node.overall_confidence for r in self._results) / max(len(self._results), 1)
             ),
         }
+
+
+# ══════════════════════════════════════════════════════════════
+# Elo Tournament for Hypotheses
+# ══════════════════════════════════════════════════════════════
+# Google AI Co-Scientist style hypothesis ranking via pairwise
+# competition. Hypotheses are iteratively matched against each other,
+# with ratings updated using the Elo chess rating system. The LLM
+# judges each match based on novelty, depth, verifiability, and impact.
+
+
+@dataclass
+class EloRating:
+    """Elo rating record for a single hypothesis."""
+
+    hypothesis_id: str
+    rating: float = 1500.0
+    matches_played: int = 0
+    wins: int = 0
+    losses: int = 0
+    draws: int = 0
+    confidence_interval: float = 0.0
+
+    def win_rate(self) -> float:
+        """Calculate win rate."""
+        if self.matches_played == 0:
+            return 0.0
+        return (self.wins + 0.5 * self.draws) / self.matches_played
+
+
+@dataclass
+class MatchResult:
+    """Result of a match between two hypotheses."""
+
+    winner_id: str
+    loser_id: str
+    is_draw: bool
+    comparison_reasoning: str
+    judge_confidence: float
+
+    def loser_id_or_draw(self) -> str | None:
+        """Return loser ID, or None if draw."""
+        return None if self.is_draw else self.loser_id
+
+
+class EloTournament:
+    """Elo rating tournament for hypothesis ranking.
+
+    Uses pairwise LLM-judged competitions to rank hypotheses based on
+    novelty, depth, verifiability, and impact. Ratings update via the
+    standard Elo formula used in chess.
+    """
+
+    def __init__(self, k_factor: float = 32.0, initial_rating: float = 1500.0):
+        """Initialize the tournament.
+
+        Args:
+            k_factor: Elo update sensitivity (higher = more volatile).
+            initial_rating: Starting rating for new hypotheses.
+        """
+        self.k_factor = k_factor
+        self.initial_rating = initial_rating
+        self._ratings: dict[str, EloRating] = {}
+        self._match_history: list[MatchResult] = []
+
+    def register_hypothesis(
+        self, hypothesis_id: str, initial_rating: float | None = None
+    ) -> None:
+        """Register a hypothesis in the tournament.
+
+        Args:
+            hypothesis_id: Unique identifier for the hypothesis.
+            initial_rating: Optional custom initial rating (default 1500).
+        """
+        rating = initial_rating if initial_rating is not None else self.initial_rating
+        self._ratings[hypothesis_id] = EloRating(
+            hypothesis_id=hypothesis_id, rating=rating
+        )
+
+    async def run_match(
+        self,
+        h1_id: str,
+        h1_content: str,
+        h2_id: str,
+        h2_content: str,
+        llm: Any,
+        criteria: str | None = None,
+    ) -> MatchResult:
+        """Run a match between two hypotheses.
+
+        The LLM judges which hypothesis is stronger based on:
+        - Novelty: How original vs. existing work
+        - Depth: How theoretically deep/sophisticated
+        - Verifiability: How rigorously checkable
+        - Impact: Potential significance/applicability
+
+        Args:
+            h1_id: ID of first hypothesis.
+            h1_content: Text content of first hypothesis.
+            h2_id: ID of second hypothesis.
+            h2_content: Text content of second hypothesis.
+            llm: LLM instance with async __call__.
+            criteria: Optional custom judging criteria.
+
+        Returns:
+            MatchResult with winner, loser, and reasoning.
+        """
+        if criteria is None:
+            criteria = (
+                "Consider: (1) Novelty relative to known results, "
+                "(2) Theoretical depth and sophistication, "
+                "(3) Rigor and verifiability, "
+                "(4) Potential impact and applicability."
+            )
+
+        prompt = f"""Compare these two scientific hypotheses and judge which is stronger.
+
+Hypothesis A (ID: {h1_id}):
+{h1_content}
+
+Hypothesis B (ID: {h2_id}):
+{h2_content}
+
+Judging criteria: {criteria}
+
+Respond in JSON:
+{{
+    "winner": "A" or "B",
+    "is_draw": true/false,
+    "reasoning": "Detailed comparison...",
+    "confidence": 0.0-1.0
+}}"""
+
+        response_text = await llm(prompt)
+        result_data = _extract_json(response_text)
+
+        if result_data is None:
+            # Fallback: declare a draw
+            logging.warning(f"Failed to parse judge response for {h1_id} vs {h2_id}")
+            result_data = {
+                "winner": "A",
+                "is_draw": True,
+                "reasoning": "Judge parsing failed; draw declared.",
+                "confidence": 0.0,
+            }
+
+        winner_id = h1_id if result_data.get("winner") == "A" else h2_id
+        loser_id = h2_id if result_data.get("winner") == "A" else h1_id
+        is_draw = result_data.get("is_draw", False)
+        reasoning = result_data.get("reasoning", "")
+        confidence = result_data.get("confidence", 0.5)
+
+        match = MatchResult(
+            winner_id=winner_id,
+            loser_id=loser_id,
+            is_draw=is_draw,
+            comparison_reasoning=reasoning,
+            judge_confidence=float(confidence),
+        )
+
+        self._update_ratings(match)
+        self._match_history.append(match)
+
+        return match
+
+    def _update_ratings(self, match: MatchResult) -> None:
+        """Update Elo ratings after a match.
+
+        Uses standard Elo formula:
+            E_a = 1 / (1 + 10^((R_b - R_a) / 400))
+            R_a_new = R_a + K * (S_a - E_a)
+
+        Args:
+            match: The match result.
+        """
+        # Ensure both IDs are registered
+        if match.winner_id not in self._ratings:
+            self.register_hypothesis(match.winner_id)
+        if match.loser_id not in self._ratings:
+            self.register_hypothesis(match.loser_id)
+
+        rating_a = self._ratings[match.winner_id]
+        rating_b = self._ratings[match.loser_id]
+
+        # Expected score for A (winner)
+        exp_a = 1.0 / (1.0 + 10.0 ** ((rating_b.rating - rating_a.rating) / 400.0))
+
+        if match.is_draw:
+            # Draw: each gets 0.5
+            rating_a.rating += self.k_factor * (0.5 - exp_a)
+            rating_b.rating += self.k_factor * (0.5 - (1.0 - exp_a))
+            rating_a.draws += 1
+            rating_b.draws += 1
+        else:
+            # Winner gets 1, loser gets 0
+            rating_a.rating += self.k_factor * (1.0 - exp_a)
+            rating_b.rating += self.k_factor * (0.0 - (1.0 - exp_a))
+            rating_a.wins += 1
+            rating_b.losses += 1
+
+        rating_a.matches_played += 1
+        rating_b.matches_played += 1
+
+        # Update confidence intervals
+        rating_a.confidence_interval = self._compute_confidence_interval(rating_a)
+        rating_b.confidence_interval = self._compute_confidence_interval(rating_b)
+
+    def _compute_confidence_interval(self, rating: EloRating) -> float:
+        """Compute confidence interval for a rating based on matches played.
+
+        More matches → narrower interval.
+
+        Args:
+            rating: The EloRating to compute for.
+
+        Returns:
+            Estimated 95% confidence interval width.
+        """
+        if rating.matches_played < 2:
+            return 200.0  # Very wide
+        # Standard error approximation: sqrt(N) scaling
+        return 200.0 / math.sqrt(rating.matches_played)
+
+    async def run_tournament(
+        self,
+        hypotheses: dict[str, str],
+        llm: Any,
+        rounds: int | None = None,
+    ) -> dict[str, Any]:
+        """Run a tournament among hypotheses.
+
+        Can be round-robin (all vs all) or Swiss-style (multiple rounds,
+        selective pairings).
+
+        Args:
+            hypotheses: Dict mapping hypothesis_id → content.
+            llm: LLM instance.
+            rounds: Number of tournament rounds (default: ceil(log2(n))).
+
+        Returns:
+            Tournament summary with final rankings.
+        """
+        # Register all hypotheses
+        for hyp_id in hypotheses:
+            if hyp_id not in self._ratings:
+                self.register_hypothesis(hyp_id)
+
+        n = len(hypotheses)
+        if rounds is None:
+            rounds = max(3, math.ceil(math.log2(n)))
+
+        hyp_list = list(hypotheses.items())
+
+        for round_num in range(rounds):
+            logging.info(f"Tournament round {round_num + 1}/{rounds}")
+
+            # Simple round-robin: pair adjacent indices in shuffled order
+            # (more sophisticated Swiss system could be implemented)
+            indices = list(range(n))
+            # Rotate for different pairings each round
+            indices = indices[round_num % n :] + indices[: round_num % n]
+
+            for i in range(0, n - 1, 2):
+                idx_a, idx_b = indices[i], indices[i + 1]
+                h1_id, h1_content = hyp_list[idx_a]
+                h2_id, h2_content = hyp_list[idx_b]
+
+                await self.run_match(h1_id, h1_content, h2_id, h2_content, llm)
+
+        return {
+            "total_matches": len(self._match_history),
+            "rankings": self.get_rankings(),
+            "top_5": self.get_top_k(5),
+            "stats": self.get_tournament_stats(),
+        }
+
+    def get_rankings(self) -> list[tuple[str, EloRating]]:
+        """Get all hypotheses sorted by Elo rating (descending).
+
+        Returns:
+            List of (hypothesis_id, EloRating) tuples.
+        """
+        return sorted(
+            self._ratings.items(), key=lambda x: x[1].rating, reverse=True
+        )
+
+    def get_top_k(self, k: int = 5) -> list[tuple[str, float]]:
+        """Get top k hypotheses by Elo rating.
+
+        Args:
+            k: Number of top hypotheses to return.
+
+        Returns:
+            List of (hypothesis_id, rating) tuples.
+        """
+        rankings = self.get_rankings()
+        return [(hyp_id, rating.rating) for hyp_id, rating in rankings[:k]]
+
+    def get_tournament_stats(self) -> dict[str, Any]:
+        """Get summary statistics for the tournament.
+
+        Returns:
+            Dict with counts, averages, and extrema.
+        """
+        ratings_list = list(self._ratings.values())
+        if not ratings_list:
+            return {"total_hypotheses": 0}
+
+        return {
+            "total_hypotheses": len(ratings_list),
+            "total_matches": len(self._match_history),
+            "avg_rating": sum(r.rating for r in ratings_list) / len(ratings_list),
+            "min_rating": min(r.rating for r in ratings_list),
+            "max_rating": max(r.rating for r in ratings_list),
+            "avg_win_rate": sum(r.win_rate() for r in ratings_list) / len(ratings_list),
+            "draws_count": sum(1 for m in self._match_history if m.is_draw),
+        }

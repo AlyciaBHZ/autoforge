@@ -228,6 +228,7 @@ class AdvancedConfig:
     symbolic_compute_enabled: bool = True
     peer_review_enabled: bool = True
     proof_embedding_enabled: bool = True
+    pantograph_repl_enabled: bool = True
 
     def __post_init__(self) -> None:
         """Validate bounds on critical settings (D6)."""

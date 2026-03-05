@@ -7,7 +7,7 @@
                                        |___/
 ```
 
-**One command. Six agents. A complete, runnable software project.**
+**AI Multi-Agent Framework — Autonomous Research Reasoning · Formal Proving · Full-Stack Project Generation**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](../LICENSE)
@@ -18,7 +18,102 @@
 
 ---
 
-## Quick Start
+## Table of Contents
+
+- [Academic & Research Capabilities](#academic--research-capabilities)
+  - [End-to-End Article Reasoning](#end-to-end-article-reasoning)
+  - [Formal Verification & Theorem Proving](#formal-verification--theorem-proving)
+  - [Autonomous Research Discovery](#autonomous-research-discovery)
+  - [Full Paper Pipeline](#full-paper-pipeline)
+  - [Key Techniques & Inspirations](#key-techniques--inspirations)
+- [Engineering Capabilities](#engineering-capabilities)
+  - [Quick Start](#quick-start)
+  - [Architecture](#architecture)
+  - [Usage](#usage)
+  - [Intelligent Engines](#intelligent-engines)
+  - [Supported LLM Providers](#supported-llm-providers)
+- [Requirements](#requirements)
+
+---
+
+## Academic & Research Capabilities
+
+AutoForge includes a complete academic research pipeline that serves as an AI-powered autonomous research assistant. It covers the full workflow from paper reading, formal verification, and autonomous theorem discovery to paper writing — from ingesting a paper to producing a new one, fully automated.
+
+### End-to-End Article Reasoning
+
+> Feed any paper → automatic parsing → TheoryGraph construction → claim verification → interleaved formal/informal reasoning → Lean 4 formalisation → autonomous discovery → Elo hypothesis ranking → reasoning extension → peer review → output new paper
+
+Core orchestrator: [`article_reasoning.py`](../autoforge/engine/article_reasoning.py) — unified 8-phase pipeline
+
+### Formal Verification & Theorem Proving
+
+| Module | Capability | Method |
+|--------|-----------|--------|
+| [Lean 4 MCTS Proof Search](../autoforge/engine/provers/proof_search.py) | Monte Carlo tree search over tactic space | HILBERT recursive decomposition + COPRA + STP |
+| [Lean Lake Integration](../autoforge/engine/provers/lean_lake.py) | Real Lean 4 compilation with Mathlib | Lake build system, 32 concept→import mappings |
+| [Pantograph REPL](../autoforge/engine/provers/pantograph_repl.py) | Incremental tactic application, no full recompilation | TACAS 2025, machine-to-machine Lean 4 interaction, BFS/DFS search |
+| [GRPO Verifiable Reward Training](../autoforge/engine/rl_proof_search.py) | Group Relative Policy Optimization + scaffolded progressive RL | DeepSeek-Prover-V2 (88.9% miniF2F) + Scaf-GRPO |
+| [Kimina Interleaved Reasoning](../autoforge/engine/recursive_decomp_prover.py) | Informal-formal interleaved single-pass proof generation | Kimina-Prover (80.7% miniF2F) |
+| [DPO Tactic Optimization](../autoforge/engine/proof_embedding.py) | Direct Preference Optimization, no reward model needed | BFS-Prover-V2 state-tactic DPO |
+| [Multi-Prover Cross-Verification](../autoforge/engine/provers/multi_prover.py) | Coq, Isabelle, TLA+, Z3/SMT, Dafny | 6-backend parallel verification |
+| [Dense Embedding Retrieval](../autoforge/engine/dense_retrieval.py) | Premise selection replacing Jaccard | ReProver/LeanDojo style + FAISS |
+| [Proof Embedding Transfer](../autoforge/engine/proof_embedding.py) | Cross-domain tactic transfer learning | Vector memory bank + FAISS + experience tracking |
+| [Standard Benchmarks](../autoforge/engine/benchmark_eval.py) | miniF2F / PutnamBench / LeanWorkbook / ProofNet | Unbiased Pass@k estimation |
+
+### Autonomous Research Discovery
+
+| Module | Capability | Method |
+|--------|-----------|--------|
+| [Autonomous Theorem Discovery](../autoforge/engine/autonomous_discovery.py) | Extract kernel → generate conjectures → novelty filter → depth evaluation | DomainContext templates + Thompson sampling |
+| [Elo Hypothesis Tournament](../autoforge/engine/autonomous_discovery.py) | Pairwise hypothesis competition → Elo ranking → select best | Google AI Co-Scientist (2025) style |
+| [Self-Play Conjecturing](../autoforge/engine/self_play_conjecture.py) | Dual-agent Conjecturer/Prover game | STP (ICML 2025) + Bayesian difficulty calibration |
+| [Reasoning Extension](../autoforge/engine/reasoning_extension.py) | Minimal axiom kernel → iterative deep conclusions | Thompson sampling + publication-gate quality control |
+| [Cross-Domain Scientific Reasoning](../autoforge/engine/theoretical_reasoning.py) | TheoryGraph + hypergraph n-ary relations + 12 reasoning strategies | SciAgents HyperEdge + 10 verification modes |
+| [Structured World Model](../autoforge/engine/world_model.py) | Temporal query layer for TheoryGraph + cross-session persistence | Kosmos (2025) |
+| [Curriculum Learning](../autoforge/engine/curriculum_learning.py) | Complexity-ordered proving + positive transfer tracking | LeanAgent (ICLR 2025) |
+
+### Full Paper Pipeline
+
+| Module | Capability | Method |
+|--------|-----------|--------|
+| [Closed-Loop Experiments](../autoforge/engine/experiment_loop.py) | Hypothesis → code → run → analyse → ablation → iterate | AI Scientist v2 |
+| [Automated Paper Writing](../autoforge/engine/paper_writer.py) | LaTeX generation + BibTeX + figures + templates | NeurIPS/ICML/ICLR/ArXiv templates |
+| [Literature Search & Analysis](../autoforge/engine/literature_search.py) | Citation graph traversal + SPECTER2 semantic search + full-text analysis + gap detection | Semantic Scholar API + arXiv |
+| [Paper Reproduction](../autoforge/engine/paper_repro.py) | Goal inference → signal extraction → code generation → execution → metric comparison → report | OpenReview API integration |
+| [VLM Figure Analysis](../autoforge/engine/vlm_figure.py) | Figure extraction → visual analysis → data extraction → reproduction → verification | Vision-Language Models |
+| [Symbolic Computation](../autoforge/engine/symbolic_compute.py) | SymPy/SageMath integration, LaTeX↔SymPy bidirectional conversion | Algebraic identity verification + limits/series |
+| [Peer Review Simulation](../autoforge/engine/peer_review.py) | Multi-reviewer + author rebuttal + meta-review + iterative revision | 6 specialised reviewer roles |
+
+### Key Techniques & Inspirations
+
+| Technique | Source | Key Innovation |
+|-----------|--------|----------------|
+| **GRPO Verifiable Rewards** | DeepSeek-Prover-V2 (2025, 88.9% miniF2F) | Group-relative advantage replaces PPO critic, verifiable reward training |
+| **Interleaved Reasoning Pattern** | Kimina-Prover (2025, 80.7% miniF2F) | Informal + formal interleaved single-pass generation |
+| **Pantograph REPL** | TACAS 2025 | Incremental tactic application, 10x+ compilation speedup |
+| **DPO Tactic Preference** | BFS-Prover-V2 (72.95% miniF2F) | Direct preference optimization without reward model |
+| **Elo Hypothesis Ranking** | Google AI Co-Scientist (2025) | Pairwise competition for dynamic hypothesis ranking |
+| **Hypergraph Knowledge Representation** | SciAgents + Hypergraph KG (2025) | N-ary relations replace binary relations |
+| **Darwin Self-Rewriting** | Darwin Gödel Machine (2025) | Evolutionary self-rewriting agent constitutions |
+| **Scaffolded Progressive RL** | Scaf-GRPO (2025, 44.3%↑ AIME) | Tiered hints + progressive scaffold removal |
+| **PUCT-MCTS Proof Search** | AlphaProof (DeepMind, 2024) | AlphaZero formula adapted to tactic space search |
+| **Recursive Decomposition** | HILBERT (NeurIPS 2025) | 4-component: informal reasoner + prover + verifier + retriever |
+| **Self-Play Conjecturing** | STP (ICML 2025, 28.5% LeanWorkbook) | Dual-agent + Bayesian calibration targeting 50% success sweet spot |
+| **Dense Premise Retrieval** | ReProver / LeanDojo (NeurIPS 2023) | Dense embeddings + FAISS replacing Jaccard overlap |
+| **Curriculum Learning** | LeanAgent (ICLR 2025) | Complexity-ordered proving with positive transfer |
+| **Closed-Loop Experiments** | AI Scientist v2 (2025) | Hypothesis → code → execute → analyse → ablation → iterate loop |
+| **Process Reward Model** | CodePRM (2024) | Step-level code quality, not just outcome-level |
+| **Verbal RL** | Reflexion (NeurIPS 2023) | Linguistic memory + failure pattern avoidance |
+| **Self-Growing Knowledge Graph** | CapabilityDAG (internal) | Cross-project capability accumulation, community-mergeable |
+
+---
+
+## Engineering Capabilities
+
+AutoForge is also a full-stack code generation engine — 6 specialised AI agents collaborate through a 5-phase pipeline to turn a natural-language description into a complete codebase.
+
+### Quick Start
 
 ```bash
 pip install forgeai                           # Install from PyPI
@@ -51,23 +146,7 @@ pip install -e ".[all]"
 
 </details>
 
----
-
-## What It Does
-
-AutoForge orchestrates 6 specialized AI agents through a 5-phase pipeline to turn a natural-language idea into a working codebase. Requirements analysis, architecture design, parallel code generation, testing, code review, refactoring, and deployment packaging — fully automated.
-
-**Highlights:**
-- Full-stack web apps, APIs, CLI tools, and mobile apps from a single prompt
-- Multi-provider LLM support with cross-provider mixing (strong model for planning, fast model for coding)
-- Budget controls with real-time cost tracking (`--budget 5.00`)
-- Sandbox execution (Docker or subprocess) for safe testing
-- Interrupt-safe — resume any run without losing progress
-- 24/7 daemon mode with build queue, Telegram bot, and REST API
-
----
-
-## Architecture
+### Architecture
 
 ```
  "Build a todo app with auth"
@@ -100,28 +179,7 @@ AutoForge orchestrates 6 specialized AI agents through a 5-phase pipeline to tur
 | **Tester** | Build, test, auto-fix loop | Fast |
 | **Gardener** | Refactoring & security fixes | Fast |
 
----
-
-## Supported LLM Providers
-
-| Provider | Environment Variable | Strong Models | Fast Models |
-|----------|---------------------|---------------|-------------|
-| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4.6 | Claude Sonnet 4.5 |
-| **OpenAI** | `OPENAI_API_KEY` | Codex 5.3, o3, GPT-4o | o4-mini, GPT-4o-mini |
-| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro | Gemini 2.5 Flash, Gemini 2.0 Flash |
-
-**Auth methods:** API Key, Codex OAuth (browser login, uses ChatGPT subscription), Device Code (headless/SSH), OAuth2 Client Credentials, Azure/LiteLLM Bearer Token, Google ADC/Service Account, AWS Bedrock, and Google Vertex AI are all supported.
-
-Keys can also be stored in `~/.autoforge/config.toml`. Cross-provider example:
-
-```bash
-export FORGE_MODEL_STRONG=o3              # Strong model from OpenAI
-export FORGE_MODEL_FAST=gemini-2.5-flash  # Fast model from Google
-```
-
----
-
-## Usage
+### Usage
 
 ```bash
 # Interactive session (recommended)
@@ -155,9 +213,7 @@ Default budget cap: $10. Override with `--budget`.
 
 </details>
 
----
-
-## Intelligent Engines
+### Intelligent Engines
 
 AutoForge includes multiple intelligent engines that work together across the code generation pipeline:
 
@@ -169,70 +225,24 @@ AutoForge includes multiple intelligent engines that work together across the co
 - **Block-Level Fault Localisation** — Pinpoints code defects to the block level
 - **Function-Level Task Decomposition** — Breaks complex requirements into independently verifiable subtasks
 - **Speculative Pipeline** — Overlapping phase execution for faster builds
+- **Darwin Self-Rewriting** — Evolutionary self-rewriting agent constitutions and workflows
 
----
+### Supported LLM Providers
 
-## Academic & Research Capabilities
+| Provider | Environment Variable | Strong Models | Fast Models |
+|----------|---------------------|---------------|-------------|
+| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4.6 | Claude Sonnet 4.5 |
+| **OpenAI** | `OPENAI_API_KEY` | Codex 5.3, o3, GPT-4o | o4-mini, GPT-4o-mini |
+| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro | Gemini 2.5 Flash, Gemini 2.0 Flash |
 
-AutoForge includes a complete academic research pipeline that serves as an AI-powered research assistant. It covers the full workflow from paper reading, formal verification, autonomous discovery to paper writing.
+**Auth methods:** API Key, Codex OAuth (browser login, uses ChatGPT subscription), Device Code (headless/SSH), OAuth2 Client Credentials, Azure/LiteLLM Bearer Token, Google ADC/Service Account, AWS Bedrock, and Google Vertex AI are all supported.
 
-### End-to-End Article Reasoning
+Keys can also be stored in `~/.autoforge/config.toml`. Cross-provider example:
 
-> Feed any paper → automatic parsing → TheoryGraph construction → claim verification → Lean 4 formalisation → autonomous discovery → reasoning extension → output new paper
-
-Core module: [`article_reasoning.py`](autoforge/engine/article_reasoning.py) — unified 8-phase orchestrator
-
-### Formal Verification & Theorem Proving
-
-| Module | Capability | Method |
-|--------|-----------|--------|
-| [Lean 4 MCTS Proof Search](autoforge/engine/provers/proof_search.py) | Monte Carlo tree search over tactic space | HILBERT recursive decomposition + COPRA + STP |
-| [Lean Lake Integration](autoforge/engine/provers/lean_lake.py) | Real Lean 4 compilation with Mathlib | Lake build system, 32 concept→import mappings |
-| [RL Proof Search](autoforge/engine/rl_proof_search.py) | Reinforcement learning-driven proof tactics | AlphaProof/DeepSeek-Prover-V2 style PUCT-MCTS |
-| [Multi-Prover Cross-Verification](autoforge/engine/provers/multi_prover.py) | Coq, Isabelle, TLA+, Z3/SMT, Dafny | 6 backend parallel verification |
-| [Dense Embedding Retrieval](autoforge/engine/dense_retrieval.py) | Premise selection replacing Jaccard | ReProver/LeanDojo style + FAISS |
-| [Proof Embedding Transfer](autoforge/engine/proof_embedding.py) | Cross-domain tactic transfer learning | Vector memory bank + experience tracking |
-| [Standard Benchmarks](autoforge/engine/benchmark_eval.py) | miniF2F / PutnamBench / LeanWorkbook / ProofNet | Unbiased Pass@k estimation |
-
-### Autonomous Research Discovery
-
-| Module | Capability | Method |
-|--------|-----------|--------|
-| [Autonomous Theorem Discovery](autoforge/engine/autonomous_discovery.py) | Extract kernel → generate conjectures → novelty filter → depth evaluation | DomainContext templates + Thompson sampling |
-| [Self-Play Conjecturing](autoforge/engine/self_play_conjecture.py) | Dual-agent Conjecturer/Prover game | STP (ICML 2025) + Bayesian difficulty calibration |
-| [Reasoning Extension](autoforge/engine/reasoning_extension.py) | Minimal axiom kernel → iterative deep conclusions | Thompson sampling + publication-gate quality control |
-| [Cross-Domain Scientific Reasoning](autoforge/engine/theoretical_reasoning.py) | TheoryGraph + 12 reasoning strategies + multi-modal verification | 10 verification modes with confidence weighting |
-| [Structured World Model](autoforge/engine/world_model.py) | Temporal query layer for TheoryGraph + cross-session persistence | Kosmos (2025) |
-| [Curriculum Learning](autoforge/engine/curriculum_learning.py) | Complexity-ordered proving + positive transfer tracking | LeanAgent (ICLR 2025) |
-
-### Full Paper Pipeline
-
-| Module | Capability | Method |
-|--------|-----------|--------|
-| [Closed-Loop Experiments](autoforge/engine/experiment_loop.py) | Hypothesis → code → run → analyse → ablation → iterate | AI Scientist v2 |
-| [Automated Paper Writing](autoforge/engine/paper_writer.py) | LaTeX generation + BibTeX + figures + templates | NeurIPS/ICML/ICLR/ArXiv templates |
-| [Literature Search & Analysis](autoforge/engine/literature_search.py) | Citation graph traversal + SPECTER2 semantic search + full-text analysis + gap detection | Semantic Scholar API + arXiv |
-| [Paper Reproduction](autoforge/engine/paper_repro.py) | Goal inference → signal extraction → code generation → execution → metric comparison → report | OpenReview API integration |
-| [VLM Figure Analysis](autoforge/engine/vlm_figure.py) | Figure extraction → visual analysis → data extraction → reproduction → verification | Vision-Language Models |
-| [Symbolic Computation](autoforge/engine/symbolic_compute.py) | SymPy/SageMath integration, LaTeX↔SymPy bidirectional conversion | Algebraic identity verification + limits/series |
-| [Peer Review Simulation](autoforge/engine/peer_review.py) | Multi-reviewer + author rebuttal + meta-review + iterative revision | 6 specialised reviewer roles |
-
-### Key Techniques & Inspirations
-
-| Technique | Source | Key Innovation |
-|-----------|--------|----------------|
-| **PUCT-MCTS Proof Search** | AlphaProof (DeepMind, 2024) | AlphaZero formula adapted to tactic space search |
-| **Recursive Decomposition** | HILBERT (NeurIPS 2025) | 4-component: informal reasoner + prover + verifier + retriever |
-| **Self-Play Conjecturing** | STP (ICML 2025, 28.5% LeanWorkbook) | Dual-agent + Bayesian calibration targeting 50% success sweet spot |
-| **Dense Premise Retrieval** | ReProver / LeanDojo (NeurIPS 2023) | Dense embeddings + FAISS replacing Jaccard overlap |
-| **Curriculum Learning** | LeanAgent (ICLR 2025) | Complexity-ordered proving with positive transfer |
-| **Structured World Model** | Kosmos (2025) | Temporal queries + cross-session persistent knowledge |
-| **Closed-Loop Experiments** | AI Scientist v2 (2025) | Hypothesis→code→execute→analyse→ablation→iterate loop |
-| **Process Reward Model** | CodePRM (2024) | Step-level code quality, not just outcome-level |
-| **Verbal RL** | Reflexion (NeurIPS 2023) | Linguistic memory + failure pattern avoidance |
-| **Text Backpropagation** | EvoMAC (2024) | Natural-language gradient feedback between agents |
-| **Adaptive Compute** | Adaptive TTC (2024) | Difficulty-aware resource allocation + self-calibration |
-| **Self-Growing Knowledge Graph** | CapabilityDAG (internal) | Cross-project capability accumulation, community-mergeable |
+```bash
+export FORGE_MODEL_STRONG=o3              # Strong model from OpenAI
+export FORGE_MODEL_FAST=gemini-2.5-flash  # Fast model from Google
+```
 
 ---
 

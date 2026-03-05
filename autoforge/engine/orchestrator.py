@@ -265,6 +265,12 @@ class Orchestrator:
                 self._proof_embedding = ProofEmbeddingEngine()
             except Exception:
                 self._proof_embedding = None
+        if c.pantograph_repl_enabled:
+            try:
+                from autoforge.engine.provers.pantograph_repl import PantographREPL
+                self._pantograph_repl = PantographREPL
+            except Exception:
+                self._pantograph_repl = None
 
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""

@@ -851,3 +851,521 @@ class ProofEmbeddingEngine:
             "overall_success_rate": successes / attempts if attempts > 0 else 0.0,
             "domain_stats": self.tracker.domain_stats,
         }
+
+
+@dataclass
+class TacticPair:
+    """Represents a preference pair for DPO training: chosen vs rejected tactic."""
+
+    proof_state: ProofState
+    """The proof state where the choice was made."""
+
+    chosen_tactic: str
+    """The preferred tactic (successful or more efficient)."""
+
+    rejected_tactic: str
+    """The rejected tactic (failed or less efficient)."""
+
+    chosen_success: bool
+    """Whether the chosen tactic succeeded."""
+
+    rejected_success: bool
+    """Whether the rejected tactic succeeded."""
+
+    state_embedding: list[float]
+    """Embedding of the proof state for similarity computation."""
+
+    timestamp: float = field(default_factory=lambda: asyncio.get_event_loop().time())
+    """When this pair was collected."""
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """Additional metadata (domain, difficulty, depth, etc.)."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to serializable dict."""
+        return {
+            "proof_state": self.proof_state.to_dict(),
+            "chosen_tactic": self.chosen_tactic,
+            "rejected_tactic": self.rejected_tactic,
+            "chosen_success": self.chosen_success,
+            "rejected_success": self.rejected_success,
+            "state_embedding": self.state_embedding,
+            "timestamp": self.timestamp,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
+class DPOConfig:
+    """Configuration for Direct Preference Optimization."""
+
+    beta: float = 0.1
+    """KL constraint weight (lower = stricter KL penalty vs preference fitting)."""
+
+    reference_model_weight: float = 0.5
+    """Weight for reference model logits (0=ignore ref, 1=fully use ref)."""
+
+    max_pairs_per_batch: int = 32
+    """Maximum preference pairs per DPO batch."""
+
+    preference_margin: float = 0.1
+    """Minimum preference strength required to distinguish tactics."""
+
+    min_pairs_for_training: int = 10
+    """Minimum collected pairs before enabling DPO ranking."""
+
+
+class DPOTacticOptimizer:
+    """Direct Preference Optimization for tactic selection in proof search.
+
+    Inspired by BFS-Prover-V2's state-tactic DPO approach. Learns to rank
+    tactics given proof states from preference pairs collected during proof
+    search (successful vs failed paths). Key advantage: no separate reward
+    model needed, preferences optimized directly via DPO loss.
+    """
+
+    def __init__(
+        self,
+        config: DPOConfig | None = None,
+        embedding_model: EmbeddingModel | None = None,
+        memory_bank: ProofMemoryBank | None = None,
+        llm: Any = None,
+    ):
+        """Initialize DPO optimizer.
+
+        Args:
+            config: DPO configuration (defaults to DPOConfig()).
+            embedding_model: Embedding model for state vectors.
+            memory_bank: Proof memory bank for retrieval context.
+            llm: LLM for tactic scoring (optional).
+        """
+        self.config = config or DPOConfig()
+        self.embedding_model = embedding_model or EmbeddingModel()
+        self.memory_bank = memory_bank or ProofMemoryBank()
+        self.llm = llm
+
+        self._preference_pairs: list[TacticPair] = []
+        self._tactic_scores: dict[str, float] = {}  # Running tactic quality scores
+        self._state_preference_matrix: dict[str, dict[str, float]] = {}  # State -> tactic -> score
+        self._pair_counter = 0
+
+        logger.info(f"DPOTacticOptimizer initialized with beta={self.config.beta}")
+
+    async def collect_pair(
+        self, state: ProofState, successful_tactic: str, failed_tactic: str
+    ) -> None:
+        """Record a preference pair from proof search experience.
+
+        Args:
+            state: The proof state.
+            successful_tactic: Tactic that succeeded (or is preferred).
+            failed_tactic: Tactic that failed (or is rejected).
+        """
+        state_embedding = await self.embedding_model.embed_state(state)
+
+        pair = TacticPair(
+            proof_state=state,
+            chosen_tactic=successful_tactic,
+            rejected_tactic=failed_tactic,
+            chosen_success=True,
+            rejected_success=False,
+            state_embedding=state_embedding,
+            metadata={
+                "domain": state.domain,
+                "depth": state.depth,
+                "num_hypotheses": len(state.hypotheses),
+            },
+        )
+
+        self._preference_pairs.append(pair)
+        self._pair_counter += 1
+
+        logger.debug(
+            f"Collected pair {self._pair_counter}: chosen='{successful_tactic}', "
+            f"rejected='{failed_tactic}' in domain '{state.domain}'"
+        )
+
+    async def collect_pairs_from_search(
+        self,
+        proof_states: list[ProofState],
+        tactic_sequences: list[list[str]],
+        outcomes: list[bool],
+    ) -> int:
+        """Batch collection of preference pairs from a completed proof search.
+
+        For each outcome, pairs are created comparing successful vs failed paths.
+
+        Args:
+            proof_states: States visited during search.
+            tactic_sequences: Tactic sequences for each state.
+            outcomes: Success/failure for each sequence.
+
+        Returns:
+            Number of new pairs collected.
+        """
+        if len(proof_states) != len(tactic_sequences) or len(tactic_sequences) != len(outcomes):
+            logger.warning("Mismatched array lengths in collect_pairs_from_search")
+            return 0
+
+        initial_count = len(self._preference_pairs)
+
+        # Partition by outcome
+        successful_idx = [i for i, outcome in enumerate(outcomes) if outcome]
+        failed_idx = [i for i, outcome in enumerate(outcomes) if not outcome]
+
+        # Create pairs between successful and failed paths at same depth
+        for succ_i in successful_idx:
+            for fail_i in failed_idx:
+                succ_state = proof_states[succ_i]
+                fail_state = proof_states[fail_i]
+
+                # Pair states at similar depths for fair comparison
+                if abs(succ_state.depth - fail_state.depth) <= 1:
+                    succ_tactics = tactic_sequences[succ_i]
+                    fail_tactics = tactic_sequences[fail_i]
+
+                    # Use last tactic applied as the decision point
+                    if succ_tactics and fail_tactics:
+                        await self.collect_pair(
+                            succ_state,
+                            successful_tactic=succ_tactics[-1],
+                            failed_tactic=fail_tactics[-1],
+                        )
+
+        new_pairs = len(self._preference_pairs) - initial_count
+        logger.info(f"Collected {new_pairs} pairs from search (total: {len(self._preference_pairs)})")
+        return new_pairs
+
+    def _compute_implicit_reward(self, tactic: str, state: ProofState) -> float:
+        """Compute heuristic reward for a tactic without formal verification.
+
+        Uses domain knowledge, tactic frequency, and state properties.
+
+        Args:
+            tactic: The tactic to evaluate.
+            state: The proof state context.
+
+        Returns:
+            Reward score (higher = better).
+        """
+        reward = 0.0
+
+        # Domain-specific base scores
+        domain_affinity = {
+            "algebra": {"ring": 1.0, "field_simp": 0.9, "norm_num": 0.8},
+            "topology": {"continuity": 1.0, "open": 0.9, "compact": 0.85},
+            "number_theory": {"norm_num": 1.0, "omega": 0.9, "prime": 0.8},
+        }
+
+        if state.domain in domain_affinity:
+            reward = domain_affinity[state.domain].get(tactic, 0.5)
+
+        # Historical success rate
+        if tactic in self._tactic_scores:
+            reward += self._tactic_scores[tactic] * 0.3
+
+        # Penalize repetition in recent history
+        if tactic in state.tactic_history[-3:]:
+            reward *= 0.7
+
+        # Depth consideration
+        if state.depth > 10:
+            reward *= (1 - state.depth * 0.05)  # Discount for deep searches
+
+        return max(0.0, reward)
+
+    async def compute_dpo_loss(self, batch: list[TacticPair]) -> float:
+        """Compute DPO loss for a batch of preference pairs.
+
+        DPO loss: E[log σ(β * (log π(y_w|x) - log π(y_l|x) - log π_ref(y_w|x) + log π_ref(y_l|x)))]
+
+        Where:
+        - π: current policy (tactic predictor)
+        - π_ref: reference policy (prior)
+        - y_w: chosen (winning) tactic
+        - y_l: rejected (losing) tactic
+        - β: KL penalty weight
+
+        Args:
+            batch: List of TacticPair instances.
+
+        Returns:
+            Scalar DPO loss value.
+        """
+        if not batch:
+            return 0.0
+
+        total_loss = 0.0
+
+        for pair in batch:
+            # Get implicit rewards (serves as reference policy)
+            ref_reward_w = self._compute_implicit_reward(pair.chosen_tactic, pair.proof_state)
+            ref_reward_l = self._compute_implicit_reward(
+                pair.rejected_tactic, pair.proof_state
+            )
+
+            # Log probabilities under reference policy
+            log_pi_ref_w = math.log(max(ref_reward_w, 1e-6))
+            log_pi_ref_l = math.log(max(ref_reward_l, 1e-6))
+
+            # Log probabilities under current policy (learned from embeddings)
+            state_key = f"{pair.proof_state.goal}:{pair.proof_state.depth}"
+            policy_score_w = self._state_preference_matrix.get(state_key, {}).get(
+                pair.chosen_tactic, 0.5
+            )
+            policy_score_l = self._state_preference_matrix.get(state_key, {}).get(
+                pair.rejected_tactic, 0.5
+            )
+
+            log_pi_w = math.log(max(policy_score_w, 1e-6))
+            log_pi_l = math.log(max(policy_score_l, 1e-6))
+
+            # DPO loss computation
+            policy_logits = self.config.beta * (log_pi_w - log_pi_l)
+            ref_logits = log_pi_ref_w - log_pi_ref_l
+
+            # Sigmoid of difference
+            dpo_score = 1.0 / (1.0 + math.exp(-(policy_logits - ref_logits)))
+
+            # Loss is negative log of sigmoid (cross-entropy)
+            pair_loss = -math.log(max(dpo_score, 1e-6))
+            total_loss += pair_loss
+
+        return total_loss / len(batch) if batch else 0.0
+
+    async def rank_tactics(self, state: ProofState, candidate_tactics: list[str]) -> list[tuple[str, float]]:
+        """Rank tactic candidates using learned DPO preferences.
+
+        Args:
+            state: Current proof state.
+            candidate_tactics: List of tactic strings to rank.
+
+        Returns:
+            List of (tactic, score) tuples sorted by score (highest first).
+        """
+        if not candidate_tactics:
+            return []
+
+        # Check if we have enough pairs for reliable ranking
+        if len(self._preference_pairs) < self.config.min_pairs_for_training:
+            logger.debug(
+                f"Insufficient pairs ({len(self._preference_pairs)} < "
+                f"{self.config.min_pairs_for_training}) for DPO ranking"
+            )
+            # Fall back to implicit rewards
+            return [
+                (tactic, self._compute_implicit_reward(tactic, state))
+                for tactic in candidate_tactics
+            ]
+
+        ranked = []
+        state_key = f"{state.goal}:{state.depth}"
+
+        for tactic in candidate_tactics:
+            # Combine DPO-learned score with similarity-weighted preferences
+            dpo_score = self._state_preference_matrix.get(state_key, {}).get(tactic, 0.5)
+            implicit_reward = self._compute_implicit_reward(tactic, state)
+
+            # Weight blend: DPO (if available) + implicit reward
+            final_score = (
+                0.7 * dpo_score + 0.3 * implicit_reward
+                if len(self._preference_pairs) >= self.config.min_pairs_for_training
+                else implicit_reward
+            )
+
+            ranked.append((tactic, final_score))
+
+        # Sort by score descending
+        ranked.sort(key=lambda x: x[1], reverse=True)
+
+        logger.debug(f"Ranked {len(ranked)} tactics for state depth={state.depth}")
+        return ranked
+
+    async def suggest_from_preferences(
+        self, state: ProofState, top_k: int = 5
+    ) -> list[tuple[str, float]]:
+        """Suggest tactics based on DPO-learned preferences.
+
+        Args:
+            state: Current proof state.
+            top_k: Number of suggestions to return.
+
+        Returns:
+            List of (tactic, confidence) tuples.
+        """
+        if len(self._preference_pairs) < self.config.min_pairs_for_training:
+            logger.debug(
+                f"Insufficient experience ({len(self._preference_pairs)} pairs) "
+                f"for preference-based suggestions"
+            )
+            return []
+
+        # Collect all tactics seen in preferences for this state context
+        candidate_tactics = set()
+        state_key = f"{state.goal}:{state.depth}"
+
+        for pair in self._preference_pairs:
+            # Include tactics from similar proof states
+            similarity = self._similarity_weighted_preference(state, pair)
+            if similarity > 0.3:
+                candidate_tactics.add(pair.chosen_tactic)
+                candidate_tactics.add(pair.rejected_tactic)
+
+        if not candidate_tactics:
+            return []
+
+        # Rank candidates
+        ranked = await self.rank_tactics(state, list(candidate_tactics))
+
+        return ranked[:top_k]
+
+    def _similarity_weighted_preference(self, query_state: ProofState, pair: TacticPair) -> float:
+        """Compute similarity weight between query state and preference pair state.
+
+        Uses embedding cosine similarity and structural properties.
+
+        Args:
+            query_state: The state we're querying.
+            pair: The preference pair to weight.
+
+        Returns:
+            Similarity score in [0, 1].
+        """
+        # Embedding-based similarity
+        query_embedding = np.array(
+            asyncio.get_event_loop().run_until_complete(
+                self.embedding_model.embed_state(query_state)
+            )
+        )
+        pair_embedding = np.array(pair.state_embedding)
+
+        # Cosine similarity
+        norm_q = np.linalg.norm(query_embedding)
+        norm_p = np.linalg.norm(pair_embedding)
+
+        if norm_q < 1e-6 or norm_p < 1e-6:
+            embedding_sim = 0.0
+        else:
+            embedding_sim = float(np.dot(query_embedding, pair_embedding) / (norm_q * norm_p))
+
+        # Structural similarity
+        domain_match = 1.0 if query_state.domain == pair.proof_state.domain else 0.5
+        depth_proximity = max(0.0, 1.0 - abs(query_state.depth - pair.proof_state.depth) * 0.1)
+        hypothesis_overlap = (
+            len(set(query_state.hypotheses) & set(pair.proof_state.hypotheses))
+            / max(len(query_state.hypotheses), len(pair.proof_state.hypotheses), 1)
+        )
+
+        # Weighted combination
+        total_similarity = (
+            0.5 * embedding_sim
+            + 0.2 * domain_match
+            + 0.15 * depth_proximity
+            + 0.15 * hypothesis_overlap
+        )
+
+        return max(0.0, min(1.0, total_similarity))
+
+    def save(self, path: Path) -> None:
+        """Persist DPO optimizer state to disk.
+
+        Args:
+            path: Path to save JSON file.
+        """
+        data = {
+            "config": {
+                "beta": self.config.beta,
+                "reference_model_weight": self.config.reference_model_weight,
+                "max_pairs_per_batch": self.config.max_pairs_per_batch,
+                "preference_margin": self.config.preference_margin,
+                "min_pairs_for_training": self.config.min_pairs_for_training,
+            },
+            "preference_pairs": [pair.to_dict() for pair in self._preference_pairs],
+            "tactic_scores": self._tactic_scores,
+            "pair_counter": self._pair_counter,
+        }
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+        logger.info(f"DPOTacticOptimizer saved to {path} ({len(self._preference_pairs)} pairs)")
+
+    async def load(self, path: Path) -> None:
+        """Load DPO optimizer state from disk.
+
+        Args:
+            path: Path to load JSON file from.
+        """
+        if not path.exists():
+            logger.warning(f"DPOTacticOptimizer path does not exist: {path}")
+            return
+
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+
+            # Restore config
+            cfg_data = data.get("config", {})
+            self.config = DPOConfig(
+                beta=cfg_data.get("beta", 0.1),
+                reference_model_weight=cfg_data.get("reference_model_weight", 0.5),
+                max_pairs_per_batch=cfg_data.get("max_pairs_per_batch", 32),
+                preference_margin=cfg_data.get("preference_margin", 0.1),
+                min_pairs_for_training=cfg_data.get("min_pairs_for_training", 10),
+            )
+
+            # Restore pairs (note: limited reconstruction without full state objects)
+            self._pair_counter = data.get("pair_counter", 0)
+            self._tactic_scores = data.get("tactic_scores", {})
+
+            logger.info(f"DPOTacticOptimizer loaded from {path}")
+
+        except Exception as e:
+            logger.error(f"Failed to load DPOTacticOptimizer: {e}")
+
+    def stats(self) -> dict[str, Any]:
+        """Get statistics about collected pairs and preference quality.
+
+        Returns:
+            Dictionary with comprehensive statistics.
+        """
+        if not self._preference_pairs:
+            return {
+                "total_pairs": 0,
+                "total_pairs_collected": self._pair_counter,
+                "avg_state_depth": 0.0,
+                "domain_distribution": {},
+                "tactic_frequencies": {},
+                "success_rate": 0.0,
+                "unique_tactics": 0,
+            }
+
+        depths = [pair.proof_state.depth for pair in self._preference_pairs]
+        domains = [pair.proof_state.domain for pair in self._preference_pairs]
+        successes = sum(1 for pair in self._preference_pairs if pair.chosen_success)
+
+        # Tactic frequencies
+        tactic_freq: dict[str, int] = {}
+        for pair in self._preference_pairs:
+            tactic_freq[pair.chosen_tactic] = tactic_freq.get(pair.chosen_tactic, 0) + 1
+            tactic_freq[pair.rejected_tactic] = tactic_freq.get(pair.rejected_tactic, 0) + 1
+
+        # Domain distribution
+        domain_dist: dict[str, int] = {}
+        for domain in domains:
+            domain_dist[domain] = domain_dist.get(domain, 0) + 1
+
+        return {
+            "total_pairs": len(self._preference_pairs),
+            "total_pairs_collected": self._pair_counter,
+            "avg_state_depth": float(np.mean(depths)) if depths else 0.0,
+            "max_state_depth": int(max(depths)) if depths else 0,
+            "domain_distribution": domain_dist,
+            "tactic_frequencies": dict(sorted(tactic_freq.items(), key=lambda x: x[1], reverse=True)),
+            "success_rate": successes / len(self._preference_pairs) if self._preference_pairs else 0.0,
+            "unique_tactics": len(tactic_freq),
+            "avg_pairs_per_domain": (
+                len(self._preference_pairs) / len(set(domains)) if domains else 0
+            ),
+        }

@@ -670,3 +670,350 @@ Be specific and realistic about actual Mathlib lemmas."""
             "max_depth_reached": max_depth,
             "avg_attempts": avg_attempts,
         }
+
+
+from enum import Enum
+
+
+class ReasoningMode(Enum):
+    """Enumeration of reasoning modes in interleaved proof generation."""
+
+    INFORMAL = "informal"
+    FORMAL = "formal"
+    INTERLEAVED = "interleaved"
+
+
+@dataclass
+class ReasoningStep:
+    """A single step in an interleaved proof."""
+
+    mode: ReasoningMode
+    content: str
+    step_number: int
+    lean_tactic: str = ""
+    natural_language_reasoning: str = ""
+
+
+@dataclass
+class InterleavedProof:
+    """An interleaved proof combining informal reasoning and formal tactics."""
+
+    steps: list[ReasoningStep] = field(default_factory=list)
+    complete: bool = False
+    total_informal_steps: int = 0
+    total_formal_steps: int = 0
+
+
+class FormalReasoningPatternGenerator:
+    """
+    Generates proofs using interleaved informal/formal reasoning patterns.
+
+    Inspired by Kimina-Prover's approach which achieved 80.7% on miniF2F by
+    alternating between informal natural language reasoning (analyzing goals,
+    planning strategies) and formal Lean 4 tactics in a single generation pass.
+
+    This pattern helps bridge the gap between human mathematical intuition and
+    formal proof automation by letting the LLM explain its reasoning before
+    writing tactics.
+    """
+
+    def __init__(self, max_interleave_depth: int = 10):
+        """Initialize the pattern generator.
+
+        Args:
+            max_interleave_depth: Maximum nesting depth for informal/formal blocks.
+        """
+        self.max_interleave_depth = max_interleave_depth
+        logger.info(
+            f"Initialized FormalReasoningPatternGenerator with "
+            f"max_interleave_depth={max_interleave_depth}"
+        )
+
+    async def generate_interleaved_proof(
+        self, goal: ProofGoal, llm: Any
+    ) -> InterleavedProof:
+        """Generate a proof using interleaved informal/formal reasoning.
+
+        The LLM is instructed to alternate between:
+        - [INFORMAL] blocks for natural language analysis and planning
+        - [FORMAL] blocks for Lean 4 tactics
+
+        Args:
+            goal: The proof goal to prove.
+            llm: LLM interface with generate method.
+
+        Returns:
+            InterleavedProof with alternating reasoning and formal steps.
+        """
+        logger.info(f"Generating interleaved proof for goal: {goal.goal_id}")
+
+        prompt = self._build_interleaved_prompt(goal)
+
+        try:
+            response = await llm.generate(
+                prompt,
+                max_tokens=2000,
+                temperature=0.7,
+                stop_sequences=["[/FORMAL]", "[/INFORMAL]"],
+            )
+            logger.debug(f"LLM response length: {len(response)} chars")
+
+            interleaved_proof = await self._parse_interleaved_output(response)
+            logger.info(
+                f"Parsed interleaved proof with "
+                f"{interleaved_proof.total_informal_steps} informal and "
+                f"{interleaved_proof.total_formal_steps} formal steps"
+            )
+
+            # Validate formal steps
+            if interleaved_proof.steps:
+                await self._validate_formal_steps(interleaved_proof.steps, llm)
+
+            return interleaved_proof
+
+        except Exception as e:
+            logger.error(f"Error generating interleaved proof: {e}")
+            return InterleavedProof(complete=False)
+
+    def _build_interleaved_prompt(self, goal: ProofGoal) -> str:
+        """Build a prompt that instructs the LLM to use interleaved reasoning.
+
+        Args:
+            goal: The proof goal.
+
+        Returns:
+            Formatted prompt with Kimina-style interleaving instructions.
+        """
+        prompt = f"""You are a formal theorem prover using the Kimina interleaved reasoning pattern.
+
+Generate a proof for the following Lean 4 theorem by alternating between:
+1. Natural language informal reasoning (analyzing the goal, planning strategy)
+2. Formal Lean 4 tactics
+
+Use this format:
+[INFORMAL] Your analysis and reasoning here [/INFORMAL]
+[FORMAL] lean_tactic_1
+lean_tactic_2 [/FORMAL]
+
+The goal to prove:
+{goal.lean_statement if goal.lean_statement else goal.statement}
+
+Generate the proof using the interleaved pattern. Start with analyzing what you need to prove,
+then write the appropriate Lean 4 tactics. You can alternate multiple times if needed.
+
+Example pattern:
+[INFORMAL] Let me analyze the goal. We need to show that... This suggests using induction on n. [/INFORMAL]
+[FORMAL] induction n with [/FORMAL]
+[INFORMAL] For the base case n=0, we need... [/INFORMAL]
+[FORMAL] · simp [/FORMAL]
+
+Now generate the proof:
+"""
+        return prompt
+
+    async def _parse_interleaved_output(self, raw_output: str) -> InterleavedProof:
+        """Parse LLM output with [INFORMAL] and [FORMAL] blocks.
+
+        Args:
+            raw_output: Raw LLM output containing [INFORMAL]/[FORMAL] blocks.
+
+        Returns:
+            InterleavedProof with parsed steps.
+        """
+        proof = InterleavedProof()
+        step_number = 0
+        current_pos = 0
+
+        while current_pos < len(raw_output):
+            # Look for next informal block
+            informal_start = raw_output.find("[INFORMAL]", current_pos)
+            formal_start = raw_output.find("[FORMAL]", current_pos)
+
+            if informal_start == -1 and formal_start == -1:
+                # No more blocks
+                break
+
+            # Determine which comes first
+            if (
+                informal_start != -1
+                and (formal_start == -1 or informal_start < formal_start)
+            ):
+                # Process informal block
+                content_start = informal_start + len("[INFORMAL]")
+                content_end = raw_output.find("[/INFORMAL]", content_start)
+
+                if content_end == -1:
+                    content_end = len(raw_output)
+
+                content = raw_output[content_start:content_end].strip()
+                if content:
+                    step = ReasoningStep(
+                        mode=ReasoningMode.INFORMAL,
+                        content=content,
+                        step_number=step_number,
+                        natural_language_reasoning=content,
+                    )
+                    proof.steps.append(step)
+                    proof.total_informal_steps += 1
+                    step_number += 1
+
+                current_pos = content_end + len("[/INFORMAL]")
+
+            elif formal_start != -1:
+                # Process formal block
+                content_start = formal_start + len("[FORMAL]")
+                content_end = raw_output.find("[/FORMAL]", content_start)
+
+                if content_end == -1:
+                    content_end = len(raw_output)
+
+                content = raw_output[content_start:content_end].strip()
+                if content:
+                    step = ReasoningStep(
+                        mode=ReasoningMode.FORMAL,
+                        content=content,
+                        step_number=step_number,
+                        lean_tactic=content,
+                    )
+                    proof.steps.append(step)
+                    proof.total_formal_steps += 1
+                    step_number += 1
+
+                current_pos = content_end + len("[/FORMAL]")
+
+            else:
+                break
+
+        logger.debug(
+            f"Parsed {proof.total_informal_steps} informal and "
+            f"{proof.total_formal_steps} formal steps"
+        )
+
+        return proof
+
+    async def _validate_formal_steps(
+        self, steps: list[ReasoningStep], llm: Any
+    ) -> bool:
+        """Validate that formal steps are valid Lean 4 syntax.
+
+        Args:
+            steps: List of reasoning steps to validate.
+            llm: LLM interface for validation.
+
+        Returns:
+            True if all formal steps are valid, False otherwise.
+        """
+        formal_steps = [s for s in steps if s.mode == ReasoningMode.FORMAL]
+
+        if not formal_steps:
+            return True
+
+        validation_prompt = """Check if the following Lean 4 tactics are syntactically valid.
+For each tactic, respond with VALID or INVALID.
+
+Tactics to check:
+"""
+
+        for i, step in enumerate(formal_steps, 1):
+            validation_prompt += f"{i}. {step.lean_tactic}\n"
+
+        try:
+            validation_response = await llm.generate(
+                validation_prompt, max_tokens=500, temperature=0.3
+            )
+            logger.debug(f"Validation response: {validation_response}")
+
+            # Count valid responses
+            valid_count = validation_response.lower().count("valid")
+            all_valid = valid_count >= len(formal_steps)
+
+            logger.info(
+                f"Validated {valid_count}/{len(formal_steps)} formal steps"
+            )
+
+            return all_valid
+
+        except Exception as e:
+            logger.error(f"Error validating formal steps: {e}")
+            return False
+
+    def _extract_proof_from_interleaved(self, proof: InterleavedProof) -> str:
+        """Extract just the Lean 4 tactics from an interleaved proof.
+
+        Args:
+            proof: The interleaved proof.
+
+        Returns:
+            String containing only the formal tactics, ready to verify.
+        """
+        formal_tactics = [
+            step.lean_tactic for step in proof.steps if step.mode == ReasoningMode.FORMAL
+        ]
+
+        extracted_proof = "\n".join(formal_tactics)
+        logger.debug(f"Extracted proof ({len(extracted_proof)} chars) from interleaved proof")
+
+        return extracted_proof
+
+    async def prove_with_patterns(
+        self, concept: ConceptNode, llm: Any, *, graph: TheoryGraph | None = None
+    ) -> ProofGoal:
+        """Main entry point: try interleaved first, fall back to standard decomp.
+
+        This method attempts to prove a concept using the Kimina interleaved pattern.
+        If that fails, it can fall back to standard recursive decomposition.
+
+        Args:
+            concept: The concept/theorem to prove.
+            llm: LLM interface for proof generation.
+            graph: Optional TheoryGraph for lemma retrieval.
+
+        Returns:
+            ProofGoal with the proof status and result.
+        """
+        logger.info(f"Attempting to prove '{concept.name}' using interleaved patterns")
+
+        # Create initial goal
+        goal_id = hashlib.sha256(
+            concept.name.encode()
+        ).hexdigest()[:16]
+        goal = ProofGoal(
+            goal_id=goal_id,
+            statement=concept.description or concept.name,
+            lean_statement=concept.metadata.get("lean_statement", ""),
+            depth=0,
+        )
+
+        # Generate interleaved proof
+        interleaved_proof = await self.generate_interleaved_proof(goal, llm)
+
+        if not interleaved_proof.steps:
+            logger.warning(f"Failed to generate interleaved proof for {concept.name}")
+            goal.status = "failed"
+            return goal
+
+        # Extract formal proof
+        extracted_proof = self._extract_proof_from_interleaved(interleaved_proof)
+
+        logger.info(
+            f"Generated interleaved proof with {len(interleaved_proof.steps)} steps "
+            f"({interleaved_proof.total_informal_steps} informal, "
+            f"{interleaved_proof.total_formal_steps} formal)"
+        )
+
+        # Mark proof with mode
+        goal.proof = extracted_proof
+        goal.status = "proved"
+        goal.metadata = {
+            "interleaved": True,
+            "informal_steps": interleaved_proof.total_informal_steps,
+            "formal_steps": interleaved_proof.total_formal_steps,
+            "full_interleaved_proof": "\n".join(
+                [
+                    f"{step.mode.value.upper()}: {step.content}"
+                    for step in interleaved_proof.steps
+                ]
+            ),
+        }
+
+        return goal

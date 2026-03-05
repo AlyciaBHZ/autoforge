@@ -601,3 +601,769 @@ class SICAEngine:
             logger.info(f"[SICA] Loaded {len(self._history)} improvement records")
         except Exception as e:
             logger.debug(f"[SICA] Could not load history: {e}")
+
+
+# ──────────────────────────────────────────────
+# Darwin Gödel Machine — Self-Rewriting Agent
+# ──────────────────────────────────────────────
+
+
+@dataclass
+class RewriteCandidate:
+    """A candidate rewrite of a module or constitution file."""
+    candidate_id: str
+    target_module: str      # Name of the module/file being rewritten
+    original_code: str      # Original source code
+    rewritten_code: str     # Proposed rewritten code
+    test_results: dict[str, Any] = field(default_factory=dict)  # {test_name: passed, ...}
+    fitness_delta: float = 0.0  # Improvement over baseline (delta)
+    generation: int = 0     # Which generation this candidate came from
+    parent_id: str = ""     # Parent candidate ID (empty for generation 0)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize candidate to dict."""
+        return {
+            "candidate_id": self.candidate_id,
+            "target_module": self.target_module,
+            "test_results": self.test_results,
+            "fitness_delta": self.fitness_delta,
+            "generation": self.generation,
+            "parent_id": self.parent_id,
+        }
+
+
+@dataclass
+class RewriteConfig:
+    """Configuration for Darwin self-rewriting evolution."""
+    max_generations: int = 5
+    population_size: int = 4
+    mutation_rate: float = 0.3        # Probability of mutation during evolution
+    crossover_rate: float = 0.5       # Probability of crossover
+    fitness_threshold: float = 0.0    # Minimum fitness delta to keep a candidate
+    allowed_modules: list[str] = field(default_factory=lambda: [
+        "constitution",
+        "workflows",
+    ])
+    protected_modules: list[str] = field(default_factory=lambda: [
+        "orchestrator.py", "config.py", "llm_router.py",
+        "sandbox.py", "lock_manager.py", "sica.py",
+        "agent_base.py", "search_tree.py",
+    ])
+
+
+class DarwinSelfRewriter:
+    """Darwin Gödel Machine style self-rewriting agent.
+
+    Uses evolutionary algorithms to automatically improve the system's own
+    code by:
+    1. Proposing multiple candidate rewrites
+    2. Evaluating each candidate through actual task performance
+    3. Selecting the best performers
+    4. Breeding new candidates from winners
+    5. Persisting the best improvements
+
+    Safety: Only constitution and workflow files can be rewritten.
+    All other system modules are protected.
+    """
+
+    def __init__(
+        self,
+        config: RewriteConfig | None = None,
+        sica_engine: SICAEngine | None = None,
+        base_dir: Path | None = None,
+    ) -> None:
+        """Initialize Darwin self-rewriter.
+
+        Args:
+            config: RewriteConfig for evolution parameters
+            sica_engine: Parent SICA engine for applying approved changes
+            base_dir: Base directory for state persistence
+        """
+        self.config = config or RewriteConfig()
+        self.sica_engine = sica_engine or SICAEngine()
+        if base_dir is None:
+            base_dir = Path.home() / ".autoforge"
+        self.base_dir = base_dir
+
+        self._population: list[RewriteCandidate] = []
+        self._generation_history: list[list[RewriteCandidate]] = []
+        self._baseline_fitness: dict[str, float] = {}  # Per-module baseline
+        self._evolution_state_file = base_dir / "darwin_evolution_state.json"
+
+        logger.info("[Darwin] Self-rewriter initialized")
+        self._load_evolution_state()
+
+    # ──────── Candidate Generation ────────
+
+    async def generate_rewrite_candidate(
+        self,
+        target_module: str,
+        performance_context: dict[str, Any],
+        llm: Any,
+    ) -> RewriteCandidate | None:
+        """Generate a candidate rewrite of target_module using LLM.
+
+        Args:
+            target_module: Name of module/constitution to rewrite
+            performance_context: Dict with performance metrics, errors, suggestions
+            llm: LLM client (e.g., Anthropic)
+
+        Returns:
+            RewriteCandidate with proposed rewrite, or None if generation failed
+        """
+        try:
+            # Validate module is allowed
+            if any(p in target_module for p in self.config.protected_modules):
+                logger.warning(f"[Darwin] Cannot rewrite protected module: {target_module}")
+                return None
+
+            allowed = any(
+                a in target_module for a in self.config.allowed_modules
+            )
+            if not allowed:
+                logger.warning(f"[Darwin] Module not in allowed list: {target_module}")
+                return None
+
+            # Load original code
+            module_path = self.base_dir.parent / target_module
+            if not module_path.exists():
+                logger.warning(f"[Darwin] Module not found: {module_path}")
+                return None
+
+            original_code = module_path.read_text(encoding="utf-8")
+
+            # Build prompt for LLM
+            prompt = self._build_rewrite_prompt(
+                target_module, original_code, performance_context
+            )
+
+            # Call LLM
+            response = await llm.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            # Extract rewritten code from response
+            text = ""
+            for block in response.content:
+                if block.type == "text":
+                    text += block.text
+
+            # Look for code block
+            match = re.search(r"```(?:python|markdown)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+            if not match:
+                logger.warning("[Darwin] No code block found in LLM response")
+                return None
+
+            rewritten_code = match.group(1).strip()
+
+            # Validate rewritten code
+            if not rewritten_code or len(rewritten_code) < 10:
+                logger.warning("[Darwin] Rewritten code too short or empty")
+                return None
+
+            # Create candidate
+            candidate_id = hashlib.sha256(
+                f"darwin-{target_module}-{time.time()}".encode()
+            ).hexdigest()[:12]
+
+            candidate = RewriteCandidate(
+                candidate_id=candidate_id,
+                target_module=target_module,
+                original_code=original_code,
+                rewritten_code=rewritten_code,
+                generation=len(self._generation_history),
+                parent_id="",
+            )
+
+            logger.info(f"[Darwin] Generated candidate {candidate_id} for {target_module}")
+            return candidate
+
+        except Exception as e:
+            logger.error(f"[Darwin] Candidate generation failed: {e}")
+            return None
+
+    def _build_rewrite_prompt(
+        self,
+        target_module: str,
+        original_code: str,
+        performance_context: dict[str, Any],
+    ) -> str:
+        """Build prompt for LLM to rewrite a module."""
+        context_str = json.dumps(performance_context, indent=2)[:2000]
+
+        return f"""You are a self-improving AI system. Your task is to rewrite a module to improve performance.
+
+**Target Module**: {target_module}
+
+**Original Code** (first 2000 chars):
+```
+{original_code[:2000]}
+```
+
+**Performance Context**:
+{context_str}
+
+**Task**: Rewrite this module to address the performance issues. Focus on:
+1. Fixing identified bugs or inefficiencies
+2. Improving error handling
+3. Enhancing clarity and maintainability
+4. Optimizing critical paths
+
+Return ONLY the complete rewritten code in a markdown code block.
+Do NOT include explanations or markdown outside the code block."""
+
+    # ──────── Evaluation ────────
+
+    async def evaluate_candidate(
+        self,
+        candidate: RewriteCandidate,
+        test_runner: Any = None,
+    ) -> None:
+        """Evaluate a candidate's fitness through testing.
+
+        Runs the candidate against a test suite and records results.
+        Fitness is computed as: (tests_passed / total_tests) - baseline_for_module
+
+        Args:
+            candidate: Candidate to evaluate
+            test_runner: Optional test runner (e.g., pytest harness)
+        """
+        try:
+            # For now, simulate test results based on code quality heuristics
+            # In production, this would run actual test suite
+            results = self._run_candidate_tests(candidate, test_runner)
+
+            passed = sum(1 for v in results.values() if v)
+            total = len(results) if results else 1
+            test_pass_rate = passed / total if total > 0 else 0
+
+            # Get baseline
+            baseline = self._baseline_fitness.get(candidate.target_module, 0.5)
+
+            # Fitness delta
+            candidate.fitness_delta = test_pass_rate - baseline
+            candidate.test_results = results
+
+            logger.info(
+                f"[Darwin] {candidate.candidate_id} fitness_delta={candidate.fitness_delta:.3f} "
+                f"(pass_rate={test_pass_rate:.2%}, baseline={baseline:.2%})"
+            )
+
+        except Exception as e:
+            logger.error(f"[Darwin] Evaluation failed for {candidate.candidate_id}: {e}")
+            candidate.fitness_delta = -0.5  # Penalize failed evaluation
+
+    def _run_candidate_tests(
+        self,
+        candidate: RewriteCandidate,
+        test_runner: Any,
+    ) -> dict[str, bool]:
+        """Run tests against a candidate (simplified version).
+
+        In production, this would:
+        1. Temporarily apply the rewrite
+        2. Run test suite
+        3. Restore original
+        4. Return detailed results
+
+        For now, use heuristics.
+        """
+        results = {}
+
+        # Heuristic 1: Check syntax validity
+        try:
+            compile(candidate.rewritten_code, '<rewritten>', 'exec')
+            results['syntax_valid'] = True
+        except SyntaxError:
+            results['syntax_valid'] = False
+            return results
+
+        # Heuristic 2: Code quality checks
+        results['has_docstrings'] = '"""' in candidate.rewritten_code or "'''" in candidate.rewritten_code
+        results['has_error_handling'] = 'except' in candidate.rewritten_code or 'try' in candidate.rewritten_code
+        results['has_logging'] = 'logger' in candidate.rewritten_code
+        results['maintains_api'] = self._check_api_compatibility(candidate)
+        results['improves_clarity'] = len(candidate.rewritten_code) >= len(candidate.original_code) * 0.8
+
+        return results
+
+    def _check_api_compatibility(self, candidate: RewriteCandidate) -> bool:
+        """Check if rewritten code maintains API compatibility."""
+        # Extract function/class signatures from both versions
+        orig_defs = re.findall(r'^(?:async\s+)?def\s+(\w+)', candidate.original_code, re.MULTILINE)
+        new_defs = re.findall(r'^(?:async\s+)?def\s+(\w+)', candidate.rewritten_code, re.MULTILINE)
+
+        # All original public defs should be in new version
+        public_orig = [d for d in orig_defs if not d.startswith('_')]
+        return all(d in new_defs for d in public_orig)
+
+    # ──────── Mutation & Crossover ────────
+
+    async def mutate(
+        self,
+        candidate: RewriteCandidate,
+        llm: Any,
+    ) -> RewriteCandidate | None:
+        """Apply random mutations to a candidate to explore variation.
+
+        Mutations include:
+        - Refactoring variable names
+        - Adding/removing error handling
+        - Restructuring control flow
+        - Optimizing loops
+
+        Args:
+            candidate: Candidate to mutate
+            llm: LLM client
+
+        Returns:
+            New mutated candidate, or None if mutation failed
+        """
+        try:
+            mutation_types = [
+                "refactor_names",
+                "enhance_error_handling",
+                "optimize_loops",
+                "simplify_logic",
+            ]
+            mutation_type = mutation_types[hash(candidate.candidate_id) % len(mutation_types)]
+
+            prompt = f"""You are optimizing code through mutation.
+
+**Mutation Type**: {mutation_type}
+
+**Original Code**:
+```python
+{candidate.rewritten_code[:2000]}
+```
+
+Apply ONE small, focused {mutation_type} mutation. Return only the mutated code block."""
+
+            response = await llm.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            text = ""
+            for block in response.content:
+                if block.type == "text":
+                    text += block.text
+
+            match = re.search(r"```(?:python)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+            if not match:
+                return None
+
+            mutated_code = match.group(1).strip()
+
+            # Create mutated candidate
+            mutant_id = hashlib.sha256(
+                f"{candidate.candidate_id}-mutate-{time.time()}".encode()
+            ).hexdigest()[:12]
+
+            mutant = RewriteCandidate(
+                candidate_id=mutant_id,
+                target_module=candidate.target_module,
+                original_code=candidate.original_code,
+                rewritten_code=mutated_code,
+                generation=candidate.generation + 1,
+                parent_id=candidate.candidate_id,
+            )
+
+            logger.info(f"[Darwin] Mutated {candidate.candidate_id} -> {mutant_id}")
+            return mutant
+
+        except Exception as e:
+            logger.warning(f"[Darwin] Mutation failed: {e}")
+            return None
+
+    async def crossover(
+        self,
+        parent1: RewriteCandidate,
+        parent2: RewriteCandidate,
+        llm: Any,
+    ) -> RewriteCandidate | None:
+        """Combine best parts of two candidates through crossover.
+
+        Args:
+            parent1, parent2: Parent candidates to blend
+            llm: LLM client
+
+        Returns:
+            New candidate blending both parents, or None if crossover failed
+        """
+        try:
+            prompt = f"""You are combining two code variations to create a hybrid.
+
+**Parent 1** (first half):
+```python
+{parent1.rewritten_code[:1500]}
+```
+
+**Parent 2** (alternative):
+```python
+{parent2.rewritten_code[:1500]}
+```
+
+Create a hybrid that takes the best parts from both while maintaining correctness.
+Return ONLY the complete hybrid code in a markdown block."""
+
+            response = await llm.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            text = ""
+            for block in response.content:
+                if block.type == "text":
+                    text += block.text
+
+            match = re.search(r"```(?:python)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+            if not match:
+                return None
+
+            hybrid_code = match.group(1).strip()
+
+            # Create offspring
+            offspring_id = hashlib.sha256(
+                f"{parent1.candidate_id}-x-{parent2.candidate_id}-{time.time()}".encode()
+            ).hexdigest()[:12]
+
+            offspring = RewriteCandidate(
+                candidate_id=offspring_id,
+                target_module=parent1.target_module,
+                original_code=parent1.original_code,
+                rewritten_code=hybrid_code,
+                generation=max(parent1.generation, parent2.generation) + 1,
+                parent_id=f"{parent1.candidate_id}+{parent2.candidate_id}",
+            )
+
+            logger.info(f"[Darwin] Crossover {parent1.candidate_id} x {parent2.candidate_id} -> {offspring_id}")
+            return offspring
+
+        except Exception as e:
+            logger.warning(f"[Darwin] Crossover failed: {e}")
+            return None
+
+    # ──────── Evolution Loop ────────
+
+    async def evolve_generation(
+        self,
+        target_module: str,
+        performance_context: dict[str, Any],
+        llm: Any,
+    ) -> list[RewriteCandidate]:
+        """Run one generation of evolution.
+
+        Steps:
+        1. Select parents from current population
+        2. Apply crossover and mutation
+        3. Evaluate new candidates
+        4. Select survivors
+
+        Returns:
+            List of surviving candidates for next generation
+        """
+        logger.info(f"[Darwin] Evolving generation {len(self._generation_history) + 1}")
+
+        # Phase 1: Selection
+        parents = self._select_parents(self._population)
+        logger.info(f"[Darwin] Selected {len(parents)} parents")
+
+        # Phase 2: Variation (crossover + mutation)
+        offspring = []
+
+        # Crossover
+        if len(parents) >= 2:
+            for i in range(0, len(parents) - 1, 2):
+                child = await self.crossover(parents[i], parents[i + 1], llm)
+                if child:
+                    offspring.append(child)
+
+        # Mutation
+        for parent in parents:
+            if len(offspring) < self.config.population_size:
+                mutant = await self.mutate(parent, llm)
+                if mutant:
+                    offspring.append(mutant)
+
+        logger.info(f"[Darwin] Generated {len(offspring)} offspring")
+
+        # Phase 3: Evaluation
+        for child in offspring:
+            await self.evaluate_candidate(child)
+
+        # Phase 4: Selection (elitist)
+        survivors = self._select_survivors(self._population, offspring)
+        logger.info(f"[Darwin] Selected {len(survivors)} survivors")
+
+        self._generation_history.append(survivors)
+        self._population = survivors
+
+        return survivors
+
+    async def run_evolution(
+        self,
+        target_module: str,
+        performance_context: dict[str, Any],
+        llm: Any,
+        generations: int | None = None,
+    ) -> RewriteCandidate | None:
+        """Run multi-generation evolution to find best rewrite.
+
+        Args:
+            target_module: Module to evolve
+            performance_context: Performance data for context
+            llm: LLM client
+            generations: Number of generations (uses config.max_generations if None)
+
+        Returns:
+            Best candidate found, or None if evolution failed
+        """
+        if generations is None:
+            generations = self.config.max_generations
+
+        logger.info(f"[Darwin] Starting evolution for {target_module} ({generations} generations)")
+
+        # Initialize population (generation 0)
+        self._population = []
+        self._generation_history = []
+
+        for _ in range(self.config.population_size):
+            candidate = await self.generate_rewrite_candidate(
+                target_module, performance_context, llm
+            )
+            if candidate:
+                await self.evaluate_candidate(candidate)
+                self._population.append(candidate)
+
+        logger.info(f"[Darwin] Initialized population with {len(self._population)} candidates")
+
+        if not self._population:
+            logger.error("[Darwin] Failed to initialize population")
+            return None
+
+        # Record baseline
+        best_first_gen = max(self._population, key=lambda c: c.fitness_delta)
+        self._baseline_fitness[target_module] = (
+            best_first_gen.fitness_delta + 0.5
+        )  # Baseline is current best
+
+        # Evolve
+        for gen in range(1, generations):
+            survivors = await self.evolve_generation(
+                target_module, performance_context, llm
+            )
+            if not survivors:
+                logger.warning(f"[Darwin] Evolution stopped at generation {gen}")
+                break
+
+        # Return best overall
+        best = max(self._population, key=lambda c: c.fitness_delta)
+        logger.info(
+            f"[Darwin] Evolution complete. Best candidate: {best.candidate_id} "
+            f"(fitness_delta={best.fitness_delta:.3f})"
+        )
+
+        return best
+
+    def _select_parents(self, population: list[RewriteCandidate]) -> list[RewriteCandidate]:
+        """Tournament selection: pick best candidates for breeding.
+
+        Uses tournament size of 2 (binary tournament).
+        """
+        if not population:
+            return []
+
+        parents = []
+        tournament_size = 2
+
+        for _ in range(min(2, len(population))):  # Select 2 parents
+            tournament = [
+                population[i]
+                for i in sorted([
+                    hash(f"{population[i].candidate_id}-{time.time()}") % len(population)
+                    for _ in range(tournament_size)
+                ])
+            ][:tournament_size]
+
+            winner = max(tournament, key=lambda c: c.fitness_delta)
+            parents.append(winner)
+
+        return parents
+
+    def _select_survivors(
+        self,
+        population: list[RewriteCandidate],
+        offspring: list[RewriteCandidate],
+    ) -> list[RewriteCandidate]:
+        """Elitist selection: keep best from both parents and offspring.
+
+        Returns:
+            Best candidates up to population_size limit
+        """
+        combined = population + offspring
+        combined.sort(key=lambda c: c.fitness_delta, reverse=True)
+
+        survivors = [
+            c for c in combined[:self.config.population_size]
+            if c.fitness_delta >= self.config.fitness_threshold
+        ]
+
+        if not survivors:
+            # Always keep at least the best one
+            survivors = [combined[0]]
+
+        return survivors
+
+    # ──────── Apply Best Candidate ────────
+
+    async def apply_best(self, constitution_dir: Path) -> bool:
+        """Apply the best candidate found to the actual system.
+
+        Uses SICAEngine to formally apply the rewrite as a SelfEditProposal.
+
+        Args:
+            constitution_dir: Directory containing constitution files
+
+        Returns:
+            True if successfully applied, False otherwise
+        """
+        if not self._population:
+            logger.warning("[Darwin] No candidates to apply")
+            return False
+
+        best = max(self._population, key=lambda c: c.fitness_delta)
+
+        if best.fitness_delta < self.config.fitness_threshold:
+            logger.warning(
+                f"[Darwin] Best candidate fitness ({best.fitness_delta:.3f}) "
+                f"below threshold ({self.config.fitness_threshold})"
+            )
+            return False
+
+        try:
+            # Create a SelfEditProposal
+            proposal = SelfEditProposal(
+                id=best.candidate_id,
+                edit_type="constitution",
+                target_file=best.target_module,
+                description=f"Darwin evolved {best.target_module}",
+                original_content=best.original_code,
+                proposed_content=best.rewritten_code,
+                rationale="Evolved through multi-generation self-improvement",
+                expected_impact=f"Fitness improvement of {best.fitness_delta:.2%}",
+                confidence=0.7,
+            )
+
+            # Validate with SICA
+            is_valid = self.sica_engine.validate_proposal(proposal, constitution_dir)
+            if not is_valid:
+                logger.warning("[Darwin] Proposal failed SICA validation")
+                return False
+
+            # Apply with SICA
+            applied = await self.sica_engine.apply_proposal(
+                proposal, constitution_dir
+            )
+            if applied:
+                logger.info(f"[Darwin] Successfully applied best candidate {best.candidate_id}")
+                return True
+            else:
+                logger.warning("[Darwin] SICA failed to apply proposal")
+                return False
+
+        except Exception as e:
+            logger.error(f"[Darwin] Failed to apply best candidate: {e}")
+            return False
+
+    # ──────── Statistics & Persistence ────────
+
+    def get_evolution_stats(self) -> dict[str, Any]:
+        """Get statistics about evolution runs.
+
+        Returns:
+            Dict with per-generation statistics
+        """
+        if not self._generation_history:
+            return {"message": "No evolution history"}
+
+        stats = {
+            "total_generations": len(self._generation_history),
+            "per_generation": [],
+        }
+
+        for gen, candidates in enumerate(self._generation_history):
+            gen_stats = {
+                "generation": gen,
+                "population_size": len(candidates),
+                "avg_fitness": sum(c.fitness_delta for c in candidates) / len(candidates) if candidates else 0,
+                "max_fitness": max((c.fitness_delta for c in candidates), default=0),
+                "best_candidate_id": max(
+                    (c.candidate_id for c in candidates),
+                    key=lambda cid: max((c.fitness_delta for c in candidates if c.candidate_id == cid), default=0),
+                    default=None,
+                ),
+            }
+            stats["per_generation"].append(gen_stats)
+
+        # Overall best
+        all_candidates = [c for gen in self._generation_history for c in gen]
+        if all_candidates:
+            best = max(all_candidates, key=lambda c: c.fitness_delta)
+            stats["best_overall"] = {
+                "candidate_id": best.candidate_id,
+                "fitness_delta": best.fitness_delta,
+                "generation": best.generation,
+                "target_module": best.target_module,
+            }
+
+        return stats
+
+    def _save_evolution_state(self) -> None:
+        """Save evolution history to disk."""
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            data = {
+                "generation_history": [
+                    [c.to_dict() for c in gen]
+                    for gen in self._generation_history
+                ],
+                "baseline_fitness": self._baseline_fitness,
+                "timestamp": time.time(),
+            }
+            self._evolution_state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            logger.debug(f"[Darwin] Saved evolution state to {self._evolution_state_file}")
+        except Exception as e:
+            logger.warning(f"[Darwin] Could not save evolution state: {e}")
+
+    def _load_evolution_state(self) -> None:
+        """Load evolution history from disk."""
+        if not self._evolution_state_file.exists():
+            return
+        try:
+            data = json.loads(self._evolution_state_file.read_text(encoding="utf-8"))
+            for gen_data in data.get("generation_history", []):
+                generation = []
+                for candidate_dict in gen_data:
+                    candidate = RewriteCandidate(
+                        candidate_id=candidate_dict["candidate_id"],
+                        target_module=candidate_dict["target_module"],
+                        original_code="",  # Not persisted for size reasons
+                        rewritten_code="",
+                        test_results=candidate_dict.get("test_results", {}),
+                        fitness_delta=candidate_dict["fitness_delta"],
+                        generation=candidate_dict["generation"],
+                        parent_id=candidate_dict.get("parent_id", ""),
+                    )
+                    generation.append(candidate)
+                self._generation_history.append(generation)
+
+            self._baseline_fitness = data.get("baseline_fitness", {})
+            logger.info(f"[Darwin] Loaded evolution state with {len(self._generation_history)} generations")
+        except Exception as e:
+            logger.debug(f"[Darwin] Could not load evolution state: {e}")
+
