@@ -38,11 +38,22 @@ You must output a single JSON code block with this structure:
       "owner": "builder",
       "depends_on": [],
       "files": ["path/to/file1.ts", "path/to/file2.ts"],
-      "acceptance_criteria": "How to verify this task is done"
+      "acceptance_criteria": "How to verify this task is done",
+      "exports": "What this task provides to downstream tasks: key types, functions, classes, and their signatures. E.g. 'Exports: User model (id, email, name), createUser(data) -> User, getUserById(id) -> User | null'"
     }
   ]
 }
 ```
+
+### Interface Contracts (CRITICAL for quality)
+
+The `exports` field is essential for correct cross-task integration. When task B depends on task A:
+- A's `exports` tells B exactly what interfaces to import and use
+- Without exports, B's builder must guess at interface shapes, causing broken imports
+
+Write exports as concrete signatures, not vague descriptions:
+- GOOD: `"Exports: User type {id: string, email: string, name: string}, createUser(data: CreateUserInput): Promise<User>, getUserById(id: string): Promise<User | null>"`
+- BAD: `"Exports: User model and CRUD functions"`
 
 ## Design Principle: Composition Over Creation
 

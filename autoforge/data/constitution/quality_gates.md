@@ -65,7 +65,7 @@ Additional pipeline hardening:
 
 | Agent | Core Tools | Search Tools | Web Tools |
 |-------|-----------|-------------|-----------|
-| Director | (text only) | — | `search_web`, `fetch_url` |
+| Director | (text only) | — | `search_web`, `fetch_url`, `search_github`, `inspect_repo` |
 | Architect | `read_template` | — | `search_web`, `fetch_url` |
 | Builder | `write_file`, `read_file`, `list_files`, `run_command` | `grep_search` | `fetch_url` |
 | Scanner | `read_file`, `list_files`, `run_command` | `grep_search` | — |

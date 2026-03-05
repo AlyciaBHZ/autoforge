@@ -290,6 +290,9 @@ class Orchestrator:
             if self.config.speculative_enabled:
                 await self._speculative.speculate_test_scaffold(self.spec, self.project_dir)
 
+            # Integration check: verify cross-module imports before full test
+            await self._integration_check()
+
             # Phase 3: VERIFY
             console.print("\n[bold blue]Phase 3: VERIFY[/bold blue] — Verifying project...")
             await self._phase_verify()
@@ -1014,11 +1017,15 @@ class Orchestrator:
                 files_touched=task.files,
             )
 
+            # Gather actual file contents from dependency tasks
+            dep_context = self._gather_dependency_context(task, working_dir)
+
             result = await builder.run({
                 "task": task.to_dict(),
                 "spec": self.spec,
                 "architecture": json.dumps(self.architecture, indent=2, ensure_ascii=False),
                 "existing_files": existing_files,
+                "dependency_context": dep_context,
             })
 
             if result.success:
@@ -1058,7 +1065,7 @@ class Orchestrator:
                 await self._tdd_loop(task, builder, sandbox, working_dir, agent_id, use_git, git, branch_name)
 
                 # Quick review
-                reviewer = self._agent("reviewer", self.config, self.llm, working_dir)
+                reviewer = self._agent("reviewer", self.config, self.llm, working_dir, sandbox=sandbox)
                 if self._dynamic_constitution:
                     supplement = self._dynamic_constitution.build_supplementary_prompt("reviewer")
                     if supplement:
@@ -1250,8 +1257,183 @@ class Orchestrator:
         return None
 
     # ──────────────────────────────────────────────
+    # Dependency Context: pass upstream file contents to downstream builders
+    # ──────────────────────────────────────────────
+
+    def _gather_dependency_context(
+        self, task: Task, working_dir: Path, max_chars: int = 12000,
+    ) -> str:
+        """Read key files from dependency tasks so the builder has real context.
+
+        When task B depends on task A, B's builder needs to see A's actual code
+        (models, types, interfaces) to write compatible imports and call sites.
+        Without this, builders guess at interfaces and produce broken imports.
+
+        Returns a formatted string with file contents, truncated to max_chars.
+        """
+        if not self.dag or not task.depends_on:
+            return ""
+
+        dep_files: list[tuple[str, str]] = []  # (path, content)
+        total_chars = 0
+
+        # Collect files from all dependency tasks
+        for dep_id in task.depends_on:
+            dep_task = self.dag.get_task(dep_id)
+            if dep_task is None or dep_task.status != TaskStatus.DONE:
+                continue
+            for fpath in dep_task.files:
+                full = working_dir / fpath
+                if not full.is_file():
+                    continue
+                # Prioritize interface-like files: types, models, schemas, index
+                # Skip test files and large assets
+                fname = full.name.lower()
+                if any(skip in fname for skip in (".test.", ".spec.", ".min.", ".lock")):
+                    continue
+                try:
+                    content = full.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                # Truncate individual files to keep total under budget
+                if len(content) > 3000:
+                    content = content[:3000] + "\n... (truncated)"
+                if total_chars + len(content) > max_chars:
+                    break
+                dep_files.append((fpath, content))
+                total_chars += len(content)
+
+        if not dep_files:
+            # Even without file contents, pass exports contracts
+            exports_parts = []
+            for dep_id in task.depends_on:
+                dep_task = self.dag.get_task(dep_id)
+                if dep_task and dep_task.exports:
+                    exports_parts.append(
+                        f"- **{dep_id}** ({', '.join(dep_task.files)}): {dep_task.exports}"
+                    )
+            if exports_parts:
+                return (
+                    "## Dependency Interfaces\n"
+                    "These upstream tasks provide the following interfaces:\n"
+                    + "\n".join(exports_parts) + "\n"
+                )
+            return ""
+
+        # Build context with both file contents and interface contracts
+        parts = ["## Dependency Files (from upstream tasks — use these for correct imports)\n"]
+
+        # First, show interface contracts (compact summary)
+        for dep_id in task.depends_on:
+            dep_task = self.dag.get_task(dep_id)
+            if dep_task and dep_task.exports:
+                parts.append(f"**{dep_id}** exports: {dep_task.exports}\n")
+
+        # Then show actual file contents
+        for fpath, content in dep_files:
+            parts.append(f"### `{fpath}`\n```\n{content}\n```\n")
+        return "\n".join(parts)
+
+    # ──────────────────────────────────────────────
     # Pipeline Hardening: Smoke Check, Build Gate, File Overlap
     # ──────────────────────────────────────────────
+
+    async def _integration_check(self) -> None:
+        """Run cross-module syntax/import checks after BUILD, before VERIFY.
+
+        Catches broken imports between modules early — cheaper than full test suite.
+        If issues are found, attempts a quick fix pass with a builder.
+        """
+        if not self.project_dir:
+            return
+
+        console.print("  Running integration check...")
+        sandbox = create_sandbox(self.config, self.project_dir)
+        issues: list[str] = []
+
+        async with sandbox:
+            # Detect project type and run appropriate syntax checks
+            tech = self.spec.get("tech_stack", {})
+            lang = tech.get("language", "").lower()
+
+            if "python" in lang:
+                # Check all Python files compile
+                py_files = list(self.project_dir.rglob("*.py"))
+                for pf in py_files[:30]:  # Cap to avoid excessive checks
+                    rel = pf.relative_to(self.project_dir)
+                    result = await sandbox.exec(
+                        f"python -m py_compile {rel}", timeout=10,
+                    )
+                    if result.exit_code != 0:
+                        err = (result.stderr or result.stdout or "")[:200]
+                        issues.append(f"{rel}: {err}")
+
+            elif "typescript" in lang:
+                # Run tsc --noEmit for type checking
+                if (self.project_dir / "tsconfig.json").exists():
+                    result = await sandbox.exec("npx tsc --noEmit 2>&1", timeout=60)
+                    if result.exit_code != 0:
+                        # Extract first few errors
+                        lines = (result.stdout or "").strip().split("\n")
+                        for line in lines[:10]:
+                            if "error TS" in line:
+                                issues.append(line.strip())
+
+            elif "javascript" in lang:
+                # Check all JS files parse
+                js_files = list(self.project_dir.rglob("*.js"))
+                js_files = [f for f in js_files if "node_modules" not in str(f)]
+                for jf in js_files[:30]:
+                    rel = jf.relative_to(self.project_dir)
+                    result = await sandbox.exec(
+                        f"node --check {rel}", timeout=10,
+                    )
+                    if result.exit_code != 0:
+                        err = (result.stderr or "")[:200]
+                        issues.append(f"{rel}: {err}")
+
+            if not issues:
+                console.print("  [green]Integration check passed[/green]")
+                return
+
+            # Report issues and attempt quick fix
+            console.print(
+                f"  [yellow]Integration check found {len(issues)} issue(s)[/yellow]"
+            )
+            for issue in issues[:5]:
+                console.print(f"    - {issue[:100]}")
+
+            # Quick fix attempt: send a builder to fix the integration issues
+            try:
+                builder = self._agent(
+                    "builder", self.config, self.llm,
+                    working_dir=self.project_dir, sandbox=sandbox,
+                )
+                fix_result = await builder.run({
+                    "task": {
+                        "id": "INTEGRATION-FIX",
+                        "description": "Fix cross-module integration issues",
+                        "files": list({
+                            issue.split(":")[0]
+                            for issue in issues
+                            if ":" in issue
+                        })[:5],
+                        "fix_strategy": (
+                            "The following integration errors were found after "
+                            "building all modules. Fix the broken imports, missing "
+                            "exports, and type mismatches:\n\n"
+                            + "\n".join(f"- {i}" for i in issues[:10])
+                        ),
+                    },
+                    "spec": self.spec,
+                    "existing_files": self._list_project_files(),
+                })
+                if fix_result.success:
+                    console.print("  [green]Integration fixes applied[/green]")
+                else:
+                    console.print("  [yellow]Integration fix attempt did not fully succeed[/yellow]")
+            except Exception as e:
+                logger.warning("Integration fix failed: %s", e)
 
     async def _smoke_check(
         self, task: Task, work_dir: Path
@@ -1562,27 +1744,68 @@ class Orchestrator:
     # ──────────────────────────────────────────────
 
     async def _phase_refactor(self) -> None:
-        # Quick review of overall quality
-        reviewer = self._agent("reviewer", self.config, self.llm, self.project_dir)
-        review_result = await reviewer.run({
-            "task": {"id": "FINAL", "description": "Final quality review", "files": self._list_project_files()},
-            "spec": self.spec,
-        })
-        review = reviewer.parse_review(review_result.output)
-
-        if review.score >= round(self.config.quality_threshold * 10):
-            console.print(f"  [green]Quality score: {review.score}/10 — no refactoring needed[/green]")
-            return
-
-        console.print(f"  Quality score: {review.score}/10 — refactoring...")
-
-        if review.issues:
-            gardener = self._agent("gardener", self.config, self.llm, self.project_dir)
-            await gardener.run({
-                "review": {"issues": review.issues, "summary": review.summary},
+        sandbox = create_sandbox(self.config, self.project_dir)
+        async with sandbox:
+            # Full project review with verification tools
+            reviewer = self._agent("reviewer", self.config, self.llm, self.project_dir, sandbox=sandbox)
+            review_result = await reviewer.run({
+                "task": {"id": "FINAL", "description": "Final quality review", "files": self._list_project_files()},
                 "spec": self.spec,
+                "full_project_review": True,
             })
-            console.print("  [green]Refactoring complete[/green]")
+            review = reviewer.parse_review(review_result.output)
+
+            if review.score >= round(self.config.quality_threshold * 10):
+                console.print(f"  [green]Quality score: {review.score}/10 — no refactoring needed[/green]")
+                return
+
+            console.print(f"  Quality score: {review.score}/10 — refactoring...")
+
+            if review.issues:
+                gardener = self._agent("gardener", self.config, self.llm, self.project_dir)
+                await gardener.run({
+                    "review": {"issues": review.issues, "summary": review.summary},
+                    "spec": self.spec,
+                })
+
+                # Post-refactor verification: ensure gardener didn't break anything
+                console.print("  Verifying refactored code...")
+                tech = self.spec.get("tech_stack", {})
+                lang = tech.get("language", "").lower()
+                broke = False
+
+                if "python" in lang:
+                    for pf in list(self.project_dir.rglob("*.py"))[:30]:
+                        rel = pf.relative_to(self.project_dir)
+                        result = await sandbox.exec(f"python -m py_compile {rel}", timeout=10)
+                        if result.exit_code != 0:
+                            console.print(f"  [yellow]Refactor broke {rel}[/yellow]")
+                            broke = True
+                elif "typescript" in lang and (self.project_dir / "tsconfig.json").exists():
+                    result = await sandbox.exec("npx tsc --noEmit 2>&1", timeout=60)
+                    if result.exit_code != 0:
+                        broke = True
+                        console.print("  [yellow]Refactor introduced type errors[/yellow]")
+
+                if broke:
+                    # Attempt auto-fix
+                    builder = self._agent(
+                        "builder", self.config, self.llm,
+                        working_dir=self.project_dir, sandbox=sandbox,
+                    )
+                    await builder.run({
+                        "task": {
+                            "id": "POST-REFACTOR-FIX",
+                            "description": "Fix syntax/type errors introduced by refactoring",
+                            "files": self._list_project_files(),
+                            "fix_strategy": "Refactoring introduced syntax or type errors. Fix them while preserving the refactoring improvements.",
+                        },
+                        "spec": self.spec,
+                        "existing_files": self._list_project_files(),
+                    })
+                    console.print("  [green]Post-refactor fixes applied[/green]")
+                else:
+                    console.print("  [green]Refactoring verified — no regressions[/green]")
 
     # ──────────────────────────────────────────────
     # Phase 5: DELIVER

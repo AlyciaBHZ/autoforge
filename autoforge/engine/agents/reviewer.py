@@ -11,6 +11,7 @@ from typing import Any
 
 from autoforge.engine.agent_base import AgentBase, FileToolsMixin, ToolDefinition
 from autoforge.engine.llm_router import TaskComplexity
+from autoforge.engine.sandbox import SandboxBase
 
 logger = logging.getLogger(__name__)
 
@@ -28,19 +29,24 @@ class ReviewResult:
 class ReviewerAgent(FileToolsMixin, AgentBase):
     """Reviews code for correctness, security, and quality.
 
-    Has read-only access to project files. Produces a structured
-    review with approval status and issues list.
+    Has read-only access to project files plus the ability to run
+    verification commands (syntax checks, linting, type checking).
+    Produces a structured review with approval status and issues list.
     """
 
     ROLE = "reviewer"
     COMPLEXITY = TaskComplexity.STANDARD
 
-    def __init__(self, config, llm, working_dir: Path) -> None:
+    def __init__(
+        self, config, llm, working_dir: Path,
+        sandbox: "SandboxBase | None" = None,
+    ) -> None:
         self.working_dir = working_dir
+        self.sandbox = sandbox
         super().__init__(config, llm)
 
     def _register_tools(self) -> None:
-        """Reviewer has read-only tools."""
+        """Reviewer has read-only tools plus verification commands."""
         self._tools = [
             ToolDefinition(
                 name="read_file",
@@ -71,7 +77,68 @@ class ReviewerAgent(FileToolsMixin, AgentBase):
                 },
                 handler=self._handle_list_files,
             ),
+            ToolDefinition(
+                name="run_check",
+                description=(
+                    "Run a read-only verification command (syntax check, type check, lint). "
+                    "Use to verify code actually compiles/parses correctly. "
+                    "Examples: 'python -m py_compile src/app.py', 'npx tsc --noEmit', "
+                    "'node --check src/index.js', 'python -m flake8 src/'. "
+                    "Do NOT use for modifying files or running the application."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Verification command to run",
+                        },
+                    },
+                    "required": ["command"],
+                },
+                handler=self._handle_run_check,
+            ),
         ]
+
+        # Add grep_search for finding code patterns during review
+        from functools import partial
+
+        from autoforge.engine.tools.search import (
+            GREP_SEARCH_TOOL_SCHEMA,
+            handle_grep_search,
+        )
+
+        self._tools.append(ToolDefinition(
+            name="grep_search",
+            description=(
+                "Search project files for a pattern (regex). "
+                "Use to find cross-cutting issues like hardcoded secrets, "
+                "missing error handling patterns, or inconsistent naming."
+            ),
+            input_schema=GREP_SEARCH_TOOL_SCHEMA,
+            handler=partial(handle_grep_search, working_dir=self.working_dir),
+        ))
+
+    async def _handle_run_check(self, input_data: dict) -> str:
+        """Run a read-only verification command."""
+        command = input_data.get("command", "")
+        if not command:
+            return json.dumps({"error": "No command provided"})
+
+        # Block obviously dangerous commands
+        dangerous = ["rm ", "mv ", "cp ", "write", "chmod", "chown", "kill", "sudo"]
+        if any(d in command.lower() for d in dangerous):
+            return json.dumps({"error": "Only read-only verification commands are allowed"})
+
+        if self.sandbox:
+            result = await self.sandbox.exec(command, timeout=30)
+            return json.dumps({
+                "exit_code": result.exit_code,
+                "stdout": (result.stdout or "")[:2000],
+                "stderr": (result.stderr or "")[:1000],
+            })
+        else:
+            return json.dumps({"error": "No sandbox available for running commands"})
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         task = context.get("task", {})
