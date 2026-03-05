@@ -198,6 +198,10 @@ class AdvancedConfig:
     context_budget_tokens: int = 4000
     dag_ingest_confidence_threshold: float = 0.4
     dag_ingest_relevance_threshold: float = 0.3
+    dag_federation_enabled: bool = False
+    dag_federation_endpoint: str = ""
+    dag_federation_api_key: str = ""
+    dag_federation_timeout_seconds: float = 10.0
 
     # Lean prover deep settings
     lean_mcts_iterations: int = 200
@@ -253,6 +257,12 @@ class AdvancedConfig:
             raise ValueError(
                 f"dag_ingest_confidence_threshold must be in [0, 1] "
                 f"(got {self.dag_ingest_confidence_threshold})"
+            )
+
+        if self.dag_federation_timeout_seconds <= 0:
+            raise ValueError(
+                f"dag_federation_timeout_seconds must be > 0 "
+                f"(got {self.dag_federation_timeout_seconds})"
             )
 
         # Warn if cloud prover enabled but no backend configured
@@ -632,6 +642,12 @@ class ForgeConfig:
                 checkpoints_enabled=os.getenv("FORGE_CHECKPOINTS", "true").lower() not in ("false", "0", "no"),
                 checkpoint_interval=_safe_int("FORGE_CHECKPOINT_INTERVAL", _to_int(global_config.get("checkpoint_interval", 8), 8)),
                 build_test_loops=_safe_int("FORGE_BUILD_TEST_LOOPS", _to_int(global_config.get("build_test_loops", 0), 0)),
+            ),
+            advanced=AdvancedConfig(
+                dag_federation_enabled=os.getenv("FORGE_DAG_FEDERATION_ENABLED", "").lower() in ("true", "1", "yes"),
+                dag_federation_endpoint=os.getenv("FORGE_DAG_FEDERATION_ENDPOINT", str(global_config.get("dag_federation_endpoint", ""))),
+                dag_federation_api_key=os.getenv("FORGE_DAG_FEDERATION_API_KEY", str(global_config.get("dag_federation_api_key", ""))),
+                dag_federation_timeout_seconds=_safe_float("FORGE_DAG_FEDERATION_TIMEOUT_SECONDS", float(global_config.get("dag_federation_timeout_seconds", 10.0))),
             ),
         )
 
