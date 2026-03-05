@@ -439,6 +439,14 @@ class AgentBase(ABC):
                     # Append assistant response + tool results to conversation
                     messages.append({"role": "assistant", "content": response.content})
                     messages.append({"role": "user", "content": tool_results})
+
+                    # Prune old messages to prevent context overflow.
+                    # Keep the first user message + last N exchanges.
+                    _MAX_CONTEXT_MESSAGES = 40  # ~20 turns
+                    if len(messages) > _MAX_CONTEXT_MESSAGES:
+                        # Preserve first message (original task prompt)
+                        # and trim middle messages
+                        messages = [messages[0]] + messages[-((_MAX_CONTEXT_MESSAGES - 1)):]
             else:
                 # MAX_TURNS exceeded — this is a failure
                 self._log_action("max_turns_reached", f"turns={turns}")

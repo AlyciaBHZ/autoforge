@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 def _shell_quote(s: str) -> str:
     """Quote a string for shell use, cross-platform."""
     if sys.platform == "win32":
-        return f'"{s}"'
+        # Use subprocess.list2cmdline for proper Windows escaping
+        return subprocess.list2cmdline([s])
     return shlex.quote(s)
 
 
@@ -76,15 +77,16 @@ class SubprocessSandbox(SandboxBase):
 
     # Dangerous command patterns that must never be executed.
     BLOCKED_PATTERNS: list[str] = [
+        r"\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+(-[a-zA-Z]*\s+)*|(-[a-zA-Z]*\s+)*-[a-zA-Z]*f[a-zA-Z]*\s+)/",  # rm with -f and /
         r"\brm\s+-rf\s+/",              # rm -rf /
         r"\brm\s+-fr\s+/",              # rm -fr /
         r"\bmkfs\b",                     # mkfs (format disk)
         r"\bdd\s+if=",                   # dd if= (raw disk write)
         r"\bchmod\s+777\s+/",           # chmod 777 / (recursive perm open)
-        r"\bcurl\b.*\|\s*\bsh\b",       # curl | sh (remote code exec)
-        r"\bcurl\b.*\|\s*\bbash\b",     # curl | bash
-        r"\bwget\b.*\|\s*\bsh\b",       # wget | sh
-        r"\bwget\b.*\|\s*\bbash\b",     # wget | bash
+        r"\bcurl\b.*\|.*\bsh\b",        # curl | sh (remote code exec)
+        r"\bcurl\b.*\|.*\bbash\b",      # curl | bash
+        r"\bwget\b.*\|.*\bsh\b",        # wget | sh
+        r"\bwget\b.*\|.*\bbash\b",      # wget | bash
         r">\s*/dev/sd[a-z]",            # > /dev/sda (overwrite disk)
         r":\(\)\s*\{\s*:\|\s*:&\s*\}\s*;", # fork bomb
         r"\bshutdown\b",                # shutdown
@@ -96,6 +98,13 @@ class SubprocessSandbox(SandboxBase):
         r">\s*/etc/passwd",             # overwrite passwd
         r">\s*/etc/shadow",             # overwrite shadow
         r"\bnc\s+-[elp]",              # netcat listener/exec
+        # Additional patterns to harden against bypass
+        r"\bfind\b.*-delete\s+/",       # find / -delete
+        r"\bfind\b.*-exec\s+rm\b",     # find -exec rm
+        r"\bshutil\.rmtree\s*\(\s*['\"]\/", # Python shutil.rmtree('/')
+        r"\bos\.remove\s*\(\s*['\"]\/",     # Python os.remove('/')
+        r"\bos\.system\s*\(",           # Python os.system()
+        r"\b__import__\s*\(",           # Python __import__()
     ]
 
     def __init__(self, working_dir: Path, env: dict[str, str] | None = None) -> None:
@@ -141,7 +150,11 @@ class SubprocessSandbox(SandboxBase):
             if proc is not None:
                 try:
                     if sys.platform != "win32" and proc.pid is not None:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except (ProcessLookupError, OSError):
+                            # Process group kill failed, fall back to direct kill
+                            proc.kill()
                     else:
                         proc.kill()
                 except (ProcessLookupError, OSError):
@@ -188,7 +201,7 @@ class SubprocessSandbox(SandboxBase):
         if sys.platform == "win32" and not command.startswith("cmd"):
             sh = shutil.which("bash") or shutil.which("sh")
             if sh:
-                shell_command = f'"{sh}" -c {_shell_quote(command)}'
+                shell_command = f'{_shell_quote(sh)} -c {_shell_quote(command)}'
 
         proc_coro = asyncio.create_subprocess_shell(
             shell_command,
@@ -278,7 +291,14 @@ class DockerSandbox(SandboxBase):
         stdout, stderr = await proc.communicate()
 
         if proc.returncode == 0:
-            self._container_id = stdout.decode().strip()
+            raw_id = stdout.decode().strip()
+            # Validate container ID format (hex string, typically 64 chars)
+            if re.fullmatch(r"[0-9a-f]+", raw_id) and len(raw_id) >= 12:
+                self._container_id = raw_id
+            else:
+                raise RuntimeError(
+                    f"Docker returned unexpected container ID: {raw_id[:64]!r}"
+                )
             logger.info(f"DockerSandbox started: {self._container_id[:12]}")
         else:
             raise RuntimeError(f"Failed to start Docker sandbox: {stderr.decode()}")
@@ -286,6 +306,17 @@ class DockerSandbox(SandboxBase):
     async def exec(self, command: str, timeout: int = 120) -> SandboxResult:
         if not self._container_id:
             raise RuntimeError("Docker sandbox not started")
+
+        # Apply command sanitization even inside Docker for defense-in-depth
+        try:
+            SubprocessSandbox._sanitize_command(command)
+        except ValueError as e:
+            logger.warning("[docker-sandbox] Command blocked: %s", e)
+            return SandboxResult(
+                exit_code=-1,
+                stdout="",
+                stderr=f"Command blocked by security filter: {e}",
+            )
 
         cmd = ["docker", "exec", self._container_id, "bash", "-c", command]
         proc: asyncio.subprocess.Process | None = None

@@ -59,8 +59,10 @@ async def start_webhook_server(
             return
 
         if not config.webhook_secret:
-            local_host = config.webhook_host in {"127.0.0.1", "localhost"}
-            if config.webhook_allow_unauthenticated_local and local_host:
+            # Check actual client IP, not the server bind address
+            client_ip = request.client.host if request.client else ""
+            is_local_client = client_ip in {"127.0.0.1", "::1", "localhost"}
+            if config.webhook_allow_unauthenticated_local and is_local_client:
                 return
             raise HTTPException(status_code=503, detail="Webhook authentication misconfigured")
 
