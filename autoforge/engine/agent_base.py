@@ -116,8 +116,8 @@ class FileToolsMixin:
             result = await self.sandbox.exec(command)  # type: ignore[attr-defined]
             return json.dumps({
                 "exit_code": result.exit_code,
-                "stdout": result.stdout[:5000],
-                "stderr": result.stderr[:2000],
+                "stdout": result.stdout[:8000],
+                "stderr": result.stderr[:4000],
                 "timed_out": getattr(result, "timed_out", False),
             })
         else:

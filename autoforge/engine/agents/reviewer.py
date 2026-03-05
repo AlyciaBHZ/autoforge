@@ -134,8 +134,8 @@ class ReviewerAgent(FileToolsMixin, AgentBase):
             result = await self.sandbox.exec(command, timeout=30)
             return json.dumps({
                 "exit_code": result.exit_code,
-                "stdout": (result.stdout or "")[:2000],
-                "stderr": (result.stderr or "")[:1000],
+                "stdout": (result.stdout or "")[:4000],
+                "stderr": (result.stderr or "")[:2000],
             })
         else:
             return json.dumps({"error": "No sandbox available for running commands"})
@@ -172,15 +172,26 @@ class ReviewerAgent(FileToolsMixin, AgentBase):
             )
 
         # Standard task-level review
+        architecture = context.get("architecture")
+        arch_section = ""
+        if architecture:
+            arch_text = json.dumps(architecture, indent=2, ensure_ascii=False) if isinstance(architecture, dict) else str(architecture)
+            arch_section = (
+                f"## Architecture (validate code matches this design)\n"
+                f"```json\n{arch_text[:3000]}\n```\n\n"
+            )
+
         return (
             f"Review the code for task '{task.get('id', '')}' in project "
             f"'{spec.get('project_name', '')}'.\n\n"
             f"## Task Description\n{task.get('description', 'N/A')}\n\n"
+            f"{arch_section}"
             f"## Files to Review\n{task.get('files', [])}\n\n"
             f"## Instructions\n"
             f"1. Read each file listed above\n"
             f"2. Check correctness, security, error handling, and code quality\n"
-            f"3. Output a JSON code block with your review following the format "
+            f"3. Verify code matches the architecture design (data models, API patterns, conventions)\n"
+            f"4. Output a JSON code block with your review following the format "
             f"in your system prompt\n"
         )
 

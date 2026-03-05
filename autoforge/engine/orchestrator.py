@@ -1107,6 +1107,7 @@ class Orchestrator:
                 review_result = await reviewer.run({
                     "task": task.to_dict(),
                     "spec": self.spec,
+                    "architecture": self.architecture,
                 })
                 review = reviewer.parse_review(review_result.output)
 
@@ -1136,10 +1137,24 @@ class Orchestrator:
                 else:
                     # Revision needed — retry with feedback (not first-try success)
                     logger.info(f"Task {task.id} needs revision: {review.summary}")
+                    # Build structured feedback with both summary and specific issues
+                    fix_parts = [f"Review rejected (score {review.score}/{min_score} required):\n{review.summary}"]
+                    if review.issues:
+                        fix_parts.append("\n\nSpecific issues to fix:")
+                        for issue in review.issues:
+                            sev = issue.get("severity", "?")
+                            f_path = issue.get("file", "?")
+                            line = issue.get("line", "?")
+                            desc = issue.get("description", "")
+                            suggestion = issue.get("suggestion", "")
+                            fix_parts.append(f"  [{sev}] {f_path}:{line} — {desc}")
+                            if suggestion:
+                                fix_parts.append(f"    Fix: {suggestion}")
+
                     revision_result = await builder.run({
                         "task": {
                             **task.to_dict(),
-                            "fix_strategy": review.summary,
+                            "fix_strategy": "\n".join(fix_parts),
                         },
                         "spec": self.spec,
                         "existing_files": self._list_project_files(),
@@ -1604,7 +1619,29 @@ class Orchestrator:
                 f"exceeds contract limit of {max_files}"
             )
 
-        if not missing and len(build_tasks) <= max_tasks:
+        # Check 5: Deliverables — verify required artifacts exist
+        deliverables = contract.get("deliverables", [])
+        missing_deliverables: list[str] = []
+        for deliverable in deliverables:
+            d_lower = deliverable.lower()
+            # Check for common deliverable patterns
+            if "readme" in d_lower:
+                if not (project_dir / "README.md").exists() and not (project_dir / "readme.md").exists():
+                    missing_deliverables.append(deliverable)
+            elif "package.json" in d_lower:
+                if not (project_dir / "package.json").exists():
+                    missing_deliverables.append(deliverable)
+            elif "source code" in d_lower:
+                # Already validated via file existence check above
+                pass
+        if missing_deliverables:
+            console.print(
+                f"  [yellow]Build gate warning:[/yellow] "
+                f"missing deliverables: {', '.join(missing_deliverables)}"
+            )
+
+        gate_ok = not missing and len(build_tasks) <= max_tasks and not missing_deliverables
+        if gate_ok:
             console.print("  [green]Build gate passed[/green]")
 
     def _detect_file_overlaps(
