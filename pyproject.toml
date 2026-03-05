@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 name = "autoforgeai"
 
-version = "2.7.8"
+version = "2.7.9"
 description = "AutoForge AI-powered multi-agent development platform"
 
 readme = "README.md"
@@ -44,7 +44,6 @@ classifiers = [
 
     "Intended Audience :: Developers",
 
-    "License :: OSI Approved :: MIT License",
 
     "Programming Language :: Python :: 3",
 
