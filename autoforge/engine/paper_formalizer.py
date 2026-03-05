@@ -121,6 +121,7 @@ class FormalizationReport:
         if self.total_statements == 0:
             return 0.0
         proved_weight = 1.0
+        # "sorry" placeholders are not creditable toward formalization quality.
         sorry_weight = 0.0
         numerical_weight = 0.7
         reproduced_weight = 0.8

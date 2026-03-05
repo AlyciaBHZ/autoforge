@@ -665,14 +665,14 @@ class TestPaperFormalizer(unittest.TestCase):
             paper_source="test.pdf",
             total_statements=10,
             lean_proved=3,       # 3 * 1.0 = 3.0
-            lean_sorry=2,        # 2 * 0.5 = 1.0
+            lean_sorry=2,        # 2 * 0.0 = 0.0
             numerically_verified=2,  # 2 * 0.7 = 1.4
             computationally_reproduced=1,  # 1 * 0.8 = 0.8
             lean_failed=1,
             skipped=1,
         )
         score = report.compute_score()
-        expected = (3.0 + 1.0 + 1.4 + 0.8) / 10  # = 0.62
+        expected = (3.0 + 0.0 + 1.4 + 0.8) / 10  # = 0.52
         self.assertAlmostEqual(score, expected, places=6)
         self.assertAlmostEqual(report.overall_score, expected, places=6)
 
