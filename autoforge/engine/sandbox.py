@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -30,7 +31,6 @@ def _shell_quote(s: str) -> str:
     """Quote a string for shell use, cross-platform."""
     if sys.platform == "win32":
         return f'"{s}"'
-    import shlex
     return shlex.quote(s)
 
 
@@ -157,7 +157,7 @@ class SubprocessSandbox(SandboxBase):
                 proc.communicate(), timeout=timeout
             )
             return SandboxResult(
-                exit_code=proc.returncode or 0,
+                exit_code=proc.returncode if proc.returncode is not None else -1,
                 stdout=stdout.decode(errors="replace"),
                 stderr=stderr.decode(errors="replace"),
             )
@@ -255,7 +255,7 @@ class DockerSandbox(SandboxBase):
                 proc.communicate(), timeout=timeout
             )
             return SandboxResult(
-                exit_code=proc.returncode or 0,
+                exit_code=proc.returncode if proc.returncode is not None else -1,
                 stdout=stdout.decode(errors="replace"),
                 stderr=stderr.decode(errors="replace"),
             )

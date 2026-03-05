@@ -88,6 +88,15 @@ def _to_int(value: Any, default: int) -> int:
         return default
 
 
+def _load_clamped_int(
+    env_key: str, global_key: str, global_config: dict,
+    default: int, minimum: int = 1,
+) -> int:
+    """Load an int from env / global config with a floor clamp."""
+    val = _safe_int(env_key, _to_int(global_config.get(global_key, default), default))
+    return max(minimum, val)
+
+
 # ── Sub-config dataclasses ────────────────────────────────────────
 
 
@@ -312,593 +321,44 @@ class ForgeConfig:
         "gemini-",
     )
 
-    # ── Backward-compatible property proxies ──
-    # These let existing code use config.xxx_enabled without changes.
-    # Over time, callers should migrate to config.advanced.xxx_enabled etc.
-
-    @property
-    def daemon_enabled(self) -> bool:
-        return self.daemon.daemon_enabled
-
-    @daemon_enabled.setter
-    def daemon_enabled(self, v: bool) -> None:
-        self.daemon.daemon_enabled = v
-
-    @property
-    def daemon_poll_interval(self) -> int:
-        return self.daemon.daemon_poll_interval
-
-    @daemon_poll_interval.setter
-    def daemon_poll_interval(self, v: int) -> None:
-        self.daemon.daemon_poll_interval = v
-
-    @property
-    def db_path(self) -> Path | None:
-        return self.daemon.db_path
-
-    @db_path.setter
-    def db_path(self, v: Path | None) -> None:
-        self.daemon.db_path = v
-
-    @property
-    def telegram_token(self) -> str:
-        return self.daemon.telegram_token
-
-    @telegram_token.setter
-    def telegram_token(self, v: str) -> None:
-        self.daemon.telegram_token = v
-
-    @property
-    def telegram_allowed_users(self) -> list[str]:
-        return self.daemon.telegram_allowed_users
-
-    @telegram_allowed_users.setter
-    def telegram_allowed_users(self, v: list[str]) -> None:
-        self.daemon.telegram_allowed_users = v
-
-    @property
-    def webhook_enabled(self) -> bool:
-        return self.daemon.webhook_enabled
-
-    @webhook_enabled.setter
-    def webhook_enabled(self, v: bool) -> None:
-        self.daemon.webhook_enabled = v
-
-    @property
-    def webhook_host(self) -> str:
-        return self.daemon.webhook_host
-
-    @webhook_host.setter
-    def webhook_host(self, v: str) -> None:
-        self.daemon.webhook_host = v
-
-    @property
-    def webhook_port(self) -> int:
-        return self.daemon.webhook_port
-
-    @webhook_port.setter
-    def webhook_port(self, v: int) -> None:
-        self.daemon.webhook_port = v
-
-    @property
-    def webhook_secret(self) -> str:
-        return self.daemon.webhook_secret
-
-    @webhook_secret.setter
-    def webhook_secret(self, v: str) -> None:
-        self.daemon.webhook_secret = v
-
-    @property
-    def daemon_max_concurrent_projects(self) -> int:
-        return self.daemon.daemon_max_concurrent_projects
-
-    @daemon_max_concurrent_projects.setter
-    def daemon_max_concurrent_projects(self, v: int) -> None:
-        self.daemon.daemon_max_concurrent_projects = v
-
-    @property
-    def daemon_pid_file(self) -> Path | None:
-        return self.daemon.daemon_pid_file
-
-    @daemon_pid_file.setter
-    def daemon_pid_file(self, v: Path | None) -> None:
-        self.daemon.daemon_pid_file = v
-
-    @property
-    def queue_max_size(self) -> int:
-        return self.daemon.queue_max_size
-
-    @queue_max_size.setter
-    def queue_max_size(self, v: int) -> None:
-        self.daemon.queue_max_size = v
-
-    @property
-    def requester_queue_limit(self) -> int:
-        return self.daemon.requester_queue_limit
-
-    @requester_queue_limit.setter
-    def requester_queue_limit(self, v: int) -> None:
-        self.daemon.requester_queue_limit = v
-
-    @property
-    def requester_daily_limit(self) -> int:
-        return self.daemon.requester_daily_limit
-
-    @requester_daily_limit.setter
-    def requester_daily_limit(self, v: int) -> None:
-        self.daemon.requester_daily_limit = v
-
-    @property
-    def requester_rate_limit(self) -> int:
-        return self.daemon.requester_rate_limit
-
-    @requester_rate_limit.setter
-    def requester_rate_limit(self, v: int) -> None:
-        self.daemon.requester_rate_limit = v
-
-    @property
-    def requester_rate_window_seconds(self) -> int:
-        return self.daemon.requester_rate_window_seconds
-
-    @requester_rate_window_seconds.setter
-    def requester_rate_window_seconds(self, v: int) -> None:
-        self.daemon.requester_rate_window_seconds = v
-
-    @property
-    def request_max_budget_usd(self) -> float:
-        return self.daemon.request_max_budget_usd
-
-    @request_max_budget_usd.setter
-    def request_max_budget_usd(self, v: float) -> None:
-        self.daemon.request_max_budget_usd = v
-
-    @property
-    def request_max_description_chars(self) -> int:
-        return self.daemon.request_max_description_chars
-
-    @request_max_description_chars.setter
-    def request_max_description_chars(self, v: int) -> None:
-        self.daemon.request_max_description_chars = v
-
-    @property
-    def telegram_allow_public(self) -> bool:
-        return self.daemon.telegram_allow_public
-
-    @telegram_allow_public.setter
-    def telegram_allow_public(self, v: bool) -> None:
-        self.daemon.telegram_allow_public = v
-
-    @property
-    def webhook_require_auth(self) -> bool:
-        return self.daemon.webhook_require_auth
-
-    @webhook_require_auth.setter
-    def webhook_require_auth(self, v: bool) -> None:
-        self.daemon.webhook_require_auth = v
-
-    @property
-    def webhook_allow_unauthenticated_local(self) -> bool:
-        return self.daemon.webhook_allow_unauthenticated_local
-
-    @webhook_allow_unauthenticated_local.setter
-    def webhook_allow_unauthenticated_local(self, v: bool) -> None:
-        self.daemon.webhook_allow_unauthenticated_local = v
-
-    @property
-    def webhook_admin_secret(self) -> str:
-        return self.daemon.webhook_admin_secret
-
-    @webhook_admin_secret.setter
-    def webhook_admin_secret(self, v: str) -> None:
-        self.daemon.webhook_admin_secret = v
-
-    @property
-    def webhook_requester_header(self) -> str:
-        return self.daemon.webhook_requester_header
-
-    @webhook_requester_header.setter
-    def webhook_requester_header(self, v: str) -> None:
-        self.daemon.webhook_requester_header = v
-
-    @property
-    def webhook_trust_requester_header(self) -> bool:
-        return self.daemon.webhook_trust_requester_header
-
-    @webhook_trust_requester_header.setter
-    def webhook_trust_requester_header(self, v: bool) -> None:
-        self.daemon.webhook_trust_requester_header = v
-
-    @property
-    def webhook_idempotency_header(self) -> str:
-        return self.daemon.webhook_idempotency_header
-
-    @webhook_idempotency_header.setter
-    def webhook_idempotency_header(self, v: str) -> None:
-        self.daemon.webhook_idempotency_header = v
-
-    @property
-    def web_tools_enabled(self) -> bool:
-        return self.tools.web_tools_enabled
-
-    @web_tools_enabled.setter
-    def web_tools_enabled(self, v: bool) -> None:
-        self.tools.web_tools_enabled = v
-
-    @property
-    def search_backend(self) -> str:
-        return self.tools.search_backend
-
-    @search_backend.setter
-    def search_backend(self, v: str) -> None:
-        self.tools.search_backend = v
-
-    @property
-    def search_api_key(self) -> str:
-        return self.tools.search_api_key
-
-    @search_api_key.setter
-    def search_api_key(self, v: str) -> None:
-        self.tools.search_api_key = v
-
-    @property
-    def github_token(self) -> str:
-        return self.tools.github_token
-
-    @github_token.setter
-    def github_token(self, v: str) -> None:
-        self.tools.github_token = v
-
-    @property
-    def search_tree_enabled(self) -> bool:
-        return self.pipeline.search_tree_enabled
-
-    @search_tree_enabled.setter
-    def search_tree_enabled(self, v: bool) -> None:
-        self.pipeline.search_tree_enabled = v
-
-    @property
-    def search_tree_max_candidates(self) -> int:
-        return self.pipeline.search_tree_max_candidates
-
-    @search_tree_max_candidates.setter
-    def search_tree_max_candidates(self, v: int) -> None:
-        self.pipeline.search_tree_max_candidates = v
-
-    @property
-    def checkpoints_enabled(self) -> bool:
-        return self.pipeline.checkpoints_enabled
-
-    @checkpoints_enabled.setter
-    def checkpoints_enabled(self, v: bool) -> None:
-        self.pipeline.checkpoints_enabled = v
-
-    @property
-    def checkpoint_interval(self) -> int:
-        return self.pipeline.checkpoint_interval
-
-    @checkpoint_interval.setter
-    def checkpoint_interval(self, v: int) -> None:
-        self.pipeline.checkpoint_interval = v
-
-    @property
-    def confirm_phases(self) -> list[str]:
-        return self.pipeline.confirm_phases
-
-    @confirm_phases.setter
-    def confirm_phases(self, v: list[str]) -> None:
-        self.pipeline.confirm_phases = v
-
-    @property
-    def build_test_loops(self) -> int:
-        return self.pipeline.build_test_loops
-
-    @build_test_loops.setter
-    def build_test_loops(self, v: int) -> None:
-        self.pipeline.build_test_loops = v
-
-    @property
-    def speculative_enabled(self) -> bool:
-        return self.pipeline.speculative_enabled
-
-    @speculative_enabled.setter
-    def speculative_enabled(self, v: bool) -> None:
-        self.pipeline.speculative_enabled = v
-
-    @property
-    def hierarchical_decomp_enabled(self) -> bool:
-        return self.pipeline.hierarchical_decomp_enabled
-
-    @hierarchical_decomp_enabled.setter
-    def hierarchical_decomp_enabled(self, v: bool) -> None:
-        self.pipeline.hierarchical_decomp_enabled = v
-
-    @property
-    def evolution_enabled(self) -> bool:
-        return self.advanced.evolution_enabled
-
-    @evolution_enabled.setter
-    def evolution_enabled(self, v: bool) -> None:
-        self.advanced.evolution_enabled = v
-
-    @property
-    def prompt_optimization_enabled(self) -> bool:
-        return self.advanced.prompt_optimization_enabled
-
-    @prompt_optimization_enabled.setter
-    def prompt_optimization_enabled(self, v: bool) -> None:
-        self.advanced.prompt_optimization_enabled = v
-
-    @property
-    def process_reward_enabled(self) -> bool:
-        return self.advanced.process_reward_enabled
-
-    @process_reward_enabled.setter
-    def process_reward_enabled(self, v: bool) -> None:
-        self.advanced.process_reward_enabled = v
-
-    @property
-    def mcts_enabled(self) -> bool:
-        return self.advanced.mcts_enabled
-
-    @mcts_enabled.setter
-    def mcts_enabled(self, v: bool) -> None:
-        self.advanced.mcts_enabled = v
-
-    @property
-    def mcts_max_iterations(self) -> int:
-        return self.advanced.mcts_max_iterations
-
-    @mcts_max_iterations.setter
-    def mcts_max_iterations(self, v: int) -> None:
-        self.advanced.mcts_max_iterations = v
-
-    @property
-    def evomac_enabled(self) -> bool:
-        return self.advanced.evomac_enabled
-
-    @evomac_enabled.setter
-    def evomac_enabled(self, v: bool) -> None:
-        self.advanced.evomac_enabled = v
-
-    @property
-    def sica_enabled(self) -> bool:
-        return self.advanced.sica_enabled
-
-    @sica_enabled.setter
-    def sica_enabled(self, v: bool) -> None:
-        self.advanced.sica_enabled = v
-
-    @property
-    def rag_enabled(self) -> bool:
-        return self.advanced.rag_enabled
-
-    @rag_enabled.setter
-    def rag_enabled(self, v: bool) -> None:
-        self.advanced.rag_enabled = v
-
-    @property
-    def formal_verify_enabled(self) -> bool:
-        return self.advanced.formal_verify_enabled
-
-    @formal_verify_enabled.setter
-    def formal_verify_enabled(self, v: bool) -> None:
-        self.advanced.formal_verify_enabled = v
-
-    @property
-    def debate_enabled(self) -> bool:
-        return self.advanced.debate_enabled
-
-    @debate_enabled.setter
-    def debate_enabled(self, v: bool) -> None:
-        self.advanced.debate_enabled = v
-
-    @property
-    def security_scan_enabled(self) -> bool:
-        return self.advanced.security_scan_enabled
-
-    @security_scan_enabled.setter
-    def security_scan_enabled(self, v: bool) -> None:
-        self.advanced.security_scan_enabled = v
-
-    @property
-    def reflexion_enabled(self) -> bool:
-        return self.advanced.reflexion_enabled
-
-    @reflexion_enabled.setter
-    def reflexion_enabled(self, v: bool) -> None:
-        self.advanced.reflexion_enabled = v
-
-    @property
-    def adaptive_compute_enabled(self) -> bool:
-        return self.advanced.adaptive_compute_enabled
-
-    @adaptive_compute_enabled.setter
-    def adaptive_compute_enabled(self, v: bool) -> None:
-        self.advanced.adaptive_compute_enabled = v
-
-    @property
-    def ldb_debugger_enabled(self) -> bool:
-        return self.advanced.ldb_debugger_enabled
-
-    @ldb_debugger_enabled.setter
-    def ldb_debugger_enabled(self, v: bool) -> None:
-        self.advanced.ldb_debugger_enabled = v
-
-    @property
-    def lean_prover_enabled(self) -> bool:
-        return self.advanced.lean_prover_enabled
-
-    @lean_prover_enabled.setter
-    def lean_prover_enabled(self, v: bool) -> None:
-        self.advanced.lean_prover_enabled = v
-
-    @property
-    def capability_dag_enabled(self) -> bool:
-        return self.advanced.capability_dag_enabled
-
-    @capability_dag_enabled.setter
-    def capability_dag_enabled(self, v: bool) -> None:
-        self.advanced.capability_dag_enabled = v
-
-    @property
-    def theoretical_reasoning_enabled(self) -> bool:
-        return self.advanced.theoretical_reasoning_enabled
-
-    @theoretical_reasoning_enabled.setter
-    def theoretical_reasoning_enabled(self, v: bool) -> None:
-        self.advanced.theoretical_reasoning_enabled = v
-
-    @property
-    def context_budget_tokens(self) -> int:
-        return self.advanced.context_budget_tokens
-
-    @context_budget_tokens.setter
-    def context_budget_tokens(self, v: int) -> None:
-        self.advanced.context_budget_tokens = v
-
-    @property
-    def dag_ingest_confidence_threshold(self) -> float:
-        return self.advanced.dag_ingest_confidence_threshold
-
-    @dag_ingest_confidence_threshold.setter
-    def dag_ingest_confidence_threshold(self, v: float) -> None:
-        self.advanced.dag_ingest_confidence_threshold = v
-
-    @property
-    def dag_ingest_relevance_threshold(self) -> float:
-        return self.advanced.dag_ingest_relevance_threshold
-
-    @dag_ingest_relevance_threshold.setter
-    def dag_ingest_relevance_threshold(self, v: float) -> None:
-        self.advanced.dag_ingest_relevance_threshold = v
-
-    @property
-    def lean_mcts_iterations(self) -> int:
-        return self.advanced.lean_mcts_iterations
-
-    @lean_mcts_iterations.setter
-    def lean_mcts_iterations(self, v: int) -> None:
-        self.advanced.lean_mcts_iterations = v
-
-    @property
-    def lean_decomposition_depth(self) -> int:
-        return self.advanced.lean_decomposition_depth
-
-    @lean_decomposition_depth.setter
-    def lean_decomposition_depth(self, v: int) -> None:
-        self.advanced.lean_decomposition_depth = v
-
-    @property
-    def lean_auto_repair_passes(self) -> int:
-        return self.advanced.lean_auto_repair_passes
-
-    @lean_auto_repair_passes.setter
-    def lean_auto_repair_passes(self, v: int) -> None:
-        self.advanced.lean_auto_repair_passes = v
-
-    @property
-    def lean_mathlib_search_enabled(self) -> bool:
-        return self.advanced.lean_mathlib_search_enabled
-
-    @lean_mathlib_search_enabled.setter
-    def lean_mathlib_search_enabled(self, v: bool) -> None:
-        self.advanced.lean_mathlib_search_enabled = v
-
-    @property
-    def lean_pantograph_repl(self) -> bool:
-        return self.advanced.lean_pantograph_repl
-
-    @lean_pantograph_repl.setter
-    def lean_pantograph_repl(self, v: bool) -> None:
-        self.advanced.lean_pantograph_repl = v
-
-    @property
-    def coq_enabled(self) -> bool:
-        return self.advanced.coq_enabled
-
-    @coq_enabled.setter
-    def coq_enabled(self, v: bool) -> None:
-        self.advanced.coq_enabled = v
-
-    @property
-    def isabelle_enabled(self) -> bool:
-        return self.advanced.isabelle_enabled
-
-    @isabelle_enabled.setter
-    def isabelle_enabled(self, v: bool) -> None:
-        self.advanced.isabelle_enabled = v
-
-    @property
-    def tlaplus_enabled(self) -> bool:
-        return self.advanced.tlaplus_enabled
-
-    @tlaplus_enabled.setter
-    def tlaplus_enabled(self, v: bool) -> None:
-        self.advanced.tlaplus_enabled = v
-
-    @property
-    def z3_smt_enabled(self) -> bool:
-        return self.advanced.z3_smt_enabled
-
-    @z3_smt_enabled.setter
-    def z3_smt_enabled(self, v: bool) -> None:
-        self.advanced.z3_smt_enabled = v
-
-    @property
-    def dafny_enabled(self) -> bool:
-        return self.advanced.dafny_enabled
-
-    @dafny_enabled.setter
-    def dafny_enabled(self, v: bool) -> None:
-        self.advanced.dafny_enabled = v
-
-    @property
-    def project_goal_type(self) -> str:
-        return self.goal.project_goal_type
-
-    @project_goal_type.setter
-    def project_goal_type(self, v: str) -> None:
-        self.goal.project_goal_type = v
-
-    @property
-    def project_goal_description(self) -> str:
-        return self.goal.project_goal_description
-
-    @project_goal_description.setter
-    def project_goal_description(self, v: str) -> None:
-        self.goal.project_goal_description = v
-
-    @property
-    def project_goal_disciplines(self) -> list[str]:
-        return self.goal.project_goal_disciplines
-
-    @project_goal_disciplines.setter
-    def project_goal_disciplines(self, v: list[str]) -> None:
-        self.goal.project_goal_disciplines = v
-
-    @property
-    def autonomous_discovery_enabled(self) -> bool:
-        return self.advanced.autonomous_discovery_enabled
-
-    @autonomous_discovery_enabled.setter
-    def autonomous_discovery_enabled(self, v: bool) -> None:
-        self.advanced.autonomous_discovery_enabled = v
-
-    @property
-    def paper_formalizer_enabled(self) -> bool:
-        return self.advanced.paper_formalizer_enabled
-
-    @paper_formalizer_enabled.setter
-    def paper_formalizer_enabled(self, v: bool) -> None:
-        self.advanced.paper_formalizer_enabled = v
-
-    @property
-    def cloud_prover_enabled(self) -> bool:
-        return self.advanced.cloud_prover_enabled
-
-    @cloud_prover_enabled.setter
-    def cloud_prover_enabled(self, v: bool) -> None:
-        self.advanced.cloud_prover_enabled = v
+    # ── Backward-compatible sub-config delegation ──
+    # These names used to live on sub-config objects (daemon, tools, pipeline,
+    # advanced, goal).  __getattr__ / __setattr__ delegate transparently so
+    # existing code can keep using  config.xxx_enabled  without changes.
+
+    _SUB_CONFIG_NAMES: tuple[str, ...] = (
+        "daemon", "tools", "pipeline", "advanced", "goal",
+    )
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate unknown attributes to sub-configs for backward compat."""
+        for sub_name in ForgeConfig._SUB_CONFIG_NAMES:
+            try:
+                sub = object.__getattribute__(self, sub_name)
+            except AttributeError:
+                continue
+            if hasattr(type(sub), name) or name in sub.__dict__:
+                return getattr(sub, name)
+        raise AttributeError(f"{type(self).__name__!r} has no attribute {name!r}")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Route attribute sets to sub-configs when they own the field."""
+        # Always allow setting ForgeConfig's own dataclass fields and private attrs
+        own_fields = ForgeConfig.__dataclass_fields__
+        if name in own_fields or name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+        # Check sub-configs for the attribute
+        for sub_name in ForgeConfig._SUB_CONFIG_NAMES:
+            try:
+                sub = object.__getattribute__(self, sub_name)
+            except AttributeError:
+                continue
+            if hasattr(type(sub), name) or name in sub.__dict__:
+                setattr(sub, name, value)
+                return
+        # Fall back to normal set (e.g. for dynamically added attrs)
+        object.__setattr__(self, name, value)
 
     def __post_init__(self) -> None:
         if self.workspace_dir is None:
@@ -1024,54 +484,16 @@ class ForgeConfig:
         )
         daemon_pid_file = Path(daemon_pid_raw).expanduser() if daemon_pid_raw else None
 
-        daemon_max_concurrent_projects = _safe_int(
-            "FORGE_DAEMON_MAX_CONCURRENT_PROJECTS",
-            _to_int(global_config.get("daemon_max_concurrent_projects", 1), 1),
+        _cli = lambda env, key, default, minimum=1: _load_clamped_int(
+            env, key, global_config, default, minimum,
         )
-        if daemon_max_concurrent_projects < 1:
-            daemon_max_concurrent_projects = 1
-
-        queue_max_size = _safe_int(
-            "FORGE_QUEUE_MAX_SIZE",
-            _to_int(global_config.get("queue_max_size", 200), 200),
-        )
-        if queue_max_size < 1:
-            queue_max_size = 1
-
-        requester_queue_limit = _safe_int(
-            "FORGE_REQUESTER_QUEUE_LIMIT",
-            _to_int(global_config.get("requester_queue_limit", 3), 3),
-        )
-        if requester_queue_limit < 1:
-            requester_queue_limit = 1
-
-        requester_daily_limit = _safe_int(
-            "FORGE_REQUESTER_DAILY_LIMIT",
-            _to_int(global_config.get("requester_daily_limit", 20), 20),
-        )
-        if requester_daily_limit < 1:
-            requester_daily_limit = 1
-
-        requester_rate_limit = _safe_int(
-            "FORGE_REQUESTER_RATE_LIMIT",
-            _to_int(global_config.get("requester_rate_limit", 5), 5),
-        )
-        if requester_rate_limit < 1:
-            requester_rate_limit = 1
-
-        requester_rate_window_seconds = _safe_int(
-            "FORGE_REQUESTER_RATE_WINDOW_SECONDS",
-            _to_int(global_config.get("requester_rate_window_seconds", 60), 60),
-        )
-        if requester_rate_window_seconds < 1:
-            requester_rate_window_seconds = 1
-
-        request_max_description_chars = _safe_int(
-            "FORGE_REQUEST_MAX_DESCRIPTION_CHARS",
-            _to_int(global_config.get("request_max_description_chars", 10000), 10000),
-        )
-        if request_max_description_chars < 100:
-            request_max_description_chars = 100
+        daemon_max_concurrent_projects = _cli("FORGE_DAEMON_MAX_CONCURRENT_PROJECTS", "daemon_max_concurrent_projects", 1)
+        queue_max_size = _cli("FORGE_QUEUE_MAX_SIZE", "queue_max_size", 200)
+        requester_queue_limit = _cli("FORGE_REQUESTER_QUEUE_LIMIT", "requester_queue_limit", 3)
+        requester_daily_limit = _cli("FORGE_REQUESTER_DAILY_LIMIT", "requester_daily_limit", 20)
+        requester_rate_limit = _cli("FORGE_REQUESTER_RATE_LIMIT", "requester_rate_limit", 5)
+        requester_rate_window_seconds = _cli("FORGE_REQUESTER_RATE_WINDOW_SECONDS", "requester_rate_window_seconds", 60)
+        request_max_description_chars = _cli("FORGE_REQUEST_MAX_DESCRIPTION_CHARS", "request_max_description_chars", 10000, minimum=100)
 
         request_max_budget_usd = _safe_float(
             "FORGE_REQUEST_MAX_BUDGET_USD",

@@ -6,12 +6,13 @@ FileExistsError-based race detection using os.open with O_CREAT|O_EXCL).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,16 @@ class LockManager:
             logger.debug(f"Task {task_id} already claimed by {existing}")
             return False
 
+    @contextlib.contextmanager
+    def claim(self, task_id: str, agent_id: str) -> Iterator[bool]:
+        """Context manager: claim a task and auto-release on exit."""
+        claimed = self.try_claim(task_id, agent_id)
+        try:
+            yield claimed
+        finally:
+            if claimed:
+                self.release(task_id, agent_id)
+
     def release(self, task_id: str, agent_id: str) -> bool:
         """Release a task lock. Only the owner can release."""
         lock_path = self.lock_dir / f"{task_id}.lock"
@@ -72,7 +83,7 @@ class LockManager:
             self._lock_cache.pop(task_id, None)
             return False
 
-    def get_owner(self, task_id: str) -> Optional[str]:
+    def get_owner(self, task_id: str) -> str | None:
         """Query who owns a task lock."""
         lock_path = self.lock_dir / f"{task_id}.lock"
         try:
@@ -80,7 +91,7 @@ class LockManager:
         except (FileNotFoundError, OSError):
             return None
 
-    def _read_owner(self, lock_path: Path) -> Optional[str]:
+    def _read_owner(self, lock_path: Path) -> str | None:
         """Read the owner from a lock file (symlink or regular file)."""
         if _IS_WINDOWS:
             if lock_path.exists():

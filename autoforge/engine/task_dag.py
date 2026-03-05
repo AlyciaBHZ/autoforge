@@ -7,7 +7,6 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +38,8 @@ class Task:
     status: TaskStatus = TaskStatus.TODO
     depends_on: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
-    claimed_by: Optional[str] = None
-    result: Optional[str] = None
+    claimed_by: str | None = None
+    result: str | None = None
     acceptance_criteria: str = ""
     retry_count: int = 0
 
@@ -73,7 +72,7 @@ class TaskDAG:
     def add_task(self, task: Task) -> None:
         self._tasks[task.id] = task
 
-    def get_task(self, task_id: str) -> Optional[Task]:
+    def get_task(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)
 
     def get_all_tasks(self) -> list[Task]:
@@ -96,7 +95,7 @@ class TaskDAG:
     def get_tasks_by_phase(self, phase: TaskPhase) -> list[Task]:
         return [t for t in self._tasks.values() if t.phase == phase]
 
-    def has_pending_tasks(self, phase: Optional[TaskPhase] = None) -> bool:
+    def has_pending_tasks(self, phase: TaskPhase | None = None) -> bool:
         """Check if there are tasks not yet done."""
         tasks = self.get_tasks_by_phase(phase) if phase else self.get_all_tasks()
         return any(

@@ -206,10 +206,10 @@ class AgentBase(ABC):
         files_written_list: list[str] = []
         # --- Anti-spin tracking (Section B) ---
         last_write_turn = 0  # last turn that called write_file
-        is_write_agent = bool(self.WRITE_TOOLS & {t.name for t in self._tools})  # spin detection only for write-capable agents
+        has_write_tools = bool(self.WRITE_TOOLS & {t.name for t in self._tools})
 
         # --- Checkpoint setup (Section E) ---
-        checkpoint_enabled = is_write_agent and self.MAX_TURNS >= 15
+        checkpoint_enabled = has_write_tools and self.MAX_TURNS >= 15
         if checkpoint_enabled:
             from autoforge.engine.checkpoints import CheckpointManager
             self._checkpoint_mgr = CheckpointManager(
@@ -284,7 +284,7 @@ class AgentBase(ABC):
                         last_write_turn = turns
 
                     # --- Anti-spin detection (Section B) ---
-                    if is_write_agent and self.mode != "research":
+                    if has_write_tools and self.mode != "research":
                         idle_turns = turns - last_write_turn
 
                         # Hard fail: too many turns without writing
@@ -340,7 +340,6 @@ class AgentBase(ABC):
                                 files_written = 0
                                 last_write_turn = 0
                                 tool_counts = {}
-                                idle_turns = 0
                                 reset_msg = (
                                     f"\n\n[CHECKPOINT RESET — Turn {turns}]\n"
                                     f"Your previous approach scored {verdict.score:.1f}/1.0.\n"

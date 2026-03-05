@@ -99,6 +99,13 @@ class Orchestrator:
         self._article_verifier: Any = None
         self._init_engines()
 
+    @property
+    def _forge_dir(self) -> Path:
+        """Return (and create) the per-project .autoforge metadata directory."""
+        d = self.project_dir / ".autoforge"
+        d.mkdir(exist_ok=True)
+        return d
+
     def _agent(self, role: str, *args: Any, **kwargs: Any) -> Any:
         """Instantiate an agent by role name via AGENT_REGISTRY.
 
@@ -878,7 +885,7 @@ class Orchestrator:
             # Estimate task difficulty if adaptive_compute is available
             difficulty_level = "standard"  # fallback
             difficulty_multiplier = 1.0
-            if hasattr(self, "_adaptive_compute"):
+            if self._adaptive_compute is not None:
                 try:
                     difficulty = await self._adaptive_compute.estimate_difficulty(task.description)
                     difficulty_level = difficulty.level.value if hasattr(difficulty.level, "value") else str(difficulty.level)
@@ -1598,10 +1605,7 @@ class Orchestrator:
         for internal_file in ["spec.json", "dev_plan.json", "test_results.json", "architecture.md"]:
             p = self.project_dir / internal_file
             if p.exists():
-                # Move to a .autoforge subdirectory
-                forge_dir = self.project_dir / ".autoforge"
-                forge_dir.mkdir(exist_ok=True)
-                p.rename(forge_dir / internal_file)
+                p.rename(self._forge_dir / internal_file)
 
         console.print("  [green]Project packaged[/green]")
 
@@ -1697,9 +1701,7 @@ class Orchestrator:
         }
 
         # Save report
-        forge_dir = self.project_dir / ".autoforge"
-        forge_dir.mkdir(exist_ok=True)
-        (forge_dir / "review_report.json").write_text(
+        (self._forge_dir / "review_report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
@@ -2243,9 +2245,7 @@ class Orchestrator:
                 run_security=False,  # Security scan runs separately
             )
             # Save report
-            forge_dir = self.project_dir / ".autoforge"
-            forge_dir.mkdir(exist_ok=True)
-            (forge_dir / "formal_verify_report.json").write_text(
+            (self._forge_dir / "formal_verify_report.json").write_text(
                 json.dumps(report.to_dict(), indent=2), encoding="utf-8",
             )
             if report.errors > 0:
@@ -2266,9 +2266,7 @@ class Orchestrator:
             report = await self._security_scanner.scan(
                 self.project_dir, llm=self.llm,
             )
-            forge_dir = self.project_dir / ".autoforge"
-            forge_dir.mkdir(exist_ok=True)
-            (forge_dir / "security_report.json").write_text(
+            (self._forge_dir / "security_report.json").write_text(
                 json.dumps(report.to_dict(), indent=2), encoding="utf-8",
             )
             if not report.passed:
