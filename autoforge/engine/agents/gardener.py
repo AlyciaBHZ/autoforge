@@ -8,13 +8,13 @@ import re
 from pathlib import Path
 from typing import Any
 
-from autoforge.engine.agent_base import AgentBase, ToolDefinition
+from autoforge.engine.agent_base import AgentBase, FileToolsMixin, ToolDefinition
 from autoforge.engine.llm_router import TaskComplexity
 
 logger = logging.getLogger(__name__)
 
 
-class GardenerAgent(AgentBase):
+class GardenerAgent(FileToolsMixin, AgentBase):
     """Improves code quality through targeted refactoring.
 
     Only refactors when there are specific, actionable issues from the Reviewer.
@@ -115,51 +115,6 @@ class GardenerAgent(AgentBase):
                 handler=handle_fetch_url,
             ))
 
-    # 2 MB per file limit to prevent runaway writes (matches builder)
-    MAX_FILE_SIZE = 2 * 1024 * 1024
-
-    def _validate_path(self, rel_path: str) -> Path:
-        """Validate and resolve a relative path, preventing path traversal."""
-        return self.validate_path(rel_path, self.working_dir)
-
-    async def _handle_write_file(self, input_data: dict[str, Any]) -> str:
-        rel_path = input_data["path"]
-        content = input_data["content"]
-        if len(content) > self.MAX_FILE_SIZE:
-            return json.dumps({
-                "error": f"File too large ({len(content)} bytes). Max is {self.MAX_FILE_SIZE} bytes.",
-            })
-        full_path = self._validate_path(rel_path)
-        full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_text(content, encoding="utf-8")
-        self._artifacts[rel_path] = str(full_path)
-        return json.dumps({"status": "ok", "path": rel_path})
-
-    async def _handle_read_file(self, input_data: dict[str, Any]) -> str:
-        rel_path = input_data["path"]
-        full_path = self._validate_path(rel_path)
-        if not full_path.exists():
-            return json.dumps({"error": f"File not found: {rel_path}"})
-        return full_path.read_text(encoding="utf-8")
-
-    async def _handle_list_files(self, input_data: dict[str, Any]) -> str:
-        rel_path = input_data.get("path", ".")
-        full_path = self._validate_path(rel_path)
-        if not full_path.is_dir():
-            return json.dumps({"error": f"Not a directory: {rel_path}"})
-        base_resolved = self.working_dir.resolve()
-        files = []
-        for p in sorted(full_path.rglob("*")):
-            if p.is_file() and ".git" not in p.parts:
-                # Prevent symlinks from escaping the workspace
-                if not p.resolve().is_relative_to(base_resolved):
-                    continue
-                try:
-                    files.append(str(p.relative_to(self.working_dir)))
-                except ValueError:
-                    continue
-        return json.dumps(files)
-
     def build_prompt(self, context: dict[str, Any]) -> str:
         review = context.get("review", {})
         spec = context.get("spec", {})
@@ -193,20 +148,9 @@ class GardenerAgent(AgentBase):
 
     def parse_changes(self, output: str) -> dict[str, Any]:
         """Extract change summary from output."""
-        raw: str | None = None
-        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
-        if match:
-            raw = match.group(1).strip()
-        else:
-            start = output.find("{")
-            end = output.rfind("}")
-            if start != -1 and end != -1:
-                raw = output[start : end + 1]
-
-        if raw is not None:
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError as e:
-                logger.warning(f"Invalid JSON in gardener output: {e}")
-
-        return {"changes_made": [], "summary": output[:500]}
+        from autoforge.engine.utils import extract_json_from_text
+        try:
+            return extract_json_from_text(output)
+        except ValueError as e:
+            logger.warning("Could not extract JSON from gardener output: %s", e)
+            return {"changes_made": [], "summary": output[:500]}

@@ -110,29 +110,11 @@ class DirectorAgent(AgentBase):
 
     def parse_spec(self, output: str) -> dict[str, Any]:
         """Extract JSON spec from the Director's output text."""
-        # Try to find a JSON code block
-        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1).strip())
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Found JSON code block in Director output but it contains invalid JSON: {e}"
-                ) from e
-
-        # Fallback: try parsing the entire output as JSON
-        # Find the first { and last }
-        start = output.find("{")
-        end = output.rfind("}")
-        if start != -1 and end != -1:
-            try:
-                return json.loads(output[start : end + 1])
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Found JSON-like content in Director output but it is invalid: {e}"
-                ) from e
-
-        raise ValueError("Could not extract JSON spec from Director output")
+        from autoforge.engine.utils import extract_json_from_text
+        try:
+            return extract_json_from_text(output)
+        except ValueError as e:
+            raise ValueError(f"Could not extract JSON spec from Director output: {e}") from e
 
 
 class DirectorFixAgent(AgentBase):
@@ -142,11 +124,28 @@ class DirectorFixAgent(AgentBase):
     targeted fix tasks for the Builder.
     """
 
-    ROLE = "director"
+    ROLE = "director_fix"
     COMPLEXITY = TaskComplexity.HIGH
 
     def _register_tools(self) -> None:
         self._tools = []
+
+    def _load_system_prompt(self) -> None:
+        """Load system prompt, falling back to director.md if no dedicated file."""
+        prompt_path = self.config.constitution_dir / "agents" / f"{self.ROLE}.md"
+        if prompt_path.exists():
+            self._system_prompt = prompt_path.read_text(encoding="utf-8")
+        else:
+            # Fall back to base director prompt with fix-specific addendum
+            base_path = self.config.constitution_dir / "agents" / "director.md"
+            if base_path.exists():
+                self._system_prompt = base_path.read_text(encoding="utf-8")
+            else:
+                self._system_prompt = f"You are the {self.ROLE} agent in the AutoForge system."
+            self._system_prompt += (
+                "\n\nYou are in FIX mode: analyze test failures and "
+                "produce targeted fix tasks for the Builder agent."
+            )
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         failure = context.get("failure", {})
@@ -172,21 +171,8 @@ class DirectorFixAgent(AgentBase):
 
     def parse_fix_task(self, output: str) -> dict[str, Any]:
         """Extract fix task from output."""
-        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1).strip())
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Found JSON code block in fix task output but it contains invalid JSON: {e}"
-                ) from e
-        start = output.find("{")
-        end = output.rfind("}")
-        if start != -1 and end != -1:
-            try:
-                return json.loads(output[start : end + 1])
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Found JSON-like content in fix task output but it is invalid: {e}"
-                ) from e
-        raise ValueError("Could not extract fix task from Director output")
+        from autoforge.engine.utils import extract_json_from_text
+        try:
+            return extract_json_from_text(output)
+        except ValueError as e:
+            raise ValueError(f"Could not extract fix task from Director output: {e}") from e

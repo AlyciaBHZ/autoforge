@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from autoforge.engine.agent_base import AgentBase, ToolDefinition
+from autoforge.engine.agent_base import AgentBase, FileToolsMixin, ToolDefinition
 from autoforge.engine.llm_router import TaskComplexity
 from autoforge.engine.sandbox import SandboxBase
 
@@ -29,7 +29,7 @@ class TestResults:
         return [r for r in self.results if not r.get("passed", True)]
 
 
-class TesterAgent(AgentBase):
+class TesterAgent(FileToolsMixin, AgentBase):
     """Verifies that the generated project builds, runs, and functions correctly.
 
     Detects the project type, installs dependencies, runs builds and tests,
@@ -82,32 +82,6 @@ class TesterAgent(AgentBase):
                 handler=self._handle_read_file,
             ),
         ]
-
-    async def _handle_run_command(self, input_data: dict[str, Any]) -> str:
-        command = input_data["command"]
-        if self.sandbox:
-            result = await self.sandbox.exec(command)
-            return json.dumps({
-                "exit_code": result.exit_code,
-                "stdout": result.stdout[:5000],
-                "stderr": result.stderr[:2000],
-                "timed_out": result.timed_out,
-            })
-        else:
-            return json.dumps({
-                "warning": "No sandbox available, command not executed",
-                "command": command,
-            })
-
-    async def _handle_read_file(self, input_data: dict[str, Any]) -> str:
-        rel_path = input_data["path"]
-        try:
-            full_path = self.validate_path(rel_path, self.working_dir)
-        except ValueError:
-            return json.dumps({"error": "Path traversal not allowed"})
-        if not full_path.exists():
-            return json.dumps({"error": f"File not found: {rel_path}"})
-        return full_path.read_text(encoding="utf-8")
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         spec = context.get("spec", {})
@@ -166,24 +140,11 @@ class TesterAgent(AgentBase):
         """Extract structured test results from output."""
         _fail = TestResults(all_passed=False, summary="Could not parse test results — treating as failure")
 
-        raw: str | None = None
-        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
-        if match:
-            raw = match.group(1).strip()
-        else:
-            start = output.find("{")
-            end = output.rfind("}")
-            if start != -1 and end != -1:
-                raw = output[start : end + 1]
-
-        if raw is None:
-            logger.warning("Could not find JSON in test output, treating as failure")
-            return _fail
-
+        from autoforge.engine.utils import extract_json_from_text
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Invalid JSON in test results: {e}")
+            data = extract_json_from_text(output)
+        except ValueError as e:
+            logger.warning("Could not find JSON in test output: %s", e)
             return _fail
 
         return TestResults(

@@ -154,6 +154,8 @@ class TaskDAG:
 
     def reset_failed(self, task_id: str) -> None:
         """Reset a failed task to TODO for retry."""
+        if task_id not in self._tasks:
+            raise ValueError(f"Unknown task: {task_id}")
         task = self._tasks[task_id]
         if task.status == TaskStatus.FAILED:
             task.status = TaskStatus.TODO

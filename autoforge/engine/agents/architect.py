@@ -155,16 +155,11 @@ class ArchitectAgent(AgentBase):
 
     def parse_architecture(self, output: str) -> dict[str, Any]:
         """Extract architecture and tasks from the Architect's output."""
-        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", output, re.DOTALL)
-        if match:
-            return json.loads(match.group(1).strip())
-
-        start = output.find("{")
-        end = output.rfind("}")
-        if start != -1 and end != -1:
-            return json.loads(output[start : end + 1])
-
-        raise ValueError("Could not extract architecture from Architect output")
+        from autoforge.engine.utils import extract_json_from_text
+        try:
+            return extract_json_from_text(output)
+        except (ValueError, json.JSONDecodeError) as e:
+            raise ValueError(f"Could not extract architecture from Architect output: {e}") from e
 
     async def generate_diverse_architectures(
         self,

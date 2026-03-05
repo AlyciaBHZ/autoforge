@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine
 
 from autoforge.engine.config import ForgeConfig
-from autoforge.engine.llm_router import LLMRouter, TaskComplexity
+from autoforge.engine.llm_router import BudgetExceededError, LLMRouter, TaskComplexity
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,86 @@ class AgentResult:
     duration_seconds: float = 0.0
     files_written: int = 0
     tool_calls: dict[str, int] = field(default_factory=dict)
+
+
+class FileToolsMixin:
+    """Mixin providing standard file tool handlers for agents with a working_dir.
+
+    Subclasses must set ``self.working_dir`` (a :class:`Path`) before using
+    these handlers.  Each handler returns a JSON string suitable for the
+    agentic tool-use loop.
+    """
+
+    # 2 MB per file limit to prevent runaway writes
+    MAX_FILE_SIZE = 2 * 1024 * 1024
+
+    # --- handlers -----------------------------------------------------------
+
+    async def _handle_read_file(self, input_data: dict[str, Any]) -> str:
+        rel_path = input_data["path"]
+        try:
+            full_path = AgentBase.validate_path(rel_path, self.working_dir)  # type: ignore[attr-defined]
+        except ValueError:
+            return json.dumps({"error": "Path traversal not allowed"})
+        if not full_path.exists():
+            return json.dumps({"error": f"File not found: {rel_path}"})
+        try:
+            return full_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return json.dumps({"error": f"Cannot read binary file: {rel_path}"})
+
+    async def _handle_write_file(self, input_data: dict[str, Any]) -> str:
+        rel_path = input_data["path"]
+        content = input_data["content"]
+        if len(content) > self.MAX_FILE_SIZE:
+            return json.dumps({
+                "error": f"File too large ({len(content)} bytes). Max is {self.MAX_FILE_SIZE} bytes.",
+            })
+        try:
+            full_path = AgentBase.validate_path(rel_path, self.working_dir)  # type: ignore[attr-defined]
+        except ValueError:
+            return json.dumps({"error": "Path traversal not allowed"})
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content, encoding="utf-8")
+        self._artifacts[rel_path] = str(full_path)  # type: ignore[attr-defined]
+        return json.dumps({"status": "ok", "path": rel_path, "bytes": len(content)})
+
+    async def _handle_list_files(self, input_data: dict[str, Any]) -> str:
+        rel_path = input_data.get("path", ".")
+        try:
+            full_path = AgentBase.validate_path(rel_path, self.working_dir)  # type: ignore[attr-defined]
+        except ValueError:
+            return json.dumps({"error": "Path traversal not allowed"})
+        if not full_path.is_dir():
+            return json.dumps({"error": f"Not a directory: {rel_path}"})
+        base_resolved = self.working_dir.resolve()  # type: ignore[attr-defined]
+        files = []
+        for p in sorted(full_path.rglob("*")):
+            if p.is_file() and ".git" not in p.parts:
+                # Prevent symlinks from escaping the workspace
+                if not p.resolve().is_relative_to(base_resolved):
+                    continue
+                try:
+                    files.append(str(p.relative_to(self.working_dir)))  # type: ignore[attr-defined]
+                except ValueError:
+                    continue
+        return json.dumps(files)
+
+    async def _handle_run_command(self, input_data: dict[str, Any]) -> str:
+        command = input_data["command"]
+        if getattr(self, "sandbox", None):
+            result = await self.sandbox.exec(command)  # type: ignore[attr-defined]
+            return json.dumps({
+                "exit_code": result.exit_code,
+                "stdout": result.stdout[:5000],
+                "stderr": result.stderr[:2000],
+                "timed_out": getattr(result, "timed_out", False),
+            })
+        else:
+            return json.dumps({
+                "warning": "No sandbox available, command not executed",
+                "command": command,
+            })
 
 
 class AgentBase(ABC):
@@ -338,6 +418,7 @@ class AgentBase(ABC):
                                 # spin-detection false positives and
                                 # accumulated metric drift after rollback.
                                 files_written = 0
+                                files_written_list = []
                                 last_write_turn = 0
                                 tool_counts = {}
                                 reset_msg = (
@@ -375,6 +456,8 @@ class AgentBase(ABC):
 
             return _build_result(True)
 
+        except BudgetExceededError:
+            raise  # Propagate budget errors to the orchestrator
         except Exception as e:
             self._log_action("failed", str(e))
             return _build_result(False, error=str(e))
