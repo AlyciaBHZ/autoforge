@@ -680,7 +680,6 @@ class FormalizationPipeline:
     MCTS_TIMEOUT_PER_SORRY = 30  # seconds per sorry gap
 
     def __init__(self, *, use_mcts: bool = True) -> None:
-        self._formalization_cache: dict[str, str] = {}
         self._use_mcts = use_mcts
 
     async def formalize_claim(
@@ -744,7 +743,14 @@ class FormalizationPipeline:
                         claim.lean_formalization = lean_code
                         re_verify = await self._verify_lean(lean_code)
                         if re_verify["success"]:
+                            # MCTS replacement compiled — use updated result
                             verify_result = re_verify
+                        else:
+                            # MCTS replacement broke compilation — revert
+                            logger.warning(
+                                "[MCTS] Sorry replacement broke compilation for %s, "
+                                "keeping original code", claim.label,
+                            )
                     # ────────────────────────────────────────────────
                     if verify_result["sorry_count"] > 0:
                         claim.verification_status = VerificationStatus.VERIFIED_WITH_SORRY
@@ -874,6 +880,7 @@ class FormalizationPipeline:
         searcher = RLProofSearch(config, llm)
 
         # Optionally hook up Pantograph as the verifier for tactic application
+        repl = None
         try:
             from autoforge.engine.provers.pantograph_repl import (
                 PantographConfig,
@@ -887,44 +894,45 @@ class FormalizationPipeline:
 
         # Process sorry blocks in reverse order to keep offsets stable
         result_code = lean_code
-        for block in reversed(sorry_blocks):
-            # Build a proof search query from the goal hint
-            goal_query = (
-                f"-- Context from article claim: {claim.label}\n"
-                f"-- Local proof state before sorry:\n"
-                f"{block['goal_hint']}\n"
-                f"-- Goal: Fill in a valid Lean 4 tactic proof for `sorry`"
-            )
-            try:
-                proved, proof_text, _experiences = await asyncio.wait_for(
-                    searcher.search(goal_query, max_depth=self.MCTS_MAX_DEPTH),
-                    timeout=self.MCTS_TIMEOUT_PER_SORRY,
+        try:
+            for block in reversed(sorry_blocks):
+                # Build a proof search query from the goal hint
+                goal_query = (
+                    f"-- Context from article claim: {claim.label}\n"
+                    f"-- Local proof state before sorry:\n"
+                    f"{block['goal_hint']}\n"
+                    f"-- Goal: Fill in a valid Lean 4 tactic proof for `sorry`"
                 )
-            except (asyncio.TimeoutError, Exception) as exc:
-                logger.debug(
-                    "[MCTS] Search timed out or failed for sorry at offset %d: %s",
-                    block["start"], exc,
-                )
-                continue
+                try:
+                    proved, proof_text, _experiences = await asyncio.wait_for(
+                        searcher.search(goal_query, max_depth=self.MCTS_MAX_DEPTH),
+                        timeout=self.MCTS_TIMEOUT_PER_SORRY,
+                    )
+                except (asyncio.TimeoutError, Exception) as exc:
+                    logger.debug(
+                        "[MCTS] Search timed out or failed for sorry at offset %d: %s",
+                        block["start"], exc,
+                    )
+                    continue
 
-            if proved and proof_text:
-                # Splice the discovered proof in place of ``sorry``
-                result_code = (
-                    result_code[: block["start"]]
-                    + proof_text.strip()
-                    + result_code[block["end"] :]
-                )
-                logger.info(
-                    "[MCTS] Replaced sorry at offset %d with %d-char proof",
-                    block["start"], len(proof_text),
-                )
-
-        # Clean up Pantograph REPL if we started one
-        if hasattr(searcher, "verifier") and hasattr(searcher.verifier, "stop"):
-            try:
-                await searcher.verifier.stop()
-            except Exception:
-                pass
+                if proved and proof_text:
+                    # Splice the discovered proof in place of ``sorry``
+                    result_code = (
+                        result_code[: block["start"]]
+                        + proof_text.strip()
+                        + result_code[block["end"] :]
+                    )
+                    logger.info(
+                        "[MCTS] Replaced sorry at offset %d with %d-char proof",
+                        block["start"], len(proof_text),
+                    )
+        finally:
+            # Clean up Pantograph REPL if we started one
+            if repl is not None:
+                try:
+                    await repl.stop()
+                except Exception:
+                    pass
 
         return result_code
 
@@ -1059,13 +1067,14 @@ Return ONLY the corrected Lean 4 code:
                 f.write(lean_code)
                 lean_file = Path(f.name)
 
-            result = await lean_env.verify_file(lean_file)
-
-            # Cleanup
             try:
-                lean_file.unlink()
-            except OSError:
-                pass
+                result = await lean_env.verify_file(lean_file)
+            finally:
+                # Always clean up temp file
+                try:
+                    lean_file.unlink()
+                except OSError:
+                    pass
 
             return {
                 "success": result.success,
@@ -1234,18 +1243,30 @@ class ArticleVerifier:
         return claim
 
     def _topological_sort(self, claims: list[VerifiableClaim]) -> list[VerifiableClaim]:
-        """Topologically sort claims by dependency order."""
+        """Topologically sort claims by dependency order.
+
+        Raises ValueError if a cycle is detected.
+        """
         claim_map = {c.id: c for c in claims}
         visited: set[str] = set()
+        in_stack: set[str] = set()
         result: list[VerifiableClaim] = []
 
         def visit(cid: str) -> None:
-            if cid in visited or cid not in claim_map:
+            if cid not in claim_map:
                 return
+            if cid in in_stack:
+                raise ValueError(
+                    f"Circular dependency detected involving claim {cid}"
+                )
+            if cid in visited:
+                return
+            in_stack.add(cid)
             visited.add(cid)
             claim = claim_map[cid]
             for dep in claim.dependencies:
                 visit(dep)
+            in_stack.discard(cid)
             result.append(claim)
 
         for claim in claims:

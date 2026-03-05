@@ -691,8 +691,15 @@ class StatisticalAnalyzer:
         std = stats["std"]
         n = stats["count"]
 
-        # Approximate t-value for 95% CI (two-tailed)
-        t_approx = 1.96 if n > 30 else 2.042  # Simple approximation
+        # t-value for 95% CI (two-tailed) — lookup for small samples
+        _t_table = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571,
+                     7: 2.447, 8: 2.365, 9: 2.306, 10: 2.262, 15: 2.145,
+                     20: 2.093, 25: 2.064, 30: 2.045}
+        if n > 30:
+            t_approx = 1.96
+        else:
+            # Find closest df in table
+            t_approx = min(_t_table.items(), key=lambda kv: abs(kv[0] - n))[1]
         margin_of_error = t_approx * (std / (n ** 0.5))
 
         return {
@@ -789,15 +796,17 @@ class ExperimentRunner:
             sandbox = SubprocessSandbox(work_dir)
             await sandbox.start()
 
-            if hasattr(sandbox, "exec_args"):
-                result = await sandbox.exec_args(
-                    [exec_config.python_executable, "experiment.py"],
-                    timeout=exec_config.execution_timeout,
-                )
-            else:
-                command = f"{exec_config.python_executable} experiment.py"
-                result = await sandbox.exec(command, timeout=exec_config.execution_timeout)
-            await sandbox.stop()
+            try:
+                if hasattr(sandbox, "exec_args"):
+                    result = await sandbox.exec_args(
+                        [exec_config.python_executable, "experiment.py"],
+                        timeout=exec_config.execution_timeout,
+                    )
+                else:
+                    command = f"{exec_config.python_executable} experiment.py"
+                    result = await sandbox.exec(command, timeout=exec_config.execution_timeout)
+            finally:
+                await sandbox.stop()
 
             execution_time = time.time() - start_time
 
@@ -1097,9 +1106,11 @@ class ExperimentLoop:
         """
         self.logger.info(f"Starting experiment loop for: {research_question}")
 
+        # Reset ranker state so previous run data doesn't contaminate this run
+        self.ranker = HypothesisRanker()
+
         iterations: list[ExperimentIteration] = []
-        best_iteration: ExperimentIteration | None = None
-        best_metric: float = 0.0
+        best_metric: float = float("-inf")
 
         # Phase 1: Generate initial hypotheses
         self.logger.info("Phase 1: Generating initial hypotheses")
@@ -1177,7 +1188,6 @@ class ExperimentLoop:
                 self.ranker.observe(current_hypothesis, first_metric)
                 if first_metric > best_metric:
                     best_metric = first_metric
-                    best_iteration = iteration
                     code_attempts = 0
             else:
                 # Record failure as low outcome so BO steers away
@@ -1202,7 +1212,7 @@ class ExperimentLoop:
                 if code_attempts >= self.config.max_code_attempts:
                     self.logger.warning("Max code attempts reached")
                     break
-                continue  # Retry without counting as a new iteration
+                continue  # Retry code fix (still consumes one loop iteration)
             elif next_action in ("accept", "reject"):
                 self.logger.info(f"Hypothesis {next_action}ed")
                 break
