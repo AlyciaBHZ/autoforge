@@ -1861,6 +1861,9 @@ class EloTournament:
             hypothesis_id: Unique identifier for the hypothesis.
             initial_rating: Optional custom initial rating (default 1500).
         """
+        if hypothesis_id in self._ratings:
+            return
+
         rating = initial_rating if initial_rating is not None else self.initial_rating
         self._ratings[hypothesis_id] = EloRating(
             hypothesis_id=hypothesis_id, rating=rating
@@ -2035,6 +2038,21 @@ Respond in JSON:
                 self.register_hypothesis(hyp_id)
 
         n = len(hypotheses)
+        if n == 0:
+            return {
+                "total_matches": 0,
+                "rankings": [],
+                "top_5": [],
+                "stats": self.get_tournament_stats(),
+            }
+        if n == 1:
+            return {
+                "total_matches": 0,
+                "rankings": self.get_rankings(),
+                "top_5": self.get_top_k(5),
+                "stats": self.get_tournament_stats(),
+            }
+
         if rounds is None:
             rounds = max(3, math.ceil(math.log2(n)))
 
@@ -2104,3 +2122,134 @@ Respond in JSON:
             "avg_win_rate": sum(r.win_rate() for r in ratings_list) / len(ratings_list),
             "draws_count": sum(1 for m in self._match_history if m.is_draw),
         }
+
+
+@dataclass
+class Hypothesis:
+    """Structured hypothesis item used by HypothesisTournament."""
+
+    id: str
+    statement: str
+    novelty: float = 0.5
+    depth: float = 0.5
+    verification_confidence: float = 0.5
+    seed_round: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HypothesisMatch:
+    """Recorded match between two hypotheses."""
+
+    round_index: int
+    hypothesis_a: str
+    hypothesis_b: str
+    winner_id: str
+    loser_id: str
+    score_a: float
+    score_b: float
+
+
+class HypothesisTournament:
+    """Deterministic Elo-based tournament for discovery hypotheses."""
+
+    K_FACTOR = 32.0
+
+    def __init__(self, initial_rating: float = 1500.0) -> None:
+        self.initial_rating = initial_rating
+        self._hypotheses: dict[str, Hypothesis] = {}
+        self._ratings: dict[str, float] = {}
+        self._wins: dict[str, int] = {}
+        self._losses: dict[str, int] = {}
+        self._match_history: list[HypothesisMatch] = []
+
+    def register(self, hypothesis: Hypothesis) -> None:
+        """Register a hypothesis idempotently."""
+        if hypothesis.id in self._hypotheses:
+            return
+        self._hypotheses[hypothesis.id] = hypothesis
+        self._ratings[hypothesis.id] = self.initial_rating
+        self._wins[hypothesis.id] = 0
+        self._losses[hypothesis.id] = 0
+
+    def expected_score(self, rating_a: float, rating_b: float) -> float:
+        """Elo expected score, same formula as EloArgumentRanker."""
+        return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400))
+
+    def update(self, winner_id: str, loser_id: str) -> None:
+        """Apply one Elo update after a deterministic match outcome."""
+        ra = self._ratings.get(winner_id, self.initial_rating)
+        rb = self._ratings.get(loser_id, self.initial_rating)
+        ea = self.expected_score(ra, rb)
+        self._ratings[winner_id] = ra + self.K_FACTOR * (1 - ea)
+        self._ratings[loser_id] = rb + self.K_FACTOR * (0 - (1 - ea))
+        self._wins[winner_id] = self._wins.get(winner_id, 0) + 1
+        self._losses[loser_id] = self._losses.get(loser_id, 0) + 1
+
+    def _pair_round(self, round_index: int) -> list[tuple[str, str]]:
+        ids = sorted(self._hypotheses.keys())
+        n = len(ids)
+        if n < 2:
+            return []
+        shift = round_index % n
+        rotated = ids[shift:] + ids[:shift]
+        pairs = []
+        for i in range(0, n - 1, 2):
+            pairs.append((rotated[i], rotated[i + 1]))
+        return pairs
+
+    def _composite_score(self, h: Hypothesis) -> float:
+        return 0.4 * h.novelty + 0.35 * h.depth + 0.25 * h.verification_confidence
+
+    async def run(self, rounds: int = 3) -> dict[str, Any]:
+        """Run deterministic pairings for N rounds and return rankings."""
+        if not self._hypotheses:
+            return {"rankings": [], "match_history": []}
+
+        if len(self._hypotheses) == 1:
+            return {
+                "rankings": self.rankings(),
+                "match_history": [],
+            }
+
+        for round_index in range(rounds):
+            for aid, bid in self._pair_round(round_index):
+                a = self._hypotheses[aid]
+                b = self._hypotheses[bid]
+                score_a = self._composite_score(a)
+                score_b = self._composite_score(b)
+
+                if score_a >= score_b:
+                    winner_id, loser_id = aid, bid
+                else:
+                    winner_id, loser_id = bid, aid
+
+                self.update(winner_id, loser_id)
+                self._match_history.append(
+                    HypothesisMatch(
+                        round_index=round_index,
+                        hypothesis_a=aid,
+                        hypothesis_b=bid,
+                        winner_id=winner_id,
+                        loser_id=loser_id,
+                        score_a=score_a,
+                        score_b=score_b,
+                    )
+                )
+
+        return {
+            "rankings": self.rankings(),
+            "match_history": [m.__dict__ for m in self._match_history],
+        }
+
+    def rankings(self) -> list[dict[str, Any]]:
+        rows = []
+        for hyp_id, rating in sorted(self._ratings.items(), key=lambda x: x[1], reverse=True):
+            rows.append({
+                "id": hyp_id,
+                "rating": rating,
+                "wins": self._wins.get(hyp_id, 0),
+                "losses": self._losses.get(hyp_id, 0),
+                "statement": self._hypotheses[hyp_id].statement,
+            })
+        return rows
