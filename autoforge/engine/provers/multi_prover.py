@@ -570,7 +570,10 @@ class Z3SMTAdapter(ProverAdapter):
             )
             elapsed = time.time() - start
 
-            success = "sat" in result.stdout or "unsat" in result.stdout or "unknown" in result.stdout
+            # Z3: "unsat" means the negation is unsatisfiable (claim is valid),
+            # "sat" means a counterexample exists, "unknown" is inconclusive.
+            # Only "unsat" is a successful verification.
+            success = "unsat" in result.stdout
 
             return {
                 "success": success,

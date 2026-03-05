@@ -116,7 +116,7 @@ async def start_telegram_bot(
             return
 
         _remember_chat(update)
-        message_text = update.message.text if update.message else ""
+        message_text = (update.message.text or "") if update.message else ""
         text = message_text.replace("/build", "", 1).strip()
         if not text:
             await _send_reply(update, "Usage: /build <project description>")
@@ -291,7 +291,7 @@ async def start_telegram_bot(
 
         workspace = Path(project.workspace_path).resolve()
         guide_path = (workspace / "DEPLOY_GUIDE.md").resolve()
-        if not str(guide_path).startswith(str(workspace)):
+        if not guide_path.is_relative_to(workspace):
             await _send_reply(update, "Invalid workspace path.")
             return
         if not guide_path.exists():

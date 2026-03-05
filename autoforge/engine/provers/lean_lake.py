@@ -468,6 +468,7 @@ class LakeProject:
             except asyncio.TimeoutError:
                 logger.error("lake update timed out")
                 proc.kill()
+                await proc.wait()
                 return False
         except Exception as e:
             logger.error(f"Error initializing Lake project: {e}")
@@ -511,6 +512,7 @@ class LakeProject:
             except asyncio.TimeoutError:
                 logger.error("Build timed out")
                 proc.kill()
+                await proc.wait()
                 return False, "Build timed out"
         except Exception as e:
             logger.error(f"Error building project: {e}")
@@ -560,6 +562,7 @@ class LakeProject:
             except asyncio.TimeoutError:
                 logger.error("File check timed out")
                 proc.kill()
+                await proc.wait()
                 return False, ["Verification timed out"]
         except Exception as e:
             logger.error(f"Error checking file: {e}")
@@ -615,8 +618,9 @@ class LakeProject:
         start_time = time.time()
 
         try:
-            # Create temp file
-            temp_name = f"verify_{int(time.time()*1000)}"
+            # Create temp file with unique name
+            import uuid
+            temp_name = f"verify_{uuid.uuid4().hex[:12]}"
             temp_file = await self.add_file(temp_name, "")
 
             # Build content
