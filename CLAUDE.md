@@ -8,6 +8,7 @@ AutoForge is a Python framework that uses 6 AI agents to automatically generate 
 
 ```bash
 # Install
+pip install forgeai                          # From PyPI
 pip install -e .                             # From source
 pip install -e ".[all]"                      # From source (all extras)
 

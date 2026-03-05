@@ -31,6 +31,7 @@ MODEL_PRICING = {
     "claude-sonnet-4-5-20250929": {"input": 3.0, "output": 15.0},
     "claude-haiku-4-5-20251001": {"input": 1.0, "output": 5.0},
     # OpenAI
+    "codex-5.3": {"input": 5.0, "output": 20.0},
     "gpt-4o": {"input": 2.5, "output": 10.0},
     "gpt-4o-mini": {"input": 0.15, "output": 0.6},
     "o3": {"input": 10.0, "output": 40.0},
@@ -332,6 +333,7 @@ class ForgeConfig:
     # Known model name patterns for validation (prefix-based)
     _KNOWN_MODEL_PATTERNS: tuple[str, ...] = (
         "claude-",
+        "codex-",
         "gpt-",
         "o3",
         "o4",

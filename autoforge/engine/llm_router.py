@@ -114,7 +114,7 @@ _RETRY_BASE_DELAY = 1.0  # seconds — base delay for exponential backoff
 
 # Known OpenAI model prefixes/names
 _OPENAI_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo",
-                  "o3", "o3-mini", "o4-mini", "o1", "o1-mini", "o1-preview"}
+                  "codex-5.3", "o3", "o3-mini", "o4-mini", "o1", "o1-mini", "o1-preview"}
 
 
 def detect_provider(model: str) -> str:
@@ -125,7 +125,7 @@ def detect_provider(model: str) -> str:
     model_lower = model.lower()
 
     # OpenAI: check exact matches and prefixes
-    if model_lower in _OPENAI_MODELS or model_lower.startswith(("gpt-", "o1", "o3", "o4")):
+    if model_lower in _OPENAI_MODELS or model_lower.startswith(("gpt-", "codex-", "o1", "o3", "o4")):
         return "openai"
 
     # Google Gemini
@@ -526,9 +526,9 @@ class LLMRouter:
         # Convert messages to OpenAI format
         oai_messages = self._messages_to_openai(system, messages)
 
-        # OpenAI reasoning models (o1, o3, o4) use max_completion_tokens
+        # OpenAI reasoning/codex models use max_completion_tokens
         model_lower = model.lower()
-        is_reasoning = model_lower.startswith(("o1", "o3", "o4"))
+        is_reasoning = model_lower.startswith(("o1", "o3", "o4", "codex-"))
         token_key = "max_completion_tokens" if is_reasoning else "max_tokens"
 
         kwargs: dict[str, Any] = {

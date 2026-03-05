@@ -21,9 +21,7 @@
 ## 快速开始
 
 ```bash
-git clone https://github.com/AlyciaBHZ/autoforge.git
-cd autoforge
-pip install -e .                              # 安装（从源码）
+pip install forgeai                           # 从 PyPI 安装
 forgeai                                       # 启动交互式会话
 ```
 
@@ -33,11 +31,22 @@ forgeai                                       # 启动交互式会话
 <summary>可选依赖</summary>
 
 ```bash
-pip install -e ".[openai]"       # OpenAI 支持
-pip install -e ".[google]"       # Google Gemini 支持
-pip install -e ".[search]"       # Web 搜索能力
-pip install -e ".[channels]"     # Telegram / Webhook 频道
-pip install -e ".[all]"          # 全部安装
+pip install "forgeai[openai]"    # OpenAI 支持
+pip install "forgeai[google]"    # Google Gemini 支持
+pip install "forgeai[search]"    # Web 搜索能力
+pip install "forgeai[channels]"  # Telegram / Webhook 频道
+pip install "forgeai[all]"       # 全部安装
+```
+
+</details>
+
+<details>
+<summary>从源码安装（开发者）</summary>
+
+```bash
+git clone https://github.com/AlyciaBHZ/autoforge.git
+cd autoforge
+pip install -e ".[all]"
 ```
 
 </details>
@@ -95,16 +104,18 @@ AutoForge 通过 6 个专业化 AI 智能体协作，经过 5 阶段流水线，
 
 ## 支持的 LLM 提供商
 
-| 提供商 | 环境变量 | 推荐模型 |
-|--------|----------|----------|
-| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4（强）、Claude Sonnet 4（快） |
-| **OpenAI** | `OPENAI_API_KEY` | GPT-4o / o3（强）、GPT-4o-mini（快） |
-| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro（强）、Gemini 2.5 Flash（快） |
+| 提供商 | 环境变量 | 强模型 | 快模型 |
+|--------|----------|--------|--------|
+| **Anthropic** | `ANTHROPIC_API_KEY` | Claude Opus 4.6 | Claude Sonnet 4.5 |
+| **OpenAI** | `OPENAI_API_KEY` | Codex 5.3、o3、GPT-4o | o4-mini、GPT-4o-mini |
+| **Google** | `GOOGLE_API_KEY` | Gemini 2.5 Pro | Gemini 2.5 Flash、Gemini 2.0 Flash |
+
+**认证方式：** API Key、Codex OAuth（浏览器登录，使用 ChatGPT 订阅）、Device Code（无头/SSH 环境）、OAuth2 客户端凭证、Azure/LiteLLM Bearer Token、Google ADC/Service Account、AWS Bedrock、Google Vertex AI 均受支持。
 
 也可以通过 `~/.autoforge/config.toml` 统一管理密钥。支持跨厂商混搭：
 
 ```bash
-export FORGE_MODEL_STRONG=gpt-4o          # 强模型用 OpenAI
+export FORGE_MODEL_STRONG=o3              # 强模型用 OpenAI
 export FORGE_MODEL_FAST=gemini-2.5-flash  # 快模型用 Google
 ```
 
