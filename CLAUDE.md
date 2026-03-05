@@ -87,6 +87,11 @@ engine/rl_proof_search.py       RL proof search — AlphaProof/DeepSeek-Prover-V
 engine/literature_search.py     Enhanced literature search — citation graph traversal, SPECTER2 embedding search, full-text analysis, gap detection
 engine/paper_repro.py           Enhanced paper reproduction — full pipeline: goal→paper→signals→code→execute→compare→report
 engine/provers/lean_lake.py     Real Lean 4 Lake integration — proper Mathlib project scaffolding, Lake build, project pool, 32 import mappings
+engine/article_reasoning.py     End-to-end article reasoning orchestrator — unified pipeline: ingest→parse→verify→formalize→discover→extend→generate
+engine/vlm_figure.py            VLM-powered figure analysis — extraction, analysis, reproduction, verification of paper figures
+engine/symbolic_compute.py      Symbolic computation backend — SymPy/SageMath integration, LaTeX↔SymPy, algebraic verification
+engine/peer_review.py           Peer review simulation — multi-reviewer academic review, rebuttal, meta-review, iterative revision
+engine/proof_embedding.py       Proof embedding & transfer — cross-domain tactic suggestion, memory bank, experience tracking, FAISS indexing
 engine/task_dag.py           TaskDAG — dependency graph, scheduling, persistence
 engine/lock_manager.py      Cross-platform atomic task locking (symlink on POSIX, O_CREAT|O_EXCL on Windows)
 engine/git_manager.py       Git worktree isolation for parallel builders

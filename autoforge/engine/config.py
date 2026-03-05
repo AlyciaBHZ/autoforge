@@ -211,6 +211,23 @@ class AdvancedConfig:
     z3_smt_enabled: bool = False
     dafny_enabled: bool = False
 
+    # Research & academic pipeline (v2.9+)
+    world_model_enabled: bool = True
+    recursive_decomp_prover_enabled: bool = True
+    self_play_conjecture_enabled: bool = True
+    curriculum_learning_enabled: bool = True
+    literature_search_enabled: bool = True
+    experiment_loop_enabled: bool = True
+    paper_writer_enabled: bool = True
+    dense_retrieval_enabled: bool = True
+    benchmark_eval_enabled: bool = False
+    rl_proof_search_enabled: bool = True
+    article_reasoning_enabled: bool = True
+    vlm_figure_enabled: bool = True
+    symbolic_compute_enabled: bool = True
+    peer_review_enabled: bool = True
+    proof_embedding_enabled: bool = True
+
     def __post_init__(self) -> None:
         """Validate bounds on critical settings (D6)."""
         import warnings

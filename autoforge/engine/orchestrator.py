@@ -180,6 +180,92 @@ class Orchestrator:
             from autoforge.engine.cloud_prover import CloudProver
             self._cloud_prover = CloudProver()
 
+        # ── Research & academic pipeline (v2.9+) ──
+        if c.world_model_enabled:
+            try:
+                from autoforge.engine.world_model import WorldModel
+                self._world_model = WorldModel()
+            except Exception:
+                self._world_model = None
+        if c.recursive_decomp_prover_enabled:
+            try:
+                from autoforge.engine.recursive_decomp_prover import RecursiveDecompProver
+                self._recursive_decomp_prover = RecursiveDecompProver()
+            except Exception:
+                self._recursive_decomp_prover = None
+        if c.self_play_conjecture_enabled:
+            try:
+                from autoforge.engine.self_play_conjecture import SelfPlayEngine
+                self._self_play_conjecture = SelfPlayEngine()
+            except Exception:
+                self._self_play_conjecture = None
+        if c.curriculum_learning_enabled:
+            try:
+                from autoforge.engine.curriculum_learning import LifelongLearner
+                self._curriculum_learning = LifelongLearner()
+            except Exception:
+                self._curriculum_learning = None
+        if c.literature_search_enabled:
+            try:
+                from autoforge.engine.literature_search import LiteratureSearchEngine
+                self._literature_search = LiteratureSearchEngine()
+            except Exception:
+                self._literature_search = None
+        if c.experiment_loop_enabled:
+            try:
+                from autoforge.engine.experiment_loop import ExperimentLoop
+                self._experiment_loop = ExperimentLoop()
+            except Exception:
+                self._experiment_loop = None
+        if c.paper_writer_enabled:
+            try:
+                from autoforge.engine.paper_writer import PaperWriter
+                self._paper_writer = PaperWriter()
+            except Exception:
+                self._paper_writer = None
+        if c.dense_retrieval_enabled:
+            try:
+                from autoforge.engine.dense_retrieval import DenseRetriever
+                self._dense_retrieval = DenseRetriever()
+            except Exception:
+                self._dense_retrieval = None
+        if c.rl_proof_search_enabled:
+            try:
+                from autoforge.engine.rl_proof_search import RLMCTSSearch
+                self._rl_proof_search = RLMCTSSearch()
+            except Exception:
+                self._rl_proof_search = None
+        if c.article_reasoning_enabled:
+            try:
+                from autoforge.engine.article_reasoning import ArticleReasoningOrchestrator
+                self._article_reasoning = ArticleReasoningOrchestrator()
+            except Exception:
+                self._article_reasoning = None
+        if c.vlm_figure_enabled:
+            try:
+                from autoforge.engine.vlm_figure import VLMFigurePipeline
+                self._vlm_figure = VLMFigurePipeline()
+            except Exception:
+                self._vlm_figure = None
+        if c.symbolic_compute_enabled:
+            try:
+                from autoforge.engine.symbolic_compute import SymbolicComputeEngine
+                self._symbolic_compute = SymbolicComputeEngine()
+            except Exception:
+                self._symbolic_compute = None
+        if c.peer_review_enabled:
+            try:
+                from autoforge.engine.peer_review import PeerReviewPipeline
+                self._peer_review = PeerReviewPipeline()
+            except Exception:
+                self._peer_review = None
+        if c.proof_embedding_enabled:
+            try:
+                from autoforge.engine.proof_embedding import ProofEmbeddingEngine
+                self._proof_embedding = ProofEmbeddingEngine()
+            except Exception:
+                self._proof_embedding = None
+
     async def run(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
         self._start_time = time.monotonic()

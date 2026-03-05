@@ -12,6 +12,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-217%20checks-brightgreen.svg)](tests/)
+[![Engines](https://img.shields.io/badge/engines-47%20modules-orange.svg)](autoforge/engine/)
 
 [English](docs/README_EN.md) | [开发者文档](CLAUDE.md)
 
@@ -158,20 +159,69 @@ AutoForge 内置多个智能引擎，在代码生成全流程中自动协作：
 - **函数级任务分解** — 将复杂需求拆解为可独立验证的函数级子任务
 - **阶段预执行** — 流水线各阶段重叠并行，加速整体构建
 
-<details>
-<summary>高级推理能力</summary>
+---
 
-- **定理证明** — Lean 4 形式化证明，含 MCTS 策略搜索与自动修复
-- **多证明器验证** — 支持 Coq、Isabelle、TLA+、Z3/SMT、Dafny 交叉验证
-- **跨领域科研推理** — 理论图谱构建、多模态验证、理论演化与论文生成
-- **自增长知识图谱** — 跨项目能力积累，社区可合并的通用知识网络
-- **提示词自优化** — 自动 A/B 测试与进化式提示词改进
-- **跨项目 RAG 检索** — BM25+TF-IDF 混合检索历史项目代码
-- **多智能体辩论** — 奖励引导的架构方案多角度辩论
-- **安全漏洞扫描** — 模式匹配 + LLM 深度分析双重安全检测
-- **工作流自我进化** — 基于历史运行 fitness 的跨项目策略进化
+## 学术与科研能力
 
-</details>
+AutoForge 内置完整的学术科研流水线，可作为 AI 驱动的科研助手使用。涵盖从论文阅读、形式化验证、自主发现到论文撰写的全流程。
+
+### 端到端文章推理
+
+> 输入任意一篇论文，自动完成：解析 → 理论图谱构建 → 声明验证 → Lean 4 形式化 → 自主发现 → 推理扩展 → 输出新论文
+
+核心模块：[`article_reasoning.py`](autoforge/engine/article_reasoning.py) — 统一编排 8 个阶段的完整管线
+
+### 形式化验证与定理证明
+
+| 模块 | 功能 | 技术方法 |
+|------|------|----------|
+| [Lean 4 MCTS 证明搜索](autoforge/engine/provers/proof_search.py) | 策略空间蒙特卡洛树搜索 | HILBERT 递归分解 + COPRA + STP |
+| [Lean Lake 集成](autoforge/engine/provers/lean_lake.py) | 真实 Lean 4 编译与 Mathlib 项目管理 | Lake 构建系统，32 组概念→import 映射 |
+| [RL 证明搜索](autoforge/engine/rl_proof_search.py) | 强化学习驱动的证明策略 | AlphaProof/DeepSeek-Prover-V2 风格 PUCT-MCTS |
+| [多证明器交叉验证](autoforge/engine/provers/multi_prover.py) | Coq、Isabelle、TLA+、Z3/SMT、Dafny | 6 后端并行验证 |
+| [密集嵌入检索](autoforge/engine/dense_retrieval.py) | 前提选择替代 Jaccard | ReProver/LeanDojo 风格 + FAISS |
+| [证明嵌入迁移](autoforge/engine/proof_embedding.py) | 跨领域策略迁移学习 | 向量记忆库 + 经验追踪 |
+| [标准基准评测](autoforge/engine/benchmark_eval.py) | miniF2F / PutnamBench / LeanWorkbook / ProofNet | Pass@k 无偏估计 |
+
+### 自主科研发现
+
+| 模块 | 功能 | 技术方法 |
+|------|------|----------|
+| [自主定理发现](autoforge/engine/autonomous_discovery.py) | 从论文提取核心 → 生成猜想 → 过滤新颖性 → 评估深度 | DomainContext 模板 + Thompson 采样策略选择 |
+| [自对弈猜想生成](autoforge/engine/self_play_conjecture.py) | 双智能体 Conjecturer/Prover 对弈 | STP (ICML 2025) + 贝叶斯难度校准 |
+| [推理核心自增长](autoforge/engine/reasoning_extension.py) | 从最小公理核心出发，迭代生成深层结论 | Thompson 采样 + 出版级质量门控 |
+| [跨领域科学推理](autoforge/engine/theoretical_reasoning.py) | TheoryGraph + 12 种推理策略 + 多模态验证 | 10 种验证模式加权融合 |
+| [结构化世界模型](autoforge/engine/world_model.py) | TheoryGraph 时序查询层 + 跨会话持久化 | Kosmos (2025) |
+| [课程学习](autoforge/engine/curriculum_learning.py) | 复杂度排序 + 正迁移追踪 | LeanAgent (ICLR 2025) |
+
+### 论文全流程
+
+| 模块 | 功能 | 技术方法 |
+|------|------|----------|
+| [闭环实验管线](autoforge/engine/experiment_loop.py) | 假设 → 代码 → 运行 → 分析 → 消融实验 → 迭代 | AI Scientist v2 |
+| [自动论文撰写](autoforge/engine/paper_writer.py) | LaTeX 生成 + BibTeX + 图表 + 模板 | NeurIPS/ICML/ICLR/ArXiv 模板 |
+| [文献检索与分析](autoforge/engine/literature_search.py) | 引用图谱遍历 + SPECTER2 语义搜索 + 全文分析 + 研究空白检测 | Semantic Scholar API + arXiv |
+| [论文复现管线](autoforge/engine/paper_repro.py) | 目标推断 → 信号提取 → 代码生成 → 执行 → 指标比较 → 报告 | OpenReview API 集成 |
+| [VLM 图表分析](autoforge/engine/vlm_figure.py) | 图表提取 → 视觉分析 → 数据提取 → 复现 → 验证 | 视觉语言模型 |
+| [符号计算后端](autoforge/engine/symbolic_compute.py) | SymPy/SageMath 集成，LaTeX↔SymPy 双向转换 | 代数恒等式验证 + 极限/级数检查 |
+| [同行评审模拟](autoforge/engine/peer_review.py) | 多审稿人 + 作者反驳 + 元审稿 + 迭代修改 | 6 种审稿角色 |
+
+### 采用的核心技术与灵感来源
+
+| 技术 | 来源 | 关键创新 |
+|------|------|----------|
+| **PUCT-MCTS 证明搜索** | AlphaProof (DeepMind, 2024) | 将 AlphaZero 公式适配至策略空间搜索 |
+| **递归分解证明** | HILBERT (NeurIPS 2025) | 四组件架构：informal reasoner + prover + verifier + retriever |
+| **自对弈猜想** | STP (ICML 2025, 28.5% LeanWorkbook) | 双智能体 + 贝叶斯难度校准锁定 50% 成功率甜区 |
+| **密集前提检索** | ReProver / LeanDojo (NeurIPS 2023) | 替代 Jaccard 的密集嵌入 + FAISS 索引 |
+| **课程学习** | LeanAgent (ICLR 2025) | 复杂度排序 + 正迁移追踪的终身学习 |
+| **结构化世界模型** | Kosmos (2025) | 时序查询 + 跨会话持久化的知识管理 |
+| **闭环实验** | AI Scientist v2 (2025) | 假设→代码→执行→分析→消融→迭代的全闭环 |
+| **过程奖励模型** | CodePRM (2024) | 步级代码质量评估而非仅结果级 |
+| **语言强化学习** | Reflexion (NeurIPS 2023) | 语言化记忆 + 失败模式避免 |
+| **文本反向传播** | EvoMAC (2024) | Agent 间自然语言梯度反馈 |
+| **自适应算力** | Adaptive TTC (2024) | 难度感知资源分配 + 自校准 |
+| **知识图谱自增长** | CapabilityDAG (内部) | 跨项目能力积累，社区可合并 |
 
 ---
 
@@ -181,6 +231,7 @@ AutoForge 内置多个智能引擎，在代码生成全流程中自动协作：
 - **至少一个 LLM API Key** — [Anthropic](https://console.anthropic.com/) / [OpenAI](https://platform.openai.com/api-keys) / [Google](https://aistudio.google.com/apikey)
 - **Git**（推荐）— 用于 Worktree 隔离并行开发
 - **Docker**（可选）— 用于沙盒执行
+- **Lean 4**（可选）— 用于形式化定理证明
 
 ---
 
