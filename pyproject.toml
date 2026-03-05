@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 name = "autoforgeai"
 
-version = "2.7.7"
+version = "2.7.8"
 description = "AutoForge AI-powered multi-agent development platform"
 
 readme = "README.md"
@@ -18,6 +18,17 @@ readme = "README.md"
 license = "MIT"
 
 requires-python = ">=3.11"
+
+dependencies = [
+    "anthropic>=0.84.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "InquirerPy>=0.3.4",
+    "tomli-w>=1.0",
+    "aiosqlite>=0.20.0",
+    "httpx>=0.27",
+]
 
 authors = [
 
@@ -56,26 +67,6 @@ Homepage = "https://github.com/AlyciaBHZ/autoforge"
 Repository = "https://github.com/AlyciaBHZ/autoforge"
 
 Issues = "https://github.com/AlyciaBHZ/autoforge/issues"
-
-dependencies = [
-
-    "anthropic>=0.84.0",
-
-    "python-dotenv>=1.0.0",
-
-    "rich>=13.0",
-
-    "pyyaml>=6.0",
-
-    "InquirerPy>=0.3.4",
-
-    "tomli-w>=1.0",
-
-    "aiosqlite>=0.20.0",
-
-    "httpx>=0.27",
-
-]
 
 
 
