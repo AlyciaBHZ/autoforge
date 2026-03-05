@@ -70,12 +70,22 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.repository == 'testpypi'
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
-        run: python -m twine upload --repository-url https://test.pypi.org/legacy/ dist/*
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN || secrets.TEST_PYPI_TOKEN }}
+        run: |
+          if [ -z "${TWINE_PASSWORD}" ]; then
+            echo "::error::TEST_PYPI API token is empty. Set TEST_PYPI_API_TOKEN in repo secrets."
+            exit 1
+          fi
+          python -m twine upload --repository-url https://test.pypi.org/legacy/ dist/*
 
       - name: Publish to PyPI
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.repository == 'pypi'
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: python -m twine upload dist/*
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN || secrets.PYPI_TOKEN }}
+        run: |
+          if [ -z "${TWINE_PASSWORD}" ]; then
+            echo "::error::PYPI_API_TOKEN is empty. Set PYPI_API_TOKEN in repo secrets."
+            exit 1
+          fi
+          python -m twine upload dist/*
