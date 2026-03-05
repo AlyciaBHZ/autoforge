@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,21 @@ class ScannerAgent(AgentBase):
 
     ROLE = "scanner"
     COMPLEXITY = TaskComplexity.HIGH  # Uses Opus for complex analysis
+
+    _OUTPUT_SCHEMA_SCAN: dict[str, Any] = {
+        "type": "object",
+        "required": ["spec", "gaps", "completeness"],
+        "properties": {
+            "spec": {"type": "object"},
+            "gaps": {"type": "array", "items": {"type": "string"}},
+            "completeness": {"type": "number"},
+            "description": {"type": "string"},
+            "excluded": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+    def _resolve_output_schema(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        return deepcopy(self._OUTPUT_SCHEMA_SCAN)
 
     def __init__(self, config, llm, working_dir: Path) -> None:
         self.working_dir = working_dir

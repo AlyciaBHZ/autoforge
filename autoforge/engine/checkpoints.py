@@ -33,6 +33,21 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+_CHECKPOINT_DIRECTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["on_track", "score", "suggested_action"],
+    "properties": {
+        "on_track": {"type": "boolean"},
+        "score": {"type": "number"},
+        "feedback": {"type": "string"},
+        "suggested_action": {
+            "type": "string",
+            "enum": ["continue", "adjust", "reset"],
+        },
+    },
+}
+
+
 @dataclass
 class CheckpointVerdict:
     """Result of a mid-task direction check."""
@@ -169,6 +184,7 @@ class CheckpointManager:
                 system="You are a senior tech lead reviewing a junior developer's progress. "
                        "Be constructive but honest. Respond with JSON only.",
                 messages=[{"role": "user", "content": prompt}],
+                response_json_schema=_CHECKPOINT_DIRECTION_SCHEMA,
             )
 
             text = ""
@@ -180,16 +196,8 @@ class CheckpointManager:
             try:
                 data = extract_json_from_text(
                     text,
-                    schema={
-                        "type": "object",
-                        "required": ["on_track", "score", "suggested_action"],
-                        "properties": {
-                            "on_track": {"type": "boolean"},
-                            "score": {"type": "number"},
-                            "feedback": {"type": "string"},
-                            "suggested_action": {"type": "string"},
-                        },
-                    },
+                    schema=_CHECKPOINT_DIRECTION_SCHEMA,
+                    strict=True,
                 )
                 score = float(data.get("score", 0.5))
 

@@ -38,6 +38,46 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+_DEBATE_TRIGGER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["uncertainty", "positions_differ_substantially", "reason"],
+    "properties": {
+        "uncertainty": {"type": "number"},
+        "reason": {"type": "string"},
+        "positions_differ_substantially": {"type": "boolean"},
+    },
+}
+
+_DEBATE_ROUND_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["position", "reasoning"],
+    "properties": {
+        "position": {"type": "string"},
+        "reasoning": {"type": "string"},
+        "concessions": {"type": "string"},
+    },
+}
+
+_DEBATE_SCORE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["score"],
+    "properties": {
+        "score": {"type": "number"},
+        "reason": {"type": "string"},
+    },
+}
+
+_DEBATE_SYNTHESIS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["winner_position", "synthesis", "confidence"],
+    "properties": {
+        "winner_position": {"type": "string"},
+        "synthesis": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+}
+
+
 # ──────────────────────────────────────────────
 # Algorithmic Argument Ranking
 # ──────────────────────────────────────────────
@@ -174,22 +214,18 @@ class LogicalConsistencyChecker:
         return False
 
 
-def _extract_json(text: str) -> dict[str, Any] | None:
+def _extract_json(
+    text: str,
+    schema: dict[str, Any] | None = None,
+    strict: bool = False,
+) -> dict[str, Any] | None:
     """Robustly extract JSON object from LLM response text."""
     from autoforge.engine.utils import extract_json_from_text
     try:
         return extract_json_from_text(
             text,
-            schema={
-                "type": "object",
-                "required": ["consistent", "conflicts", "confidence"],
-                "properties": {
-                    "consistent": {"type": "boolean"},
-                    "conflicts": {"type": "array", "items": {"type": "string"}},
-                    "confidence": {"type": "number"},
-                    "action": {"type": "string"},
-                },
-            },
+            schema=schema,
+            strict=strict,
         )
     except ValueError:
         return None
@@ -334,6 +370,7 @@ class ConditionalDebateEngine:
                 complexity=TaskComplexity.STANDARD,
                 system="You evaluate whether multiple viewpoints warrant formal debate.",
                 messages=[{"role": "user", "content": prompt}],
+                response_json_schema=_DEBATE_TRIGGER_SCHEMA,
             )
 
             text = ""
@@ -341,7 +378,11 @@ class ConditionalDebateEngine:
                 if block.type == "text":
                     text += block.text
 
-            data = _extract_json(text)
+            data = _extract_json(
+                text,
+                schema=_DEBATE_TRIGGER_SCHEMA,
+                strict=True,
+            )
             if data:
                 uncertainty = float(data.get("uncertainty", 0.5))
                 should_trigger = (
@@ -535,6 +576,7 @@ class ConditionalDebateEngine:
                     complexity=TaskComplexity.STANDARD,
                     system=f"You are the {arg.agent_role}. Engage constructively.",
                     messages=[{"role": "user", "content": prompt}],
+                    response_json_schema=_DEBATE_ROUND_SCHEMA,
                 )
 
                 text = ""
@@ -542,7 +584,11 @@ class ConditionalDebateEngine:
                     if block.type == "text":
                         text += block.text
 
-                data = _extract_json(text)
+                data = _extract_json(
+                    text,
+                    schema=_DEBATE_ROUND_SCHEMA,
+                    strict=True,
+                )
                 if data:
                     new_arg = DebateArgument(
                         agent_role=arg.agent_role,
@@ -584,13 +630,18 @@ class ConditionalDebateEngine:
                 complexity=TaskComplexity.STANDARD,
                 system="You are an objective judge evaluating debate arguments.",
                 messages=[{"role": "user", "content": prompt}],
+                response_json_schema=_DEBATE_SCORE_SCHEMA,
             )
             text = ""
             for block in response.content:
                 if block.type == "text":
                     text += block.text
 
-            data = _extract_json(text)
+            data = _extract_json(
+                text,
+                schema=_DEBATE_SCORE_SCHEMA,
+                strict=True,
+            )
             if data:
                 return float(data.get("score", 0.5))
 
@@ -666,6 +717,7 @@ class ConditionalDebateEngine:
                 complexity=TaskComplexity.STANDARD,
                 system="You synthesise debate outcomes into actionable decisions.",
                 messages=[{"role": "user", "content": prompt}],
+                response_json_schema=_DEBATE_SYNTHESIS_SCHEMA,
             )
 
             text = ""
@@ -673,7 +725,11 @@ class ConditionalDebateEngine:
                 if block.type == "text":
                     text += block.text
 
-            data = _extract_json(text)
+            data = _extract_json(
+                text,
+                schema=_DEBATE_SYNTHESIS_SCHEMA,
+                strict=True,
+            )
             if data:
                 return DebateOutcome(
                     topic=topic,

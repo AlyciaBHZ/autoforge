@@ -1810,6 +1810,7 @@ class MathematicalVerifier:
     async def _extract_with_llm(self, llm: Any, claim_text: str) -> dict[str, Any] | None:
         from autoforge.engine.llm_router import TaskComplexity
 
+        schema = self._math_claim_schema()
         prompt = (
             "Extract math claim structure as strict JSON.\n"
             "Allowed types: algebraic_identity, limit, series_convergence, numerical_spot_check, eigenvalue.\n"
@@ -1822,6 +1823,7 @@ class MathematicalVerifier:
                 prompt,
                 complexity=TaskComplexity.STANDARD,
                 max_tokens=400,
+                response_json_schema=schema,
             )
         except Exception:
             return None
@@ -1832,10 +1834,17 @@ class MathematicalVerifier:
                 text += str(getattr(block, "text", ""))
         if not text:
             return None
+        text = text.strip()
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict) and payload.get("type"):
+                return payload
+        except Exception:
+            pass
         try:
             payload = extract_json_from_text(
                 text,
-                schema=self._math_claim_schema(),
+                schema=schema,
                 strict=True,
             )
             if isinstance(payload, dict) and payload.get("type"):

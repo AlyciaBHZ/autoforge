@@ -248,6 +248,33 @@ class AgentBase(ABC):
                     return json.dumps({"error": str(e)})
         return json.dumps({"error": f"Unknown tool: {name}"})
 
+    def _resolve_output_schema(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        """Return structured output schema for this agent run, if any."""
+        return None
+
+    def _build_schema_repair_prompt(self, raw_output: str, schema: dict[str, Any]) -> str:
+        schema_hint = json.dumps(schema, ensure_ascii=False)
+        snippet = (raw_output or "").strip()
+        if len(snippet) > 1600:
+            snippet = snippet[:800] + "\n...\n" + snippet[-800:]
+        return (
+            "Your previous response did not match the requested JSON schema.\n\n"
+            "Invalid payload:\n"
+            f"```text\n{snippet}\n```\n\n"
+            "Return ONLY a valid JSON object matching this schema, with no markdown or prose.\n"
+            "Schema:\n"
+            f"```json\n{schema_hint}\n```\n"
+        )
+
+    def _validate_output_schema(self, output: str, schema: dict[str, Any]) -> bool:
+        from autoforge.engine.utils import extract_json_from_text
+
+        try:
+            extract_json_from_text(output, schema=schema, strict=True)
+            return True
+        except Exception:
+            return False
+
     def _log_action(self, action: str, detail: str = "") -> None:
         """Log an agent action."""
         msg = f"[{self.ROLE}] {action}"
@@ -298,6 +325,9 @@ class AgentBase(ABC):
             )
 
         self._log_action("started", f"prompt length={len(user_prompt)}")
+        output_schema = self._resolve_output_schema(context)
+        schema_retries = 0
+        max_schema_retries = 2
 
         def _build_result(success: bool, error: str = "") -> AgentResult:
             elapsed = time.monotonic() - start_time
@@ -322,20 +352,44 @@ class AgentBase(ABC):
                     system=effective_system,
                     messages=messages,
                     tools=tool_defs if tool_defs else None,
+                    response_json_schema=output_schema,
                 )
 
-                # Collect text output
-                for block in response.content:
-                    if block.type == "text":
-                        self._output_parts.append(block.text)
+                current_text = "\n".join(
+                    block.text for block in response.content if block.type == "text"
+                )
 
                 # If model is done (no more tool calls), break
                 if response.stop_reason == "end_turn":
+                    if output_schema is not None and not self._validate_output_schema(current_text, output_schema):
+                        if schema_retries < max_schema_retries:
+                            schema_retries += 1
+                            self._log_action(
+                                "schema_repair",
+                                f"retry {schema_retries}/{max_schema_retries}",
+                            )
+                            messages.append({"role": "assistant", "content": response.content})
+                            messages.append({
+                                "role": "user",
+                                "content": self._build_schema_repair_prompt(
+                                    current_text,
+                                    output_schema,
+                                ),
+                            })
+                            continue
+
+                        self._log_action(
+                            "schema_repair_exhausted",
+                            "using last best-effort output",
+                        )
+                    self._output_parts.append(current_text)
                     self._log_action("completed", f"turns={turns}")
                     break
 
                 # Process tool calls
                 if response.stop_reason == "tool_use":
+                    if current_text:
+                        self._output_parts.append(current_text)
                     tool_results = []
                     wrote_this_turn = False
 

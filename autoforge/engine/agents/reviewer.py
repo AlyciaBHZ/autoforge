@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,20 @@ class ReviewerAgent(FileToolsMixin, AgentBase):
 
     ROLE = "reviewer"
     COMPLEXITY = TaskComplexity.STANDARD
+
+    _OUTPUT_SCHEMA_REVIEW: dict[str, Any] = {
+        "type": "object",
+        "required": ["approved", "score", "issues"],
+        "properties": {
+            "approved": {"type": "boolean"},
+            "score": {"type": "number"},
+            "issues": {"type": "array", "items": {"type": "object"}},
+            "summary": {"type": "string"},
+        },
+    }
+
+    def _resolve_output_schema(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        return deepcopy(self._OUTPUT_SCHEMA_REVIEW)
 
     def __init__(
         self, config, llm, working_dir: Path,
@@ -203,18 +218,8 @@ class ReviewerAgent(FileToolsMixin, AgentBase):
         )
 
         from autoforge.engine.utils import extract_json_from_text
-        schema = {
-            "type": "object",
-            "required": ["approved", "score", "issues"],
-            "properties": {
-                "approved": {"type": "boolean"},
-                "score": {"type": "number"},
-                "issues": {"type": "array", "items": {"type": "object"}},
-                "summary": {"type": "string"},
-            },
-        }
         try:
-            data = extract_json_from_text(output, schema=schema, strict=True)
+            data = extract_json_from_text(output, schema=self._OUTPUT_SCHEMA_REVIEW, strict=True)
         except ValueError as e:
             logger.warning("Could not find JSON in review output: %s", e)
             return _fail

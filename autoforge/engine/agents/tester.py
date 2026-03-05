@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,19 @@ class TesterAgent(FileToolsMixin, AgentBase):
 
     ROLE = "tester"
     COMPLEXITY = TaskComplexity.STANDARD
+
+    _OUTPUT_SCHEMA_RESULTS: dict[str, Any] = {
+        "type": "object",
+        "required": ["all_passed"],
+        "properties": {
+            "all_passed": {"type": "boolean"},
+            "summary": {"type": "string"},
+            "results": {"type": "array", "items": {"type": "object"}},
+        },
+    }
+
+    def _resolve_output_schema(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        return deepcopy(self._OUTPUT_SCHEMA_RESULTS)
 
     def __init__(
         self, config, llm, working_dir: Path, sandbox: SandboxBase | None = None
@@ -141,17 +155,8 @@ class TesterAgent(FileToolsMixin, AgentBase):
         _fail = TestResults(all_passed=False, summary="Could not parse test results — treating as failure")
 
         from autoforge.engine.utils import extract_json_from_text
-        schema = {
-            "type": "object",
-            "required": ["all_passed"],
-            "properties": {
-                "all_passed": {"type": "boolean"},
-                "summary": {"type": "string"},
-                "results": {"type": "array", "items": {"type": "object"}},
-            },
-        }
         try:
-            data = extract_json_from_text(output, schema=schema, strict=True)
+            data = extract_json_from_text(output, schema=self._OUTPUT_SCHEMA_RESULTS, strict=True)
         except ValueError as e:
             logger.warning("Could not find JSON in test output: %s", e)
             return _fail

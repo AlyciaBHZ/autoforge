@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,18 @@ class GardenerAgent(FileToolsMixin, AgentBase):
 
     ROLE = "gardener"
     COMPLEXITY = TaskComplexity.STANDARD
+
+    _OUTPUT_SCHEMA_CHANGES: dict[str, Any] = {
+        "type": "object",
+        "required": ["changes_made", "summary"],
+        "properties": {
+            "changes_made": {"type": "array", "items": {"type": "object"}},
+            "summary": {"type": "string"},
+        },
+    }
+
+    def _resolve_output_schema(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        return deepcopy(self._OUTPUT_SCHEMA_CHANGES)
 
     def __init__(self, config, llm, working_dir: Path) -> None:
         self.working_dir = working_dir
@@ -149,16 +162,8 @@ class GardenerAgent(FileToolsMixin, AgentBase):
     def parse_changes(self, output: str) -> dict[str, Any]:
         """Extract change summary from output."""
         from autoforge.engine.utils import extract_json_from_text
-        schema = {
-            "type": "object",
-            "required": ["changes_made", "summary"],
-            "properties": {
-                "changes_made": {"type": "array", "items": {"type": "object"}},
-                "summary": {"type": "string"},
-            },
-        }
         try:
-            return extract_json_from_text(output, schema=schema, strict=True)
+            return extract_json_from_text(output, schema=self._OUTPUT_SCHEMA_CHANGES, strict=True)
         except ValueError as e:
             logger.warning("Could not extract JSON from gardener output: %s", e)
             return {"changes_made": [], "summary": output[:500]}

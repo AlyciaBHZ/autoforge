@@ -40,6 +40,26 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+_OPTIMIZE_ROLE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["improved_prompt", "changes_made", "expected_improvement"],
+    "properties": {
+        "improved_prompt": {"type": "string"},
+        "changes_made": {"type": "string"},
+        "expected_improvement": {"type": "string"},
+    },
+}
+
+_MUTATE_PROMPT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["mutated_prompt", "mutation_description"],
+    "properties": {
+        "mutated_prompt": {"type": "string"},
+        "mutation_description": {"type": "string"},
+    },
+}
+
+
 # ──────────────────────────────────────────────
 # Data Structures
 # ──────────────────────────────────────────────
@@ -444,6 +464,7 @@ class PromptOptimizer:
                     "and suggest targeted improvements. Be specific and measurable."
                 ),
                 messages=[{"role": "user", "content": prompt}],
+                response_json_schema=_OPTIMIZE_ROLE_SCHEMA,
             )
 
             text = ""
@@ -453,7 +474,11 @@ class PromptOptimizer:
 
             from autoforge.engine.utils import extract_json_from_text
             try:
-                data = extract_json_from_text(text)
+                data = extract_json_from_text(
+                    text,
+                    schema=_OPTIMIZE_ROLE_SCHEMA,
+                    strict=True,
+                )
             except ValueError:
                 logger.warning("[PromptOpt] Could not parse optimization response")
                 return None
@@ -562,6 +587,7 @@ class PromptOptimizer:
                 complexity=TaskComplexity.STANDARD,
                 system="You are a prompt engineering expert creating diverse variants.",
                 messages=[{"role": "user", "content": prompt}],
+                response_json_schema=_MUTATE_PROMPT_SCHEMA,
             )
 
             text = ""
@@ -571,7 +597,11 @@ class PromptOptimizer:
 
             from autoforge.engine.utils import extract_json_from_text
             try:
-                data = extract_json_from_text(text)
+                data = extract_json_from_text(
+                    text,
+                    schema=_MUTATE_PROMPT_SCHEMA,
+                    strict=True,
+                )
             except ValueError:
                 return None
             mutated = data.get("mutated_prompt", "")

@@ -60,6 +60,68 @@ def _repair_json(text: str) -> str:
     return repaired.strip()
 
 
+def _extract_balanced_json_prefix(text: str) -> str:
+    """Try to recover a top-level JSON object/array from a potentially truncated suffix."""
+    stripped = text.lstrip()
+    if not stripped:
+        return ""
+
+    if stripped[0] not in ("{", "["):
+        return ""
+
+    expected_stack: list[str] = ["]" if stripped[0] == "[" else "}"]
+    in_string = False
+    quote_char = ""
+    escape = False
+
+    for idx, ch in enumerate(stripped[1:], start=1):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote_char:
+                in_string = False
+            continue
+
+        if ch in {"\"", "'"}:
+            in_string = True
+            quote_char = ch
+            continue
+
+        if ch in "{[":
+            expected_stack.append("}" if ch == "{" else "]")
+            continue
+
+        if ch in "}]":
+            if not expected_stack or expected_stack[-1] != ch:
+                return ""
+            expected_stack.pop()
+            if not expected_stack:
+                return stripped[: idx + 1]
+            continue
+
+    # Unclosed JSON: close remaining containers.
+    return stripped + "".join(reversed(expected_stack))
+
+
+def _try_parse_with_truncation_correction(text: str) -> list[str]:
+    """Return a sequence of repaired snippets for truncated/broken JSON candidates."""
+    trimmed = text.strip()
+    if not trimmed or trimmed[0] not in {"{", "["}:
+        return []
+
+    first_pass = _extract_balanced_json_prefix(trimmed)
+    if not first_pass:
+        return []
+
+    repaired = _repair_json(first_pass)
+    candidates = [first_pass]
+    if repaired and repaired != first_pass:
+        candidates.append(repaired)
+    return candidates
+
+
 def _iter_candidate_json_snippets(
     text: str,
     *,
@@ -79,15 +141,15 @@ def _iter_candidate_json_snippets(
 
     # 2) any fenced block that looks like raw JSON (all language markers)
     if len(candidates) < 10:
-        for match in re.finditer(r"```[^\n]*\n(.*?)```", text, re.DOTALL):
-            snippet = match.group(1).strip()
-            if snippet in seen:
-                continue
-            if snippet.startswith("{") or snippet.startswith("["):
-                candidates.append(snippet)
-                seen.add(snippet)
-                if len(candidates) >= 10:
-                    break
+    for match in re.finditer(r"```[^\n]*\n(.*?)```", text, re.DOTALL):
+        snippet = match.group(1).strip()
+        if snippet in seen:
+            continue
+        if snippet.startswith("{") or snippet.startswith("["):
+            candidates.append(snippet)
+            seen.add(snippet)
+            if len(candidates) >= 10:
+                break
 
     # 3) raw scanner from brace / bracket starts (JSONDecoder boundary-based)
     decoder = json.JSONDecoder()
@@ -112,6 +174,30 @@ def _iter_candidate_json_snippets(
 
     for _, raw in sorted(candidates_from_raw, key=lambda item: item[0]):
         candidates.append(raw)
+
+    # 4) Last-resort scan from each opening bracket/object boundary.
+    for start in [m.start() for m in re.finditer(r"[{[]", text)]:
+        if start in seen:
+            continue
+        raw_snippet = text[start:]
+        if not raw_snippet:
+            continue
+        if raw_snippet[0] == "{" and not allow_objects:
+            continue
+        if raw_snippet[0] == "[" and not allow_arrays:
+            continue
+        for repaired in _try_parse_with_truncation_correction(raw_snippet):
+            if not repaired:
+                continue
+            normalized = repaired
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            candidates.append(normalized)
+            if len(candidates) >= 20:
+                break
+        if len(candidates) >= 20:
+            break
 
     return candidates
 

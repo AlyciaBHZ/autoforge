@@ -49,6 +49,7 @@ class LLMProvider:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         max_tokens: int,
+        response_json_schema: dict[str, Any] | None = None,
     ) -> "LLMResponse":
         """Make an API call and return a normalized LLMResponse."""
         raise NotImplementedError
@@ -523,6 +524,7 @@ class LLMRouter:
         temperature: float | None = None,
         messages: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
+        response_json_schema: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Make an LLM call with automatic provider routing.
@@ -577,6 +579,20 @@ class LLMRouter:
             model = self._canonicalize_openai_model(model)
         budget_enforced = self._is_budget_enforced(provider)
         reservation = 0.0
+        if response_json_schema is not None and provider == "anthropic":
+            schema_hint = json.dumps(response_json_schema, ensure_ascii=False)
+            if system:
+                system = (
+                    system
+                    + "\n\nReturn exactly one JSON object that matches the schema below "
+                    "and contains no extra prose.\n"
+                    f"Schema:\n```json\n{schema_hint}\n```"
+                )
+            else:
+                system = (
+                    "Return exactly one JSON object that matches the schema below and contains no extra prose.\n"
+                    f"Schema:\n```json\n{schema_hint}\n```"
+                )
         lock = self._get_budget_lock()
         if budget_enforced:
             reservation = self._estimate_call_cost_usd(
@@ -619,9 +635,20 @@ class LLMRouter:
             if provider in self._custom_providers:
                 custom = self._custom_providers[provider]
                 client = self._get_client(provider)
-                response = await self._retry_with_backoff(
-                    lambda: custom.call(client, model, system, messages, tools, effective_max_tokens)
-                )
+                try:
+                    response = await self._retry_with_backoff(
+                        lambda: custom.call(
+                            client, model, system, messages, tools,
+                            effective_max_tokens, response_json_schema,
+                        )
+                    )
+                except TypeError:
+                    response = await self._retry_with_backoff(
+                        lambda: custom.call(
+                            client, model, system, messages, tools,
+                            effective_max_tokens,
+                        )
+                    )
             elif provider == "anthropic":
                 response = await self._call_anthropic(
                     model,
@@ -629,6 +656,7 @@ class LLMRouter:
                     system,
                     messages,
                     tools,
+                    response_json_schema=response_json_schema,
                     temperature=temperature,
                 )
             elif provider == "openai":
@@ -638,6 +666,7 @@ class LLMRouter:
                     system,
                     messages,
                     tools,
+                    response_json_schema=response_json_schema,
                     temperature=temperature,
                 )
             elif provider == "google":
@@ -647,6 +676,7 @@ class LLMRouter:
                     system,
                     messages,
                     tools,
+                    response_json_schema=response_json_schema,
                     temperature=temperature,
                 )
             else:
@@ -676,6 +706,7 @@ class LLMRouter:
     async def _call_anthropic(
         self, model: str, max_tokens: int, system: str,
         messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+        response_json_schema: dict[str, Any] | None = None,
         temperature: float | None = None,
     ) -> LLMResponse:
         """Call Anthropic API and normalize the response."""
@@ -695,9 +726,65 @@ class LLMRouter:
         if tools:
             kwargs["tools"] = tools  # Already in Anthropic format
 
-        raw = await self._retry_with_backoff(
-            lambda: client.messages.create(**kwargs)
-        )
+        raw = None
+        schema_attempts: list[dict[str, Any]] = [{}]
+        if response_json_schema is not None:
+            schema_attempts = [
+                {
+                    "response_format": {
+                        "type": "json",
+                        "schema": response_json_schema,
+                    }
+                },
+                {
+                    "response_format": {
+                        "type": "json",
+                        "json_schema": {
+                            "name": "auto_forge_schema",
+                            "strict": True,
+                            "schema": response_json_schema,
+                        },
+                    }
+                },
+                {},
+            ]
+
+        last_error: BaseException | None = None
+        for schema_config in schema_attempts:
+            attempt = dict(kwargs)
+            attempt.update(schema_config)
+            try:
+                raw = await self._retry_with_backoff(
+                    lambda: client.messages.create(**attempt)
+                )
+                break
+            except TypeError:
+                # Legacy SDK compatibility. Retry without response format.
+                if schema_config == {}:
+                    raise
+                schema_attempts = [{}]
+                last_error = None
+                continue
+            except Exception as exc:
+                last_error = exc
+                if response_json_schema is not None:
+                    payload = str(exc).lower()
+                    if any(token in payload for token in (
+                        "response_format",
+                        "json_schema",
+                        "invalid_request_error",
+                        "unsupported value",
+                        "unrecognized field",
+                    )):
+                        continue
+                break
+
+        if raw is None:
+            if last_error is not None:
+                raise last_error
+            raw = await self._retry_with_backoff(
+                lambda: client.messages.create(**kwargs)
+            )
 
         # Normalize response
         content = []
@@ -766,6 +853,7 @@ class LLMRouter:
     async def _call_openai(
         self, model: str, max_tokens: int, system: str,
         messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+        response_json_schema: dict[str, Any] | None = None,
         temperature: float | None = None,
     ) -> LLMResponse:
         """Call OpenAI API and normalize the response with model fallback."""
@@ -823,7 +911,52 @@ class LLMRouter:
         if tools:
             kwargs["tools"] = self._tools_to_openai(tools)
 
-        raw = await self._retry_with_backoff(lambda: client.chat.completions.create(**kwargs))
+        # OpenAI schema support: prefer JSON schema, fallback to json_object.
+        response_format_chain: list[dict[str, Any] | None] = [None]
+        if response_json_schema is not None and not is_reasoning:
+            response_format_chain = [
+                {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "auto_forge_schema",
+                        "strict": True,
+                        "schema": response_json_schema,
+                    },
+                },
+                {"type": "json_object"},
+            ]
+
+        raw: Any | None = None
+        last_error: BaseException | None = None
+        for response_format in response_format_chain:
+            if response_format is None:
+                kwargs.pop("response_format", None)
+            else:
+                kwargs["response_format"] = response_format
+            try:
+                raw = await self._retry_with_backoff(
+                    lambda: client.chat.completions.create(**kwargs),
+                )
+                break
+            except TypeError:
+                # Legacy SDK does not accept response_format parameter.
+                if response_format is None:
+                    raise
+                response_format_chain = [None]
+                last_error = None
+                continue
+            except Exception as exc:  # pragma: no cover - API compatibility boundary
+            if response_format is not None and self._is_openai_schema_unsupported_error(exc):
+                    last_error = exc
+                    continue
+                raise
+        else:
+            if last_error is not None:
+                raise last_error
+            raw = await self._retry_with_backoff(
+                lambda: client.chat.completions.create(**kwargs),
+            )
+
         choice = raw.choices[0]
         message = choice.message
 
@@ -976,11 +1109,36 @@ class LLMRouter:
             for t in tools
         ]
 
+    @staticmethod
+    def _is_openai_schema_unsupported_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        text = str(getattr(exc, "message", msg)).lower()
+        payload = f"{msg} {text}"
+        detail = getattr(exc, "error", None)
+        if detail is not None:
+            payload += f" {detail}"
+        try:
+            status = getattr(exc, "status")
+            status_code = getattr(exc, "status_code")
+            if status in ("400", 400) or status_code in ("400", 400):
+                return "response_format" in payload or "json_schema" in payload
+        except Exception:
+            pass
+
+        return any(marker in payload for marker in (
+            "response_format",
+            "json_schema",
+            "unexpected argument",
+            "unexpected keyword",
+            "unsupported parameter",
+        ))
+
     # ── Google Gemini ──────────────────────────────────────────────
 
     async def _call_google(
         self, model: str, max_tokens: int, system: str,
         messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+        response_json_schema: dict[str, Any] | None = None,
         temperature: float | None = None,
     ) -> LLMResponse:
         """Call Google Gemini API and normalize the response."""
@@ -1006,13 +1164,66 @@ class LLMRouter:
             gemini_tools = self._tools_to_gemini(tools)
             config["tools"] = gemini_tools
 
-        raw = await self._retry_with_backoff(
-            lambda: client.aio.models.generate_content(
-                model=model,
-                contents=contents,
-                config=types.GenerateContentConfig(**config),
+        schema_attempts: list[dict[str, Any]] = [{}]
+        if response_json_schema is not None:
+            schema_attempts = [
+                {
+                    "response_mime_type": "application/json",
+                    "response_schema": response_json_schema,
+                },
+                {
+                    "response_mime_type": "application/json",
+                    "response_json_schema": {
+                        "name": "auto_forge_schema",
+                        "schema": response_json_schema,
+                        "strict": True,
+                    },
+                },
+                {"response_mime_type": "application/json"},
+                {},
+            ]
+
+        last_error: BaseException | None = None
+        raw: Any | None = None
+        for schema_config in schema_attempts:
+            attempt = dict(config)
+            attempt.update(schema_config)
+            try:
+                raw = await self._retry_with_backoff(
+                    lambda: client.aio.models.generate_content(
+                        model=model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(**attempt),
+                    )
+                )
+                break
+            except TypeError:
+                raw = None
+                last_error = None
+                continue
+            except Exception as exc:
+                last_error = exc
+                if response_json_schema is not None:
+                    payload = str(exc).lower()
+                    if any(token in payload for token in (
+                        "response_json_schema",
+                        "response_schema",
+                        "response_mime_type",
+                        "unrecognized fields",
+                    )):
+                        continue
+                break
+
+        if raw is None:
+            if last_error is not None:
+                raise last_error
+            raw = await self._retry_with_backoff(
+                lambda: client.aio.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**config),
+                )
             )
-        )
 
         # Normalize response
         content: list[ContentBlock] = []

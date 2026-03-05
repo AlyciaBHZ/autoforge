@@ -53,6 +53,56 @@ class ExperimentStatus(Enum):
     FAILED = "failed"             # Terminal failure
 
 
+_HYPOTHESIS_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["statement", "rationale", "predicted_outcome", "confidence"],
+    "properties": {
+        "statement": {"type": "string"},
+        "rationale": {"type": "string"},
+        "predicted_outcome": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+}
+
+_HYPOTHESIS_LIST_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["hypotheses"],
+    "properties": {
+        "hypotheses": {
+            "type": "array",
+            "items": _HYPOTHESIS_ITEM_SCHEMA,
+            "minItems": 1,
+        },
+    },
+}
+
+_HYPOTHESIS_REFINED_SCHEMA: dict[str, Any] = _HYPOTHESIS_ITEM_SCHEMA
+
+_CODE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["code"],
+    "properties": {
+        "code": {"type": "string"},
+    },
+}
+
+_RESULT_ANALYSIS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["analysis", "next_action", "improvement_delta"],
+    "properties": {
+        "prediction_met": {"type": "boolean"},
+        "analysis": {"type": "string"},
+        "evidence": {"type": "string"},
+        "next_action": {
+            "type": "string",
+            "enum": ["refine_hypothesis", "refine_code", "accept", "reject"],
+        },
+        "reasoning": {"type": "string"},
+        "improvement_delta": {"type": "number"},
+    },
+}
+
+
 @dataclass
 class Hypothesis:
     """A testable scientific hypothesis for an experiment."""
@@ -385,13 +435,25 @@ Ensure hypotheses are:
 """
 
         try:
-            response = await llm.call(prompt, complexity=TaskComplexity.HIGH)
+            response = await llm.call(
+                prompt,
+                complexity=TaskComplexity.HIGH,
+                response_json_schema=_HYPOTHESIS_LIST_SCHEMA,
+            )
             content = response.content if hasattr(response, 'content') else str(response)
+            if isinstance(content, list):
+                content = "".join(
+                    block.text for block in content if getattr(block, "type", "") == "text"
+                )
 
             # Extract JSON from response
             from autoforge.engine.utils import extract_json_from_text
             try:
-                data = extract_json_from_text(content)
+                data = extract_json_from_text(
+                    content,
+                    schema=_HYPOTHESIS_LIST_SCHEMA,
+                    strict=True,
+                )
             except ValueError:
                 self.logger.error("No JSON found in hypothesis generation response")
                 return []
@@ -473,12 +535,24 @@ Provide the refined hypothesis in JSON format:
 """
 
         try:
-            response = await llm.call(prompt, complexity=TaskComplexity.HIGH)
+            response = await llm.call(
+                prompt,
+                complexity=TaskComplexity.HIGH,
+                response_json_schema=_HYPOTHESIS_REFINED_SCHEMA,
+            )
             content = response.content if hasattr(response, 'content') else str(response)
+            if isinstance(content, list):
+                content = "".join(
+                    block.text for block in content if getattr(block, "type", "") == "text"
+                )
 
             from autoforge.engine.utils import extract_json_from_text
             try:
-                data = extract_json_from_text(content)
+                data = extract_json_from_text(
+                    content,
+                    schema=_HYPOTHESIS_REFINED_SCHEMA,
+                    strict=True,
+                )
             except ValueError:
                 self.logger.error("No JSON in refined hypothesis response")
                 return hypothesis
@@ -593,23 +667,41 @@ Wrap the complete code in triple backticks:
 """
 
         try:
-            response = await llm.call(prompt, complexity=TaskComplexity.HIGH)
+            response = await llm.call(
+                prompt,
+                complexity=TaskComplexity.HIGH,
+                response_json_schema=_CODE_SCHEMA,
+            )
             content = response.content if hasattr(response, 'content') else str(response)
+            if isinstance(content, list):
+                content = "".join(
+                    block.text for block in content if getattr(block, "type", "") == "text"
+                )
 
             # Extract code from markdown code fence
-            code_match = re.search(r'```python\n([\s\S]*?)\n```', content)
-            if code_match:
-                code = code_match.group(1)
-            else:
-                # Try without language specifier
-                code_match = re.search(r'```\n([\s\S]*?)\n```', content)
+            from autoforge.engine.utils import extract_json_from_text
+            try:
+                code_data = extract_json_from_text(
+                    content,
+                    schema=_CODE_SCHEMA,
+                    strict=True,
+                )
+                code = str(code_data.get("code", ""))
+            except ValueError:
+                code_match = re.search(r'```python\n([\s\S]*?)\n```', content)
                 if code_match:
                     code = code_match.group(1)
                 else:
-                    self.logger.error("Could not extract code from response")
-                    return ""
+                    # Try without language specifier
+                    code_match = re.search(r'```\n([\s\S]*?)\n```', content)
+                    if code_match:
+                        code = code_match.group(1)
+                    else:
+                        self.logger.error("Could not extract code from response")
+                        return ""
 
             self.logger.debug(f"Generated {len(code.splitlines())} lines of code")
+            code = code.strip()
             return code
 
         except Exception as e:
@@ -950,12 +1042,24 @@ Guidelines:
 """
 
         try:
-            response = await llm.call(prompt, complexity=TaskComplexity.HIGH)
+            response = await llm.call(
+                prompt,
+                complexity=TaskComplexity.HIGH,
+                response_json_schema=_RESULT_ANALYSIS_SCHEMA,
+            )
             content = response.content if hasattr(response, 'content') else str(response)
+            if isinstance(content, list):
+                content = "".join(
+                    block.text for block in content if getattr(block, "type", "") == "text"
+                )
 
             from autoforge.engine.utils import extract_json_from_text
             try:
-                data = extract_json_from_text(content)
+                data = extract_json_from_text(
+                    content,
+                    schema=_RESULT_ANALYSIS_SCHEMA,
+                    strict=True,
+                )
             except ValueError:
                 self.logger.warning("No JSON in analysis response, falling back to basic")
                 return await self._analyze_basic(hypothesis, result, previous_best_metric)
@@ -1321,10 +1425,31 @@ Wrap the code in triple backticks:
 """
 
             try:
-                response = await llm.call(prompt, complexity=TaskComplexity.STANDARD)
+                response = await llm.call(
+                    prompt,
+                    complexity=TaskComplexity.STANDARD,
+                    response_json_schema=_CODE_SCHEMA,
+                )
                 content = response.content if hasattr(response, 'content') else str(response)
+                if isinstance(content, list):
+                    content = "".join(
+                        block.text for block in content if getattr(block, "type", "") == "text"
+                    )
 
                 # Extract code
+                from autoforge.engine.utils import extract_json_from_text
+                try:
+                    code_data = extract_json_from_text(
+                        content,
+                        schema=_CODE_SCHEMA,
+                        strict=True,
+                    )
+                    structured_code = str(code_data.get("code", ""))
+                    if structured_code.strip():
+                        content = structured_code.strip()
+                except ValueError:
+                    pass
+
                 code_match = re.search(r'```python\n([\s\S]*?)\n```', content)
                 if not code_match:
                     code_match = re.search(r'```\n([\s\S]*?)\n```', content)

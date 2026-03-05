@@ -13,6 +13,7 @@ import logging
 import os
 import re
 from pathlib import Path
+from copy import deepcopy
 from typing import Any
 
 import autoforge
@@ -32,6 +33,19 @@ class ArchitectAgent(AgentBase):
 
     ROLE = "architect"
     COMPLEXITY = TaskComplexity.HIGH  # Uses Opus for architectural decisions
+
+    _OUTPUT_SCHEMA_ARCHITECTURE: dict[str, Any] = {
+        "type": "object",
+        "required": ["architecture", "tasks"],
+        "properties": {
+            "architecture": {"type": "object"},
+            "tasks": {"type": "array", "items": {"type": "object"}},
+            "deliverables": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+    def _resolve_output_schema(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        return deepcopy(self._OUTPUT_SCHEMA_ARCHITECTURE)
 
     def __init__(self, config, llm, templates_dir: Path | None = None) -> None:
         self.templates_dir = templates_dir or autoforge.DATA_DIR / "templates"
@@ -156,17 +170,8 @@ class ArchitectAgent(AgentBase):
     def parse_architecture(self, output: str) -> dict[str, Any]:
         """Extract architecture and tasks from the Architect's output."""
         from autoforge.engine.utils import extract_json_from_text
-        schema = {
-            "type": "object",
-            "required": ["architecture", "tasks"],
-            "properties": {
-                "architecture": {"type": "object"},
-                "tasks": {"type": "array", "items": {"type": "object"}},
-                "deliverables": {"type": "array", "items": {"type": "string"}},
-            },
-        }
         try:
-            return extract_json_from_text(output, schema=schema, strict=True)
+            return extract_json_from_text(output, schema=self._OUTPUT_SCHEMA_ARCHITECTURE, strict=True)
         except (ValueError, json.JSONDecodeError) as e:
             raise ValueError(f"Could not extract architecture from Architect output: {e}") from e
 

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from copy import deepcopy
 from functools import partial
 from typing import Any
 
@@ -24,6 +25,21 @@ class DirectorAgent(AgentBase):
 
     ROLE = "director"
     COMPLEXITY = TaskComplexity.HIGH  # Uses Opus for deep understanding
+
+    _OUTPUT_SCHEMA_SPEC: dict[str, Any] = {
+        "type": "object",
+        "required": ["project_name", "modules"],
+        "properties": {
+            "project_name": {"type": "string"},
+            "description": {"type": "string"},
+            "modules": {"type": "array", "items": {"type": "object"}},
+            "tech_stack": {"type": "object"},
+            "build_contract": {"type": "object"},
+        },
+    }
+
+    def _resolve_output_schema(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        return deepcopy(self._OUTPUT_SCHEMA_SPEC)
 
     def _register_tools(self) -> None:
         """Director has web tools and GitHub tools for researching frameworks."""
@@ -111,19 +127,8 @@ class DirectorAgent(AgentBase):
     def parse_spec(self, output: str) -> dict[str, Any]:
         """Extract JSON spec from the Director's output text."""
         from autoforge.engine.utils import extract_json_from_text
-        schema = {
-            "type": "object",
-            "required": ["project_name", "modules"],
-            "properties": {
-                "project_name": {"type": "string"},
-                "description": {"type": "string"},
-                "modules": {"type": "array", "items": {"type": "object"}},
-                "tech_stack": {"type": "object"},
-                "build_contract": {"type": "object"},
-            },
-        }
         try:
-            return extract_json_from_text(output, schema=schema, strict=True)
+            return extract_json_from_text(output, schema=self._OUTPUT_SCHEMA_SPEC, strict=True)
         except ValueError as e:
             raise ValueError(f"Could not extract JSON spec from Director output: {e}") from e
 
@@ -137,6 +142,21 @@ class DirectorFixAgent(AgentBase):
 
     ROLE = "director_fix"
     COMPLEXITY = TaskComplexity.HIGH
+
+    _OUTPUT_SCHEMA_FIX_TASK: dict[str, Any] = {
+        "type": "object",
+        "required": ["id", "description", "files"],
+        "properties": {
+            "id": {"type": "string"},
+            "description": {"type": "string"},
+            "files": {"type": "array", "items": {"type": "string"}},
+            "owner": {"type": "string"},
+            "fix_strategy": {"type": "string"},
+        },
+    }
+
+    def _resolve_output_schema(self, context: dict[str, Any]) -> dict[str, Any] | None:
+        return deepcopy(self._OUTPUT_SCHEMA_FIX_TASK)
 
     def _register_tools(self) -> None:
         self._tools = []

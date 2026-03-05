@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -117,6 +118,10 @@ class Orchestrator:
         self._agent_counter: int = 0
         self._wall_start: float = 0.0
         self._difficulty: float | None = None
+        self._state_epoch: int = 0
+        self._state_version: int = 0
+        self._transition_seq: int = 0
+        self._force_rebuild_plan: bool = False
         # Adaptive context budget tracking
         self._context_budget_multiplier: float = 1.0
         self._context_success_history: list[bool] = []
@@ -225,6 +230,8 @@ class Orchestrator:
         """Execute the full pipeline. Returns path to the generated project."""
         self._start_time = time.monotonic()
         self._wall_start = time.time()
+        self._force_rebuild_plan = False
+        self._state_epoch = int(self._wall_start)
         logger.info(f"AutoForge run {self.config.run_id} starting")
 
         # Load capability DAG from global storage
@@ -649,9 +656,11 @@ class Orchestrator:
     # ──────────────────────────────────────────────
 
     async def _phase_build(self) -> None:
+        self._save_state("build_in_progress")
+
         # Resume from persisted task plan if available.
         dev_plan_file = self.project_dir / "dev_plan.json"
-        if dev_plan_file.exists():
+        if dev_plan_file.exists() and not self._force_rebuild_plan:
             try:
                 loaded = TaskDAG.load(dev_plan_file)
                 self._normalize_dag_for_resume(
@@ -664,6 +673,9 @@ class Orchestrator:
             except Exception as e:
                 logger.warning("Failed to load existing dev_plan.json: %s", e)
                 self.dag = None
+        elif self._force_rebuild_plan:
+            logger.warning("  [yellow]Build:[/yellow] signature changed — regenerating plan from architecture output")
+            self._force_rebuild_plan = False
 
         if self.dag is None:
             # Step 1: Architect designs and creates task DAG
@@ -818,16 +830,103 @@ class Orchestrator:
         reason: str,
         agent_id: str | None = None,
     ) -> None:
-        self._task_transition_log.append({
+        self._transition_seq += 1
+        entry = {
             "ts": time.time(),
+            "event_seq": self._transition_seq,
+            "state_version": self._state_version + 1,
+            "state_epoch": self._state_epoch,
             "task_id": task_id,
             "from_status": from_status,
             "to_status": to_status,
             "reason": reason,
             "agent_id": agent_id,
-        })
+        }
+        entry["event_id"] = hashlib.sha256(
+            (
+                f"{entry['state_epoch']}|{entry['event_seq']}|{entry['task_id']}|"
+                f"{entry['from_status']}->{entry['to_status']}|{entry['reason']}"
+            ).encode("utf-8"),
+        ).hexdigest()[:16]
+        self._task_transition_log.append(entry)
         if len(self._task_transition_log) > 2000:
             self._task_transition_log = self._task_transition_log[-2000:]
+        self._append_task_transition(entry)
+
+    def _task_transition_log_path(self) -> Path | None:
+        if not self._state_file:
+            return None
+        return self._state_file.parent / ".forge_task_transition_log.jsonl"
+
+    def _append_task_transition(self, entry: dict[str, Any]) -> None:
+        if not self._state_file:
+            return
+        if not isinstance(entry, dict):
+            return
+        path = self._task_transition_log_path()
+        if not path:
+            return
+
+        with self._state_lock:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except OSError as exc:
+                logger.warning("Failed to persist task transition entry: %s", exc)
+
+    def _load_task_transitions(self) -> list[dict[str, Any]]:
+        path = self._task_transition_log_path()
+        if not path or not path.exists():
+            return []
+
+        entries: list[dict[str, Any]] = []
+        max_seq = 0
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                seq = payload.get("event_seq")
+                if isinstance(seq, int):
+                    max_seq = max(max_seq, seq)
+                elif isinstance(seq, str) and seq.isdigit():
+                    max_seq = max(max_seq, int(seq))
+                entries.append(payload)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to load task transition log from %s: %s", path, exc)
+            return []
+
+        if max_seq:
+            self._transition_seq = max(self._transition_seq, max_seq)
+        if len(entries) > 2000:
+            entries = entries[-2000:]
+        return entries
+
+    def _build_plan_signature(self) -> str:
+        if not self.project_dir:
+            return ""
+
+        signature = hashlib.sha256()
+        has_content = False
+        for path in (self.project_dir / "dev_plan.json", self.project_dir / "architecture.md"):
+            if not path.exists():
+                continue
+            try:
+                signature.update(path.read_text(encoding="utf-8").encode("utf-8"))
+            except OSError:
+                continue
+            signature.update(b"|")
+            has_content = True
+        if not has_content:
+            return ""
+        return signature.hexdigest()
 
     def _apply_task_progress_snapshot(
         self, dag: TaskDAG, snapshot: list[dict[str, Any]] | None
@@ -1571,28 +1670,95 @@ class Orchestrator:
                     branch_name, f"TDD fix: {task.description}", task.id
                 )
 
+    def _normalize_package_manager(self, raw_manager: str | None) -> str:
+        if not raw_manager:
+            return ""
+        normalized = str(raw_manager).strip().lower()
+        for manager in ("pnpm", "yarn", "bun", "npm"):
+            if normalized == manager or normalized.startswith(f"{manager}@"):
+                return manager
+        return ""
+
+    def _detect_package_manager(self, project_dir: Path) -> str:
+        package_manager = "npm"
+        package_json = project_dir / "package.json"
+        if package_json.exists():
+            try:
+                package = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(package, dict):
+                    raw = package.get("packageManager")
+                    if normalized := self._normalize_package_manager(raw):
+                        return normalized
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if (project_dir / "pnpm-lock.yaml").exists():
+            return "pnpm"
+        if (project_dir / "yarn.lock").exists():
+            return "yarn"
+        if (project_dir / "bun.lockb").exists() or (project_dir / "bun.lock").exists():
+            return "bun"
+        if (project_dir / "package-lock.json").exists():
+            return "npm"
+        return package_manager
+
     @staticmethod
-    def _detect_test_command(work_dir: Path) -> str | None:
+    def _select_node_test_script(scripts: dict[str, Any]) -> str | None:
+        candidates = ("test", "test:ci", "test:unit", "test:all", "ci")
+        for script_name in candidates:
+            script_body = scripts.get(script_name)
+            if isinstance(script_body, str) and script_body.strip():
+                return script_name
+        return None
+
+    def _build_node_test_command(self, manager: str, script_name: str | None) -> str:
+        manager = self._normalize_package_manager(manager) or "npm"
+        if script_name:
+            return f"{manager} run {script_name} 2>&1"
+
+        if manager == "npm":
+            return "npm test -- --passWithNoTests 2>&1"
+        if manager == "pnpm":
+            return "pnpm test -- --passWithNoTests 2>&1"
+        return f"{manager} test 2>&1"
+
+    @staticmethod
+    def _makefile_has_test_target(makefile_path: Path) -> bool:
+        try:
+            content = makefile_path.read_text(encoding="utf-8", errors="replace")
+            return re.search(r"(?m)^[ \t]*test[ \t]*:", content) is not None
+        except OSError:
+            return False
+
+    def _detect_test_command(self, work_dir: Path) -> str | None:
         """Detect appropriate test command based on project type."""
         # Node.js / npm
-        pkg_json = work_dir / "package.json"
-        if pkg_json.exists():
+        package_json = work_dir / "package.json"
+        if package_json.exists():
             try:
-                pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
-                scripts = pkg.get("scripts", {})
-                if "test" in scripts:
-                    return "npm test -- --passWithNoTests 2>&1"
+                package = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(package, dict):
+                    scripts = package.get("scripts")
+                    if isinstance(scripts, dict):
+                        package_manager = self._detect_package_manager(work_dir)
+                        script_name = self._select_node_test_script(scripts)
+                        return self._build_node_test_command(package_manager, script_name)
             except (json.JSONDecodeError, OSError):
                 pass
 
         # Python / pytest
-        if (work_dir / "pytest.ini").exists() or (work_dir / "setup.cfg").exists():
+        if (
+            (work_dir / "pytest.ini").exists()
+            or (work_dir / "setup.cfg").exists()
+            or (work_dir / "tox.ini").exists()
+        ):
             return "python -m pytest --tb=short -q 2>&1"
+
         pyproject = work_dir / "pyproject.toml"
         if pyproject.exists():
             try:
-                content = pyproject.read_text(encoding="utf-8")
-                if "pytest" in content or "tool.pytest" in content:
+                content = pyproject.read_text(encoding="utf-8", errors="replace")
+                if "tool.pytest" in content or "pytest" in content:
                     return "python -m pytest --tb=short -q 2>&1"
             except OSError:
                 pass
@@ -1605,7 +1771,75 @@ class Orchestrator:
         if (work_dir / "go.mod").exists():
             return "go test ./... 2>&1"
 
+        # Dart / Flutter
+        if (work_dir / "pubspec.yaml").exists():
+            return "dart test 2>&1"
+
+        # Java
+        if (work_dir / "pom.xml").exists():
+            return "./mvnw test 2>&1" if (work_dir / "mvnw").exists() else "mvn test 2>&1"
+        if (work_dir / "build.gradle").exists() or (work_dir / "build.gradle.kts").exists():
+            return "./gradlew test 2>&1" if (work_dir / "gradlew").exists() else "gradle test 2>&1"
+
+        # .NET
+        if (any(work_dir.glob("*.sln")) or any(work_dir.glob("*.csproj"))):
+            return "dotnet test 2>&1"
+
+        # Native make-based test flow
+        makefile = work_dir / "Makefile"
+        if makefile.exists() and self._makefile_has_test_target(makefile):
+            return "make test"
+        lowercase_makefile = work_dir / "makefile"
+        if lowercase_makefile.exists() and self._makefile_has_test_target(lowercase_makefile):
+            return "make test"
+
         return None
+
+    @staticmethod
+    def _dependency_signature(project_dir: Path) -> str:
+        signature = hashlib.sha256()
+        dependency_files = [
+            "package.json",
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "pnpm-workspace.yaml",
+            "bun.lockb",
+            "bun.lock",
+            "requirements.txt",
+            "requirements-dev.txt",
+            "requirements.in",
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "poetry.lock",
+            "uv.lock",
+            "poetry.toml",
+        ]
+        signature.update(str(project_dir.resolve()).encode("utf-8"))
+        for rel in sorted(dependency_files):
+            manifest = project_dir / rel
+            if manifest.is_file():
+                signature.update(rel.encode("utf-8"))
+                try:
+                    signature.update(manifest.read_bytes())
+                except OSError:
+                    continue
+        return signature.hexdigest()
+
+    @staticmethod
+    def _dependency_cache_key(project_dir: Path, dependency_signature: str) -> str:
+        return f"{project_dir}::{dependency_signature}"
+
+    @staticmethod
+    def _dependency_probe_command(command: str) -> str:
+        command = command.strip()
+        if command.startswith("python -m pip"):
+            return "python -m pip --version"
+        if command.startswith("python "):
+            return "python --version"
+        first_token = command.split(" ", 1)[0] if command else ""
+        return f"{first_token} --version"
 
     async def _prepare_runtime_dependencies(self, project_dir: Path) -> None:
         """Install runtime/test dependencies for Node.js and Python projects.
@@ -1617,74 +1851,136 @@ class Orchestrator:
             return
 
         project_dir = project_dir.resolve()
-        marker = str(project_dir)
-        if marker in self._dependency_prepared_dirs:
+        dependency_signature = self._dependency_signature(project_dir)
+        marker = self._dependency_cache_key(project_dir, dependency_signature)
+        legacy_marker = str(project_dir)
+        if marker in self._dependency_prepared_dirs or legacy_marker in self._dependency_prepared_dirs:
+            # Backward-compatible with older state: legacy marker means dependencies were
+            # prepared in a previous run for this project root.
+            self._dependency_prepared_dirs.add(marker)
+            self._save_state("dependencies_prepared")
             return
 
         async with self._dependency_state_lock:
-            if marker in self._dependency_prepared_dirs:
+            if marker in self._dependency_prepared_dirs or legacy_marker in self._dependency_prepared_dirs:
+                self._dependency_prepared_dirs.add(marker)
+                self._save_state("dependencies_prepared")
                 return
 
-            steps: list[tuple[str, str]] = []
+            steps: list[tuple[str, str, bool]] = []
+
             if (project_dir / "package.json").exists():
-                if (project_dir / "package-lock.json").exists():
-                    steps.append(("npm ci --no-audit --no-fund", "npm dependencies (ci)"))
-                elif (project_dir / "yarn.lock").exists():
-                    steps.append(("yarn install --frozen-lockfile", "yarn dependencies"))
-                elif (project_dir / "pnpm-lock.yaml").exists():
-                    steps.append(("pnpm install --frozen-lockfile", "pnpm dependencies"))
+                package_manager = self._detect_package_manager(project_dir)
+                if package_manager == "pnpm":
+                    if (project_dir / "pnpm-lock.yaml").exists():
+                        steps.append(("pnpm install --frozen-lockfile", "pnpm dependencies (frozen)", True))
+                    else:
+                        steps.append(("pnpm install", "pnpm dependencies", True))
+                elif package_manager == "yarn":
+                    if (project_dir / "yarn.lock").exists():
+                        steps.append(("yarn install --frozen-lockfile", "yarn dependencies (frozen)", True))
+                    else:
+                        steps.append(("yarn install", "yarn dependencies", True))
+                elif package_manager == "bun":
+                    steps.append(("bun install", "bun dependencies", True))
                 else:
-                    steps.append(("npm install --no-audit --no-fund", "npm dependencies"))
+                    if (project_dir / "package-lock.json").exists():
+                        steps.append(("npm ci --no-audit --no-fund", "npm dependencies (ci)", True))
+                    else:
+                        steps.append(("npm install --no-audit --no-fund", "npm dependencies", True))
 
             if (project_dir / "requirements.txt").exists():
-                steps.append(("python -m pip install -r requirements.txt", "python requirements"))
-            if (project_dir / "pyproject.toml").exists():
-                steps.append(("python -m pip install -e .", "python package"))
+                steps.append(("python -m pip install -r requirements.txt", "python requirements", True))
+            if (project_dir / "requirements-dev.txt").exists():
+                steps.append(("python -m pip install -r requirements-dev.txt", "python dev requirements", False))
+
+            pyproject = project_dir / "pyproject.toml"
+            has_pyproject = pyproject.exists()
+            has_python_setup = (
+                has_pyproject
+                or (project_dir / "setup.py").exists()
+                or (project_dir / "setup.cfg").exists()
+            )
+
+            if has_pyproject:
+                is_poetry = False
+                try:
+                    pyproject_content = pyproject.read_text(encoding="utf-8", errors="replace")
+                    is_poetry = "tool.poetry" in pyproject_content
+                except OSError:
+                    pass
+                if is_poetry or (project_dir / "poetry.lock").exists():
+                    steps.append(("poetry install --no-interaction --no-ansi", "poetry dependencies", True))
+                elif (project_dir / "uv.lock").exists():
+                    steps.append(("uv sync --frozen", "uv dependencies", True))
+                else:
+                    steps.append(("python -m pip install -e .", "python package", True))
+            elif has_python_setup:
+                steps.append(("python -m pip install -e .", "python package", True))
+
+            deduped_steps: list[tuple[str, str, bool]] = []
+            seen_commands: set[str] = set()
+            for command, reason, required in steps:
+                if command in seen_commands:
+                    continue
+                seen_commands.add(command)
+                deduped_steps.append((command, reason, required))
+            steps = deduped_steps
 
             if not steps:
                 self._dependency_prepared_dirs.add(marker)
+                self._save_state("dependencies_prepared")
                 return
 
             sandbox = create_sandbox(self.config, project_dir)
             async with sandbox:
-                for command, reason in steps:
+                required_failures: list[str] = []
+                for command, reason, required in steps:
                     console.print(f"  [yellow]Dependency setup[/yellow]: {reason}")
-                    # Avoid retrying the same missing command repeatedly.
-                    if "npm" in command:
-                        check = await sandbox.exec("npm --version", timeout=30)
-                        if check.exit_code != 0:
-                            logger.warning("npm not available, skipping npm dependency install")
-                            continue
-                    if "yarn" in command:
-                        check = await sandbox.exec("yarn --version", timeout=30)
-                        if check.exit_code != 0:
-                            logger.warning("yarn not available, skipping yarn dependency install")
-                            continue
-                    if "pnpm" in command:
-                        check = await sandbox.exec("pnpm --version", timeout=30)
-                        if check.exit_code != 0:
-                            logger.warning("pnpm not available, skipping pnpm dependency install")
-                            continue
-                    if "pip install" in command:
-                        check = await sandbox.exec("python -m pip --version", timeout=30)
-                        if check.exit_code != 0:
-                            logger.warning("python pip not available, skipping python dependency install")
+                    probe = self._dependency_probe_command(command)
+                    if probe:
+                        probe_result = await sandbox.exec(probe, timeout=30)
+                        if probe_result.exit_code != 0:
+                            if required:
+                                required_failures.append(f"{command} (tool check failed: {probe})")
+                                logger.warning(
+                                    "Required dependency tool unavailable: %s (for %s)",
+                                    probe,
+                                    command,
+                                )
+                            else:
+                                logger.warning(
+                                    "Skipping optional dependency step %s because %s unavailable",
+                                    command,
+                                    probe,
+                                )
                             continue
 
                     result = await sandbox.exec(command, timeout=900)
                     if result.exit_code != 0:
-                        logger.warning(
-                            "Dependency step failed: %s (exit %s) — %s",
-                            command,
-                            result.exit_code,
-                            result.stderr[:500],
-                        )
-                        # Even if one step fails, continue the pipeline.
-                        # _tdd_loop/VERIFY will surface actionable errors.
+                        if required:
+                            stderr = (result.stderr or "").strip()[:500]
+                            required_failures.append(f"{command} (exit {result.exit_code}): {stderr}")
+                            logger.warning(
+                                "Dependency step failed: %s (exit %s) — %s",
+                                command,
+                                result.exit_code,
+                                stderr,
+                            )
+                        # Continue with remaining steps so we surface the highest-value
+                        # failures and maximize partial setup in best-effort mode.
                     else:
                         logger.info("Dependency step succeeded: %s", command)
 
+            if required_failures:
+                raise RuntimeError(
+                    "Required dependency setup failed: "
+                    + "; ".join(required_failures)
+                )
+
             self._dependency_prepared_dirs.add(marker)
+            self._save_state("dependencies_prepared")
+
 
     # ──────────────────────────────────────────────
     # Dependency Context: pass upstream file contents to downstream builders
@@ -2070,6 +2366,8 @@ class Orchestrator:
         if not self.project_dir:
             return False
 
+        self._save_state("verify_in_progress")
+
         # Ensure runtime and test dependencies are installed before tests start.
         await self._prepare_runtime_dependencies(self.project_dir)
 
@@ -2091,6 +2389,7 @@ class Orchestrator:
 
             if test_results.all_passed:
                 console.print("  [green]All tests passed[/green]")
+                self._save_state("verify_complete")
                 return True
 
             console.print(f"  [yellow]Some tests failed — attempting fixes[/yellow]")
@@ -2117,6 +2416,7 @@ class Orchestrator:
                 console.print(
                     f"  [yellow]VERIFY gate: {n_fail} test(s) still failing[/yellow]"
                 )
+            self._save_state("verify_complete")
             return final_results.all_passed
 
     async def _fix_failures(self, test_results, sandbox: SandboxBase) -> None:
@@ -2241,6 +2541,12 @@ class Orchestrator:
     # ──────────────────────────────────────────────
 
     async def _phase_refactor(self) -> None:
+        if not self.project_dir:
+            return
+
+        self._save_state("refactor_in_progress")
+        await self._prepare_runtime_dependencies(self.project_dir)
+
         sandbox = create_sandbox(self.config, self.project_dir)
         async with sandbox:
             # Full project review with verification tools
@@ -2254,6 +2560,7 @@ class Orchestrator:
 
             if review.score >= round(self.config.quality_threshold * 10):
                 console.print(f"  [green]Quality score: {review.score}/10 — no refactoring needed[/green]")
+                self._save_state("refactor_complete")
                 return
 
             console.print(f"  Quality score: {review.score}/10 — refactoring...")
@@ -2303,6 +2610,7 @@ class Orchestrator:
                     console.print("  [green]Post-refactor fixes applied[/green]")
                 else:
                     console.print("  [green]Refactoring verified — no regressions[/green]")
+            self._save_state("refactor_complete")
 
     # ──────────────────────────────────────────────
     # Phase 5: DELIVER
@@ -3734,6 +4042,7 @@ class Orchestrator:
             return
 
         task_progress = self._task_progress_snapshot()
+        next_state_version = self._state_version + 1
 
         state = {
             "run_id": self.config.run_id,
@@ -3746,6 +4055,11 @@ class Orchestrator:
             "total_input_tokens": self.config.total_input_tokens,
             "total_output_tokens": self.config.total_output_tokens,
             "token_usage": dict(self.config.token_usage),
+            "state_version": next_state_version,
+            "state_epoch": self._state_epoch,
+            "task_transition_seq": self._transition_seq,
+            "build_plan_signature": self._build_plan_signature(),
+            "prepared_dependency_dirs": sorted(self._dependency_prepared_dirs),
             "task_transition_log": self._task_transition_log[-1000:],
             "elapsed_seconds": time.time() - self._wall_start,
             "updated_at": time.time(),
@@ -3757,6 +4071,7 @@ class Orchestrator:
                 tmp = self._state_file.parent / f".{self._state_file.name}.tmp"
                 tmp.write_text(state_json, encoding="utf-8")
                 tmp.replace(self._state_file)
+                self._state_version = next_state_version
             except OSError as exc:
                 logger.error("Failed to save state to %s: %s", self._state_file, exc)
 
@@ -3794,6 +4109,9 @@ class Orchestrator:
 
         self.project_dir = workspace_path
         self._state_file = workspace_path / ".forge_state.json"
+        self._force_rebuild_plan = False
+        self._task_transition_log = []
+        self._transition_seq = 0
         try:
             state = json.loads(self._state_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
@@ -3811,12 +4129,43 @@ class Orchestrator:
                 item for item in task_progress
                 if isinstance(item, dict)
             ]
+        state_version = state.get("state_version", self._state_version)
+        if isinstance(state_version, (int, str)) and str(state_version).isdigit():
+            self._state_version = int(state_version)
+        state_epoch = state.get("state_epoch", self._state_epoch)
+        if isinstance(state_epoch, (int, str)) and str(state_epoch).isdigit():
+            self._state_epoch = int(state_epoch)
+        task_transition_seq = state.get("task_transition_seq", self._transition_seq)
+        if isinstance(task_transition_seq, (int, str)) and str(task_transition_seq).isdigit():
+            self._transition_seq = int(task_transition_seq)
+        prepared_dirs = state.get("prepared_dependency_dirs", [])
+        if isinstance(prepared_dirs, list):
+            self._dependency_prepared_dirs = set(
+                str(item) for item in prepared_dirs if isinstance(item, str)
+            )
         transition_log = state.get("task_transition_log", [])
         if isinstance(transition_log, list):
             self._task_transition_log = [
                 entry for entry in transition_log
                 if isinstance(entry, dict)
             ]
+
+        for entry in self._load_task_transitions():
+            if isinstance(entry, dict) and entry not in self._task_transition_log:
+                self._task_transition_log.append(entry)
+        if len(self._task_transition_log) > 2000:
+            self._task_transition_log = self._task_transition_log[-2000:]
+
+        expected_signature = state.get("build_plan_signature")
+        if isinstance(expected_signature, str) and expected_signature:
+            current_signature = self._build_plan_signature()
+            if current_signature and current_signature != expected_signature:
+                logger.warning(
+                    "Build plan signature mismatch while resuming. "
+                    "Clearing resumed task progress and rebuilding plan."
+                )
+                self._resumed_task_progress = None
+                self._force_rebuild_plan = True
 
         # Restore token usage so budget tracking is accurate across resumes
         if "token_usage" in state and isinstance(state["token_usage"], dict):
@@ -3849,6 +4198,13 @@ class Orchestrator:
             await self._phase_refactor()
             await self._phase_deliver()
         elif phase == "verify_in_progress":
+            await self._phase_verify()
+            await self._phase_refactor()
+            await self._phase_deliver()
+        elif phase == "refactor_in_progress":
+            await self._phase_refactor()
+            await self._phase_deliver()
+        elif phase == "dependencies_prepared":
             await self._phase_verify()
             await self._phase_refactor()
             await self._phase_deliver()
