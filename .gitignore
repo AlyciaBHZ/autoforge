@@ -40,6 +40,9 @@ docker/sandbox-data/
 # Database (daemon mode)
 *.db
 
+# Local runtime metadata
+.claude/
+
 # Local audit docs (do not commit)
 AutoForge_Academic_Audit*.docx
 AutoForge_Audit*.docx
