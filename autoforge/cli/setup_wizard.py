@@ -26,10 +26,10 @@ PROVIDERS = {
         "invalid_msg": "API key must be at least 20 characters",
         "models_strong": [
             {"name": "Claude Opus 4.6 (best quality, higher cost)", "value": "claude-opus-4-6"},
-            {"name": "Claude Sonnet 4.5 (good balance)", "value": "claude-sonnet-4-5-20250929"},
+            {"name": "Claude Sonnet 4.6 (good balance)", "value": "claude-sonnet-4-6"},
         ],
         "models_fast": [
-            {"name": "Claude Sonnet 4.5 (recommended)", "value": "claude-sonnet-4-5-20250929"},
+            {"name": "Claude Sonnet 4.6 (recommended)", "value": "claude-sonnet-4-6"},
             {"name": "Claude Haiku 4.5 (faster, cheaper)", "value": "claude-haiku-4-5-20251001"},
         ],
         "auth_methods": [
@@ -46,16 +46,17 @@ PROVIDERS = {
         "validate": lambda x: x.startswith("sk-") and len(x) > 20,
         "invalid_msg": "Must start with 'sk-' and be at least 20 characters",
         "models_strong": [
-            {"name": "Codex 5.3 (newest, code-specialized)", "value": "codex-5.3"},
-            {"name": "GPT-5.3-Codex (latest family, may require Responses API)", "value": "gpt-5.3-codex"},
-            {"name": "GPT-5.2-Codex (high reasoning, may require Responses API)", "value": "gpt-5.2-codex"},
+            {"name": "GPT-5.3-Codex (latest code-specialized)", "value": "gpt-5.3-codex"},
+            {"name": "GPT-5.2-Codex (stable code model)", "value": "gpt-5.2-codex"},
+            {"name": "GPT-5.2 (latest general model)", "value": "gpt-5.2"},
+            {"name": "Codex 5.3 (alias)", "value": "codex-5.3"},
             {"name": "o3 (strongest reasoning)", "value": "o3"},
-            {"name": "GPT-4o (fast + capable)", "value": "gpt-4o"},
+            {"name": "GPT-4o (legacy fallback)", "value": "gpt-4o"},
         ],
         "models_fast": [
-            {"name": "GPT-4o-mini (recommended)", "value": "gpt-4o-mini"},
-            {"name": "GPT-5.1-Codex-mini (lightweight codex, may require Responses API)", "value": "gpt-5.1-codex-mini"},
-            {"name": "Codex-mini-latest (lightweight codex)", "value": "codex-mini-latest"},
+            {"name": "GPT-5 mini (recommended)", "value": "gpt-5-mini"},
+            {"name": "GPT-5.1-Codex-mini (lightweight coding)", "value": "gpt-5.1-codex-mini"},
+            {"name": "GPT-4o-mini (legacy fallback)", "value": "gpt-4o-mini"},
             {"name": "o4-mini (reasoning, cheaper)", "value": "o4-mini"},
         ],
         "auth_methods": [
@@ -73,11 +74,13 @@ PROVIDERS = {
         "invalid_msg": "API key seems too short",
         "models_strong": [
             {"name": "Gemini 2.5 Pro (best quality)", "value": "gemini-2.5-pro"},
+            {"name": "Gemini 3 Pro Preview (latest preview)", "value": "gemini-3-pro-preview"},
             {"name": "Gemini 2.5 Flash (good balance)", "value": "gemini-2.5-flash"},
         ],
         "models_fast": [
             {"name": "Gemini 2.5 Flash (recommended)", "value": "gemini-2.5-flash"},
-            {"name": "Gemini 2.0 Flash (fastest, cheapest)", "value": "gemini-2.0-flash"},
+            {"name": "Gemini 2.5 Flash-Lite (fastest, cheapest stable)", "value": "gemini-2.5-flash-lite"},
+            {"name": "Gemini 3 Flash Preview (latest preview)", "value": "gemini-3-flash-preview"},
         ],
         "auth_methods": [
             {"name": "API Key (recommended)", "value": "api_key"},
@@ -161,7 +164,7 @@ def run_setup_wizard() -> None:
 
     api_keys: dict[str, str] = {}
     auth_configs: dict[str, dict[str, str]] = {}
-    model_strong = "claude-sonnet-4-5-20250929"
+    model_strong = "claude-sonnet-4-6"
     model_fast = "claude-haiku-4-5-20251001"
     openai_reasoning_effort = "medium"
     budget = 10.0

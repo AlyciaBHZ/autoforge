@@ -117,8 +117,11 @@ _RETRY_BASE_DELAY = 1.0  # seconds — base delay for exponential backoff
 
 # Known OpenAI model prefixes/names
 _OPENAI_MODELS = {
+    "gpt-5.2",
     "gpt-4o",
     "gpt-4o-mini",
+    "gpt-5-mini",
+    "gpt-5-nano",
     "gpt-4-turbo",
     "gpt-4",
     "gpt-3.5-turbo",
@@ -128,7 +131,6 @@ _OPENAI_MODELS = {
     "gpt-5.1-codex-mini",
     "gpt-5.1-codex-max",
     "codex-5.3",
-    "codex-mini-latest",
     "o3",
     "o3-mini",
     "o4",
@@ -244,7 +246,7 @@ class LLMRouter:
 
     def _is_openai_reasoning_model(self, model: str) -> bool:
         model_lower = model.lower()
-        if model_lower.startswith(("o1", "o3", "o4", "o5", "codex-")):
+        if model_lower.startswith(("o1", "o3", "o4", "o5", "codex-", "gpt-5")):
             return True
         if "codex" in model_lower:
             return True

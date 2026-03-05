@@ -183,7 +183,7 @@ class DirectorFixAgent(AgentBase):
     def parse_fix_task(self, output: str) -> dict[str, Any]:
         """Extract fix task from output."""
         from autoforge.engine.utils import extract_json_from_text
-        schema = {
+        strict_schema = {
             "type": "object",
             "required": ["id", "description", "files"],
             "properties": {
@@ -194,6 +194,24 @@ class DirectorFixAgent(AgentBase):
             },
         }
         try:
-            return extract_json_from_text(output, schema=schema, strict=True)
+            result = extract_json_from_text(output, schema=strict_schema, strict=True)
+            result.setdefault("files", [])
+            return result
         except ValueError as e:
-            raise ValueError(f"Could not extract fix task from Director output: {e}") from e
+            # Backward-compatible fallback: older prompts may omit `files`.
+            fallback_schema = {
+                "type": "object",
+                "required": ["id", "description"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "description": {"type": "string"},
+                    "files": {"type": "array", "items": {"type": "string"}},
+                    "owner": {"type": "string"},
+                },
+            }
+            try:
+                result = extract_json_from_text(output, schema=fallback_schema, strict=True)
+                result.setdefault("files", [])
+                return result
+            except ValueError:
+                raise ValueError(f"Could not extract fix task from Director output: {e}") from e

@@ -228,7 +228,7 @@ def test_forge_config_from_env():
 def test_forge_config_budget_tracking():
     from autoforge.engine.config import ForgeConfig
     config = ForgeConfig(budget_limit_usd=1.0)
-    config.record_usage("claude-sonnet-4-5-20250929", 1000, 500)
+    config.record_usage("claude-sonnet-4-6", 1000, 500)
     assert config.total_input_tokens == 1000
     assert config.total_output_tokens == 500
     assert config.estimated_cost_usd > 0
@@ -439,7 +439,7 @@ def test_llm_router_instantiation():
     assert m == "claude-opus-4-6"
     assert t == 16384
     m2, t2 = router._select_model(TaskComplexity.STANDARD)
-    assert m2 == "claude-sonnet-4-5-20250929"
+    assert m2 == "claude-sonnet-4-6"
     assert t2 == 8192
 
 
@@ -811,15 +811,17 @@ def test_agent_parse_failsafe():
 def test_provider_detection():
     from autoforge.engine.llm_router import detect_provider
     assert detect_provider("claude-opus-4-6") == "anthropic"
-    assert detect_provider("claude-sonnet-4-5-20250929") == "anthropic"
+    assert detect_provider("claude-sonnet-4-6") == "anthropic"
     assert detect_provider("claude-haiku-4-5-20251001") == "anthropic"
     assert detect_provider("gpt-4o") == "openai"
+    assert detect_provider("gpt-5-mini") == "openai"
     assert detect_provider("gpt-4o-mini") == "openai"
     assert detect_provider("o3") == "openai"
     assert detect_provider("o4-mini") == "openai"
     assert detect_provider("gemini-2.5-pro") == "google"
+    assert detect_provider("gemini-3-pro-preview") == "google"
     assert detect_provider("gemini-2.5-flash") == "google"
-    assert detect_provider("gemini-2.0-flash") == "google"
+    assert detect_provider("gemini-2.5-flash-lite") == "google"
     # Unknown model defaults to anthropic
     assert detect_provider("some-unknown-model") == "anthropic"
 
@@ -867,12 +869,15 @@ def test_extended_model_pricing():
     from autoforge.engine.config import MODEL_PRICING
     # Anthropic
     assert "claude-opus-4-6" in MODEL_PRICING
+    assert "claude-sonnet-4-6" in MODEL_PRICING
     # OpenAI
+    assert "gpt-5.2" in MODEL_PRICING
+    assert "gpt-5-mini" in MODEL_PRICING
     assert "gpt-4o" in MODEL_PRICING
     assert "o3" in MODEL_PRICING
     # Google
     assert "gemini-2.5-pro" in MODEL_PRICING
-    assert "gemini-2.0-flash" in MODEL_PRICING
+    assert "gemini-2.5-flash-lite" in MODEL_PRICING
 
 
 # ────────────────────────────────────────────

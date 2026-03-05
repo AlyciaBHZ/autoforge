@@ -243,7 +243,7 @@ class ScannerAgent(AgentBase):
     def parse_scan(self, output: str) -> ScanResult:
         """Extract structured scan result from agent output."""
         from autoforge.engine.utils import extract_json_from_text
-        schema = {
+        strict_schema = {
             "type": "object",
             "required": ["spec", "gaps", "completeness"],
             "properties": {
@@ -255,10 +255,31 @@ class ScannerAgent(AgentBase):
             },
         }
         try:
-            data = extract_json_from_text(output, schema=schema, strict=True)
+            data = extract_json_from_text(output, schema=strict_schema, strict=True)
         except (ValueError, json.JSONDecodeError) as e:
-            logger.warning("Could not parse scanner output: %s", e)
-            return ScanResult(summary="Failed to parse scan results")
+            # Backward-compatible fallback: accept legacy flat scan payload.
+            fallback_schema = {
+                "type": "object",
+                "required": ["completeness", "gaps"],
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "gaps": {"type": "array", "items": {"type": "string"}},
+                    "completeness": {"type": "number"},
+                    "excluded": {"type": "array", "items": {"type": "string"}},
+                },
+            }
+            try:
+                data = extract_json_from_text(output, schema=fallback_schema, strict=True)
+                return ScanResult(
+                    spec=data,
+                    gaps=data.get("gaps", []),
+                    completeness=data.get("completeness", 50),
+                    summary=data.get("description", ""),
+                )
+            except (ValueError, json.JSONDecodeError):
+                logger.warning("Could not parse scanner output: %s", e)
+                return ScanResult(summary="Failed to parse scan results")
 
         return ScanResult(
             spec=data,

@@ -28,19 +28,31 @@ import autoforge
 # Approximate pricing per million tokens (USD)
 MODEL_PRICING = {
     # Anthropic
-    "claude-opus-4-6": {"input": 15.0, "output": 75.0},
+    "claude-opus-4-6": {"input": 5.0, "output": 25.0},
+    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
+    # Legacy snapshot (kept for backward compatibility)
     "claude-sonnet-4-5-20250929": {"input": 3.0, "output": 15.0},
     "claude-haiku-4-5-20251001": {"input": 1.0, "output": 5.0},
     # OpenAI
-    "codex-5.3": {"input": 5.0, "output": 20.0},
+    "codex-5.3": {"input": 1.75, "output": 14.0},
+    "gpt-5.3-codex": {"input": 1.75, "output": 14.0},
+    "gpt-5.2-codex": {"input": 1.75, "output": 14.0},
+    "gpt-5.2": {"input": 1.75, "output": 14.0},
+    "gpt-5-mini": {"input": 0.25, "output": 2.0},
+    "gpt-5.1-codex-mini": {"input": 0.25, "output": 2.0},
+    "gpt-5-nano": {"input": 0.05, "output": 0.4},
     "gpt-4o": {"input": 2.5, "output": 10.0},
     "gpt-4o-mini": {"input": 0.15, "output": 0.6},
     "o3": {"input": 10.0, "output": 40.0},
     "o3-mini": {"input": 1.1, "output": 4.4},
     "o4-mini": {"input": 1.1, "output": 4.4},
     # Google Gemini
+    "gemini-3-pro-preview": {"input": 2.0, "output": 12.0},
+    "gemini-3-flash-preview": {"input": 0.5, "output": 3.0},
     "gemini-2.5-pro": {"input": 1.25, "output": 10.0},
-    "gemini-2.5-flash": {"input": 0.15, "output": 0.6},
+    "gemini-2.5-flash": {"input": 0.3, "output": 2.5},
+    "gemini-2.5-flash-lite": {"input": 0.1, "output": 0.4},
+    # Legacy model (kept for backward compatibility)
     "gemini-2.0-flash": {"input": 0.1, "output": 0.4},
 }
 
@@ -308,7 +320,7 @@ class ForgeConfig:
     api_keys: dict[str, str] = field(default_factory=dict)
     auth_config: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_strong: str = "claude-opus-4-6"
-    model_fast: str = "claude-sonnet-4-5-20250929"
+    model_fast: str = "claude-sonnet-4-6"
     max_tokens_strong: int = 16384
     max_tokens_fast: int = 8192
     openai_reasoning_effort: str = "medium"
@@ -592,7 +604,7 @@ class ForgeConfig:
             ),
             model_fast=(
                 os.getenv("FORGE_MODEL_FAST")
-                or global_config.get("model_fast", "claude-sonnet-4-5-20250929")
+                or global_config.get("model_fast", "claude-sonnet-4-6")
             ),
             openai_reasoning_effort=openai_reasoning_effort,
             budget_limit_usd=budget,

@@ -391,7 +391,7 @@ class SymPyEngine:
                 backend=self.backend,
                 success=True,
                 computation_time=time.time() - start,
-                steps=[f"Verified: {lhs} {'=' if is_equal else '鈮?} {rhs}"],
+                steps=[f"Verified: {lhs} {'=' if is_equal else '!='} {rhs}"],
                 algorithm_ratio=1.0,  # Pure SymPy computation
             )
         except Exception as e:
