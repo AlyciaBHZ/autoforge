@@ -486,7 +486,20 @@ class CodexOAuthAuth(AuthProvider):
         url = f"{self.AUTH_URL}?{urllib.parse.urlencode(params)}"
 
         logger.info("Opening browser for Codex OAuth login...")
-        webbrowser.open(url)
+        logger.info("If browser does not open automatically, visit: %s", url)
+        opened = False
+        try:
+            opened = bool(webbrowser.open(url, new=2))
+        except Exception:
+            opened = False
+        if not opened and os.name == "nt":
+            try:
+                os.startfile(url)  # type: ignore[attr-defined]
+                opened = True
+            except OSError:
+                opened = False
+        if not opened:
+            logger.warning("Could not open browser automatically. Open this URL manually: %s", url)
 
         # Wait for callback (up to 120 seconds)
         server_thread.join(timeout=120)

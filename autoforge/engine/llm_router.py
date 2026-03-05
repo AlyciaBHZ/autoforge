@@ -116,8 +116,27 @@ _RETRY_BASE_DELAY = 1.0  # seconds — base delay for exponential backoff
 # ── Provider detection ─────────────────────────────────────────────
 
 # Known OpenAI model prefixes/names
-_OPENAI_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo",
-                  "codex-5.3", "o3", "o3-mini", "o4", "o4-mini", "o1", "o1-mini", "o1-preview"}
+_OPENAI_MODELS = {
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4-turbo",
+    "gpt-4",
+    "gpt-3.5-turbo",
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-codex-max",
+    "codex-5.3",
+    "codex-mini-latest",
+    "o3",
+    "o3-mini",
+    "o4",
+    "o4-mini",
+    "o1",
+    "o1-mini",
+    "o1-preview",
+}
 
 
 def detect_provider(model: str) -> str:
@@ -128,7 +147,7 @@ def detect_provider(model: str) -> str:
     model_lower = model.lower()
 
     # OpenAI: check exact matches and prefixes
-    if model_lower in _OPENAI_MODELS or model_lower.startswith(("gpt-", "codex-", "o1-", "o3-", "o4-")):
+    if model_lower in _OPENAI_MODELS or model_lower.startswith(("gpt-", "codex-", "o1", "o3", "o4", "o5")):
         return "openai"
 
     # Google Gemini
@@ -212,6 +231,24 @@ class LLMRouter:
         if self._budget_lock is None:
             self._budget_lock = asyncio.Lock()
         return self._budget_lock
+
+    def _is_openai_subscription_auth(self) -> bool:
+        auth = self.config.auth_config.get("openai", {})
+        method = str(auth.get("auth_method", "")).strip().lower()
+        return method in ("codex_oauth", "device_code")
+
+    def _is_budget_enforced(self, provider: str) -> bool:
+        if provider == "openai" and self._is_openai_subscription_auth():
+            return False
+        return True
+
+    def _is_openai_reasoning_model(self, model: str) -> bool:
+        model_lower = model.lower()
+        if model_lower.startswith(("o1", "o3", "o4", "o5", "codex-")):
+            return True
+        if "codex" in model_lower:
+            return True
+        return False
 
     def _estimate_call_cost_usd(
         self,
@@ -459,31 +496,33 @@ class LLMRouter:
         elif messages is None:
             raise ValueError("Either a positional prompt or messages= is required")
         model, max_tokens = self._select_model(complexity)
-        reservation = self._estimate_call_cost_usd(
-            model=model,
-            system=system,
-            messages=messages,
-            max_tokens=max_tokens,
-        )
-
-        lock = self._get_budget_lock()
-        async with lock:
-            projected = (
-                self.config.estimated_cost_usd
-                + self._reserved_budget_usd
-                + reservation
-            )
-            if projected > self.config.budget_limit_usd:
-                raise BudgetExceededError(
-                    "Budget exhausted before call: "
-                    f"used=${self.config.estimated_cost_usd:.4f}, "
-                    f"reserved=${self._reserved_budget_usd:.4f}, "
-                    f"next_estimate=${reservation:.4f}, "
-                    f"limit=${self.config.budget_limit_usd:.4f}"
-                )
-            self._reserved_budget_usd += reservation
-
         provider = detect_provider(model)
+        budget_enforced = self._is_budget_enforced(provider)
+        reservation = 0.0
+        lock = self._get_budget_lock()
+        if budget_enforced:
+            reservation = self._estimate_call_cost_usd(
+                model=model,
+                system=system,
+                messages=messages,
+                max_tokens=max_tokens,
+            )
+            async with lock:
+                projected = (
+                    self.config.estimated_cost_usd
+                    + self._reserved_budget_usd
+                    + reservation
+                )
+                if projected > self.config.budget_limit_usd:
+                    raise BudgetExceededError(
+                        "Budget exhausted before call: "
+                        f"used=${self.config.estimated_cost_usd:.4f}, "
+                        f"reserved=${self._reserved_budget_usd:.4f}, "
+                        f"next_estimate=${reservation:.4f}, "
+                        f"limit=${self.config.budget_limit_usd:.4f}"
+                    )
+                self._reserved_budget_usd += reservation
+
         # Async-safe client initialization — prevent duplicate creation
         async with self._get_client_lock():
             self._get_client(provider)
@@ -515,14 +554,16 @@ class LLMRouter:
                 raise ValueError(f"Unknown provider: {provider}")
             return response
         finally:
-            async with lock:
-                self._reserved_budget_usd = max(0.0, self._reserved_budget_usd - reservation)
-                if response is not None:
-                    self.config.record_usage(
-                        model,
-                        response.usage.input_tokens,
-                        response.usage.output_tokens,
-                    )
+            if budget_enforced:
+                async with lock:
+                    self._reserved_budget_usd = max(0.0, self._reserved_budget_usd - reservation)
+
+            if response is not None:
+                self.config.record_usage(
+                    model,
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                )
 
             if response is not None:
                 logger.info(
@@ -628,8 +669,7 @@ class LLMRouter:
         client = self._get_client("openai")
 
         # OpenAI reasoning/codex models use max_completion_tokens
-        model_lower = model.lower()
-        is_reasoning = model_lower.startswith(("o1", "o3", "o4", "codex-"))
+        is_reasoning = self._is_openai_reasoning_model(model)
         token_key = "max_completion_tokens" if is_reasoning else "max_tokens"
 
         # Convert messages to OpenAI format
@@ -640,6 +680,8 @@ class LLMRouter:
             token_key: max_tokens,
             "messages": oai_messages,
         }
+        if is_reasoning:
+            kwargs["reasoning_effort"] = self.config.openai_reasoning_effort
         if tools:
             kwargs["tools"] = self._tools_to_openai(tools)
 

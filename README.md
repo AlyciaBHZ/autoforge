@@ -127,6 +127,12 @@ export FORGE_MODEL_STRONG=o3              # 强模型用 OpenAI
 export FORGE_MODEL_FAST=gemini-2.5-flash  # 快模型用 Google
 ```
 
+### OpenAI Subscription Notes
+
+- `Codex OAuth` will start browser login immediately during setup (with manual URL fallback if auto-open fails).
+- When both selected default models are OpenAI and auth method is `codex_oauth`/`device_code`, setup and interactive mode skip the USD budget prompt.
+- Thinking level is configurable via `openai_reasoning_effort` in `~/.autoforge/config.toml` or env `FORGE_OPENAI_REASONING_EFFORT` (`minimal|low|medium|high|xhigh|none`).
+
 ### 系统要求
 
 - **Python 3.10+** — [python.org](https://python.org)

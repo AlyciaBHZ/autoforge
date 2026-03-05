@@ -69,6 +69,27 @@ def _current_workspace_path() -> str:
     return str(Path.cwd().resolve())
 
 
+def _skip_budget_prompt_for_subscription_mode() -> bool:
+    """Return True when selected default models run on OpenAI subscription auth."""
+    try:
+        from autoforge.cli.setup_wizard import load_global_config
+        from autoforge.engine.llm_router import detect_provider
+    except Exception:
+        return False
+
+    config = load_global_config()
+    auth_openai = config.get("auth_openai", {})
+    auth_method = str(auth_openai.get("auth_method", "")).strip().lower()
+    if auth_method not in ("codex_oauth", "device_code"):
+        return False
+
+    model_strong = str(config.get("model_strong", "")).strip()
+    model_fast = str(config.get("model_fast", "")).strip()
+    if not model_strong or not model_fast:
+        return False
+    return detect_provider(model_strong) == "openai" and detect_provider(model_fast) == "openai"
+
+
 def _developer_session(inquirer: Any) -> dict[str, Any]:
     """Developer mode: generate or import a project."""
     action = inquirer.select(
@@ -108,15 +129,17 @@ def _developer_session(inquirer: Any) -> dict[str, Any]:
             ).execute()
             result["enhance_description"] = enhance_desc
 
-    # Budget
-    budget = inquirer.number(
-        message="Budget limit (USD):",
-        default=10.0,
-        float_allowed=True,
-        min_allowed=0.5,
-        max_allowed=100.0,
-    ).execute()
-    result["budget"] = float(budget)
+    if _skip_budget_prompt_for_subscription_mode():
+        console.print("[dim]OpenAI subscription mode detected - skipping USD budget prompt.[/dim]")
+    else:
+        budget = inquirer.number(
+            message="Budget limit (USD):",
+            default=10.0,
+            float_allowed=True,
+            min_allowed=0.5,
+            max_allowed=100.0,
+        ).execute()
+        result["budget"] = float(budget)
 
     # Max agents
     max_agents = inquirer.number(
@@ -156,14 +179,17 @@ def _academic_session(inquirer: Any) -> dict[str, Any]:
         result["project_path"] = project_path
         console.print(f"[dim]Using current workspace: {project_path}[/dim]")
 
-    budget = inquirer.number(
-        message="Budget limit (USD):",
-        default=10.0,
-        float_allowed=True,
-        min_allowed=0.5,
-        max_allowed=100.0,
-    ).execute()
-    result["budget"] = float(budget)
+    if _skip_budget_prompt_for_subscription_mode():
+        console.print("[dim]OpenAI subscription mode detected - skipping USD budget prompt.[/dim]")
+    else:
+        budget = inquirer.number(
+            message="Budget limit (USD):",
+            default=10.0,
+            float_allowed=True,
+            min_allowed=0.5,
+            max_allowed=100.0,
+        ).execute()
+        result["budget"] = float(budget)
     result["max_agents"] = 3
 
     return result
@@ -179,14 +205,17 @@ def _verification_session(inquirer: Any) -> dict[str, Any]:
         "project_path": project_path,
     }
 
-    budget = inquirer.number(
-        message="Budget limit (USD):",
-        default=5.0,
-        float_allowed=True,
-        min_allowed=0.5,
-        max_allowed=50.0,
-    ).execute()
-    result["budget"] = float(budget)
+    if _skip_budget_prompt_for_subscription_mode():
+        console.print("[dim]OpenAI subscription mode detected - skipping USD budget prompt.[/dim]")
+    else:
+        budget = inquirer.number(
+            message="Budget limit (USD):",
+            default=5.0,
+            float_allowed=True,
+            min_allowed=0.5,
+            max_allowed=50.0,
+        ).execute()
+        result["budget"] = float(budget)
     result["max_agents"] = 3
 
     return result

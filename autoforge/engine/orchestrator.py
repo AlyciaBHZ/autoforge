@@ -82,7 +82,7 @@ class Orchestrator:
         ("_experiment_loop", "experiment_loop_enabled", "autoforge.engine.experiment_loop", "ExperimentLoop"),
         ("_paper_writer", "paper_writer_enabled", "autoforge.engine.paper_writer", "PaperWriter"),
         ("_dense_retrieval", "dense_retrieval_enabled", "autoforge.engine.dense_retrieval", "DenseRetriever"),
-        ("_rl_proof_search", "rl_proof_search_enabled", "autoforge.engine.rl_proof_search", "RLMCTSSearch"),
+        ("_rl_proof_search", "rl_proof_search_enabled", "autoforge.engine.rl_proof_search", "RLProofSearch"),
         ("_article_reasoning", "article_reasoning_enabled", "autoforge.engine.article_reasoning", "ArticleReasoningOrchestrator"),
         ("_vlm_figure", "vlm_figure_enabled", "autoforge.engine.vlm_figure", "VLMFigurePipeline"),
         ("_symbolic_compute", "symbolic_compute_enabled", "autoforge.engine.symbolic_compute", "SymbolicComputeEngine"),
@@ -150,15 +150,31 @@ class Orchestrator:
         try:
             mod = importlib.import_module(module_path)
             cls = getattr(mod, class_name)
-            setattr(self, attr, cls())
         except ImportError as e:
             logger.warning(
                 "Engine %s unavailable (import failed): %s", class_name, e
             )
+            return
+        except AttributeError as e:
+            logger.warning(
+                "Engine %s unavailable (symbol missing): %s", class_name, e
+            )
+            return
+
+        try:
+            setattr(self, attr, cls())
+        except TypeError as e:
+            # Many optional research engines require runtime dependencies
+            # (graph/config/llm) and are intentionally deferred.
+            if "required positional argument" in str(e):
+                logger.debug("Engine %s deferred: %s", class_name, e)
+                return
+            logger.warning(
+                "Engine %s failed to initialize: %s", class_name, e,
+            )
         except Exception as e:
             logger.warning(
                 "Engine %s failed to initialize: %s", class_name, e,
-                exc_info=True,
             )
 
     def _init_engines(self) -> None:
@@ -2081,9 +2097,19 @@ class Orchestrator:
             self.project_dir = self.config.workspace_dir / f"{project_name}-forge"
             if self.project_dir.exists():
                 shutil.rmtree(self.project_dir)
-            shutil.copytree(source_dir, self.project_dir, ignore=shutil.ignore_patterns(
-                ".git", "node_modules", "__pycache__", ".venv", "venv", ".env"
-            ))
+            ignore_names = {".git", "node_modules", "__pycache__", ".venv", "venv", ".env"}
+            try:
+                workspace_rel = self.config.workspace_dir.resolve().relative_to(source_dir)
+                if workspace_rel.parts:
+                    # Prevent recursive self-copy when importing current repo.
+                    ignore_names.add(workspace_rel.parts[0])
+            except ValueError:
+                pass
+            shutil.copytree(
+                source_dir,
+                self.project_dir,
+                ignore=shutil.ignore_patterns(*sorted(ignore_names)),
+            )
             self._state_file = self.project_dir / ".forge_state.json"
 
             # Phase 1: SCAN

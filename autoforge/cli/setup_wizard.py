@@ -47,11 +47,15 @@ PROVIDERS = {
         "invalid_msg": "Must start with 'sk-' and be at least 20 characters",
         "models_strong": [
             {"name": "Codex 5.3 (newest, code-specialized)", "value": "codex-5.3"},
+            {"name": "GPT-5.3-Codex (latest family, may require Responses API)", "value": "gpt-5.3-codex"},
+            {"name": "GPT-5.2-Codex (high reasoning, may require Responses API)", "value": "gpt-5.2-codex"},
             {"name": "o3 (strongest reasoning)", "value": "o3"},
             {"name": "GPT-4o (fast + capable)", "value": "gpt-4o"},
         ],
         "models_fast": [
             {"name": "GPT-4o-mini (recommended)", "value": "gpt-4o-mini"},
+            {"name": "GPT-5.1-Codex-mini (lightweight codex, may require Responses API)", "value": "gpt-5.1-codex-mini"},
+            {"name": "Codex-mini-latest (lightweight codex)", "value": "codex-mini-latest"},
             {"name": "o4-mini (reasoning, cheaper)", "value": "o4-mini"},
         ],
         "auth_methods": [
@@ -82,6 +86,15 @@ PROVIDERS = {
         ],
     },
 }
+
+OPENAI_REASONING_LEVELS = [
+    {"name": "medium (balanced, recommended)", "value": "medium"},
+    {"name": "low (faster)", "value": "low"},
+    {"name": "high (deeper reasoning)", "value": "high"},
+    {"name": "minimal (very fast, shallow)", "value": "minimal"},
+    {"name": "xhigh (max depth, slower)", "value": "xhigh"},
+    {"name": "none (disable reasoning)", "value": "none"},
+]
 
 
 def needs_setup() -> bool:
@@ -150,6 +163,7 @@ def run_setup_wizard() -> None:
     auth_configs: dict[str, dict[str, str]] = {}
     model_strong = "claude-sonnet-4-5-20250929"
     model_fast = "claude-haiku-4-5-20251001"
+    openai_reasoning_effort = "medium"
     budget = 10.0
     max_agents = 3
     docker_enabled = False
@@ -205,14 +219,28 @@ def run_setup_wizard() -> None:
                 _validate_model_provider(inquirer, api_keys, auth_configs, model_strong, "strong")
                 _validate_model_provider(inquirer, api_keys, auth_configs, model_fast, "fast")
 
+                if "openai" in auth_configs or "openai" in api_keys:
+                    openai_reasoning_effort = inquirer.select(
+                        message="OpenAI thinking level (reasoning effort):",
+                        choices=OPENAI_REASONING_LEVELS,
+                        default="medium",
+                    ).execute()
+
         # Step 4: Budget
-        budget = float(inquirer.number(
-            message="Default budget limit (USD):",
-            default=10.0,
-            float_allowed=True,
-            min_allowed=1.0,
-            max_allowed=100.0,
-        ).execute())
+        if _should_skip_budget_prompt(model_strong, model_fast, auth_configs):
+            budget = 10.0
+            console.print(
+                "[dim]OpenAI subscription mode detected for selected models "
+                "- skipping USD budget prompt.[/dim]"
+            )
+        else:
+            budget = float(inquirer.number(
+                message="Default budget limit (USD):",
+                default=10.0,
+                float_allowed=True,
+                min_allowed=1.0,
+                max_allowed=100.0,
+            ).execute())
 
         # Step 5: Max agents
         max_agents = int(inquirer.number(
@@ -237,7 +265,7 @@ def run_setup_wizard() -> None:
     # Always write config (even with defaults / no API keys)
     _write_config(
         api_keys, model_strong, model_fast,
-        budget, max_agents, docker_enabled,
+        budget, max_agents, docker_enabled, openai_reasoning_effort,
         auth_configs=auth_configs,
         github_config=github_config,
     )
@@ -268,24 +296,44 @@ def _default_auth_method(provider_id: str) -> str:
     return "api_key"
 
 
+def _is_openai_subscription_auth_method(auth_method: str | None) -> bool:
+    method = (auth_method or "").strip().lower()
+    return method in ("codex_oauth", "device_code")
+
+
+def _should_skip_budget_prompt(
+    model_strong: str,
+    model_fast: str,
+    auth_configs: dict[str, dict[str, str]],
+) -> bool:
+    """Skip USD budget prompt when both selected models run on OpenAI subscription auth."""
+    from autoforge.engine.llm_router import detect_provider
+
+    if detect_provider(model_strong) != "openai":
+        return False
+    if detect_provider(model_fast) != "openai":
+        return False
+    return _is_openai_subscription_auth_method(
+        auth_configs.get("openai", {}).get("auth_method")
+    )
+
+
 def _maybe_run_openai_subscription_login(
     inquirer: Any,
     provider_id: str,
     auth_method: str,
     auth_configs: dict[str, dict[str, str]],
 ) -> None:
-    """Optionally run Codex OAuth / Device Code login during setup."""
+    """Run Codex OAuth / Device Code login during setup."""
     if provider_id != "openai" or auth_method not in ("codex_oauth", "device_code"):
         return
 
     if auth_method == "codex_oauth":
-        prompt = "Run Codex OAuth login now? (opens browser)"
+        console.print("[dim]Starting Codex OAuth login (browser)...[/dim]")
     else:
-        prompt = "Run Device Code login now?"
-
-    run_now = inquirer.confirm(message=prompt, default=True).execute()
-    if not run_now:
-        return
+        run_now = inquirer.confirm(message="Run Device Code login now?", default=True).execute()
+        if not run_now:
+            return
 
     try:
         import asyncio
@@ -753,6 +801,7 @@ def _write_config(
     budget: float,
     max_agents: int,
     docker_enabled: bool,
+    openai_reasoning_effort: str = "medium",
     auth_configs: dict[str, dict[str, str]] | None = None,
     github_config: dict[str, Any] | None = None,
 ) -> None:
@@ -792,6 +841,7 @@ def _write_config(
                 "max_agents": max_agents,
                 "docker": docker_enabled,
                 "mode": "developer",
+                "openai_reasoning_effort": openai_reasoning_effort,
             },
         }
 
@@ -827,6 +877,7 @@ def _write_config(
         lines.append(f"max_agents = {max_agents}")
         lines.append(f'docker = {"true" if docker_enabled else "false"}')
         lines.append('mode = "developer"')
+        lines.append(f'openai_reasoning_effort = "{_escape_toml_value(openai_reasoning_effort)}"')
         lines.append("")
 
         # Write auth configs
@@ -904,6 +955,8 @@ def load_global_config() -> dict:
         result["docker_enabled"] = bool(defaults["docker"])
     if "mode" in defaults:
         result["mode"] = defaults["mode"]
+    if "openai_reasoning_effort" in defaults:
+        result["openai_reasoning_effort"] = str(defaults["openai_reasoning_effort"])
 
     # Load per-provider auth config
     auth = data.get("auth", {})
@@ -969,6 +1022,7 @@ def _parse_toml_simple(path: Path) -> dict:
             "max_agents": "max_agents",
             "docker": "docker_enabled",
             "mode": "mode",
+            "openai_reasoning_effort": "openai_reasoning_effort",
         }
         config_key = key_map.get(key)
         if config_key:

@@ -301,6 +301,7 @@ class ForgeConfig:
     model_fast: str = "claude-sonnet-4-5-20250929"
     max_tokens_strong: int = 16384
     max_tokens_fast: int = 8192
+    openai_reasoning_effort: str = "medium"
 
     # Budget
     budget_limit_usd: float = 10.0
@@ -341,8 +342,10 @@ class ForgeConfig:
         "claude-",
         "codex-",
         "gpt-",
+        "o1",
         "o3",
         "o4",
+        "o5",
         "gemini-",
     )
 
@@ -411,6 +414,17 @@ class ForgeConfig:
                     model_name,
                     ", ".join(self._KNOWN_MODEL_PATTERNS),
                 )
+
+        allowed_reasoning = {"none", "minimal", "low", "medium", "high", "xhigh"}
+        level = self.openai_reasoning_effort.strip().lower()
+        if level not in allowed_reasoning:
+            logger.warning(
+                "openai_reasoning_effort=%r is invalid; using 'medium'",
+                self.openai_reasoning_effort,
+            )
+            self.openai_reasoning_effort = "medium"
+        else:
+            self.openai_reasoning_effort = level
 
     @property
     def has_api_key(self) -> bool:
@@ -545,6 +559,11 @@ class ForgeConfig:
         if budget <= 0:
             budget = 10.0
 
+        openai_reasoning_effort = (
+            os.getenv("FORGE_OPENAI_REASONING_EFFORT")
+            or str(global_config.get("openai_reasoning_effort", "medium"))
+        ).strip().lower()
+
         max_agents = _safe_int(
             "FORGE_MAX_AGENTS",
             _to_int(global_config.get("max_agents", 3), 3),
@@ -565,6 +584,7 @@ class ForgeConfig:
                 os.getenv("FORGE_MODEL_FAST")
                 or global_config.get("model_fast", "claude-sonnet-4-5-20250929")
             ),
+            openai_reasoning_effort=openai_reasoning_effort,
             budget_limit_usd=budget,
             max_agents=max_agents,
             log_level=log_level,
