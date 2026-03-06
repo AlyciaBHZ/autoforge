@@ -1038,10 +1038,15 @@ class LLMRouter:
     ) -> LLMResponse:
         client = self._get_client("openai")
         is_reasoning = self._is_openai_reasoning_model(model)
-        input_items = self._messages_to_openai_responses_input(system, messages, is_reasoning=is_reasoning)
+        # The ChatGPT-subscription Codex backend requires an `instructions` field.
+        # Even on standard Responses API, `instructions` is the preferred place
+        # for the system prompt.
+        instructions = (system or "").strip() or "You are a helpful assistant."
+        input_items = self._messages_to_openai_responses_input("", messages, is_reasoning=is_reasoning)
         kwargs: dict[str, Any] = {
             "model": model,
             "input": input_items,
+            "instructions": instructions,
             "max_output_tokens": max_tokens,
         }
         if is_reasoning:
