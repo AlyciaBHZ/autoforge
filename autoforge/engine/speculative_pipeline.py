@@ -255,11 +255,16 @@ class SpeculativePipeline:
 
             if sandbox:
                 try:
-                    lint_result = await sandbox.exec(
-                        f"cd {shlex.quote(str(project_dir))} && python -m py_compile *.py 2>&1 || true",
+                    platform = getattr(sandbox, "execution_platform", "posix")
+                    venv_py = ".autoforge/venv/Scripts/python.exe" if platform == "windows" else ".autoforge/venv/bin/python"
+                    python_exe = venv_py if (project_dir / Path(venv_py)).exists() else "python"
+
+                    lint_result = await sandbox.exec_args(
+                        [python_exe, "-m", "compileall", "-q", "."],
                         timeout=15,
                     )
-                    result.scaffolding["syntax_check"] = lint_result.stdout[:2000]
+                    combined = (lint_result.stdout or "") + (lint_result.stderr or "")
+                    result.scaffolding["syntax_check"] = (combined or "")[:2000]
                     result.commands_run.append("py_compile check")
                 except Exception:
                     pass

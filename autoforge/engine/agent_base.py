@@ -113,12 +113,23 @@ class FileToolsMixin:
     async def _handle_run_command(self, input_data: dict[str, Any]) -> str:
         command = input_data["command"]
         if getattr(self, "sandbox", None):
-            result = await self.sandbox.exec(command)  # type: ignore[attr-defined]
+            raw_cap = input_data.get("capability")
+            cap = raw_cap if isinstance(raw_cap, str) and raw_cap.strip() else ""
+            if not cap:
+                role = str(getattr(self, "ROLE", "")).strip().lower()
+                role_to_cap = {
+                    "tester": "test",
+                    "reviewer": "lint",
+                    "builder": "general",
+                }
+                cap = role_to_cap.get(role, "general")
+            result = await self.sandbox.exec(command, capability=cap)  # type: ignore[attr-defined]
             return json.dumps({
                 "exit_code": result.exit_code,
                 "stdout": result.stdout[:8000],
                 "stderr": result.stderr[:4000],
                 "timed_out": getattr(result, "timed_out", False),
+                "capability": cap,
             })
         else:
             return json.dumps({

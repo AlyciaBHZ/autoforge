@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any
 
 from autoforge.engine.agent_base import AgentBase, ToolDefinition
 from autoforge.engine.llm_router import TaskComplexity
+from autoforge.engine.runtime.commands import run_args
 
 logger = logging.getLogger(__name__)
 
@@ -165,10 +167,15 @@ class ScannerAgent(AgentBase):
         return json.dumps(files[:500])  # Limit to 500 files
 
     # Read-only commands the scanner is allowed to execute
-    _ALLOWED_COMMANDS = frozenset({
-        "ls", "cat", "head", "tail", "wc", "find", "tree", "file",
-        "grep", "rg", "ag", "awk", "sed", "sort", "uniq", "diff",
-        "stat", "du", "git", "python", "node", "go", "cargo",
+    # Keep this tight: scanner must never mutate the project or run arbitrary code.
+    _ALLOWED_COMMANDS = frozenset({"git"})
+    _ALLOWED_GIT_SUBCOMMANDS = frozenset({
+        "status",
+        "log",
+        "diff",
+        "show",
+        "ls-files",
+        "rev-parse",
     })
 
     async def _handle_run_command(self, input_data: dict[str, Any]) -> str:
@@ -176,44 +183,69 @@ class ScannerAgent(AgentBase):
 
         Uses an allowlist of safe commands instead of a bypassable blocklist.
         """
-        import asyncio
         import shlex
 
         command = input_data["command"]
 
+        # Disallow shell operators (pipes/redirections/command chaining). Scanner must be read-only.
+        if any(op in command for op in ("|", ">", "<", ";", "&&", "||")):
+            return json.dumps({"error": "Shell operators are not allowed in scanner.run_command"})
+
         # Allowlist: only permit known-safe read-only commands
         try:
-            parts = shlex.split(command)
+            parts = shlex.split(command, posix=(sys.platform != "win32"))
         except ValueError:
             return json.dumps({"error": "Invalid command syntax"})
         if not parts:
             return json.dumps({"error": "Empty command"})
 
         # Extract the base command name (strip path prefix)
-        base_cmd = parts[0].rsplit("/", 1)[-1]
+        base_cmd = Path(parts[0]).name.lower()
+        if base_cmd.endswith(".exe"):
+            base_cmd = base_cmd[:-4]
         if base_cmd not in self._ALLOWED_COMMANDS:
             return json.dumps({
                 "error": f"Command '{base_cmd}' not in scanner allowlist. "
                 f"Allowed: {', '.join(sorted(self._ALLOWED_COMMANDS))}"
             })
 
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                cwd=str(self.working_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        # Additional restrictions for git: allow only read-only subcommands.
+        if base_cmd == "git":
+            if len(parts) < 2:
+                return json.dumps({"error": "git command missing subcommand"})
+            if parts[1].startswith("-"):
+                return json.dumps({"error": "git global options are not allowed in scanner.run_command"})
+            sub = parts[1].strip().lower()
+            if sub not in self._ALLOWED_GIT_SUBCOMMANDS:
+                return json.dumps({
+                    "error": f"git subcommand '{sub}' not allowed. "
+                    f"Allowed: {', '.join(sorted(self._ALLOWED_GIT_SUBCOMMANDS))}"
+                })
+            blocked_flags = (
+                "-c", "--config", "--exec-path", "--git-dir", "--work-tree",
+                "--upload-pack", "--receive-pack", "--output",
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-            return json.dumps({
-                "exit_code": proc.returncode,
-                "stdout": stdout.decode("utf-8", errors="replace")[:5000],
-                "stderr": stderr.decode("utf-8", errors="replace")[:1000],
-            })
-        except asyncio.TimeoutError:
+            for p in parts[2:]:
+                if any(p == flag or p.startswith(flag + "=") for flag in blocked_flags):
+                    return json.dumps({"error": f"git flag '{p}' not allowed in scanner.run_command"})
+
+        res = await run_args(
+            parts,
+            cwd=self.working_dir,
+            timeout_s=15.0,
+            max_stdout_chars=5000,
+            max_stderr_chars=1000,
+            label="scanner.run_command",
+        )
+        if res.timed_out:
             return json.dumps({"error": "Command timed out (15s limit)"})
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+        if res.exit_code == -1:
+            return json.dumps({"error": res.stderr or "Command failed"})
+        return json.dumps({
+            "exit_code": res.exit_code,
+            "stdout": res.stdout,
+            "stderr": res.stderr,
+        })
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         project_path = context.get("project_path", str(self.working_dir))

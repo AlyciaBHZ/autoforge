@@ -13,6 +13,7 @@ Subcommands:
     projects            List queued/completed projects from registry
     deploy <id>         Print deploy guide for a completed project
     paper <action>      Infer/reproduce ICLR papers from high-level goals
+    harness <action>    Run evaluation harness over datasets (JSONL)
 """
 
 from __future__ import annotations
@@ -102,6 +103,86 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="TDD iterations per build task (0=disabled, 1-3 recommended)",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "docker", "subprocess", "slurm"],
+        default=None,
+        help="Execution backend for running commands: auto, docker, subprocess, slurm",
+    )
+    parser.add_argument("--slurm-partition", default=None, help="Slurm partition (backend=slurm)")
+    parser.add_argument("--slurm-account", default=None, help="Slurm account (backend=slurm)")
+    parser.add_argument("--slurm-qos", default=None, help="Slurm QoS (backend=slurm)")
+    parser.add_argument("--slurm-cpus", type=int, default=None, help="Slurm cpus-per-task (backend=slurm)")
+    parser.add_argument("--slurm-mem", default=None, help="Slurm memory, e.g. 4G (backend=slurm)")
+    parser.add_argument("--slurm-gres", default=None, help="Slurm gres, e.g. gpu:1 (backend=slurm)")
+    parser.add_argument("--slurm-queue-timeout", type=int, default=None, help="Extra seconds to wait for Slurm queueing")
+    parser.add_argument(
+        "--slurm-poll-interval",
+        type=float,
+        default=None,
+        help="Polling interval seconds for Slurm job status",
+    )
+    parser.add_argument(
+        "--slurm-local-in-alloc",
+        dest="slurm_local_in_alloc",
+        action="store_true",
+        default=None,
+        help="If inside a Slurm allocation, run commands locally instead of submitting sbatch",
+    )
+    parser.add_argument(
+        "--no-slurm-local-in-alloc",
+        dest="slurm_local_in_alloc",
+        action="store_false",
+        default=None,
+        help="Always submit sbatch even inside a Slurm allocation",
+    )
+    parser.add_argument(
+        "--deterministic",
+        dest="deterministic",
+        action="store_true",
+        default=None,
+        help="Deterministic mode: forces temperature=0 and stabilizes backoff jitter",
+    )
+    parser.add_argument(
+        "--no-deterministic",
+        dest="deterministic",
+        action="store_false",
+        default=None,
+        help="Disable deterministic mode",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="Deterministic seed (FORGE_SEED)")
+    parser.add_argument(
+        "--source-date-epoch",
+        type=int,
+        default=None,
+        help="Set SOURCE_DATE_EPOCH inside sandboxes (FORGE_SOURCE_DATE_EPOCH)",
+    )
+    parser.add_argument("--pip-index-url", default=None, help="PIP_INDEX_URL injected into sandboxes (FORGE_PIP_INDEX_URL)")
+    parser.add_argument("--pip-cache-dir", default=None, help="PIP_CACHE_DIR injected into sandboxes (FORGE_PIP_CACHE_DIR)")
+    parser.add_argument("--npm-registry", default=None, help="NPM_CONFIG_REGISTRY injected into sandboxes (FORGE_NPM_REGISTRY)")
+    parser.add_argument("--npm-cache-dir", default=None, help="NPM_CONFIG_CACHE injected into sandboxes (FORGE_NPM_CACHE_DIR)")
+    parser.add_argument(
+        "--llm-rate-limit",
+        dest="llm_rate_limit",
+        action="store_true",
+        default=None,
+        help="Enable global LLM rate limiting (FORGE_LLM_RATE_LIMIT)",
+    )
+    parser.add_argument(
+        "--no-llm-rate-limit",
+        dest="llm_rate_limit",
+        action="store_false",
+        default=None,
+        help="Disable global LLM rate limiting",
+    )
+    parser.add_argument("--llm-rpm", type=int, default=None, help="Global LLM requests/minute (FORGE_LLM_RPM)")
+    parser.add_argument("--llm-tpm", type=int, default=None, help="Global LLM tokens/minute (FORGE_LLM_TPM)")
+    parser.add_argument("--llm-rate-db", default=None, help="SQLite path for global rate limiting (FORGE_LLM_RATE_LIMIT_DB)")
+    parser.add_argument(
+        "--llm-rate-namespace",
+        default=None,
+        help="Rate limiter namespace key (FORGE_LLM_RATE_LIMIT_NAMESPACE)",
+    )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -188,6 +269,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Bypass requester filter and read any project id",
     )
+
+    # harness
+    harness_parser = subparsers.add_parser("harness", help="Evaluation harness (batch datasets)")
+    harness_subparsers = harness_parser.add_subparsers(dest="harness_action", required=True)
+
+    harness_run = harness_subparsers.add_parser("run", help="Run a JSONL dataset")
+    harness_run.add_argument("dataset", help="Path to dataset.jsonl")
+    harness_run.add_argument("--out", default=None, help="Output directory (default: .autoforge/harness/runs/<run_id>)")
+    harness_run.add_argument("--concurrency", type=int, default=1, help="Number of cases to run in parallel")
+    harness_run.add_argument("--allow-subprocess", action="store_true", help="Allow falling back to SubprocessSandbox if Docker is unavailable (not recommended)")
+    harness_run.add_argument("--no-trace", action="store_true", help="Disable trace export (not recommended)")
+
+    harness_prewarm = harness_subparsers.add_parser("prewarm", help="Build/prewarm docker images referenced by dataset")
+    harness_prewarm.add_argument("dataset", help="Path to dataset.jsonl")
+    harness_prewarm.add_argument("--out", default=None, help="Output directory (default: .autoforge/harness/)")
 
     # paper
     from datetime import datetime
@@ -352,6 +448,50 @@ def _build_config_overrides(args: argparse.Namespace) -> dict:
         overrides["confirm_phases"] = [p.strip() for p in args.confirm.split(",")]
     if getattr(args, "tdd", None) is not None:
         overrides["build_test_loops"] = max(0, min(args.tdd, 5))
+    if getattr(args, "backend", None) is not None:
+        overrides["execution_backend"] = args.backend
+    if getattr(args, "slurm_partition", None) is not None:
+        overrides["slurm_partition"] = args.slurm_partition
+    if getattr(args, "slurm_account", None) is not None:
+        overrides["slurm_account"] = args.slurm_account
+    if getattr(args, "slurm_qos", None) is not None:
+        overrides["slurm_qos"] = args.slurm_qos
+    if getattr(args, "slurm_cpus", None) is not None:
+        overrides["slurm_cpus_per_task"] = args.slurm_cpus
+    if getattr(args, "slurm_mem", None) is not None:
+        overrides["slurm_mem"] = args.slurm_mem
+    if getattr(args, "slurm_gres", None) is not None:
+        overrides["slurm_gres"] = args.slurm_gres
+    if getattr(args, "slurm_queue_timeout", None) is not None:
+        overrides["slurm_queue_timeout_seconds"] = args.slurm_queue_timeout
+    if getattr(args, "slurm_poll_interval", None) is not None:
+        overrides["slurm_poll_interval_seconds"] = args.slurm_poll_interval
+    if getattr(args, "slurm_local_in_alloc", None) is not None:
+        overrides["slurm_use_local_in_allocation"] = bool(args.slurm_local_in_alloc)
+    if getattr(args, "deterministic", None) is not None:
+        overrides["deterministic"] = bool(args.deterministic)
+    if getattr(args, "seed", None) is not None:
+        overrides["deterministic_seed"] = int(args.seed)
+    if getattr(args, "source_date_epoch", None) is not None:
+        overrides["deterministic_source_date_epoch"] = int(args.source_date_epoch)
+    if getattr(args, "pip_index_url", None) is not None:
+        overrides["pip_index_url"] = args.pip_index_url
+    if getattr(args, "pip_cache_dir", None) is not None:
+        overrides["pip_cache_dir"] = args.pip_cache_dir
+    if getattr(args, "npm_registry", None) is not None:
+        overrides["npm_registry"] = args.npm_registry
+    if getattr(args, "npm_cache_dir", None) is not None:
+        overrides["npm_cache_dir"] = args.npm_cache_dir
+    if getattr(args, "llm_rate_limit", None) is not None:
+        overrides["llm_rate_limit_enabled"] = bool(args.llm_rate_limit)
+    if getattr(args, "llm_rpm", None) is not None:
+        overrides["llm_rpm_limit"] = int(args.llm_rpm)
+    if getattr(args, "llm_tpm", None) is not None:
+        overrides["llm_tpm_limit"] = int(args.llm_tpm)
+    if getattr(args, "llm_rate_db", None) is not None:
+        overrides["llm_rate_limit_db_path"] = args.llm_rate_db
+    if getattr(args, "llm_rate_namespace", None) is not None:
+        overrides["llm_rate_limit_namespace"] = args.llm_rate_namespace
     return overrides
 
 
@@ -1396,6 +1536,59 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
 
     elif args.command == "deploy":
         return await _run_deploy(config, args)
+
+    elif args.command == "harness":
+        from autoforge.engine.harness.runner import (
+            HarnessRunConfig,
+            prewarm_dataset_images,
+            run_dataset,
+        )
+
+        action = getattr(args, "harness_action", "")
+        dataset_path = Path(getattr(args, "dataset", "")).resolve()
+        if not dataset_path.is_file():
+            console.print(f"[red]Error:[/red] Dataset not found: {dataset_path}")
+            return 1
+
+        if action == "prewarm":
+            out = getattr(args, "out", None)
+            out_dir = (
+                Path(out).resolve()
+                if out
+                else (config.project_root / ".autoforge" / "harness").resolve()
+            )
+            try:
+                mapping = await prewarm_dataset_images(dataset_path, out_dir=out_dir)
+                console.print(f"[green]Prewarm complete[/green] ({len(mapping)} images)")
+                return 0
+            except Exception as e:
+                console.print(f"[red]Prewarm failed:[/red] {e}")
+                logging.getLogger(__name__).debug("Harness prewarm failed", exc_info=True)
+                return 1
+
+        if action == "run":
+            if not config.has_api_key:
+                console.print("[red]Error:[/red] No API key configured. Run: autoforgeai setup")
+                return 1
+
+            out = getattr(args, "out", None)
+            out_dir = Path(out).resolve() if out else None
+            hcfg = HarnessRunConfig(
+                concurrency=max(1, int(getattr(args, "concurrency", 1) or 1)),
+                out_dir=out_dir,
+                docker_required=not bool(getattr(args, "allow_subprocess", False)),
+                trace_enabled=not bool(getattr(args, "no_trace", False)),
+            )
+            try:
+                _ = await run_dataset(config, dataset_path, cfg=hcfg)
+                return 0
+            except Exception as e:
+                console.print(f"[red]Harness run failed:[/red] {e}")
+                logging.getLogger(__name__).debug("Harness run failed", exc_info=True)
+                return 1
+
+        console.print(f"[red]Unknown harness action:[/red] {action}")
+        return 1
 
     elif args.command == "paper":
         action = getattr(args, "paper_action", "")

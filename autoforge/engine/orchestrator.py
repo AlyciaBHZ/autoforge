@@ -32,6 +32,17 @@ from autoforge.engine.lock_manager import LockManager
 from autoforge.engine.sandbox import SandboxBase, create_sandbox
 from autoforge.engine.task_dag import Task, TaskDAG, TaskPhase, TaskStatus
 from autoforge.engine.utils import count_tokens, truncate_text_to_token_budget
+from autoforge.engine.runtime.commands import run_args
+from autoforge.engine.runtime.dependencies import (
+    build_node_test_command as runtime_build_node_test_command,
+    dependency_steps as runtime_dependency_steps,
+    detect_package_manager as runtime_detect_package_manager,
+    detect_test_command as runtime_detect_test_command,
+    normalize_package_manager as runtime_normalize_package_manager,
+    select_node_test_script as runtime_select_node_test_script,
+)
+from autoforge.engine.runtime.journal import RunJournal
+from autoforge.engine.runtime.runtime import ForgeRuntime
 
 # Agents — loaded via registry (no direct class imports needed at module level)
 from autoforge.engine.agents import AGENT_REGISTRY
@@ -103,6 +114,7 @@ class Orchestrator:
     def __init__(self, config: ForgeConfig) -> None:
         self.config = config
         self.llm = LLMRouter(config)
+        self.runtime: ForgeRuntime | None = None
         self.project_dir: Path | None = None
         self.dag: TaskDAG | None = None
         self.spec: dict[str, Any] = {}
@@ -151,6 +163,18 @@ class Orchestrator:
         d = self.project_dir / ".autoforge"
         d.mkdir(exist_ok=True)
         return d
+
+    def _create_sandbox(self, working_dir: Path) -> SandboxBase:
+        telemetry = None
+        if self.runtime is not None and (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))):
+            telemetry = self.runtime.telemetry
+        return create_sandbox(self.config, working_dir, telemetry=telemetry)
+
+    def _durable_enabled(self) -> bool:
+        if not getattr(self.config, "durable_execution_enabled", True):
+            return False
+        backend = str(getattr(self.config, "state_backend", "sqlite")).strip().lower()
+        return backend in ("sqlite", "both")
 
     def _agent(self, role: str, *args: Any, **kwargs: Any) -> Any:
         """Instantiate an agent by role name via AGENT_REGISTRY.
@@ -271,11 +295,49 @@ class Orchestrator:
             self.project_dir = self.config.workspace_dir / project_name
             self.project_dir.mkdir(parents=True, exist_ok=True)
             self._state_file = self.project_dir / ".forge_state.json"
+            self.runtime = ForgeRuntime.create(
+                self.project_dir,
+                self.config.run_id,
+                artifacts_enabled=bool(getattr(self.config, "artifacts_enabled", True)),
+                trace_enabled=bool(getattr(self.config, "trace_enabled", False)),
+                trace_capture_llm_content=bool(getattr(self.config, "trace_capture_llm_content", False)),
+                trace_capture_command_output=bool(getattr(self.config, "trace_capture_command_output", False)),
+                trace_capture_fs_snapshots=bool(getattr(self.config, "trace_capture_fs_snapshots", False)),
+                trace_max_inline_chars=int(getattr(self.config, "trace_max_inline_chars", 20000) or 20000),
+                trace_redact_secrets=bool(getattr(self.config, "trace_redact_secrets", True)),
+                trace_secrets=[s for s in (
+                    list(getattr(self.config, "api_keys", {}).values())
+                    + [
+                        getattr(self.config, "search_api_key", ""),
+                        getattr(self.config, "github_token", ""),
+                        getattr(self.config, "webhook_secret", ""),
+                        getattr(self.config, "webhook_admin_secret", ""),
+                        getattr(self.config, "dag_federation_api_key", ""),
+                    ]
+                ) if isinstance(s, str) and s],
+            )
+            if self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False)):
+                self.llm.set_telemetry_sink(self.runtime.telemetry)
+                self.runtime.telemetry.record(
+                    "run_started",
+                    {
+                        "project_name": project_name,
+                        "workspace_dir": str(self.config.workspace_dir),
+                        "requirement_chars": len(requirement or ""),
+                        "docker_enabled": bool(getattr(self.config, "docker_enabled", False)),
+                        "sandbox_image": str(getattr(self.config, "sandbox_image", "")),
+                    },
+                )
 
             # Save spec
             (self.project_dir / "spec.json").write_text(
                 json.dumps(self.spec, indent=2, ensure_ascii=False), encoding="utf-8"
             )
+            if getattr(self.config, "artifacts_enabled", True) and self.runtime is not None:
+                try:
+                    self.runtime.artifacts.write_json("spec.json", self.spec)
+                except Exception:
+                    pass
             self._save_state("spec_complete")
             n_modules = len(self.spec.get("modules", []))
             console.print(f"  [green]Spec generated:[/green] {project_name} — {n_modules} modules")
@@ -513,6 +575,13 @@ class Orchestrator:
             if self.project_dir:
                 self._save_state(f"failed: {e}")
             raise
+        finally:
+            try:
+                if self.runtime is not None:
+                    self.runtime.close()
+            except Exception:
+                pass
+            self.runtime = None
 
     # ──────────────────────────────────────────────
     # Human-in-the-Loop Checkpoints
@@ -782,7 +851,7 @@ class Orchestrator:
         overlaps = self._detect_file_overlaps(self.dag)
 
         # Step 4: Build tasks
-        sandbox = create_sandbox(self.config, self.project_dir)
+        sandbox = self._create_sandbox(self.project_dir)
         lock_manager = LockManager(self.config.workspace_dir / ".locks")
         lock_manager.clear_all()
 
@@ -884,6 +953,11 @@ class Orchestrator:
         if len(self._task_transition_log) > 2000:
             self._task_transition_log = self._task_transition_log[-2000:]
         self._append_task_transition(entry)
+        if (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))) and self.runtime is not None:
+            try:
+                self.runtime.telemetry.record("task_transition", entry)
+            except Exception:
+                pass
 
     def _task_transition_log_path(self) -> Path | None:
         if not self._state_file:
@@ -1653,12 +1727,15 @@ class Orchestrator:
         if loops <= 0:
             return
 
-        test_cmd = self._detect_test_command(working_dir)
+        test_cmd = self._detect_test_command(
+            working_dir,
+            execution_platform=getattr(sandbox, "execution_platform", None),
+        )
         if not test_cmd:
             return
 
         for iteration in range(loops):
-            test_result = await sandbox.exec(test_cmd, timeout=60)
+            test_result = await sandbox.exec(test_cmd, timeout=60, capability="test")
             if test_result.exit_code == 0:
                 console.print(
                     f"  [{agent_id}] TDD pass (iter {iteration + 1}/{loops})"
@@ -1675,7 +1752,7 @@ class Orchestrator:
             if "not found" in failure_lower or "command not found" in failure_lower or "is not recognized" in failure_lower:
                 # Most likely missing test runtime/dependencies.
                 await self._prepare_runtime_dependencies(working_dir)
-                retry = await sandbox.exec(test_cmd, timeout=90)
+                retry = await sandbox.exec(test_cmd, timeout=90, capability="test")
                 if retry.exit_code == 0:
                     console.print(
                         f"  [{agent_id}] [green]Dependencies installed, TDD pass "
@@ -1714,60 +1791,20 @@ class Orchestrator:
     def _normalize_package_manager(raw_manager: str | None) -> str:
         if not raw_manager:
             return ""
-        normalized = str(raw_manager).strip().lower()
-        for manager in ("pnpm", "yarn", "bun", "npm"):
-            if normalized == manager or normalized.startswith(f"{manager}@"):
-                return manager
-        return ""
+        normalized = runtime_normalize_package_manager(str(raw_manager))
+        return normalized or ""
 
     @staticmethod
     def _detect_package_manager(project_dir: Path) -> str:
-        package_manager = "npm"
-        package_json = project_dir / "package.json"
-        if package_json.exists():
-            try:
-                package = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
-                if isinstance(package, dict):
-                    raw = package.get("packageManager")
-                    if normalized := Orchestrator._normalize_package_manager(raw):
-                        return normalized
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        if (project_dir / "pnpm-lock.yaml").exists():
-            return "pnpm"
-        if (project_dir / "yarn.lock").exists():
-            return "yarn"
-        if (project_dir / "bun.lockb").exists() or (project_dir / "bun.lock").exists():
-            return "bun"
-        if (project_dir / "package-lock.json").exists():
-            return "npm"
-        return package_manager
+        return runtime_detect_package_manager(project_dir)
 
     @staticmethod
     def _select_node_test_script(scripts: dict[str, Any]) -> str | None:
-        candidates = ("test", "test:ci", "test:unit", "test:all", "ci")
-        for script_name in candidates:
-            script_body = scripts.get(script_name)
-            if isinstance(script_body, str) and script_body.strip():
-                return script_name
-        return None
+        return runtime_select_node_test_script(scripts)
 
     @staticmethod
     def _build_node_test_command(manager: str, script_name: str | None) -> str:
-        manager = Orchestrator._normalize_package_manager(manager) or "npm"
-        if script_name:
-            if manager == "npm" and script_name == "test":
-                return "npm test -- --passWithNoTests 2>&1"
-            if manager == "pnpm" and script_name == "test":
-                return "pnpm test -- --passWithNoTests 2>&1"
-            return f"{manager} run {script_name} 2>&1"
-
-        if manager == "npm":
-            return "npm test -- --passWithNoTests 2>&1"
-        if manager == "pnpm":
-            return "pnpm test -- --passWithNoTests 2>&1"
-        return f"{manager} test 2>&1"
+        return runtime_build_node_test_command(manager, script_name)
 
     @staticmethod
     def _makefile_has_test_target(makefile_path: Path) -> bool:
@@ -1778,70 +1815,9 @@ class Orchestrator:
             return False
 
     @staticmethod
-    def _detect_test_command(work_dir: Path) -> str | None:
+    def _detect_test_command(work_dir: Path, *, execution_platform: str | None = None) -> str | None:
         """Detect appropriate test command based on project type."""
-        # Node.js / npm
-        package_json = work_dir / "package.json"
-        if package_json.exists():
-            try:
-                package = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
-                if isinstance(package, dict):
-                    scripts = package.get("scripts")
-                    if isinstance(scripts, dict):
-                        package_manager = Orchestrator._detect_package_manager(work_dir)
-                        script_name = Orchestrator._select_node_test_script(scripts)
-                        return Orchestrator._build_node_test_command(package_manager, script_name)
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        # Python / pytest
-        if (
-            (work_dir / "pytest.ini").exists()
-            or (work_dir / "setup.cfg").exists()
-            or (work_dir / "tox.ini").exists()
-        ):
-            return "python -m pytest --tb=short -q 2>&1"
-
-        pyproject = work_dir / "pyproject.toml"
-        if pyproject.exists():
-            try:
-                content = pyproject.read_text(encoding="utf-8", errors="replace")
-                if "tool.pytest" in content or "pytest" in content:
-                    return "python -m pytest --tb=short -q 2>&1"
-            except OSError:
-                pass
-
-        # Rust / cargo
-        if (work_dir / "Cargo.toml").exists():
-            return "cargo test 2>&1"
-
-        # Go
-        if (work_dir / "go.mod").exists():
-            return "go test ./... 2>&1"
-
-        # Dart / Flutter
-        if (work_dir / "pubspec.yaml").exists():
-            return "dart test 2>&1"
-
-        # Java
-        if (work_dir / "pom.xml").exists():
-            return "./mvnw test 2>&1" if (work_dir / "mvnw").exists() else "mvn test 2>&1"
-        if (work_dir / "build.gradle").exists() or (work_dir / "build.gradle.kts").exists():
-            return "./gradlew test 2>&1" if (work_dir / "gradlew").exists() else "gradle test 2>&1"
-
-        # .NET
-        if (any(work_dir.glob("*.sln")) or any(work_dir.glob("*.csproj"))):
-            return "dotnet test 2>&1"
-
-        # Native make-based test flow
-        makefile = work_dir / "Makefile"
-        if makefile.exists() and Orchestrator._makefile_has_test_target(makefile):
-            return "make test"
-        lowercase_makefile = work_dir / "makefile"
-        if lowercase_makefile.exists() and Orchestrator._makefile_has_test_target(lowercase_makefile):
-            return "make test"
-
-        return None
+        return runtime_detect_test_command(work_dir, execution_platform=execution_platform)
 
     @staticmethod
     def _dependency_signature(project_dir: Path) -> str:
@@ -1876,18 +1852,9 @@ class Orchestrator:
         return signature.hexdigest()
 
     @staticmethod
-    def _dependency_cache_key(project_dir: Path, dependency_signature: str) -> str:
-        return f"{project_dir}::{dependency_signature}"
-
-    @staticmethod
-    def _dependency_probe_command(command: str) -> str:
-        command = command.strip()
-        if command.startswith("python -m pip"):
-            return "python -m pip --version"
-        if command.startswith("python "):
-            return "python --version"
-        first_token = command.split(" ", 1)[0] if command else ""
-        return f"{first_token} --version"
+    def _dependency_cache_key(project_dir: Path, dependency_signature: str, execution_platform: str) -> str:
+        platform = (execution_platform or "").strip().lower() or "posix"
+        return f"{project_dir}::{dependency_signature}::{platform}"
 
     async def _prepare_runtime_dependencies(self, project_dir: Path) -> None:
         """Install runtime/test dependencies for Node.js and Python projects.
@@ -1900,125 +1867,63 @@ class Orchestrator:
 
         project_dir = project_dir.resolve()
         dependency_signature = self._dependency_signature(project_dir)
-        marker = self._dependency_cache_key(project_dir, dependency_signature)
-        legacy_marker = str(project_dir)
-        if marker in self._dependency_prepared_dirs or legacy_marker in self._dependency_prepared_dirs:
-            # Backward-compatible with older state: legacy marker means dependencies were
-            # prepared in a previous run for this project root.
-            self._dependency_prepared_dirs.add(marker)
+        sandbox = self._create_sandbox(project_dir)
+        execution_platform = getattr(sandbox, "execution_platform", "posix")
+        marker = self._dependency_cache_key(project_dir, dependency_signature, execution_platform)
+        if marker in self._dependency_prepared_dirs:
             self._save_state("dependencies_prepared")
             return
 
         async with self._dependency_state_lock:
-            if marker in self._dependency_prepared_dirs or legacy_marker in self._dependency_prepared_dirs:
-                self._dependency_prepared_dirs.add(marker)
+            if marker in self._dependency_prepared_dirs:
                 self._save_state("dependencies_prepared")
                 return
 
-            steps: list[tuple[str, str, bool]] = []
-
-            if (project_dir / "package.json").exists():
-                package_manager = self._detect_package_manager(project_dir)
-                if package_manager == "pnpm":
-                    if (project_dir / "pnpm-lock.yaml").exists():
-                        steps.append(("pnpm install --frozen-lockfile", "pnpm dependencies (frozen)", True))
-                    else:
-                        steps.append(("pnpm install", "pnpm dependencies", True))
-                elif package_manager == "yarn":
-                    if (project_dir / "yarn.lock").exists():
-                        steps.append(("yarn install --frozen-lockfile", "yarn dependencies (frozen)", True))
-                    else:
-                        steps.append(("yarn install", "yarn dependencies", True))
-                elif package_manager == "bun":
-                    steps.append(("bun install", "bun dependencies", True))
-                else:
-                    if (project_dir / "package-lock.json").exists():
-                        steps.append(("npm ci --no-audit --no-fund", "npm dependencies (ci)", True))
-                    else:
-                        steps.append(("npm install --no-audit --no-fund", "npm dependencies", True))
-
-            if (project_dir / "requirements.txt").exists():
-                steps.append(("python -m pip install -r requirements.txt", "python requirements", True))
-            if (project_dir / "requirements-dev.txt").exists():
-                steps.append(("python -m pip install -r requirements-dev.txt", "python dev requirements", False))
-
-            pyproject = project_dir / "pyproject.toml"
-            has_pyproject = pyproject.exists()
-            has_python_setup = (
-                has_pyproject
-                or (project_dir / "setup.py").exists()
-                or (project_dir / "setup.cfg").exists()
-            )
-
-            if has_pyproject:
-                is_poetry = False
-                try:
-                    pyproject_content = pyproject.read_text(encoding="utf-8", errors="replace")
-                    is_poetry = "tool.poetry" in pyproject_content
-                except OSError:
-                    pass
-                if is_poetry or (project_dir / "poetry.lock").exists():
-                    steps.append(("poetry install --no-interaction --no-ansi", "poetry dependencies", True))
-                elif (project_dir / "uv.lock").exists():
-                    steps.append(("uv sync --frozen", "uv dependencies", True))
-                else:
-                    steps.append(("python -m pip install -e .", "python package", True))
-            elif has_python_setup:
-                steps.append(("python -m pip install -e .", "python package", True))
-
-            deduped_steps: list[tuple[str, str, bool]] = []
-            seen_commands: set[str] = set()
-            for command, reason, required in steps:
-                if command in seen_commands:
-                    continue
-                seen_commands.add(command)
-                deduped_steps.append((command, reason, required))
-            steps = deduped_steps
+            steps = runtime_dependency_steps(project_dir, execution_platform=execution_platform)
 
             if not steps:
                 self._dependency_prepared_dirs.add(marker)
                 self._save_state("dependencies_prepared")
                 return
 
-            sandbox = create_sandbox(self.config, project_dir)
+            required_failures: list[str] = []
             async with sandbox:
-                required_failures: list[str] = []
-                for command, reason, required in steps:
-                    console.print(f"  [yellow]Dependency setup[/yellow]: {reason}")
-                    probe = self._dependency_probe_command(command)
-                    if probe:
-                        probe_result = await sandbox.exec(probe, timeout=30)
-                        if probe_result.exit_code != 0:
-                            if required:
-                                required_failures.append(f"{command} (tool check failed: {probe})")
-                                logger.warning(
-                                    "Required dependency tool unavailable: %s (for %s)",
-                                    probe,
-                                    command,
-                                )
-                            else:
-                                logger.warning(
-                                    "Skipping optional dependency step %s because %s unavailable",
-                                    command,
-                                    probe,
-                                )
-                            continue
+                for step in steps:
+                    attempts: list[tuple[str, str, int]] = [
+                        (step.command, step.reason, int(step.timeout_s)),
+                    ]
+                    if step.fallback_command:
+                        attempts.append((
+                            step.fallback_command,
+                            step.fallback_reason or (step.reason + " (fallback)"),
+                            int(step.fallback_timeout_s or step.timeout_s),
+                        ))
 
-                    result = await sandbox.exec(command, timeout=900)
-                    if result.exit_code != 0:
-                        if required:
-                            stderr = (result.stderr or "").strip()[:500]
-                            required_failures.append(f"{command} (exit {result.exit_code}): {stderr}")
-                            logger.warning(
-                                "Dependency step failed: %s (exit %s) — %s",
-                                command,
-                                result.exit_code,
-                                stderr,
-                            )
-                        # Continue with remaining steps so we surface the highest-value
-                        # failures and maximize partial setup in best-effort mode.
-                    else:
-                        logger.info("Dependency step succeeded: %s", command)
+                    success = False
+                    last_err = ""
+                    for idx, (command, reason, timeout_s) in enumerate(attempts):
+                        console.print(f"  [yellow]Dependency setup[/yellow]: {reason}")
+
+                        probe = step.probe_command() if idx == 0 else step.fallback_probe_command()
+                        if probe:
+                            probe_result = await sandbox.exec(probe, timeout=30, capability="deps")
+                            if probe_result.exit_code != 0:
+                                last_err = f"tool check failed: {probe}"
+                                logger.warning("Dependency tool unavailable: %s (for %s)", probe, command)
+                                continue
+
+                        result = await sandbox.exec(command, timeout=timeout_s, capability="deps")
+                        if result.exit_code == 0:
+                            success = True
+                            logger.info("Dependency step succeeded: %s", command)
+                            break
+
+                        stderr = (result.stderr or result.stdout or "").strip()[:500]
+                        last_err = f"exit {result.exit_code}: {stderr}"
+                        logger.warning("Dependency step failed: %s (%s)", command, last_err)
+
+                    if not success and step.required:
+                        required_failures.append(f"{step.command} ({last_err})")
 
             if required_failures:
                 raise RuntimeError(
@@ -2136,7 +2041,7 @@ class Orchestrator:
             return
 
         console.print("  Running integration check...")
-        sandbox = create_sandbox(self.config, self.project_dir)
+        sandbox = self._create_sandbox(self.project_dir)
         issues: list[str] = []
 
         async with sandbox:
@@ -2150,7 +2055,7 @@ class Orchestrator:
                 for pf in py_files[:30]:  # Cap to avoid excessive checks
                     rel = pf.relative_to(self.project_dir)
                     result = await sandbox.exec(
-                        f"python -m py_compile {rel}", timeout=10,
+                        f"python -m py_compile {rel}", timeout=10, capability="typecheck",
                     )
                     if result.exit_code != 0:
                         err = (result.stderr or result.stdout or "")[:200]
@@ -2159,7 +2064,7 @@ class Orchestrator:
             elif "typescript" in lang:
                 # Run tsc --noEmit for type checking
                 if (self.project_dir / "tsconfig.json").exists():
-                    result = await sandbox.exec("npx tsc --noEmit 2>&1", timeout=60)
+                    result = await sandbox.exec("npx tsc --noEmit", timeout=60, capability="typecheck")
                     if result.exit_code != 0:
                         # Extract first few errors
                         lines = (result.stdout or "").strip().split("\n")
@@ -2174,7 +2079,7 @@ class Orchestrator:
                 for jf in js_files[:30]:
                     rel = jf.relative_to(self.project_dir)
                     result = await sandbox.exec(
-                        f"node --check {rel}", timeout=10,
+                        f"node --check {rel}", timeout=10, capability="typecheck",
                     )
                     if result.exit_code != 0:
                         err = (result.stderr or "")[:200]
@@ -2257,46 +2162,22 @@ class Orchestrator:
     @staticmethod
     async def _run_syntax_check(path: Path, *cmd: str) -> str | None:
         """Run a syntax-check command. Returns error string or None on success."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-            if proc.returncode != 0:
-                return stderr.decode(errors="replace").strip()[:200]
-        except FileNotFoundError:
-            # Checker not installed — skip gracefully
-            return None
-        except asyncio.TimeoutError:
+        res = await run_args(
+            list(cmd),
+            cwd=path.parent,
+            timeout_s=15.0,
+            max_stdout_chars=2000,
+            max_stderr_chars=2000,
+            label="syntax_check",
+        )
+        if res.timed_out:
             return "syntax check timed out"
-        except (PermissionError, OSError) as e:
-            # Some sandboxed Windows environments disallow asyncio subprocess pipes.
-            logger.debug(f"Syntax check async exec failed for {path}: {e}")
-            try:
-                import subprocess
-
-                completed = await asyncio.to_thread(
-                    subprocess.run,
-                    list(cmd),
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                if completed.returncode != 0:
-                    err = (completed.stderr or completed.stdout or "").strip()
-                    return (err or "syntax check failed")[:200]
-            except FileNotFoundError:
-                return None
-            except subprocess.TimeoutExpired:
-                return "syntax check timed out"
-            except Exception as e2:
-                logger.debug(f"Syntax check sync fallback failed for {path}: {e2}")
-                return None
-        except Exception as e:
-            logger.debug(f"Syntax check error for {path}: {e}")
+        if res.exit_code == -1:
+            # Checker not installed or cannot be executed — skip gracefully.
             return None
+        if res.exit_code != 0:
+            err = (res.stderr or res.stdout or "").strip()
+            return (err or "syntax check failed")[:200]
         return None
 
     async def _enforce_build_gate(
@@ -2442,7 +2323,7 @@ class Orchestrator:
         # Ensure runtime and test dependencies are installed before tests start.
         await self._prepare_runtime_dependencies(self.project_dir)
 
-        sandbox = create_sandbox(self.config, self.project_dir)
+        sandbox = self._create_sandbox(self.project_dir)
         async with sandbox:
             tester = self._agent("tester", self.config, self.llm, self.project_dir, sandbox)
             result = await tester.run({"spec": self.spec})
@@ -2618,7 +2499,7 @@ class Orchestrator:
         self._save_state("refactor_in_progress")
         await self._prepare_runtime_dependencies(self.project_dir)
 
-        sandbox = create_sandbox(self.config, self.project_dir)
+        sandbox = self._create_sandbox(self.project_dir)
         async with sandbox:
             # Full project review with verification tools
             reviewer = self._agent("reviewer", self.config, self.llm, self.project_dir, sandbox=sandbox)
@@ -2652,12 +2533,12 @@ class Orchestrator:
                 if "python" in lang:
                     for pf in list(self.project_dir.rglob("*.py"))[:30]:
                         rel = pf.relative_to(self.project_dir)
-                        result = await sandbox.exec(f"python -m py_compile {rel}", timeout=10)
+                        result = await sandbox.exec(f"python -m py_compile {rel}", timeout=10, capability="typecheck")
                         if result.exit_code != 0:
                             console.print(f"  [yellow]Refactor broke {rel}[/yellow]")
                             broke = True
                 elif "typescript" in lang and (self.project_dir / "tsconfig.json").exists():
-                    result = await sandbox.exec("npx tsc --noEmit 2>&1", timeout=60)
+                    result = await sandbox.exec("npx tsc --noEmit", timeout=60, capability="typecheck")
                     if result.exit_code != 0:
                         broke = True
                         console.print("  [yellow]Refactor introduced type errors[/yellow]")
@@ -2723,6 +2604,35 @@ class Orchestrator:
         self._wall_start = time.time()
         self.project_dir = Path(project_path).resolve()
         logger.info(f"AutoForge review {self.config.run_id} starting: {self.project_dir}")
+        self.runtime = ForgeRuntime.create(
+            self.project_dir,
+            self.config.run_id,
+            artifacts_enabled=bool(getattr(self.config, "artifacts_enabled", True)),
+            trace_enabled=bool(getattr(self.config, "trace_enabled", False)),
+            trace_capture_llm_content=bool(getattr(self.config, "trace_capture_llm_content", False)),
+            trace_capture_command_output=bool(getattr(self.config, "trace_capture_command_output", False)),
+            trace_capture_fs_snapshots=bool(getattr(self.config, "trace_capture_fs_snapshots", False)),
+            trace_max_inline_chars=int(getattr(self.config, "trace_max_inline_chars", 20000) or 20000),
+            trace_redact_secrets=bool(getattr(self.config, "trace_redact_secrets", True)),
+            trace_secrets=[s for s in (
+                list(getattr(self.config, "api_keys", {}).values())
+                + [
+                    getattr(self.config, "search_api_key", ""),
+                    getattr(self.config, "github_token", ""),
+                    getattr(self.config, "webhook_secret", ""),
+                    getattr(self.config, "webhook_admin_secret", ""),
+                ]
+            ) if isinstance(s, str) and s],
+        )
+        if (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))) and self.runtime is not None:
+            self.llm.set_telemetry_sink(self.runtime.telemetry)
+            try:
+                self.runtime.telemetry.record(
+                    "review_started",
+                    {"project_dir": str(self.project_dir)},
+                )
+            except Exception:
+                pass
 
         try:
             # Phase 1: SCAN — Understand the project
@@ -2762,6 +2672,13 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Review failed: {e}", exc_info=True)
             raise
+        finally:
+            try:
+                if self.runtime is not None:
+                    self.runtime.close()
+            except Exception:
+                pass
+            self.runtime = None
 
     async def _phase_scan(self, project_dir: Path):
         """Run Scanner Agent on existing project."""
@@ -2871,6 +2788,35 @@ class Orchestrator:
                 ignore=shutil.ignore_patterns(*sorted(ignore_names)),
             )
             self._state_file = self.project_dir / ".forge_state.json"
+            self.runtime = ForgeRuntime.create(
+                self.project_dir,
+                self.config.run_id,
+                artifacts_enabled=bool(getattr(self.config, "artifacts_enabled", True)),
+                trace_enabled=bool(getattr(self.config, "trace_enabled", False)),
+                trace_capture_llm_content=bool(getattr(self.config, "trace_capture_llm_content", False)),
+                trace_capture_command_output=bool(getattr(self.config, "trace_capture_command_output", False)),
+                trace_capture_fs_snapshots=bool(getattr(self.config, "trace_capture_fs_snapshots", False)),
+                trace_max_inline_chars=int(getattr(self.config, "trace_max_inline_chars", 20000) or 20000),
+                trace_redact_secrets=bool(getattr(self.config, "trace_redact_secrets", True)),
+                trace_secrets=[s for s in (
+                    list(getattr(self.config, "api_keys", {}).values())
+                    + [
+                        getattr(self.config, "search_api_key", ""),
+                        getattr(self.config, "github_token", ""),
+                        getattr(self.config, "webhook_secret", ""),
+                        getattr(self.config, "webhook_admin_secret", ""),
+                    ]
+                ) if isinstance(s, str) and s],
+            )
+            if (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))) and self.runtime is not None:
+                self.llm.set_telemetry_sink(self.runtime.telemetry)
+                try:
+                    self.runtime.telemetry.record(
+                        "import_started",
+                        {"source_dir": str(source_dir), "project_dir": str(self.project_dir)},
+                    )
+                except Exception:
+                    pass
 
             # Phase 1: SCAN
             console.print("\n[bold blue]Phase 1: SCAN[/bold blue] — Analyzing project...")
@@ -2923,6 +2869,13 @@ class Orchestrator:
             if self.project_dir:
                 self._save_state(f"failed: {e}")
             raise
+        finally:
+            try:
+                if self.runtime is not None:
+                    self.runtime.close()
+            except Exception:
+                pass
+            self.runtime = None
 
     async def _phase_enhance(self, enhancement: str) -> None:
         """Add new features to an imported project.
@@ -3409,7 +3362,7 @@ class Orchestrator:
             return
 
         console.print(f"  Fixing {len(findings)} critical/high security issue(s)...")
-        sandbox = create_sandbox(self.config, self.project_dir)
+        sandbox = self._create_sandbox(self.project_dir)
         async with sandbox:
             builder = self._agent("builder", self.config, self.llm, self.project_dir, sandbox)
             for finding in findings[:5]:  # Cap at 5 fixes per pass
@@ -4130,21 +4083,67 @@ class Orchestrator:
             "state_epoch": self._state_epoch,
             "task_transition_seq": self._transition_seq,
             "build_plan_signature": self._build_plan_signature(),
+            "runtime_env": {
+                "execution_backend": str(getattr(self.config, "execution_backend", "")),
+                "subprocess_security_mode": str(getattr(self.config, "subprocess_security_mode", "")),
+                "deterministic": bool(getattr(self.config, "deterministic", False)),
+                "pip_index_url": str(getattr(self.config, "pip_index_url", "")),
+                "pip_cache_dir": str(getattr(self.config, "pip_cache_dir", "")),
+                "npm_registry": str(getattr(self.config, "npm_registry", "")),
+                "npm_cache_dir": str(getattr(self.config, "npm_cache_dir", "")),
+                "python_venv_dir": ".autoforge/venv",
+            },
             "prepared_dependency_dirs": sorted(self._dependency_prepared_dirs),
             "task_transition_log": self._task_transition_log[-1000:],
             "elapsed_seconds": time.time() - self._wall_start,
             "updated_at": time.time(),
         }
         state_json = json.dumps(state, indent=2, ensure_ascii=False)
+        did_save = False
         with self._state_lock:
             try:
-                # Atomic write: temp file in same dir → rename
-                tmp = self._state_file.parent / f".{self._state_file.name}.tmp"
-                tmp.write_text(state_json, encoding="utf-8")
-                tmp.replace(self._state_file)
+                if self._durable_enabled() and self.runtime is not None:
+                    # Durable snapshot: SQLite + atomic JSON file
+                    self.runtime.journal.save_snapshot(
+                        state,
+                        phase=phase,
+                        state_version=next_state_version,
+                        json_path=self._state_file,
+                    )
+                    try:
+                        self.runtime.telemetry.record_snapshot(
+                            {
+                                "phase": phase,
+                                "state_version": next_state_version,
+                                "task_progress_count": len(task_progress),
+                                "cost_usd": float(getattr(self.config, "estimated_cost_usd", 0.0)),
+                            }
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # Atomic write: temp file in same dir → rename
+                    tmp = self._state_file.parent / f".{self._state_file.name}.tmp"
+                    tmp.write_text(state_json, encoding="utf-8")
+                    tmp.replace(self._state_file)
                 self._state_version = next_state_version
+                did_save = True
             except OSError as exc:
                 logger.error("Failed to save state to %s: %s", self._state_file, exc)
+
+        # Optional trace: file-system snapshot at meaningful phase boundaries.
+        if (
+            did_save
+            and self.runtime is not None
+            and self.project_dir is not None
+            and self.runtime.trace is not None
+            and bool(getattr(self.runtime.trace, "capture_fs_snapshots", False))
+            and (phase.endswith("complete") or phase in {"dependencies_prepared"})
+        ):
+            try:
+                self.runtime.trace.record_fs_snapshot(self.project_dir, label=f"state:{phase}")
+            except Exception:
+                pass
 
     def _list_project_files(self) -> list[str]:
         """List all source files in the project directory."""
@@ -4183,118 +4182,195 @@ class Orchestrator:
         self._force_rebuild_plan = False
         self._task_transition_log = []
         self._transition_seq = 0
-        try:
-            state = json.loads(self._state_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            raise RuntimeError(
-                f"Failed to load state from {self._state_file}: {exc}. "
-                f"The state file may be corrupted — delete it and re-run."
-            ) from exc
+        state: dict[str, Any] = {}
+        loaded_from_journal = False
 
-        self.spec = state.get("spec", {})
-        self.architecture = state.get("architecture", {})
-        phase = state.get("phase", "")
-        task_progress = state.get("task_progress")
-        if isinstance(task_progress, list):
-            self._resumed_task_progress = [
-                item for item in task_progress
-                if isinstance(item, dict)
-            ]
-        state_version = state.get("state_version", self._state_version)
-        if isinstance(state_version, (int, str)) and str(state_version).isdigit():
-            self._state_version = int(state_version)
-        state_epoch = state.get("state_epoch", self._state_epoch)
-        if isinstance(state_epoch, (int, str)) and str(state_epoch).isdigit():
-            self._state_epoch = int(state_epoch)
-        task_transition_seq = state.get("task_transition_seq", self._transition_seq)
-        if isinstance(task_transition_seq, (int, str)) and str(task_transition_seq).isdigit():
-            self._transition_seq = int(task_transition_seq)
-        prepared_dirs = state.get("prepared_dependency_dirs", [])
-        if isinstance(prepared_dirs, list):
-            self._dependency_prepared_dirs = set(
-                str(item) for item in prepared_dirs if isinstance(item, str)
-            )
-        transition_log = state.get("task_transition_log", [])
-        if isinstance(transition_log, list):
-            self._task_transition_log = [
-                entry for entry in transition_log
-                if isinstance(entry, dict)
-            ]
+        file_state: dict[str, Any] | None = None
+        file_run_id: str | None = None
+        if self._state_file and self._state_file.exists():
+            try:
+                candidate = json.loads(self._state_file.read_text(encoding="utf-8"))
+                if isinstance(candidate, dict) and candidate:
+                    file_state = candidate
+                    rid = candidate.get("run_id")
+                    if isinstance(rid, str) and rid:
+                        file_run_id = rid
+            except Exception:
+                file_state = None
+                file_run_id = None
 
-        for entry in self._load_task_transitions():
-            if isinstance(entry, dict) and entry not in self._task_transition_log:
-                self._task_transition_log.append(entry)
-        if len(self._task_transition_log) > 2000:
-            self._task_transition_log = self._task_transition_log[-2000:]
+        backend = str(getattr(self.config, "state_backend", "sqlite")).strip().lower()
+        if getattr(self.config, "durable_execution_enabled", True) and backend in ("sqlite", "both"):
+            journal = RunJournal(workspace_path)
+            try:
+                snap = journal.load_latest_snapshot(run_id=file_run_id) if file_run_id else None
+                if snap is None:
+                    snap = journal.load_latest_snapshot()
+                if snap is not None and isinstance(snap.payload, dict) and snap.payload:
+                    state = snap.payload
+                    loaded_from_journal = True
+            finally:
+                journal.close()
 
-        expected_signature = state.get("build_plan_signature")
-        if isinstance(expected_signature, str) and expected_signature:
-            current_signature = self._build_plan_signature()
-            if current_signature and current_signature != expected_signature:
-                logger.warning(
-                    "Build plan signature mismatch while resuming. "
-                    "Clearing resumed task progress and rebuilding plan."
+        if not loaded_from_journal:
+            if file_state is not None:
+                state = file_state
+            else:
+                raise RuntimeError(
+                    f"Failed to load state from {self._state_file}. "
+                    "The state file may be corrupted or deleted; delete it and re-run."
                 )
-                self._resumed_task_progress = None
-                self._force_rebuild_plan = True
 
-        # Restore token usage so budget tracking is accurate across resumes
-        if "token_usage" in state and isinstance(state["token_usage"], dict):
-            for model, usage in state["token_usage"].items():
-                if isinstance(usage, dict) and "input" in usage and "output" in usage:
-                    self.config.token_usage[model] = usage
+        state_run_id = state.get("run_id")
+        if isinstance(state_run_id, str) and state_run_id:
+            self.config.run_id = state_run_id
 
-        # Restore wall-clock start so elapsed time accumulates across resumes
-        elapsed = state.get("elapsed_seconds", 0)
-        if not isinstance(elapsed, (int, float)):
-            elapsed = 0
-        self._wall_start = time.time() - elapsed
-        self._start_time = time.monotonic()
+        self.runtime = ForgeRuntime.create(
+            self.project_dir,
+            self.config.run_id,
+            artifacts_enabled=bool(getattr(self.config, "artifacts_enabled", True)),
+            trace_enabled=bool(getattr(self.config, "trace_enabled", False)),
+            trace_capture_llm_content=bool(getattr(self.config, "trace_capture_llm_content", False)),
+            trace_capture_command_output=bool(getattr(self.config, "trace_capture_command_output", False)),
+            trace_capture_fs_snapshots=bool(getattr(self.config, "trace_capture_fs_snapshots", False)),
+            trace_max_inline_chars=int(getattr(self.config, "trace_max_inline_chars", 20000) or 20000),
+            trace_redact_secrets=bool(getattr(self.config, "trace_redact_secrets", True)),
+            trace_secrets=[s for s in (
+                list(getattr(self.config, "api_keys", {}).values())
+                + [
+                    getattr(self.config, "search_api_key", ""),
+                    getattr(self.config, "github_token", ""),
+                    getattr(self.config, "webhook_secret", ""),
+                    getattr(self.config, "webhook_admin_secret", ""),
+                ]
+            ) if isinstance(s, str) and s],
+        )
+        try:
+            if (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))) and self.runtime is not None:
+                self.llm.set_telemetry_sink(self.runtime.telemetry)
+                try:
+                    self.runtime.telemetry.record(
+                        "resume_loaded",
+                        {
+                            "loaded_from_journal": loaded_from_journal,
+                            "project_dir": str(self.project_dir),
+                            "state_file": str(self._state_file),
+                        },
+                    )
+                except Exception:
+                    pass
 
-        console.print(f"Resuming from phase: {phase}")
+            self.spec = state.get("spec", {})
+            self.architecture = state.get("architecture", {})
+            phase = state.get("phase", "")
+            task_progress = state.get("task_progress")
+            if isinstance(task_progress, list):
+                self._resumed_task_progress = [
+                    item for item in task_progress
+                    if isinstance(item, dict)
+                ]
+            state_version = state.get("state_version", self._state_version)
+            if isinstance(state_version, (int, str)) and str(state_version).isdigit():
+                self._state_version = int(state_version)
+            state_epoch = state.get("state_epoch", self._state_epoch)
+            if isinstance(state_epoch, (int, str)) and str(state_epoch).isdigit():
+                self._state_epoch = int(state_epoch)
+            task_transition_seq = state.get("task_transition_seq", self._transition_seq)
+            if isinstance(task_transition_seq, (int, str)) and str(task_transition_seq).isdigit():
+                self._transition_seq = int(task_transition_seq)
+            prepared_dirs = state.get("prepared_dependency_dirs", [])
+            if isinstance(prepared_dirs, list):
+                self._dependency_prepared_dirs = set(
+                    str(item) for item in prepared_dirs if isinstance(item, str)
+                )
+            transition_log = state.get("task_transition_log", [])
+            if isinstance(transition_log, list):
+                self._task_transition_log = [
+                    entry for entry in transition_log
+                    if isinstance(entry, dict)
+                ]
 
-        # Resume from the appropriate phase
-        if phase == "spec_complete":
-            await self._phase_build()
-            await self._phase_verify()
-            await self._phase_refactor()
-            await self._phase_deliver()
-        elif phase == "build_in_progress":
-            await self._phase_build()
-            await self._phase_verify()
-            await self._phase_refactor()
-            await self._phase_deliver()
-        elif phase == "build_complete":
-            await self._phase_verify()
-            await self._phase_refactor()
-            await self._phase_deliver()
-        elif phase == "verify_in_progress":
-            await self._phase_verify()
-            await self._phase_refactor()
-            await self._phase_deliver()
-        elif phase == "refactor_in_progress":
-            await self._phase_refactor()
-            await self._phase_deliver()
-        elif phase == "dependencies_prepared":
-            await self._phase_verify()
-            await self._phase_refactor()
-            await self._phase_deliver()
-        elif phase == "verify_complete":
-            await self._phase_refactor()
-            await self._phase_deliver()
-        elif phase == "refactor_complete":
-            await self._phase_deliver()
-        elif phase == "complete":
-            console.print("Project already complete!")
-        else:
-            console.print(f"Unknown phase '{phase}', starting from build")
-            await self._phase_build()
-            await self._phase_verify()
-            await self._phase_refactor()
-            await self._phase_deliver()
+            for entry in self._load_task_transitions():
+                if isinstance(entry, dict) and entry not in self._task_transition_log:
+                    self._task_transition_log.append(entry)
+            if len(self._task_transition_log) > 2000:
+                self._task_transition_log = self._task_transition_log[-2000:]
 
-        self._print_summary()
-        return self.project_dir
+            expected_signature = state.get("build_plan_signature")
+            if isinstance(expected_signature, str) and expected_signature:
+                current_signature = self._build_plan_signature()
+                if current_signature and current_signature != expected_signature:
+                    logger.warning(
+                        "Build plan signature mismatch while resuming. "
+                        "Clearing resumed task progress and rebuilding plan."
+                    )
+                    self._resumed_task_progress = None
+                    self._force_rebuild_plan = True
+
+            # Restore token usage so budget tracking is accurate across resumes
+            if "token_usage" in state and isinstance(state["token_usage"], dict):
+                for model, usage in state["token_usage"].items():
+                    if isinstance(usage, dict) and "input" in usage and "output" in usage:
+                        self.config.token_usage[model] = usage
+
+            # Restore wall-clock start so elapsed time accumulates across resumes
+            elapsed = state.get("elapsed_seconds", 0)
+            if not isinstance(elapsed, (int, float)):
+                elapsed = 0
+            self._wall_start = time.time() - elapsed
+            self._start_time = time.monotonic()
+
+            console.print(f"Resuming from phase: {phase}")
+
+            # Resume from the appropriate phase
+            if phase == "spec_complete":
+                await self._phase_build()
+                await self._phase_verify()
+                await self._phase_refactor()
+                await self._phase_deliver()
+            elif phase == "build_in_progress":
+                await self._phase_build()
+                await self._phase_verify()
+                await self._phase_refactor()
+                await self._phase_deliver()
+            elif phase == "build_complete":
+                await self._phase_verify()
+                await self._phase_refactor()
+                await self._phase_deliver()
+            elif phase == "verify_in_progress":
+                await self._phase_verify()
+                await self._phase_refactor()
+                await self._phase_deliver()
+            elif phase == "refactor_in_progress":
+                await self._phase_refactor()
+                await self._phase_deliver()
+            elif phase == "dependencies_prepared":
+                await self._phase_verify()
+                await self._phase_refactor()
+                await self._phase_deliver()
+            elif phase == "verify_complete":
+                await self._phase_refactor()
+                await self._phase_deliver()
+            elif phase == "refactor_complete":
+                await self._phase_deliver()
+            elif phase == "complete":
+                console.print("Project already complete!")
+            else:
+                console.print(f"Unknown phase '{phase}', starting from build")
+                await self._phase_build()
+                await self._phase_verify()
+                await self._phase_refactor()
+                await self._phase_deliver()
+
+            self._print_summary()
+            return self.project_dir
+        finally:
+            try:
+                if self.runtime is not None:
+                    self.runtime.close()
+            except Exception:
+                pass
+            self.runtime = None
 
     def show_status(self) -> None:
         """Display current project status."""

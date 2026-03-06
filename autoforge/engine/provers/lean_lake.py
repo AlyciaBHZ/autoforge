@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from autoforge.engine.llm_router import TaskComplexity
+from autoforge.engine.runtime.commands import run_args
 
 logger = logging.getLogger(__name__)
 
@@ -209,43 +210,46 @@ class ElanManager:
 
         # Check lean
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "lean",
-                "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                timeout=5,
+            res = await run_args(
+                ["lean", "--version"],
+                cwd=Path("."),
+                timeout_s=5.0,
+                max_stdout_chars=2000,
+                max_stderr_chars=2000,
+                label="lean.check_installation",
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            result["lean_version"] = stdout.decode().strip()
+            if res.exit_code == 0 and res.stdout:
+                result["lean_version"] = res.stdout.strip()
         except Exception as e:
             logger.debug(f"Lean not found: {e}")
 
         # Check lake
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "lake",
-                "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                timeout=5,
+            res = await run_args(
+                ["lake", "--version"],
+                cwd=Path("."),
+                timeout_s=5.0,
+                max_stdout_chars=2000,
+                max_stderr_chars=2000,
+                label="lake.check_installation",
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            result["lake_version"] = stdout.decode().strip()
+            if res.exit_code == 0 and res.stdout:
+                result["lake_version"] = res.stdout.strip()
         except Exception as e:
             logger.debug(f"Lake not found: {e}")
 
         # Check elan
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "elan",
-                "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                timeout=5,
+            res = await run_args(
+                ["elan", "--version"],
+                cwd=Path("."),
+                timeout_s=5.0,
+                max_stdout_chars=2000,
+                max_stderr_chars=2000,
+                label="elan.check_installation",
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            result["elan_version"] = stdout.decode().strip()
+            if res.exit_code == 0 and res.stdout:
+                result["elan_version"] = res.stdout.strip()
         except Exception as e:
             logger.debug(f"Elan not found: {e}")
 
@@ -274,43 +278,41 @@ class ElanManager:
         """
         logger.info("Installing Elan...")
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "curl",
-                "--proto",
-                "=https",
-                "--tlsv1.2",
-                "-sSf",
-                "https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                timeout=30,
+            download = await run_args(
+                [
+                    "curl",
+                    "--proto",
+                    "=https",
+                    "--tlsv1.2",
+                    "-sSf",
+                    "https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh",
+                ],
+                cwd=Path("."),
+                timeout_s=30.0,
+                max_stdout_chars=200000,
+                max_stderr_chars=8000,
+                label="elan.download",
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-
-            if proc.returncode != 0:
-                logger.error(f"Failed to download elan-init.sh: {stderr.decode()}")
+            if download.exit_code != 0 or not download.stdout:
+                logger.error(f"Failed to download elan-init.sh: {download.stderr}")
                 return False
 
             # Execute installer
-            proc = await asyncio.create_subprocess_exec(
-                "sh",
-                "-s",
-                "--",
-                "-y",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                timeout=120,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=stdout), timeout=120
+            install = await run_args(
+                ["sh", "-s", "--", "-y"],
+                cwd=Path("."),
+                stdin=download.stdout.encode("utf-8", errors="replace"),
+                timeout_s=120.0,
+                max_stdout_chars=20000,
+                max_stderr_chars=20000,
+                label="elan.install",
             )
 
-            success = proc.returncode == 0
+            success = install.exit_code == 0 and not install.timed_out
             if success:
                 logger.info("Elan installed successfully")
             else:
-                logger.error(f"Elan installation failed: {stderr.decode()}")
+                logger.error(f"Elan installation failed: {install.stderr}")
             return success
         except Exception as e:
             logger.error(f"Error installing Elan: {e}")
@@ -329,22 +331,19 @@ class ElanManager:
         """
         logger.info(f"Installing Lean toolchain {version}...")
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "elan",
-                "toolchain",
-                "install",
-                version,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                timeout=300,
+            res = await run_args(
+                ["elan", "toolchain", "install", version],
+                cwd=Path("."),
+                timeout_s=300.0,
+                max_stdout_chars=20000,
+                max_stderr_chars=20000,
+                label="elan.toolchain_install",
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-
-            success = proc.returncode == 0
+            success = res.exit_code == 0 and not res.timed_out
             if success:
                 logger.info(f"Toolchain {version} installed")
             else:
-                logger.error(f"Failed to install {version}: {stderr.decode()}")
+                logger.error(f"Failed to install {version}: {res.stderr}")
             return success
         except Exception as e:
             logger.error(f"Error installing toolchain: {e}")
@@ -360,22 +359,19 @@ class ElanManager:
         """
         logger.info("Caching Mathlib...")
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "lake",
-                "exe",
-                "cache",
-                "get",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                timeout=600,
+            res = await run_args(
+                ["lake", "exe", "cache", "get"],
+                cwd=Path("."),
+                timeout_s=600.0,
+                max_stdout_chars=20000,
+                max_stderr_chars=20000,
+                label="lake.cache_mathlib",
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
-
-            success = proc.returncode == 0
+            success = res.exit_code == 0 and not res.timed_out
             if success:
                 logger.info("Mathlib cache updated")
             else:
-                logger.warning(f"Cache update had issues: {stderr.decode()}")
+                logger.warning(f"Cache update had issues: {res.stderr}")
             return success
         except Exception as e:
             logger.error(f"Error caching Mathlib: {e}")
@@ -445,31 +441,25 @@ class LakeProject:
 
             # Run lake update
             logger.info("Running 'lake update' to fetch Mathlib (this may take a while)...")
-            proc = await asyncio.create_subprocess_exec(
-                "lake",
-                "update",
-                cwd=str(self.project_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                timeout=600,
+            res = await run_args(
+                ["lake", "update"],
+                cwd=self.project_dir,
+                timeout_s=600.0,
+                max_stdout_chars=200000,
+                max_stderr_chars=200000,
+                label="lake.update",
             )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
-                output = stdout.decode() + stderr.decode()
-
-                if proc.returncode != 0:
-                    logger.error(f"lake update failed: {output}")
-                    return False
-
-                logger.info("Mathlib dependencies fetched successfully")
-                self._initialized = True
-                return True
-            except asyncio.TimeoutError:
+            output = (res.stdout or "") + (res.stderr or "")
+            if res.timed_out:
                 logger.error("lake update timed out")
-                proc.kill()
-                await proc.wait()
                 return False
+            if res.exit_code != 0:
+                logger.error(f"lake update failed: {output}")
+                return False
+
+            logger.info("Mathlib dependencies fetched successfully")
+            self._initialized = True
+            return True
         except Exception as e:
             logger.error(f"Error initializing Lake project: {e}")
             return False
@@ -487,33 +477,23 @@ class LakeProject:
         logger.info(f"Building Lake project {self.project_dir}")
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "lake",
-                "build",
-                cwd=str(self.project_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                timeout=self.config.timeout_seconds,
+            res = await run_args(
+                ["lake", "build"],
+                cwd=self.project_dir,
+                timeout_s=float(self.config.timeout_seconds),
+                max_stdout_chars=200000,
+                max_stderr_chars=200000,
+                label="lake.build",
             )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=self.config.timeout_seconds,
-                )
-                output = stdout.decode() + stderr.decode()
-
-                if proc.returncode == 0:
-                    logger.info("Build successful")
-                    return True, output
-                else:
-                    logger.warning(f"Build failed: {output}")
-                    return False, output
-            except asyncio.TimeoutError:
+            output = (res.stdout or "") + (res.stderr or "")
+            if res.timed_out:
                 logger.error("Build timed out")
-                proc.kill()
-                await proc.wait()
                 return False, "Build timed out"
+            if res.exit_code == 0:
+                logger.info("Build successful")
+                return True, output
+            logger.warning(f"Build failed: {output}")
+            return False, output
         except Exception as e:
             logger.error(f"Error building project: {e}")
             return False, str(e)
@@ -534,36 +514,26 @@ class LakeProject:
         logger.debug(f"Checking file {lean_file}")
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "lake",
-                "env",
-                "lean",
-                str(lean_file),
-                cwd=str(self.project_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                timeout=self.config.timeout_seconds,
+            res = await run_args(
+                ["lake", "env", "lean", str(lean_file)],
+                cwd=self.project_dir,
+                timeout_s=float(self.config.timeout_seconds),
+                max_stdout_chars=200000,
+                max_stderr_chars=200000,
+                label="lake.check_file",
             )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=self.config.timeout_seconds,
-                )
-                output = stdout.decode() + stderr.decode()
-
-                errors = []
-                for line in output.split("\n"):
-                    if "error" in line.lower() or "failed" in line.lower():
-                        errors.append(line.strip())
-
-                success = proc.returncode == 0
-                return success, errors
-            except asyncio.TimeoutError:
+            if res.timed_out:
                 logger.error("File check timed out")
-                proc.kill()
-                await proc.wait()
                 return False, ["Verification timed out"]
+
+            output = (res.stdout or "") + (res.stderr or "")
+            errors = []
+            for line in output.split("\n"):
+                if "error" in line.lower() or "failed" in line.lower():
+                    errors.append(line.strip())
+
+            success = res.exit_code == 0
+            return success, errors
         except Exception as e:
             logger.error(f"Error checking file: {e}")
             return False, [str(e)]

@@ -60,9 +60,54 @@ def _parse_json(
 
 def _repair_json(text: str) -> str:
     """Apply conservative repair rules for common JSON syntax glitches."""
-    repaired = re.sub(r",(\s*[}\]])", r"\1", text)
-    repaired = re.sub(r"//.*(?=[\n\r])", "", repaired)
-    repaired = re.sub(r"/\*.*?\*/", "", repaired, flags=re.DOTALL)
+
+    def _strip_comments(s: str) -> str:
+        # String-aware comment stripping so we don't corrupt URLs like "https://...".
+        out: list[str] = []
+        in_string = False
+        quote = ""
+        escape = False
+        i = 0
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if in_string:
+                out.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    in_string = False
+                i += 1
+                continue
+
+            if ch in {"\"", "'"}:
+                in_string = True
+                quote = ch
+                out.append(ch)
+                i += 1
+                continue
+
+            if ch == "/" and i + 1 < n and s[i + 1] == "/":
+                i += 2
+                while i < n and s[i] not in "\n\r":
+                    i += 1
+                continue
+
+            if ch == "/" and i + 1 < n and s[i + 1] == "*":
+                i += 2
+                while i + 1 < n and not (s[i] == "*" and s[i + 1] == "/"):
+                    i += 1
+                i = i + 2 if i + 1 < n else n
+                continue
+
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    repaired = _strip_comments(text)
+    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
     return repaired.strip()
 
 
@@ -340,7 +385,7 @@ def extract_json_from_text(
         allow_objects=True,
         allow_arrays=False,
         strict=strict,
-        allow_repair=allow_repair and not strict,
+        allow_repair=allow_repair,
     ):
         if not isinstance(payload, dict):
             continue
@@ -377,7 +422,7 @@ def extract_json_list_from_text(
         allow_objects=False,
         allow_arrays=True,
         strict=strict,
-        allow_repair=allow_repair and not strict,
+        allow_repair=allow_repair,
     ):
         if isinstance(payload, list):
             if item_schema is None:
@@ -435,10 +480,23 @@ def _truncate_by_lines(text: str, max_tokens: int) -> str:
         remain = max_tokens - used
         if remain <= 0:
             break
-        plain = chunk[: remain * 4]
+        prefix = "\n\n" if i != 0 else ""
+        prefix_tokens = count_tokens(prefix) if prefix else 0
+        if prefix_tokens >= remain:
+            break
+        body_budget = max(0, remain - prefix_tokens)
+        encoder = _load_tiktoken_encoder()
+        if encoder is None:
+            plain = chunk[: max(0, body_budget) * 4]
+        else:
+            try:
+                tokens = encoder.encode(chunk)
+                plain = encoder.decode(tokens[: max(0, body_budget)])
+            except Exception:
+                plain = chunk[: max(0, body_budget) * 4]
         if plain:
-            out.append(plain if i == 0 else f"\n\n{plain}")
-            used += count_tokens(plain)
+            out.append(prefix + plain)
+            used += prefix_tokens + count_tokens(plain)
         break
 
     return "".join(out)

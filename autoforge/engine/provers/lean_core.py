@@ -22,6 +22,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from autoforge.engine.runtime.commands import run_args, spawn_exec
+
 logger = logging.getLogger(__name__)
 
 
@@ -204,14 +206,16 @@ class LeanEnvironment:
 
         if lean_path and lake_path:
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    "lean", "--version",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                res = await run_args(
+                    ["lean", "--version"],
+                    cwd=self._workspace,
+                    timeout_s=10.0,
+                    max_stdout_chars=2000,
+                    max_stderr_chars=2000,
+                    label="lean.version",
                 )
-                stdout, _ = await proc.communicate()
-                version_text = stdout.decode(errors="replace").strip()
-                if "Lean" in version_text:
+                version_text = (res.stdout or "").strip()
+                if res.exit_code == 0 and "Lean" in version_text:
                     self._lean_available = True
                     self._lean_version = version_text
                     logger.info(f"[Lean] Found: {version_text}")
@@ -231,19 +235,22 @@ class LeanEnvironment:
             return await self._llm_simulated_verify(lean_file)
 
         try:
-            # Try direct lean check first
-            proc = await asyncio.create_subprocess_exec(
-                "lean", str(lean_file),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            res = await run_args(
+                ["lean", str(lean_file)],
                 cwd=self._workspace,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout,
+                timeout_s=float(timeout),
+                max_stdout_chars=20000,
+                max_stderr_chars=20000,
+                label="lean.verify_file",
             )
             elapsed = time.monotonic() - start
-            output = (stdout.decode(errors="replace") +
-                      stderr.decode(errors="replace"))
+            if res.timed_out:
+                return LeanVerificationResult(
+                    success=False,
+                    errors=[f"Lean verification timed out after {timeout}s"],
+                    execution_time=elapsed,
+                )
+            output = (res.stdout or "") + (res.stderr or "")
 
             errors = []
             warnings = []
@@ -262,7 +269,7 @@ class LeanEnvironment:
             sorry_count = max(sorry_count, content.count("sorry"))
 
             return LeanVerificationResult(
-                success=proc.returncode == 0 and not errors,
+                success=res.exit_code == 0 and not errors,
                 errors=errors,
                 warnings=warnings,
                 sorry_count=sorry_count,
@@ -330,14 +337,15 @@ class LeanEnvironment:
             return True
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "lake", "init", name,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            res = await run_args(
+                ["lake", "init", name],
                 cwd=project_dir.parent,
+                timeout_s=60.0,
+                max_stdout_chars=4000,
+                max_stderr_chars=4000,
+                label="lake.init",
             )
-            await asyncio.wait_for(proc.communicate(), timeout=60)
-            return proc.returncode == 0
+            return res.exit_code == 0 and not res.timed_out
         except Exception as e:
             logger.warning(f"[Lean] Project init failed: {e}")
             project_dir.mkdir(parents=True, exist_ok=True)
@@ -379,11 +387,13 @@ class PantographREPL:
             return False
 
         try:
-            self._process = await asyncio.create_subprocess_exec(
-                "lean", "--stdin",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            self._process = await spawn_exec(
+                ["lean", "--stdin"],
+                cwd=self._lean_env._workspace,
+                stdin_pipe=True,
+                stdout_pipe=True,
+                stderr_pipe=True,
+                label="pantograph.repl",
             )
             self._session_active = True
             logger.info("[Pantograph] REPL session started")

@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
@@ -18,6 +19,8 @@ from enum import Enum
 from typing import Any
 
 from autoforge.engine.config import DEFAULT_PRICING, MODEL_PRICING, ForgeConfig
+from autoforge.engine.runtime.rate_limit import RateLimitSpec, SqliteRateLimiter
+from autoforge.engine.runtime.telemetry import TelemetrySink
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +230,18 @@ class LLMRouter:
         self._budget_lock: asyncio.Lock | None = None
         self._client_lock: asyncio.Lock | None = None
         self._reserved_budget_usd: float = 0.0
+        self._telemetry: TelemetrySink | None = None
+        self._rng = random.Random()
+        if bool(getattr(config, "deterministic", False)):
+            try:
+                self._rng.seed(int(getattr(config, "deterministic_seed", 0) or 0))
+            except (ValueError, TypeError):
+                self._rng.seed(0)
+        self._rate_limiter: SqliteRateLimiter | None = None
+
+    def set_telemetry_sink(self, sink: TelemetrySink | None) -> None:
+        """Attach a best-effort telemetry sink (durable journal, trace exporter, etc)."""
+        self._telemetry = sink
 
     async def close(self) -> None:
         """Close all cached async HTTP clients to release connection pools."""
@@ -326,6 +341,42 @@ class LLMRouter:
             estimated_input_tokens * pricing["input"] / 1_000_000
             + estimated_output_tokens * pricing["output"] / 1_000_000
         )
+
+    def _estimate_call_tokens(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+    ) -> int:
+        """Estimate total tokens for rate limiting (input approx + max_tokens)."""
+        total_chars = len(system)
+        total_chars += sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
+        estimated_input_tokens = max(1, total_chars // 4)
+        return int(estimated_input_tokens) + max(1, int(max_tokens or 1))
+
+    def _get_rate_limiter(self) -> SqliteRateLimiter | None:
+        enabled = bool(getattr(self.config, "llm_rate_limit_enabled", False))
+        rpm = int(getattr(self.config, "llm_rpm_limit", 0) or 0)
+        tpm = int(getattr(self.config, "llm_tpm_limit", 0) or 0)
+        if not enabled and rpm <= 0 and tpm <= 0:
+            return None
+
+        db_path = getattr(self.config, "llm_rate_limit_db_path", None)
+        if db_path is None:
+            return None
+        ns = str(getattr(self.config, "llm_rate_limit_namespace", "global") or "global").strip() or "global"
+
+        if self._rate_limiter is None:
+            spec = RateLimitSpec(
+                enabled=True,
+                namespace=ns,
+                requests_per_minute=max(0, rpm),
+                tokens_per_minute=max(0, tpm),
+                db_path=db_path,
+            )
+            self._rate_limiter = SqliteRateLimiter(spec=spec)
+        return self._rate_limiter
 
     def _get_client_lock(self) -> asyncio.Lock:
         """Lazily create client lock to avoid cross-event-loop lock reuse."""
@@ -474,7 +525,7 @@ class LLMRouter:
 
                 # Exponential backoff with jitter (+-25 %)
                 delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                jitter = delay * 0.25 * (2 * random.random() - 1)
+                jitter = delay * 0.25 * (2 * self._rng.random() - 1)
                 delay = max(0, delay + jitter)
 
                 logger.warning(
@@ -578,6 +629,8 @@ class LLMRouter:
         effective_max_tokens = default_max_tokens if max_tokens is None else max_tokens
         if effective_max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
+        if temperature is None and bool(getattr(self.config, "deterministic", False)):
+            temperature = 0.0
         provider = detect_provider(model)
         if provider == "openai":
             model = self._canonicalize_openai_model(model)
@@ -625,8 +678,23 @@ class LLMRouter:
         async with self._get_client_lock():
             self._get_client(provider)
         await self._ensure_fresh_token(provider)
+
+        limiter = self._get_rate_limiter()
+        if limiter is not None:
+            try:
+                est_tokens = self._estimate_call_tokens(
+                    system=system,
+                    messages=messages,
+                    max_tokens=effective_max_tokens,
+                )
+                await limiter.acquire(estimated_tokens=est_tokens, requests=1)
+            except Exception:
+                # Best-effort only: never crash the pipeline due to rate limiting.
+                pass
+
         self._call_count += 1
         call_id = self._call_count
+        call_started = time.monotonic()
 
         logger.info(
             f"[LLM #{call_id}] provider={provider} model={model} "
@@ -634,6 +702,7 @@ class LLMRouter:
         )
 
         response: LLMResponse | None = None
+        error_text = ""
         try:
             # Check custom providers first
             if provider in self._custom_providers:
@@ -686,6 +755,9 @@ class LLMRouter:
             else:
                 raise ValueError(f"Unknown provider: {provider}")
             return response
+        except Exception as e:
+            error_text = str(e)
+            raise
         finally:
             if budget_enforced:
                 async with lock:
@@ -704,6 +776,60 @@ class LLMRouter:
                     f"tokens_in={response.usage.input_tokens} tokens_out={response.usage.output_tokens} "
                     f"cost_total=${self.config.estimated_cost_usd:.4f}"
                 )
+            if self._telemetry is not None:
+                try:
+                    payload: dict[str, Any] = {
+                        "run_id": self.config.run_id,
+                        "call_id": call_id,
+                        "provider": provider,
+                        "model": model,
+                        "messages": len(messages),
+                        "max_tokens": effective_max_tokens,
+                        "schema_enforced": response_json_schema is not None,
+                        "ok": response is not None,
+                        "error": error_text,
+                        "duration_seconds": time.monotonic() - call_started,
+                        "cost_total_usd": float(getattr(self.config, "estimated_cost_usd", 0.0)),
+                    }
+
+                    capture = bool(getattr(self._telemetry, "capture_llm_content", False))
+                    if capture:
+                        def _jsonable(obj: Any) -> Any:
+                            if obj is None or isinstance(obj, (str, int, float, bool)):
+                                return obj
+                            if isinstance(obj, dict):
+                                return {str(k): _jsonable(v) for k, v in obj.items()}
+                            if isinstance(obj, (list, tuple)):
+                                return [_jsonable(v) for v in obj]
+                            if isinstance(obj, ContentBlock):
+                                return {
+                                    "type": obj.type,
+                                    "text": obj.text,
+                                    "id": obj.id,
+                                    "name": obj.name,
+                                    "input": _jsonable(obj.input),
+                                    "media_type": obj.media_type,
+                                    "image_data": obj.image_data,
+                                }
+                            return str(obj)
+
+                        payload["system"] = system
+                        payload["messages_payload"] = _jsonable(messages)
+                        if tools is not None:
+                            payload["tools"] = _jsonable(tools)
+                        if response is not None:
+                            payload["response_content"] = [_jsonable(b) for b in response.content]
+                    if response is not None:
+                        payload.update(
+                            {
+                                "stop_reason": response.stop_reason,
+                                "input_tokens": response.usage.input_tokens,
+                                "output_tokens": response.usage.output_tokens,
+                            }
+                        )
+                    self._telemetry.record_llm_call(payload)
+                except Exception:
+                    pass
 
     # ── Anthropic ──────────────────────────────────────────────────
 
@@ -878,6 +1004,7 @@ class LLMRouter:
                     system,
                     messages,
                     tools,
+                    response_json_schema=response_json_schema,
                     temperature=temperature,
                 )
                 if candidate.lower() != requested_key and self._openai_model_overrides.get(requested_key) != candidate:
@@ -905,6 +1032,8 @@ class LLMRouter:
         system: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
+        *,
+        response_json_schema: dict[str, Any] | None = None,
         temperature: float | None = None,
     ) -> LLMResponse:
         client = self._get_client("openai")
