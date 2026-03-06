@@ -18,7 +18,7 @@ from autoforge.engine.config import ForgeConfig
 from autoforge.engine.deploy_guide import generate_deploy_guide
 from autoforge.engine.hil import CheckpointRequest, CheckpointResponder
 from autoforge.engine.orchestrator import Orchestrator
-from autoforge.engine.project_registry import Project, ProjectMessage, ProjectRegistry
+from autoforge.engine.project_registry import Project, ProjectMessage, ProjectRegistry, RunStage
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -305,6 +305,13 @@ class ForgeDaemon:
     async def _build_loop(self) -> None:
         """Queue polling loop with bounded concurrent project workers."""
         while self._running:
+            try:
+                recovered = await self.registry.requeue_stale_builds(max_age_seconds=600)
+                if recovered:
+                    logger.warning("Recovered %d stale BUILDING projects back to queue", recovered)
+            except Exception as exc:
+                logger.debug("stale build recovery skipped: %s", exc)
+
             while (
                 self._running
                 and len(self._active_builds) < self.config.daemon_max_concurrent_projects
@@ -468,7 +475,23 @@ class ForgeDaemon:
         progress_task: asyncio.Task[None] | None = None
         message_task: asyncio.Task[None] | None = None
 
+        lease_holder = f"daemon:{os.getpid()}"
+        lease_ok = await self.registry.acquire_task_lease(project.id, lease_holder, ttl_seconds=120)
+        if not lease_ok:
+            logger.info("Skipping %s; lease already held", project.id)
+            return
+
+        heartbeat_task: asyncio.Task[None] | None = None
         try:
+            async def _heartbeat() -> None:
+                while self._running:
+                    await asyncio.sleep(30)
+                    await self.registry.heartbeat_task_lease(project.id, lease_holder, ttl_seconds=120)
+
+            heartbeat_task = asyncio.create_task(_heartbeat())
+            await self.registry.set_run_stage(f"run_{project.id}", RunStage.RUNNING)
+            await self.registry.append_event(f"run_{project.id}", "RunStarted", {"project_id": project.id})
+
             project_config = ForgeConfig.from_env(
                 budget_limit_usd=project.budget_usd,
             )
@@ -567,6 +590,12 @@ class ForgeDaemon:
                     error=final_phase,
                     cost_usd=cost,
                 )
+                await self.registry.set_run_stage(f"run_{project.id}", RunStage.PAUSED)
+                await self.registry.append_event(
+                    f"run_{project.id}",
+                    "RunPaused",
+                    {"project_id": project.id, "phase": final_phase, "workspace": str(project_dir)},
+                )
                 console.print(f"[bold yellow]Paused:[/bold yellow] {project_name} (${cost:.4f})")
                 await self._notify(
                     project.requested_by,
@@ -578,6 +607,12 @@ class ForgeDaemon:
 
             await self.registry.update_name(project.id, project_name, str(project_dir))
             await self.registry.mark_completed(project.id, cost)
+            await self.registry.set_run_stage(f"run_{project.id}", RunStage.RUNTIME_VERIFIED)
+            await self.registry.append_event(
+                f"run_{project.id}",
+                "RunCompleted",
+                {"project_id": project.id, "cost_usd": cost, "workspace": str(project_dir)},
+            )
 
             guide = generate_deploy_guide(project_dir, project_name)
             guide_path = project_dir / "DEPLOY_GUIDE.md"
@@ -599,6 +634,12 @@ class ForgeDaemon:
             cost = project_config.estimated_cost_usd if project_config is not None else 0.0
             logger.error("Build failed for %s: %s", project.id, error_msg, exc_info=True)
             await self.registry.mark_failed(project.id, error_msg, cost_usd=cost)
+            await self.registry.set_run_stage(f"run_{project.id}", RunStage.FAILED)
+            await self.registry.append_event(
+                f"run_{project.id}",
+                "RunFailed",
+                {"project_id": project.id, "error": error_msg},
+            )
             console.print(f"[bold red]Failed:[/bold red] {project.id} - {error_msg[:80]}")
             await self._notify(project.requested_by, f"Build failed: {error_msg[:200]}")
         finally:
@@ -608,6 +649,10 @@ class ForgeDaemon:
             if message_task is not None:
                 message_task.cancel()
                 await asyncio.gather(message_task, return_exceptions=True)
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
+            await self.registry.release_task_lease(project.id, lease_holder)
 
     async def _notify(self, requested_by: str, message: str) -> None:
         """Dispatch completion/failure notifications by requester channel."""

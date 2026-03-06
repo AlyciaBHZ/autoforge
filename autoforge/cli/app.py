@@ -229,6 +229,16 @@ def build_parser() -> argparse.ArgumentParser:
     # status
     subparsers.add_parser("status", help="Show current project status")
 
+    # doctor
+    subparsers.add_parser("doctor", help="Run configuration and security doctor checks")
+
+    # healthcheck
+    subparsers.add_parser("healthcheck", help="Run runtime healthcheck for daemon/registry")
+
+    # smoke
+    smoke_parser = subparsers.add_parser("smoke", help="Run fixed smoke checks")
+    smoke_parser.add_argument("target", choices=["daemon", "proof", "discovery", "all"], help="Smoke target")
+
     # resume
     res_parser = subparsers.add_parser("resume", help="Resume a previous run")
     res_parser.add_argument("path", nargs="?", default=None, help="Workspace path to resume")
@@ -520,6 +530,9 @@ _KNOWN_COMMANDS = {
     "review",
     "import",
     "status",
+    "doctor",
+    "healthcheck",
+    "smoke",
     "resume",
     "daemon",
     "queue",
@@ -794,6 +807,100 @@ def _is_pid_running(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+async def _run_doctor(config) -> int:
+    """Run static doctor checks and print a compact health matrix."""
+    from autoforge.engine.project_registry import ProjectRegistry
+
+    checks: list[tuple[str, bool, str]] = []
+    checks.append(("api_key", bool(config.has_api_key), "Set via setup or env"))
+    checks.append(("webhook_auth_default", bool(config.webhook_require_auth), "FORGE_WEBHOOK_REQUIRE_AUTH=true"))
+    checks.append((
+        "webhook_secret_if_enabled",
+        (not config.webhook_enabled) or bool(config.webhook_secret),
+        "FORGE_WEBHOOK_SECRET required when webhook enabled",
+    ))
+    checks.append((
+        "telegram_allowlist",
+        bool(config.telegram_allowed_users) or not bool(config.telegram_token) or bool(config.telegram_allow_public),
+        "Set FORGE_TELEGRAM_ALLOWED_USERS or keep bot disabled",
+    ))
+
+    db_ok = True
+    try:
+        async with ProjectRegistry(config.db_path):
+            pass
+    except Exception:
+        db_ok = False
+    checks.append(("registry_access", db_ok, str(config.db_path)))
+
+    max_name = max(len(c[0]) for c in checks)
+    console.print("[bold]AutoForge Doctor[/bold]")
+    for name, ok, hint in checks:
+        state = "PASS" if ok else "FAIL"
+        color = "green" if ok else "red"
+        console.print(f"[{color}]{state}[/{color}] {name.ljust(max_name)}  {hint}")
+
+    failed = sum(1 for _, ok, _ in checks if not ok)
+    console.print(f"Summary: {len(checks)-failed}/{len(checks)} checks passed")
+    return 0 if failed == 0 else 1
+
+
+async def _run_healthcheck(config) -> int:
+    """Runtime healthcheck including daemon status and queue visibility."""
+    from autoforge.engine.project_registry import ProjectRegistry, ProjectStatus
+
+    pid = _read_daemon_pid_file(config.daemon_pid_file)
+    running = bool(pid and _is_pid_running(pid))
+
+    async with ProjectRegistry(config.db_path) as registry:
+        queued = await registry.queue_size()
+        building = len(await registry.list_by_status(ProjectStatus.BUILDING))
+        completed = len(await registry.list_by_status(ProjectStatus.COMPLETED))
+        failed = len(await registry.list_by_status(ProjectStatus.FAILED))
+
+    console.print("[bold]AutoForge Healthcheck[/bold]")
+    console.print(f"daemon_running={str(running).lower()}")
+    console.print(f"queue={{queued:{queued},building:{building},completed:{completed},failed:{failed}}}")
+    return 0
+
+
+async def _run_smoke(config, args: argparse.Namespace) -> int:
+    """Run fixed-output smoke checks for core claims."""
+    target = getattr(args, "target", "all")
+    results: dict[str, str] = {}
+
+    if target in ("daemon", "all"):
+        from autoforge.engine.project_registry import ProjectRegistry
+        try:
+            async with ProjectRegistry(config.db_path) as registry:
+                _ = await registry.queue_size()
+            results["daemon"] = "PASS"
+        except Exception:
+            results["daemon"] = "FAIL"
+
+    if target in ("proof", "all"):
+        try:
+            from autoforge.engine.provers.proof_search import TacticExecutor, MCTSProofSearch  # noqa: F401
+            from autoforge.engine.provers.lean_core import LeanVerificationResult  # noqa: F401
+            results["proof"] = "PASS"
+        except Exception:
+            results["proof"] = "FAIL"
+
+    if target in ("discovery", "all"):
+        try:
+            from autoforge.engine.autonomous_discovery import HypothesisTournament  # noqa: F401
+            results["discovery"] = "PASS"
+        except Exception:
+            results["discovery"] = "FAIL"
+
+    # Fixed output contract for CI/log parsing
+    ordered = [k for k in ("daemon", "proof", "discovery") if k in results]
+    for k in ordered:
+        console.print(f"SMOKE::{k}::{results[k]}")
+
+    return 0 if all(v == "PASS" for v in results.values()) else 1
 
 
 async def _run_daemon_start(config) -> int:
@@ -1784,7 +1891,7 @@ def _run_interactive_sync(args: argparse.Namespace) -> int:
 
     # First-run setup: API key, GitHub, preferences
     if needs_setup():
-        console.print("[yellow]First time? Let's set up ForgeAI.[/yellow]\n")
+        console.print("[yellow]Let's set up ForgeAI (providers/models).[/yellow]\n")
         from autoforge.cli.setup_wizard import run_setup_wizard
         run_setup_wizard()
         console.print()
@@ -1885,6 +1992,15 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
         orchestrator = Orchestrator(config)
         orchestrator.show_status()
         return 0
+
+    elif args.command == "doctor":
+        return await _run_doctor(config)
+
+    elif args.command == "healthcheck":
+        return await _run_healthcheck(config)
+
+    elif args.command == "smoke":
+        return await _run_smoke(config, args)
 
     elif args.command == "resume":
         from autoforge.engine.orchestrator import Orchestrator

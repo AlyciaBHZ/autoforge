@@ -407,16 +407,25 @@ class CodexOAuthAuth(AuthProvider):
     AUTH_URL = "https://auth.openai.com/oauth/authorize"
     TOKEN_URL = "https://auth.openai.com/oauth/token"
     REDIRECT_PORT = 1455
+    # ChatGPT-subscription Codex endpoint (used by Codex CLI).
+    #
+    # This is intentionally *not* the OpenAI API base URL. ChatGPT subscriptions
+    # don't include API credits, so calling api.openai.com with an OAuth token
+    # frequently fails with "insufficient_quota". The Codex backend endpoint
+    # routes requests against the user's subscription.
+    DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
     def __init__(
         self,
         access_token: str = "",
         refresh_token: str = "",
         expires_at: float = 0.0,
+        base_url: str | None = None,
     ) -> None:
         self._access_token = access_token
         self._refresh_token = refresh_token
         self._expires_at = expires_at
+        self._base_url = (base_url or "").strip() or self.DEFAULT_BASE_URL
         self._lock: asyncio.Lock | None = None
 
     def _get_lock(self) -> asyncio.Lock:
@@ -619,7 +628,7 @@ class CodexOAuthAuth(AuthProvider):
     def get_client_kwargs(self) -> dict[str, Any]:
         """Return kwargs for AsyncOpenAI constructor."""
         # The token will be injected via _ensure_fresh_token
-        return {}
+        return {"base_url": self._base_url}
 
 
 # ── OpenAI Device Code flow (headless) ────────────────────────────
@@ -641,10 +650,12 @@ class DeviceCodeAuth(AuthProvider):
         access_token: str = "",
         refresh_token: str = "",
         expires_at: float = 0.0,
+        base_url: str | None = None,
     ) -> None:
         self._access_token = access_token
         self._refresh_token = refresh_token
         self._expires_at = expires_at
+        self._base_url = (base_url or "").strip() or CodexOAuthAuth.DEFAULT_BASE_URL
         self._lock: asyncio.Lock | None = None
 
     def _get_lock(self) -> asyncio.Lock:
@@ -787,7 +798,7 @@ class DeviceCodeAuth(AuthProvider):
 
     def get_client_kwargs(self) -> dict[str, Any]:
         """Return kwargs for AsyncOpenAI constructor."""
-        return {}
+        return {"base_url": self._base_url}
 
 
 # ── Factory ───────────────────────────────────────────────────────
@@ -866,6 +877,7 @@ def create_auth_provider(
             access_token=config.get("access_token", ""),
             refresh_token=config.get("refresh_token", ""),
             expires_at=_as_float(config.get("expires_at", 0.0)),
+            base_url=config.get("base_url"),
         )
 
     # Device Code flow
@@ -874,6 +886,7 @@ def create_auth_provider(
             access_token=config.get("access_token", ""),
             refresh_token=config.get("refresh_token", ""),
             expires_at=_as_float(config.get("expires_at", 0.0)),
+            base_url=config.get("base_url"),
         )
 
     # Unknown method — fallback with warning

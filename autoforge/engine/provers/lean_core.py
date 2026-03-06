@@ -113,6 +113,10 @@ class ProofAttempt:
     attempts: int = 0
     verification_time: float = 0.0
     error: str = ""
+    proof_origin: str = ""             # direct | mcts | recursive
+    execution_backend: str = ""        # pantograph | heuristic | direct
+    used_formal_backend: bool = False
+    verification_backend: str = ""     # lean | simulated | unavailable
 
 
 @dataclass
@@ -162,6 +166,8 @@ class LeanVerificationResult:
     warnings: list[str] = field(default_factory=list)
     sorry_count: int = 0             # Number of sorry placeholders
     execution_time: float = 0.0
+    backend: str = "lean"
+    is_formal: bool = True
 
 
 # ══════════════════════════════════════════════════════════════
@@ -268,12 +274,25 @@ class LeanEnvironment:
                 warnings=warnings,
                 sorry_count=sorry_count,
                 execution_time=elapsed,
+                backend="lean",
+                is_formal=True,
+            )
+
+        except asyncio.TimeoutError:
+            return LeanVerificationResult(
+                success=False,
+                errors=[f"Lean verification timed out after {timeout}s"],
+                execution_time=timeout,
+                backend="lean",
+                is_formal=True,
             )
         except Exception as e:
             return LeanVerificationResult(
                 success=False,
                 errors=[f"Lean execution error: {e}"],
                 execution_time=time.monotonic() - start,
+                backend="lean",
+                is_formal=True,
             )
 
     async def _llm_simulated_verify(self, lean_file: Path) -> LeanVerificationResult:
@@ -305,6 +324,8 @@ class LeanEnvironment:
             warnings=["[SIMULATED] Lean not installed — no formal guarantee"],
             sorry_count=sorry_count,
             execution_time=0.0,
+            backend="simulated",
+            is_formal=False,
         )
 
     async def init_project(self, project_dir: Path, name: str = "AutoForgeProof") -> bool:

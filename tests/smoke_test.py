@@ -148,6 +148,15 @@ def test_cli_parse_subcommands():
     args = parser.parse_args(["status"])
     assert args.command == "status"
 
+    # Test doctor / healthcheck / smoke
+    args = parser.parse_args(["doctor"])
+    assert args.command == "doctor"
+    args = parser.parse_args(["healthcheck"])
+    assert args.command == "healthcheck"
+    args = parser.parse_args(["smoke", "proof"])
+    assert args.command == "smoke"
+    assert args.target == "proof"
+
     # Test daemon
     args = parser.parse_args(["daemon", "start"])
     assert args.command == "daemon"
@@ -253,6 +262,9 @@ def test_cli_legacy_compat():
     assert "Build a todo app" not in _KNOWN_COMMANDS
     assert "generate" in _KNOWN_COMMANDS
     assert "daemon" in _KNOWN_COMMANDS
+    assert "doctor" in _KNOWN_COMMANDS
+    assert "healthcheck" in _KNOWN_COMMANDS
+    assert "smoke" in _KNOWN_COMMANDS
     assert "queue" in _KNOWN_COMMANDS
     assert "paper" in _KNOWN_COMMANDS
 
@@ -1761,9 +1773,10 @@ def test_auth_codex_oauth_provider():
     from autoforge.engine.auth import CodexOAuthAuth
 
     auth = CodexOAuthAuth()
-    # No token yet — get_client_kwargs returns empty (token injected dynamically)
+    # No token yet — base_url is still required so subscription auth routes to
+    # the Codex backend rather than the API billing endpoint.
     kwargs = auth.get_client_kwargs()
-    assert kwargs == {}
+    assert kwargs.get("base_url") == auth.DEFAULT_BASE_URL
     # Has correct endpoints
     assert "openai.com" in auth.AUTH_URL
     assert "openai.com" in auth.TOKEN_URL
@@ -1775,7 +1788,7 @@ def test_auth_device_code_provider():
 
     auth = DeviceCodeAuth()
     kwargs = auth.get_client_kwargs()
-    assert kwargs == {}
+    assert "base_url" in kwargs
     assert "openai.com" in auth.DEVICE_URL
     assert "openai.com" in auth.TOKEN_URL
 

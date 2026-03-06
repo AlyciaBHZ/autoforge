@@ -1112,7 +1112,14 @@ class RecursiveProofDecomposer:
 
         if lean_proof:
             attempt.lean_proof = lean_proof
-            await self._verify_attempt(attempt, theorem_context=statement, require_formal_backend=False)
+            await self._verify_attempt(
+                attempt,
+                theorem_context=statement,
+                require_formal_backend=False,
+                proof_origin="direct",
+                execution_backend="direct",
+                backend_is_formal=True,
+            )
             attempt.attempts = 1
             if attempt.status == ProofStatus.PROVED:
                 logger.info(f"[Decomposer] Direct proof formally verified for {attempt.theorem_id}")
@@ -1139,6 +1146,8 @@ class RecursiveProofDecomposer:
                 theorem_context=statement,
                 require_formal_backend=True,
                 backend_is_formal=self._mcts.last_search_formal,
+                proof_origin="mcts",
+                execution_backend=self._mcts.last_backend_name,
             )
             if attempt.status == ProofStatus.PROVED:
                 logger.info(f"[Decomposer] MCTS proof formally verified for {attempt.theorem_id}")
@@ -1178,6 +1187,9 @@ class RecursiveProofDecomposer:
                             attempt,
                             theorem_context=statement,
                             require_formal_backend=False,
+                            proof_origin="recursive",
+                            execution_backend="recursive_composition",
+                            backend_is_formal=True,
                         )
                         if attempt.status == ProofStatus.PROVED:
                             logger.info(f"[Decomposer] Recursive proof complete for "
@@ -1196,9 +1208,14 @@ class RecursiveProofDecomposer:
         theorem_context: str,
         require_formal_backend: bool = True,
         backend_is_formal: bool = True,
+        proof_origin: str = "",
+        execution_backend: str = "",
     ) -> None:
         """Verify generated Lean proof and set strict proof status."""
         attempt.status = ProofStatus.FORMALIZED
+        attempt.proof_origin = proof_origin
+        attempt.execution_backend = execution_backend
+        attempt.used_formal_backend = backend_is_formal
 
         if not attempt.lean_proof.strip():
             attempt.status = ProofStatus.FAILED
@@ -1207,6 +1224,7 @@ class RecursiveProofDecomposer:
 
         if require_formal_backend and not backend_is_formal:
             attempt.status = ProofStatus.FAILED
+            attempt.verification_backend = "unavailable"
             attempt.error = (
                 "Proof generated with non-formal backend; formal verification is required "
                 "before marking as PROVED"
@@ -1216,6 +1234,7 @@ class RecursiveProofDecomposer:
         lean_available = await self._lean_env.check_lean_installation()
         if not lean_available:
             attempt.status = ProofStatus.FAILED
+            attempt.verification_backend = "unavailable"
             attempt.error = "Lean toolchain unavailable; cannot grant formal PROVED status"
             return
 
@@ -1236,6 +1255,12 @@ class RecursiveProofDecomposer:
             proof_file.unlink(missing_ok=True)
 
         attempt.verification_time = verification.execution_time
+        attempt.verification_backend = verification.backend
+
+        if not verification.is_formal:
+            attempt.status = ProofStatus.FAILED
+            attempt.error = "Non-formal verification result cannot produce PROVED"
+            return
 
         if verification.success and verification.sorry_count == 0:
             attempt.status = ProofStatus.PROVED

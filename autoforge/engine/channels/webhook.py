@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hmac
 import logging
 from pathlib import Path
@@ -70,6 +71,31 @@ async def start_webhook_server(
         expected = f"Bearer {config.webhook_secret}".encode()
         if not hmac.compare_digest(auth, expected):
             raise HTTPException(status_code=401, detail="Unauthorized")
+
+        # Replay protection: require timestamp + nonce for authenticated requests.
+        ts = request.headers.get("X-Autoforge-Timestamp", "")
+        nonce = request.headers.get("X-Autoforge-Nonce", "")
+        if not ts or not nonce:
+            raise HTTPException(status_code=400, detail="Missing replay-protection headers")
+        try:
+            req_ts = int(ts)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid X-Autoforge-Timestamp")
+
+        now = int(datetime.now(timezone.utc).timestamp())
+        if abs(now - req_ts) > 300:
+            raise HTTPException(status_code=401, detail="Request timestamp expired")
+
+        requester_hint = request.headers.get(config.webhook_requester_header, "")
+        fallback = request.client.host if request.client else "unknown"
+        requester = intake.normalize_requester(
+            channel="webhook",
+            requester_hint=requester_hint,
+            fallback_hint=fallback,
+        )
+        accepted = await registry.register_request_nonce(requester, nonce)
+        if not accepted:
+            raise HTTPException(status_code=409, detail="Replay detected")
 
     async def get_request_context(request: Request) -> RequestContext:
         requester_hint = ""

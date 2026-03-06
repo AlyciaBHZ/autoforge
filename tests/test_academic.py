@@ -37,7 +37,13 @@ from autoforge.engine.autonomous_discovery import (
     NoveltyFilter,
     PaperKernel,
 )
-from autoforge.engine.provers.lean_core import LeanEnvironment, PantographREPL, ProofState, ProofStatus
+from autoforge.engine.provers.lean_core import (
+    LeanEnvironment,
+    LeanVerificationResult,
+    PantographREPL,
+    ProofState,
+    ProofStatus,
+)
 from autoforge.engine.provers.proof_search import HeuristicExecutor, MCTSProofSearch, RecursiveProofDecomposer, TacticGenerator
 
 # â”€â”€ Imports from paper_formalizer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -354,7 +360,6 @@ class _TinyLLM:
             content = []
         return R()
 
-
 class _StickyFormalExecutor:
     """Stateful formal executor stub to verify MCTS state replay behavior."""
 
@@ -385,7 +390,6 @@ class _StickyFormalExecutor:
 
     async def close(self) -> None:
         self._busy = False
-
 
 class TestProofPipelineP0(unittest.TestCase):
     """Regression tests for real proof-chain safety guarantees."""
@@ -456,14 +460,87 @@ class TestProofPipelineP0(unittest.TestCase):
         async def no_lean(*args, **kwargs):
             return False
 
+        async def no_mcts(*args, **kwargs):
+            return None
+
         decomposer._generate_informal_proof = fake_informal  # type: ignore[assignment]
         decomposer._informal_to_formal = fake_formal  # type: ignore[assignment]
         decomposer._decompose = no_decompose  # type: ignore[assignment]
         decomposer._lean_env.check_lean_installation = no_lean  # type: ignore[assignment]
+        mcts.search = no_mcts  # type: ignore[assignment]
+
+        attempt = asyncio.run(decomposer.prove("theorem t : True", "", _TinyLLM()))
+        self.assertNotEqual(attempt.status, ProofStatus.PROVED)
+
+
+    def test_proof_result_contains_provenance_fields(self):
+        tactic_gen = TacticGenerator()
+        mcts = MCTSProofSearch(tactic_gen, executor=HeuristicExecutor())
+        decomposer = RecursiveProofDecomposer(tactic_gen, mcts, lean_env=LeanEnvironment())
+
+        async def fake_informal(*args, **kwargs):
+            return "By direct method."
+
+        async def fake_formal(*args, **kwargs):
+            return "exact trivial"
+
+        async def no_decompose(*args, **kwargs):
+            return []
+
+        async def no_mcts(*args, **kwargs):
+            return None
+
+        decomposer._generate_informal_proof = fake_informal  # type: ignore[assignment]
+        decomposer._informal_to_formal = fake_formal  # type: ignore[assignment]
+        decomposer._decompose = no_decompose  # type: ignore[assignment]
+        mcts.search = no_mcts  # type: ignore[assignment]
+
+        attempt = asyncio.run(decomposer.prove("theorem t : True", "", _TinyLLM()))
+        self.assertEqual(attempt.proof_origin, "direct")
+        self.assertEqual(attempt.execution_backend, "direct")
+        self.assertIn(attempt.verification_backend, {"unavailable", "lean", "simulated", ""})
+
+    def test_non_formal_verification_never_marks_proved(self):
+        tactic_gen = TacticGenerator()
+        mcts = MCTSProofSearch(tactic_gen, executor=HeuristicExecutor())
+        env = LeanEnvironment()
+        decomposer = RecursiveProofDecomposer(tactic_gen, mcts, lean_env=env)
+
+        async def fake_informal(*args, **kwargs):
+            return "By direct method."
+
+        async def fake_formal(*args, **kwargs):
+            return "exact trivial"
+
+        async def no_decompose(*args, **kwargs):
+            return []
+
+        async def no_mcts(*args, **kwargs):
+            return None
+
+        async def fake_check() -> bool:
+            return True
+
+        async def fake_verify(_p):
+            return LeanVerificationResult(
+                success=True,
+                sorry_count=0,
+                execution_time=0.0,
+                backend="simulated",
+                is_formal=False,
+            )
+
+        decomposer._generate_informal_proof = fake_informal  # type: ignore[assignment]
+        decomposer._informal_to_formal = fake_formal  # type: ignore[assignment]
+        decomposer._decompose = no_decompose  # type: ignore[assignment]
+        mcts.search = no_mcts  # type: ignore[assignment]
+        env.check_lean_installation = fake_check  # type: ignore[assignment]
+        env.verify_file = fake_verify  # type: ignore[assignment]
 
         attempt = asyncio.run(decomposer.prove("theorem t : True", "", _TinyLLM()))
         self.assertNotEqual(attempt.status, ProofStatus.PROVED)
         self.assertEqual(attempt.status, ProofStatus.FAILED)
+        self.assertEqual(attempt.verification_backend, "simulated")
 
     def test_mcts_formal_executor_replays_for_each_sibling(self):
         tactic_gen = TacticGenerator()
@@ -588,14 +665,14 @@ class TestPaperFormalizer(unittest.TestCase):
             paper_source="test.pdf",
             total_statements=10,
             lean_proved=3,       # 3 * 1.0 = 3.0
-            lean_sorry=2,        # 2 * 0.5 = 1.0
+            lean_sorry=2,        # 2 * 0.0 = 0.0
             numerically_verified=2,  # 2 * 0.7 = 1.4
             computationally_reproduced=1,  # 1 * 0.8 = 0.8
             lean_failed=1,
             skipped=1,
         )
         score = report.compute_score()
-        expected = (3.0 + 1.0 + 1.4 + 0.8) / 10  # = 0.62
+        expected = (3.0 + 0.0 + 1.4 + 0.8) / 10  # = 0.52
         self.assertAlmostEqual(score, expected, places=6)
         self.assertAlmostEqual(report.overall_score, expected, places=6)
 
