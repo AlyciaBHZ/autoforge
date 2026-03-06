@@ -56,6 +56,11 @@ def show_startup_info(
     model_strong: str,
     model_fast: str,
     mobile_target: str = "none",
+    run_id: str = "",
+    trace_enabled: bool = False,
+    trace_llm: bool = False,
+    trace_cmd: bool = False,
+    trace_fs: bool = False,
 ) -> None:
     """Display startup configuration panel."""
     from autoforge.engine.git_manager import is_git_available
@@ -70,6 +75,18 @@ def show_startup_info(
         f"[bold]Models:[/bold]  {model_strong} / {model_fast}",
         f"[bold]Git:[/bold]     {git_status}",
     ]
+    if run_id:
+        lines.append(f"[bold]Run ID:[/bold]  {run_id}")
+    if trace_enabled:
+        flags = []
+        if trace_llm:
+            flags.append("llm")
+        if trace_cmd:
+            flags.append("cmd")
+        if trace_fs:
+            flags.append("fs")
+        suffix = f" ({', '.join(flags)})" if flags else ""
+        lines.append(f"[bold]Trace:[/bold]   enabled{suffix}")
     if mobile_target != "none":
         lines.append(f"[bold]Mobile:[/bold]  {mobile_target}")
     if description:

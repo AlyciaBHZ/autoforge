@@ -187,6 +187,10 @@ class DaemonConfig:
     daemon_pid_file: Path | None = None
     db_path: Path | None = None
 
+    # Async bridge + progress visibility
+    bridge_timeout_seconds: float = 60.0
+    progress_notify_interval_seconds: float = 120.0  # 0 disables periodic pushes
+
     # Intake policy (CLI queue, Telegram, Webhook)
     queue_max_size: int = 200
     requester_queue_limit: int = 3
@@ -236,6 +240,7 @@ class PipelineConfig:
     build_test_loops: int = 0
     speculative_enabled: bool = True
     hierarchical_decomp_enabled: bool = True
+    user_updates: list[str] = field(default_factory=list)  # async user notes, applied at safe points
     # Durable execution + observability (kernel)
     durable_execution_enabled: bool = True
     state_backend: str = "sqlite"  # "json" | "sqlite" | "both"
@@ -858,6 +863,20 @@ class ForgeConfig:
         if request_max_budget_usd <= 0:
             request_max_budget_usd = 1000.0
 
+        bridge_timeout_seconds = _safe_float(
+            "FORGE_BRIDGE_TIMEOUT_SECONDS",
+            float(global_config.get("bridge_timeout_seconds", 60.0)),
+        )
+        if bridge_timeout_seconds <= 0:
+            bridge_timeout_seconds = 60.0
+
+        progress_notify_interval_seconds = _safe_float(
+            "FORGE_PROGRESS_NOTIFY_INTERVAL_SECONDS",
+            float(global_config.get("progress_notify_interval_seconds", 120.0)),
+        )
+        if progress_notify_interval_seconds < 0:
+            progress_notify_interval_seconds = 120.0
+
         # Validate log level
         log_level = (
             os.getenv("FORGE_LOG_LEVEL")
@@ -1055,6 +1074,8 @@ class ForgeConfig:
                 daemon_poll_interval=_safe_int("FORGE_DAEMON_POLL_INTERVAL", 10),
                 daemon_max_concurrent_projects=daemon_max_concurrent_projects,
                 daemon_pid_file=daemon_pid_file,
+                bridge_timeout_seconds=bridge_timeout_seconds,
+                progress_notify_interval_seconds=progress_notify_interval_seconds,
                 queue_max_size=queue_max_size,
                 requester_queue_limit=requester_queue_limit,
                 requester_daily_limit=requester_daily_limit,

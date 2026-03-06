@@ -154,10 +154,46 @@ def test_cli_parse_subcommands():
     assert args.daemon_action == "start"
 
     # Test queue
-    args = parser.parse_args(["queue", "Build a blog", "--budget", "5", "--idempotency-key", "abc"])
+    args = parser.parse_args([
+        "queue",
+        "Build a blog",
+        "--budget",
+        "5",
+        "--idempotency-key",
+        "abc",
+        "--wait",
+        "--poll",
+        "2",
+        "--timeout",
+        "60",
+        "--tail",
+    ])
     assert args.command == "queue"
     assert args.description == "Build a blog"
     assert args.idempotency_key == "abc"
+    assert args.wait is True
+    assert args.poll == 2.0
+    assert args.timeout == 60.0
+    assert args.tail is True
+
+    # Test watch
+    args = parser.parse_args(["watch", "abc123", "--poll", "2", "--timeout", "60", "--tail"])
+    assert args.command == "watch"
+    assert args.project_id == "abc123"
+    assert args.poll == 2.0
+    assert args.timeout == 60.0
+    assert args.tail is True
+
+    # Test msg
+    args = parser.parse_args(["msg", "abc123", "please", "prioritize", "login"])
+    assert args.command == "msg"
+    assert args.project_id == "abc123"
+    assert args.text == ["please", "prioritize", "login"]
+
+    # Test unpause
+    args = parser.parse_args(["unpause", "abc123"])
+    assert args.command == "unpause"
+    assert args.project_id == "abc123"
 
     # Test projects
     args = parser.parse_args(["projects", "--limit", "10"])
@@ -984,6 +1020,15 @@ def test_project_registry_crud():
                 updated = await reg.get(p.id)
                 assert updated.phase == "build"
 
+                # Messages
+                msg = await reg.add_message(p.id, text="hello", kind="user_note", source="cli:test")
+                assert msg.project_id == p.id
+                unhandled = await reg.list_unhandled_messages(p.id)
+                assert len(unhandled) == 1
+                assert unhandled[0].text == "hello"
+                await reg.mark_message_handled(unhandled[0].id)
+                assert await reg.list_unhandled_messages(p.id) == []
+
                 # Mark completed
                 await reg.mark_completed(p.id, 2.50)
                 completed = await reg.get(p.id)
@@ -998,6 +1043,16 @@ def test_project_registry_crud():
                 assert await reg.cancel(p3.id) is True
                 cancelled = await reg.get(p3.id)
                 assert cancelled.status == ProjectStatus.CANCELLED
+
+                # Pause state
+                p_pause = await reg.enqueue("Pause me", "cli")
+                await reg.mark_paused(p_pause.id, error="paused_after_build", cost_usd=1.23)
+                paused = await reg.get(p_pause.id)
+                assert paused.status == ProjectStatus.PAUSED
+                assert paused.cost_usd == 1.23
+                assert await reg.unpause_for_requester(p_pause.id, "cli") is True
+                unpaused = await reg.get(p_pause.id)
+                assert unpaused.status == ProjectStatus.QUEUED
 
                 # Cannot cancel non-queued
                 assert await reg.cancel(p.id) is False

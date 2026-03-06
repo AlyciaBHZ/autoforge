@@ -314,6 +314,18 @@ class AgentBase(ABC):
             effective_system += self._dynamic_supplement
 
         user_prompt = self.build_prompt(context)
+        user_updates = getattr(self.config, "user_updates", None)
+        if isinstance(user_updates, list) and user_updates:
+            lines: list[str] = []
+            for item in user_updates[-8:]:
+                s = str(item or "").strip()
+                if not s:
+                    continue
+                if len(s) > 400:
+                    s = s[:400] + "…"
+                lines.append(f"- {s}")
+            if lines:
+                user_prompt += "\n\nUser updates (apply if relevant, newest last):\n" + "\n".join(lines)
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
         tool_defs = self._get_tool_definitions()
         turns = 0
