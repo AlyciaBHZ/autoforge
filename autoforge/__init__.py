@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-__version__ = "2.7.23"
+__version__ = "2.7.24"
 
 # Package data directory (constitution/, templates/ live here)
 DATA_DIR: Path = Path(__file__).parent / "data"

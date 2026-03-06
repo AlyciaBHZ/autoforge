@@ -17,6 +17,10 @@ console = Console()
 CONFIG_DIR = Path.home() / ".autoforge"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 
+# Bump this when the interactive wizard meaningfully changes and users should
+# be prompted to re-confirm providers/models.
+SETUP_WIZARD_VERSION = 2
+
 # Provider metadata
 PROVIDERS = {
     "anthropic": {
@@ -115,6 +119,10 @@ def needs_setup() -> bool:
 
         data = tomllib.loads(content)
 
+        wizard_version = int(data.get("wizard_version", 0) or 0)
+        if wizard_version < SETUP_WIZARD_VERSION:
+            return True
+
         # Check for non-empty API keys
         api = data.get("api", {})
         has_key = any(
@@ -128,6 +136,8 @@ def needs_setup() -> bool:
         pass
 
     # Fallback: raw string matching if TOML parsing fails
+    if "wizard_version" not in content:
+        return True
     has_key = any(
         key_name in content and f'{key_name} = ""' not in content
         for key_name in ("anthropic_key", "openai_key", "google_key")
@@ -836,6 +846,7 @@ def _write_config(
             api_section["google_key"] = api_keys["google"]
 
         data: dict[str, Any] = {
+            "wizard_version": SETUP_WIZARD_VERSION,
             "api": api_section,
             "models": {"strong": model_strong, "fast": model_fast},
             "defaults": {
@@ -861,7 +872,7 @@ def _write_config(
         CONFIG_FILE.write_bytes(tomli_w.dumps(data).encode("utf-8"))
     except ImportError:
         # Fallback: write TOML manually (with proper escaping to prevent injection)
-        lines = ["[api]"]
+        lines = [f"wizard_version = {SETUP_WIZARD_VERSION}", "", "[api]"]
         if "anthropic" in api_keys:
             lines.append(f'anthropic_key = "{_escape_toml_value(api_keys["anthropic"])}"')
         if "openai" in api_keys:

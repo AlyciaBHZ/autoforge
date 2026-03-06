@@ -431,7 +431,7 @@ class LLMRouter:
             if isinstance(auth, (CodexOAuthAuth, DeviceCodeAuth)):
                 # Token-based auth: client gets a dummy key, real token
                 # injected via _ensure_fresh_token before each call
-                client = AsyncOpenAI(api_key="placeholder")
+                client = AsyncOpenAI(api_key="placeholder", **client_kwargs)
             else:
                 client = AsyncOpenAI(**client_kwargs)
 
@@ -1038,6 +1038,104 @@ class LLMRouter:
     ) -> LLMResponse:
         client = self._get_client("openai")
         is_reasoning = self._is_openai_reasoning_model(model)
+        input_items = self._messages_to_openai_responses_input(system, messages, is_reasoning=is_reasoning)
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "input": input_items,
+            "max_output_tokens": max_tokens,
+        }
+        if is_reasoning:
+            # Responses API uses nested `reasoning` config.
+            kwargs["reasoning"] = {"effort": self.config.openai_reasoning_effort}
+        elif temperature is not None:
+            kwargs["temperature"] = temperature
+        if tools:
+            kwargs["tools"] = self._tools_to_openai(tools)
+
+        # Structured outputs: prefer JSON schema; fallback to json_object; then free-form.
+        text_chain: list[dict[str, Any] | None] = [None]
+        if response_json_schema is not None and not is_reasoning:
+            text_chain = [
+                {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "auto_forge_schema",
+                        "schema": response_json_schema,
+                        "strict": True,
+                    }
+                },
+                {"format": {"type": "json_object"}},
+                None,
+            ]
+
+        raw: Any | None = None
+        last_error: BaseException | None = None
+        try:
+            for text_cfg in text_chain:
+                if text_cfg is None:
+                    kwargs.pop("text", None)
+                else:
+                    kwargs["text"] = text_cfg
+                try:
+                    raw = await self._retry_with_backoff(
+                        lambda: client.responses.create(**kwargs),
+                    )
+                    break
+                except TypeError:
+                    # Legacy SDK compatibility: retry without `text` formatting.
+                    if text_cfg is None:
+                        raise
+                    text_chain = [None]
+                    last_error = None
+                    continue
+                except Exception as exc:  # pragma: no cover - API compatibility boundary
+                    if text_cfg is not None and self._is_openai_schema_unsupported_error(exc):
+                        last_error = exc
+                        continue
+                    raise
+            else:
+                if last_error is not None:
+                    raise last_error
+                raw = await self._retry_with_backoff(
+                    lambda: client.responses.create(**kwargs),
+                )
+
+            return self._normalize_openai_responses(raw)
+        except Exception as exc:
+            # Some OpenAI-compatible proxies (Azure/LiteLLM) still only implement
+            # Chat Completions. If `/responses` isn't supported, fall back.
+            if self._is_openai_model_access_error(exc):
+                raise
+            if self._is_openai_responses_unsupported_error(exc):
+                logger.warning(
+                    "OpenAI base_url does not support /responses (%s). Falling back to /chat/completions.",
+                    exc,
+                )
+                return await self._call_openai_chat_completions_once(
+                    model,
+                    max_tokens,
+                    system,
+                    messages,
+                    tools,
+                    response_json_schema=response_json_schema,
+                    temperature=temperature,
+                )
+            raise
+
+    async def _call_openai_chat_completions_once(
+        self,
+        model: str,
+        max_tokens: int,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        *,
+        response_json_schema: dict[str, Any] | None = None,
+        temperature: float | None = None,
+    ) -> LLMResponse:
+        """Fallback path for OpenAI-compatible providers without `/responses`."""
+        client = self._get_client("openai")
+        is_reasoning = self._is_openai_reasoning_model(model)
         token_key = "max_completion_tokens" if is_reasoning else "max_tokens"
 
         oai_messages = self._messages_to_openai(system, messages, is_reasoning=is_reasoning)
@@ -1053,7 +1151,7 @@ class LLMRouter:
         if tools:
             kwargs["tools"] = self._tools_to_openai(tools)
 
-        # OpenAI schema support: prefer JSON schema, fallback to json_object.
+        # Schema support: prefer JSON schema, fallback to json_object.
         response_format_chain: list[dict[str, Any] | None] = [None]
         if response_json_schema is not None and not is_reasoning:
             response_format_chain = [
@@ -1128,6 +1226,189 @@ class LLMRouter:
                 output_tokens=raw.usage.completion_tokens or 0,
             )
         return LLMResponse(content=content, stop_reason=stop_reason, usage=usage)
+
+    def _normalize_openai_responses(self, raw: Any) -> LLMResponse:
+        """Normalize OpenAI Responses API output into ContentBlocks."""
+        content: list[ContentBlock] = []
+        stop_reason = "end_turn"
+
+        outputs = getattr(raw, "output", None) or []
+        for item in outputs:
+            item_type = getattr(item, "type", None)
+
+            if item_type == "message":
+                # Assistant message with structured content parts (output_text, etc.)
+                for part in getattr(item, "content", None) or []:
+                    part_type = getattr(part, "type", None)
+                    if part_type == "output_text":
+                        text = getattr(part, "text", "") or ""
+                        if text:
+                            content.append(ContentBlock(type="text", text=text))
+            elif item_type == "function_call":
+                stop_reason = "tool_use"
+                args_raw = getattr(item, "arguments", "") or ""
+                try:
+                    args = json.loads(args_raw) if args_raw else {}
+                except Exception:
+                    args = {}
+                call_id = getattr(item, "call_id", None) or getattr(item, "id", None) or ""
+                name = getattr(item, "name", "") or ""
+                content.append(ContentBlock(
+                    type="tool_use",
+                    id=str(call_id),
+                    name=str(name),
+                    input=args,
+                ))
+
+        # Fallback: if SDK exposes aggregated output_text and we produced no text blocks.
+        if not any(b.type == "text" for b in content):
+            text = getattr(raw, "output_text", "") or ""
+            if text:
+                content.append(ContentBlock(type="text", text=text))
+
+        usage = Usage()
+        raw_usage = getattr(raw, "usage", None)
+        if raw_usage:
+            if isinstance(raw_usage, dict):
+                usage = Usage(
+                    input_tokens=int(raw_usage.get("input_tokens", 0) or 0),
+                    output_tokens=int(raw_usage.get("output_tokens", 0) or 0),
+                )
+            else:
+                usage = Usage(
+                    input_tokens=int(getattr(raw_usage, "input_tokens", 0) or 0),
+                    output_tokens=int(getattr(raw_usage, "output_tokens", 0) or 0),
+                )
+
+        return LLMResponse(content=content, stop_reason=stop_reason, usage=usage)
+
+    def _messages_to_openai_responses_input(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        *,
+        is_reasoning: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Convert normalized messages to Responses API input items.
+
+        We intentionally support tool-use history by emitting `function_call`
+        items for assistant tool invocations and `function_call_output` items
+        for tool results.
+        """
+        items: list[dict[str, Any]] = []
+
+        sys_role = "developer" if is_reasoning else "system"
+        if system:
+            items.append({"type": "message", "role": sys_role, "content": system})
+
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if role == "assistant":
+                blocks = content if isinstance(content, list) else [content]
+                text_parts: list[str] = []
+                tool_blocks: list[ContentBlock] = []
+                for block in blocks:
+                    if isinstance(block, ContentBlock):
+                        if block.type == "text" and block.text:
+                            text_parts.append(block.text)
+                        elif block.type == "tool_use":
+                            tool_blocks.append(block)
+                        elif block.type == "image" and block.image_data:
+                            # Best-effort: represent assistant images as text.
+                            text_parts.append("[image]")
+                    elif isinstance(block, dict):
+                        btype = block.get("type")
+                        if btype == "text":
+                            text_parts.append(str(block.get("text", "")))
+                        elif btype == "tool_use":
+                            tool_blocks.append(ContentBlock(
+                                type="tool_use",
+                                id=str(block.get("id", "")),
+                                name=str(block.get("name", "")),
+                                input=block.get("input", {}) or {},
+                            ))
+                        elif btype == "image":
+                            text_parts.append("[image]")
+                        else:
+                            text_parts.append(str(block))
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+
+                if text_parts:
+                    items.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "\n".join([t for t in text_parts if t]),
+                    })
+
+                for tb in tool_blocks:
+                    call_id = str(tb.id or "")
+                    name = str(tb.name or "")
+                    try:
+                        arguments = json.dumps(tb.input or {}, ensure_ascii=False)
+                    except Exception:
+                        arguments = "{}"
+                    items.append({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": arguments,
+                        "id": call_id,
+                        "status": "completed",
+                    })
+
+            elif role == "user":
+                # User message may contain tool results + images + text parts.
+                if isinstance(content, list):
+                    msg_parts: list[dict[str, Any]] = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "tool_result":
+                            call_id = str(part.get("tool_use_id", "") or "")
+                            items.append({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": str(part.get("content", "")),
+                                "status": "completed",
+                            })
+                            continue
+
+                        if isinstance(part, ContentBlock) and part.type == "image" and part.image_data:
+                            mt = part.media_type or "image/png"
+                            msg_parts.append({
+                                "type": "input_image",
+                                "detail": "auto",
+                                "image_url": f"data:{mt};base64,{part.image_data}",
+                            })
+                            continue
+
+                        if isinstance(part, dict) and part.get("type") == "image":
+                            src = part.get("source", {})
+                            mt = src.get("media_type", "image/png")
+                            data = src.get("data", "")
+                            msg_parts.append({
+                                "type": "input_image",
+                                "detail": "auto",
+                                "image_url": f"data:{mt};base64,{data}",
+                            })
+                            continue
+
+                        text = part if isinstance(part, str) else (
+                            part.text if isinstance(part, ContentBlock) else str(part)
+                        )
+                        if text:
+                            msg_parts.append({"type": "input_text", "text": str(text)})
+
+                    if msg_parts:
+                        # Content can be a list of input_text/input_image items.
+                        items.append({"type": "message", "role": "user", "content": msg_parts})
+                else:
+                    if content is None:
+                        continue
+                    items.append({"type": "message", "role": "user", "content": str(content)})
+
+        return items
 
     def _messages_to_openai(
         self, system: str, messages: list[dict[str, Any]], *,
@@ -1274,6 +1555,38 @@ class LLMRouter:
             "unexpected keyword",
             "unsupported parameter",
         ))
+
+    @staticmethod
+    def _is_openai_responses_unsupported_error(exc: BaseException) -> bool:
+        """Detect when an OpenAI-compatible endpoint doesn't implement `/responses`."""
+        status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        try:
+            status_int = int(status) if status is not None else None
+        except Exception:
+            status_int = None
+
+        msg = str(exc).lower()
+        req = getattr(exc, "request", None)
+        url = ""
+        try:
+            if req is not None and getattr(req, "url", None) is not None:
+                url = str(req.url).lower()
+        except Exception:
+            url = ""
+        haystack = f"{msg} {url}"
+
+        if status_int in (404, 405):
+            # Only treat as unsupported when the missing route is the responses endpoint.
+            return "/responses" in haystack or " responses" in haystack
+
+        if status_int == 400 and any(marker in haystack for marker in (
+            "unknown endpoint",
+            "unknown url",
+            "unrecognized path",
+            "not found",
+        )) and "responses" in haystack:
+            return True
+        return False
 
     # ── Google Gemini ──────────────────────────────────────────────
 

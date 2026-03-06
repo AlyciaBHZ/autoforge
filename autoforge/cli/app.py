@@ -1385,7 +1385,7 @@ def _run_interactive_sync(args: argparse.Namespace) -> int:
 
     # First-run setup: API key, GitHub, preferences
     if needs_setup():
-        console.print("[yellow]First time? Let's set up ForgeAI.[/yellow]\n")
+        console.print("[yellow]Let's set up ForgeAI (providers/models).[/yellow]\n")
         from autoforge.cli.setup_wizard import run_setup_wizard
         run_setup_wizard()
         console.print()

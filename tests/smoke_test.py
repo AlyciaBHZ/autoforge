@@ -1718,9 +1718,10 @@ def test_auth_codex_oauth_provider():
     from autoforge.engine.auth import CodexOAuthAuth
 
     auth = CodexOAuthAuth()
-    # No token yet — get_client_kwargs returns empty (token injected dynamically)
+    # No token yet — base_url is still required so subscription auth routes to
+    # the Codex backend rather than the API billing endpoint.
     kwargs = auth.get_client_kwargs()
-    assert kwargs == {}
+    assert kwargs.get("base_url") == auth.DEFAULT_BASE_URL
     # Has correct endpoints
     assert "openai.com" in auth.AUTH_URL
     assert "openai.com" in auth.TOKEN_URL
@@ -1732,7 +1733,7 @@ def test_auth_device_code_provider():
 
     auth = DeviceCodeAuth()
     kwargs = auth.get_client_kwargs()
-    assert kwargs == {}
+    assert "base_url" in kwargs
     assert "openai.com" in auth.DEVICE_URL
     assert "openai.com" in auth.TOKEN_URL
 
