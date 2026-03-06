@@ -532,3 +532,17 @@ autoforgeai harness openai-export ./.autoforge/harness/runs/harness-abc123
 
 Each bundle contains `items.jsonl`, `item_schema.json`, and `bundle_manifest.json`.
 This keeps build/test execution local while making prompts, traces, judge results, and artifact paths easier to hand off to OpenAI Evals / agent-eval workflows.
+
+---
+
+## Claude Code Plugin
+
+AutoForge now ships a Claude Code plugin package plus a repository-hosted marketplace manifest.
+
+```text
+/plugin marketplace add AlyciaBHZ/autoforge
+/plugin install autoforge@autoforge
+```
+
+Plugin assets live under `plugins/autoforge`, with marketplace metadata in `.claude-plugin/marketplace.json`.
+This lets the same repository act as both the plugin source and a GitHub-hosted marketplace while you wait for official marketplace approval.

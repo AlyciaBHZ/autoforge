@@ -1259,6 +1259,44 @@ def test_service_files_exist():
     assert (PROJECT_ROOT / "services" / "com.autoforge.daemon.plist").exists()
 
 
+def test_claude_plugin_assets_exist():
+    """Claude plugin package, marketplace manifest, and repo settings should exist."""
+    plugin_manifest = PROJECT_ROOT / "plugins" / "autoforge" / ".claude-plugin" / "plugin.json"
+    marketplace_manifest = PROJECT_ROOT / ".claude-plugin" / "marketplace.json"
+    settings_path = PROJECT_ROOT / ".claude" / "settings.json"
+
+    assert plugin_manifest.exists()
+    assert marketplace_manifest.exists()
+    assert settings_path.exists()
+
+    plugin = json.loads(plugin_manifest.read_text(encoding="utf-8"))
+    marketplace = json.loads(marketplace_manifest.read_text(encoding="utf-8"))
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    assert plugin["name"] == "autoforge"
+    assert plugin["version"] == "2.7.25"
+    assert marketplace["name"] == "autoforge"
+    assert marketplace["plugins"][0]["source"] == "./plugins/autoforge"
+    assert "autoforge" in settings["extraKnownMarketplaces"]
+    assert settings["enabledPlugins"]["autoforge@autoforge"] is True
+
+
+def test_claude_plugin_skills_exist():
+    """Claude plugin should ship the key AutoForge skills."""
+    skills_root = PROJECT_ROOT / "plugins" / "autoforge" / "skills"
+    for skill_name in [
+        "autoforge-runtime-overview",
+        "academic-repro",
+        "software-forge",
+        "long-run-runtime",
+        "harness-evals-export",
+    ]:
+        skill_path = skills_root / skill_name / "SKILL.md"
+        assert skill_path.exists(), f"Missing skill: {skill_path}"
+        content = skill_path.read_text(encoding="utf-8")
+        assert "description:" in content
+
+
 # ────────────────────────────────────────────
 # Phase 6: Constitution files
 # ────────────────────────────────────────────
@@ -2504,6 +2542,10 @@ def main():
         ]),
         ("Service Files", [
             ("systemd + launchd configs exist", test_service_files_exist),
+        ]),
+        ("Claude Plugin", [
+            ("Plugin assets exist", test_claude_plugin_assets_exist),
+            ("Plugin skills exist", test_claude_plugin_skills_exist),
         ]),
         ("Constitution", [
             ("All constitution files exist + non-empty", test_constitution_files_exist),

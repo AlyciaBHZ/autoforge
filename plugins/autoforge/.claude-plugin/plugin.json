@@ -1,0 +1,21 @@
+{
+  "name": "autoforge",
+  "description": "AutoForge workflows for long-running software, research, verification, and eval tasks in Claude Code.",
+  "version": "2.7.25",
+  "author": {
+    "name": "AlyciaBHZ",
+    "url": "https://github.com/AlyciaBHZ"
+  },
+  "homepage": "https://github.com/AlyciaBHZ/autoforge",
+  "repository": "https://github.com/AlyciaBHZ/autoforge",
+  "license": "MIT",
+  "keywords": [
+    "autoforge",
+    "agents",
+    "research",
+    "verification",
+    "software",
+    "evals",
+    "automation"
+  ]
+}
