@@ -671,6 +671,11 @@ class ProcessRewardModel:
 
         step.execution_attempted = True
 
+        # Prefer project-local venv python when available (works for both subprocess and docker sandboxes).
+        platform = getattr(self.sandbox, "execution_platform", "posix")
+        venv_py = ".autoforge/venv/Scripts/python.exe" if platform == "windows" else ".autoforge/venv/bin/python"
+        python_exe = venv_py if (self.working_dir / Path(venv_py)).exists() else "python"
+
         # Check syntax for Python files
         for filepath in step.files_touched:
             full_path = self.working_dir / filepath
@@ -679,25 +684,33 @@ class ProcessRewardModel:
 
             if filepath.endswith(".py"):
                 try:
-                    result = await self.sandbox.exec(
-                        f"python -m py_compile {full_path}",
+                    rel = filepath.replace("\\", "/")
+                    result = await self.sandbox.exec_args(
+                        [python_exe, "-m", "py_compile", rel],
                         timeout=10,
                     )
+                    if result.exit_code == -1:
+                        continue  # tool unavailable; don't treat as a syntax failure
                     step.syntax_valid = result.exit_code == 0
                     if not step.syntax_valid:
-                        step.execution_output += f"Syntax error in {filepath}: {result.stderr[:200]}\n"
+                        err = (result.stderr or result.stdout or "")[:200]
+                        step.execution_output += f"Syntax error in {filepath}: {err}\n"
                 except Exception:
                     pass
 
             elif filepath.endswith((".js", ".jsx")):
                 try:
-                    result = await self.sandbox.exec(
-                        f"node --check {full_path}",
+                    rel = filepath.replace("\\", "/")
+                    result = await self.sandbox.exec_args(
+                        ["node", "--check", rel],
                         timeout=10,
                     )
+                    if result.exit_code == -1:
+                        continue
                     step.syntax_valid = result.exit_code == 0
                     if not step.syntax_valid:
-                        step.execution_output += f"Syntax error in {filepath}: {result.stderr[:200]}\n"
+                        err = (result.stderr or result.stdout or "")[:200]
+                        step.execution_output += f"Syntax error in {filepath}: {err}\n"
                 except Exception:
                     pass
 
@@ -708,17 +721,21 @@ class ProcessRewardModel:
                 try:
                     test_file = test_files[0]
                     if test_file.endswith(".py"):
-                        result = await self.sandbox.exec(
-                            f"python -m pytest {self.working_dir / test_file} --tb=short -q 2>&1 || true",
+                        rel = test_file.replace("\\", "/")
+                        result = await self.sandbox.exec_args(
+                            [python_exe, "-m", "pytest", rel, "--tb=short", "-q"],
                             timeout=30,
                         )
                     else:
-                        result = await self.sandbox.exec(
-                            f"cd {self.working_dir} && npm test -- {test_file} 2>&1 || true",
+                        rel = test_file.replace("\\", "/")
+                        result = await self.sandbox.exec_args(
+                            ["npm", "test", "--", rel],
                             timeout=30,
                         )
                     step.execution_success = result.exit_code == 0
-                    step.execution_output += result.stdout[:300]
+                    combined = (result.stdout or "") + (result.stderr or "")
+                    if combined:
+                        step.execution_output += combined[:300]
                 except Exception as e:
                     step.execution_output += f"Test execution error: {e}"
 

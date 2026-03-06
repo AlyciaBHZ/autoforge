@@ -146,7 +146,7 @@ class ReviewerAgent(FileToolsMixin, AgentBase):
             return json.dumps({"error": "Only read-only verification commands are allowed"})
 
         if self.sandbox:
-            result = await self.sandbox.exec(command, timeout=30)
+            result = await self.sandbox.exec(command, timeout=30, capability="lint")
             return json.dumps({
                 "exit_code": result.exit_code,
                 "stdout": (result.stdout or "")[:4000],

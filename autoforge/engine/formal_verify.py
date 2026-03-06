@@ -26,9 +26,12 @@ import json
 import logging
 import re
 import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from autoforge.engine.runtime.commands import run_args
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +117,30 @@ def _tool_available(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _python_executable(project_dir: Path) -> str:
+    """Best-effort python executable for verification commands.
+
+    Prefer a project-local venv created by the orchestrator (if it matches the host platform).
+    """
+    if sys.platform == "win32":
+        candidates = [
+            project_dir / ".autoforge" / "venv" / "Scripts" / "python.exe",
+            project_dir / ".autoforge" / "venv" / "bin" / "python",
+        ]
+    else:
+        candidates = [
+            project_dir / ".autoforge" / "venv" / "bin" / "python",
+            project_dir / ".autoforge" / "venv" / "Scripts" / "python.exe",
+        ]
+    for c in candidates:
+        if c.is_file():
+            try:
+                return str(c.relative_to(project_dir))
+            except ValueError:
+                return str(c)
+    return "python"
+
+
 # ──────────────────────────────────────────────
 # Individual Verifiers
 # ──────────────────────────────────────────────
@@ -123,17 +150,24 @@ async def _run_flake8(project_dir: Path) -> list[VerificationIssue]:
     """Run flake8 linter on Python files."""
     issues = []
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "python", "-m", "flake8",
-            "--max-line-length", "120",
-            "--select", "E,W,F",
-            "--format", "%(path)s:%(row)d:%(col)d: %(code)s %(text)s",
-            str(project_dir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        python_exe = _python_executable(project_dir)
+        res = await run_args(
+            [
+                python_exe, "-m", "flake8",
+                "--max-line-length", "120",
+                "--select", "E,W,F",
+                "--format", "%(path)s:%(row)d:%(col)d: %(code)s %(text)s",
+                str(project_dir),
+            ],
+            cwd=project_dir,
+            timeout_s=60.0,
+            max_stdout_chars=60000,
+            max_stderr_chars=4000,
+            label="formal.flake8",
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
-        output = stdout.decode(errors="replace")
+        if res.exit_code == -1 or res.timed_out:
+            return issues
+        output = res.stdout or ""
 
         for line in output.strip().split("\n"):
             if not line.strip():
@@ -158,7 +192,7 @@ async def _run_flake8(project_dir: Path) -> list[VerificationIssue]:
                     rule=code,
                 ))
 
-    except (asyncio.TimeoutError, FileNotFoundError, Exception) as e:
+    except Exception as e:
         logger.debug(f"flake8 not available or failed: {e}")
 
     return issues
@@ -168,16 +202,23 @@ async def _run_mypy(project_dir: Path) -> list[VerificationIssue]:
     """Run mypy type checker on Python files."""
     issues = []
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "python", "-m", "mypy",
-            "--ignore-missing-imports",
-            "--no-error-summary",
-            str(project_dir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        python_exe = _python_executable(project_dir)
+        res = await run_args(
+            [
+                python_exe, "-m", "mypy",
+                "--ignore-missing-imports",
+                "--no-error-summary",
+                str(project_dir),
+            ],
+            cwd=project_dir,
+            timeout_s=120.0,
+            max_stdout_chars=80000,
+            max_stderr_chars=8000,
+            label="formal.mypy",
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
-        output = stdout.decode(errors="replace")
+        if res.exit_code == -1 or res.timed_out:
+            return issues
+        output = res.stdout or ""
 
         for line in output.strip().split("\n"):
             if not line.strip():
@@ -203,7 +244,7 @@ async def _run_mypy(project_dir: Path) -> list[VerificationIssue]:
                     rule="mypy",
                 ))
 
-    except (asyncio.TimeoutError, FileNotFoundError, Exception) as e:
+    except Exception as e:
         logger.debug(f"mypy not available or failed: {e}")
 
     return issues
@@ -213,16 +254,23 @@ async def _run_bandit(project_dir: Path) -> list[VerificationIssue]:
     """Run Bandit security scanner on Python files."""
     issues = []
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "python", "-m", "bandit",
-            "-r", str(project_dir),
-            "-f", "json",
-            "--quiet",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        python_exe = _python_executable(project_dir)
+        res = await run_args(
+            [
+                python_exe, "-m", "bandit",
+                "-r", str(project_dir),
+                "-f", "json",
+                "--quiet",
+            ],
+            cwd=project_dir,
+            timeout_s=60.0,
+            max_stdout_chars=120000,
+            max_stderr_chars=4000,
+            label="formal.bandit",
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
-        output = stdout.decode(errors="replace")
+        if res.exit_code == -1 or res.timed_out:
+            return issues
+        output = res.stdout or ""
 
         try:
             data = json.loads(output)
@@ -256,7 +304,7 @@ async def _run_bandit(project_dir: Path) -> list[VerificationIssue]:
         except json.JSONDecodeError:
             pass
 
-    except (asyncio.TimeoutError, FileNotFoundError, Exception) as e:
+    except Exception as e:
         logger.debug(f"bandit not available or failed: {e}")
 
     return issues
@@ -279,15 +327,17 @@ async def _run_eslint(project_dir: Path) -> list[VerificationIssue]:
             "--no-error-on-unmatched-pattern",
             str(project_dir),
         ])
-
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        res = await run_args(
+            args,
             cwd=project_dir,
+            timeout_s=60.0,
+            max_stdout_chars=200000,
+            max_stderr_chars=8000,
+            label="formal.eslint",
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
-        output = stdout.decode(errors="replace")
+        if res.exit_code == -1 or res.timed_out:
+            return issues
+        output = res.stdout or ""
 
         try:
             results = json.loads(output)
@@ -312,7 +362,7 @@ async def _run_eslint(project_dir: Path) -> list[VerificationIssue]:
         except json.JSONDecodeError:
             pass
 
-    except (asyncio.TimeoutError, FileNotFoundError, Exception) as e:
+    except Exception as e:
         logger.debug(f"ESLint not available or failed: {e}")
 
     return issues
@@ -492,8 +542,8 @@ class FormalVerifier:
         if js_files:
             tasks.append(("eslint", _run_eslint(project_dir)))
 
-        # Level 2: Type checkers
-        if py_files and self._available_tools.get("mypy"):
+        # Level 2: Type checkers (best-effort; may be available in project venv)
+        if py_files:
             tasks.append(("mypy", _run_mypy(project_dir)))
 
         # Level 3: Security

@@ -6,13 +6,14 @@ Uses system grep on POSIX, falls back to pure-Python on Windows.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
 import sys
 from pathlib import Path
 from typing import Any
+
+from autoforge.engine.runtime.commands import run_args
 
 logger = logging.getLogger(__name__)
 
@@ -113,26 +114,25 @@ async def _grep_system(
 
     cmd.extend([pattern, str(search_dir)])
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-    except FileNotFoundError:
-        # grep not found — fall back to Python
-        return await _grep_python(pattern, search_dir, working_dir, file_glob, max_results)
-    except asyncio.TimeoutError:
+    # Unified command runner (Windows-safe fallback).
+    res = await run_args(
+        cmd,
+        cwd=working_dir,
+        timeout_s=15.0,
+        max_stdout_chars=20000,
+        max_stderr_chars=2000,
+        label="tool.grep",
+    )
+    if res.timed_out:
         return [{"error": "Search timed out (15s limit)"}]
-
-    if proc.returncode not in (0, 1):  # 1 = no matches
-        err = stderr.decode("utf-8", errors="replace").strip()[:200]
+    if res.exit_code == -1:
+        return await _grep_python(pattern, search_dir, working_dir, file_glob, max_results)
+    if res.exit_code not in (0, 1):  # 1 = no matches
+        err = (res.stderr or "").strip()[:200]
         if err:
             return [{"error": f"grep error: {err}"}]
+    return _parse_grep_output(res.stdout or "", working_dir, max_results)
 
-    output = stdout.decode("utf-8", errors="replace")
-    return _parse_grep_output(output, working_dir, max_results)
 
 
 def _parse_grep_output(

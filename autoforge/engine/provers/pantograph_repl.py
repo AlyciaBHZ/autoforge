@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from autoforge.engine.runtime.commands import spawn_exec
+
 logger = logging.getLogger(__name__)
 
 
@@ -258,11 +260,14 @@ class PantographREPL:
             RuntimeError: If subprocess fails to start.
         """
         try:
-            self.process = await asyncio.create_subprocess_exec(
-                self.config.pantograph_path,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            cwd = (self.config.project_path or Path(".")).resolve()
+            self.process = await spawn_exec(
+                [self.config.pantograph_path],
+                cwd=cwd,
+                stdin_pipe=True,
+                stdout_pipe=True,
+                stderr_pipe=True,
+                label="pantograph.start",
             )
             self._running = True
             logger.info("Pantograph REPL started")

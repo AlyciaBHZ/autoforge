@@ -28,6 +28,8 @@ from typing import Any
 
 from pathlib import Path
 
+from autoforge.engine.runtime.commands import run_args
+
 logger = logging.getLogger(__name__)
 
 
@@ -570,16 +572,19 @@ class CitationGraph:
             logger.debug("autoforge.engine.tools.web not available")
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                "curl",
-                "-s",
-                "-L",
-                url,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            res = await run_args(
+                ["curl", "-s", "-L", url],
+                cwd=Path("."),
+                timeout_s=10.0,
+                max_stdout_chars=200000,
+                max_stderr_chars=8000,
+                label="literature_search.http_get",
             )
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10.0)
-            return stdout.decode("utf-8", errors="replace")
+            if res.exit_code != 0:
+                raise RuntimeError(f"curl exited with code {res.exit_code}")
+            if not res.stdout:
+                raise RuntimeError("curl returned empty payload")
+            return res.stdout
         except Exception as e:
             logger.debug(f"curl fallback failed: {e}")
 
@@ -1614,21 +1619,19 @@ class LiteratureSearchEngine:
 
         # Strategy 2: Try asyncio subprocess with curl
         try:
-            process = await asyncio.create_subprocess_exec(
-                "curl",
-                "-s",
-                "-L",
-                url,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            res = await run_args(
+                ["curl", "-s", "-L", url],
+                cwd=Path("."),
+                timeout_s=10.0,
+                max_stdout_chars=200000,
+                max_stderr_chars=8000,
+                label="literature_search.http_get",
             )
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10.0)
-            if process.returncode != 0:
-                raise RuntimeError(f"curl exited with code {process.returncode}")
-            output = stdout.decode("utf-8", errors="replace")
-            if not output:
+            if res.exit_code != 0:
+                raise RuntimeError(f"curl exited with code {res.exit_code}")
+            if not res.stdout:
                 raise RuntimeError("curl returned empty payload")
-            return output
+            return res.stdout
         except Exception as e:
             logger.debug(f"curl fallback failed: {e}")
 

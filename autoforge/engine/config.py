@@ -12,6 +12,8 @@ dedicated sub-config dataclasses to keep the top-level clean.
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import os
 import threading
@@ -111,6 +113,67 @@ def _load_clamped_int(
     return max(minimum, val)
 
 
+def _parse_allowlist_map(raw: Any) -> dict[str, list[str]]:
+    """Parse capability->allowlist mapping from env/global config.
+
+    Accepted formats:
+      - dict: {"deps": ["python", "pip"], "test": "python,pytest"}
+      - JSON string: '{"deps":["python"],"test":["python","pytest"]}'
+      - semi-colon string: 'deps:python,pip;test:python,pytest'
+    """
+    if raw is None:
+        return {}
+
+    if isinstance(raw, dict):
+        out: dict[str, list[str]] = {}
+        for k, v in raw.items():
+            cap = str(k).strip().lower()
+            if not cap:
+                continue
+            if isinstance(v, list):
+                items = [str(s).strip() for s in v if str(s).strip()]
+            elif isinstance(v, str):
+                items = [s.strip() for s in v.split(",") if s.strip()]
+            else:
+                continue
+            if items:
+                out[cap] = items
+        return out
+
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return {}
+        if s.startswith("{"):
+            try:
+                parsed = json.loads(s)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                return _parse_allowlist_map(parsed)
+
+        out: dict[str, list[str]] = {}
+        for part in s.split(";"):
+            token = (part or "").strip()
+            if not token:
+                continue
+            if ":" in token:
+                cap, cmds = token.split(":", 1)
+            elif "=" in token:
+                cap, cmds = token.split("=", 1)
+            else:
+                continue
+            cap = (cap or "").strip().lower()
+            if not cap:
+                continue
+            items = [c.strip() for c in (cmds or "").split(",") if c.strip()]
+            if items:
+                out[cap] = items
+        return out
+
+    return {}
+
+
 # ── Sub-config dataclasses ────────────────────────────────────────
 
 
@@ -173,6 +236,26 @@ class PipelineConfig:
     build_test_loops: int = 0
     speculative_enabled: bool = True
     hierarchical_decomp_enabled: bool = True
+    # Durable execution + observability (kernel)
+    durable_execution_enabled: bool = True
+    state_backend: str = "sqlite"  # "json" | "sqlite" | "both"
+    artifacts_enabled: bool = True
+
+
+@dataclass
+class ObservabilityConfig:
+    """Kernel observability controls (trace + replay)."""
+
+    trace_enabled: bool = False
+
+    # Capture knobs (only effective when trace_enabled=True)
+    trace_capture_llm_content: bool = False
+    trace_capture_command_output: bool = False
+    trace_capture_fs_snapshots: bool = False
+
+    # Storage safety
+    trace_max_inline_chars: int = 20000
+    trace_redact_secrets: bool = True
 
 
 @dataclass
@@ -353,18 +436,64 @@ class ForgeConfig:
     run_id: str = ""
 
     # Thread-safe usage tracking lock (not a dataclass field)
-    _usage_lock: threading.Lock = threading.Lock()
+    _usage_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     # Docker
     sandbox_image: str = "autoforge-sandbox:latest"
     docker_enabled: bool = False
+    docker_required: bool = False
+    docker_network_mode: str = "none"  # "none" | "bridge" | ...
+    docker_memory_limit: str = "2g"
+    docker_cpu_limit: str = "2"
+    docker_pids_limit: int = 0
 
+    # Execution backend (sandbox runner)
+    execution_backend: str = "auto"  # "auto" | "docker" | "subprocess" | "slurm"
+
+    # Subprocess sandbox security policy
+    # - blacklist (default): BLOCKED_PATTERNS only (backward compatible)
+    # - allowlist: require command executable to be in allowlist (opt-in, stricter)
+    # - disabled: no filtering (not recommended)
+    subprocess_security_mode: str = "blacklist"  # "blacklist" | "allowlist" | "disabled"
+    subprocess_allowlist: list[str] = field(default_factory=list)
+    subprocess_allowlist_by_capability: dict[str, list[str]] = field(default_factory=dict)
+
+    # Slurm (HPC) backend options (used when execution_backend="slurm" or auto-detected)
+    slurm_partition: str = ""
+    slurm_account: str = ""
+    slurm_qos: str = ""
+    slurm_cpus_per_task: int = 2
+    slurm_mem: str = ""  # e.g. "4G"
+    slurm_gres: str = ""  # e.g. "gpu:1"
+    slurm_queue_timeout_seconds: int = 600  # extra wait for queueing (wall-time)
+    slurm_poll_interval_seconds: float = 1.0
+    slurm_use_local_in_allocation: bool = True
+
+
+    # Determinism (harness/benchmarking)
+    deterministic: bool = False
+    deterministic_seed: int = 0
+    deterministic_source_date_epoch: int = 0  # optional, sets SOURCE_DATE_EPOCH inside sandboxes
+
+    # Dependency cache / proxy env injection (primarily for HPC clusters)
+    pip_index_url: str = ""
+    pip_cache_dir: str = ""
+    npm_registry: str = ""
+    npm_cache_dir: str = ""
+
+    # Global LLM rate limiting (HPC/harness)
+    llm_rate_limit_enabled: bool = False
+    llm_rpm_limit: int = 0  # requests/minute (0 = unlimited)
+    llm_tpm_limit: int = 0  # tokens/minute (0 = unlimited)
+    llm_rate_limit_db_path: Path | None = None
+    llm_rate_limit_namespace: str = "global"
     # ── Sub-configs ──
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     advanced: AdvancedConfig = field(default_factory=AdvancedConfig)
     goal: ProjectGoalConfig = field(default_factory=ProjectGoalConfig)
+    obs: ObservabilityConfig = field(default_factory=ObservabilityConfig)
 
     # Known model name patterns for validation (prefix-based)
     _KNOWN_MODEL_PATTERNS: tuple[str, ...] = (
@@ -384,7 +513,7 @@ class ForgeConfig:
     # existing code can keep using  config.xxx_enabled  without changes.
 
     _SUB_CONFIG_NAMES: tuple[str, ...] = (
-        "daemon", "tools", "pipeline", "advanced", "goal",
+        "daemon", "tools", "pipeline", "advanced", "goal", "obs",
     )
 
     def __getattr__(self, name: str) -> Any:
@@ -462,6 +591,157 @@ class ForgeConfig:
             self.openai_reasoning_effort = "medium"
         else:
             self.openai_reasoning_effort = level
+
+        backend = str(getattr(self, "execution_backend", "auto") or "auto").strip().lower()
+        allowed_backends = {"auto", "docker", "subprocess", "slurm"}
+        if backend not in allowed_backends:
+            logging.getLogger(__name__).warning(
+                "execution_backend=%r invalid; using 'auto' (allowed: %s)",
+                backend,
+                ", ".join(sorted(allowed_backends)),
+            )
+            backend = "auto"
+        self.execution_backend = backend
+
+        sec_mode = str(getattr(self, "subprocess_security_mode", "blacklist") or "blacklist").strip().lower()
+        allowed_sec_modes = {"blacklist", "allowlist", "disabled"}
+        if sec_mode not in allowed_sec_modes:
+            logging.getLogger(__name__).warning(
+                "subprocess_security_mode=%r invalid; using 'blacklist' (allowed: %s)",
+                sec_mode,
+                ", ".join(sorted(allowed_sec_modes)),
+            )
+            sec_mode = "blacklist"
+        self.subprocess_security_mode = sec_mode
+        raw_allow = getattr(self, "subprocess_allowlist", [])
+        if isinstance(raw_allow, str):
+            allow = [s.strip() for s in raw_allow.split(",") if s.strip()]
+        elif isinstance(raw_allow, list):
+            allow = [str(s).strip() for s in raw_allow if str(s).strip()]
+        else:
+            allow = []
+        self.subprocess_allowlist = allow
+        raw_map = getattr(self, "subprocess_allowlist_by_capability", {})
+        self.subprocess_allowlist_by_capability = _parse_allowlist_map(raw_map)
+
+        # Determinism knobs (harness/benchmarking)
+        self.deterministic = bool(getattr(self, "deterministic", False))
+        try:
+            self.deterministic_seed = int(getattr(self, "deterministic_seed", 0) or 0)
+        except (ValueError, TypeError):
+            self.deterministic_seed = 0
+        try:
+            self.deterministic_source_date_epoch = int(
+                getattr(self, "deterministic_source_date_epoch", 0) or 0
+            )
+        except (ValueError, TypeError):
+            self.deterministic_source_date_epoch = 0
+
+        # Dependency cache/proxy fields (keep as plain strings)
+        self.pip_index_url = str(getattr(self, "pip_index_url", "") or "")
+        self.pip_cache_dir = str(getattr(self, "pip_cache_dir", "") or "")
+        self.npm_registry = str(getattr(self, "npm_registry", "") or "")
+        self.npm_cache_dir = str(getattr(self, "npm_cache_dir", "") or "")
+
+        # Global LLM rate limiting
+        self.llm_rate_limit_enabled = bool(getattr(self, "llm_rate_limit_enabled", False))
+        try:
+            self.llm_rpm_limit = max(0, int(getattr(self, "llm_rpm_limit", 0) or 0))
+        except (ValueError, TypeError):
+            self.llm_rpm_limit = 0
+        try:
+            self.llm_tpm_limit = max(0, int(getattr(self, "llm_tpm_limit", 0) or 0))
+        except (ValueError, TypeError):
+            self.llm_tpm_limit = 0
+
+        ns = str(getattr(self, "llm_rate_limit_namespace", "global") or "global").strip() or "global"
+        self.llm_rate_limit_namespace = ns
+
+        # Normalize rate limiter db path and set a safe default when enabled.
+        db_path = getattr(self, "llm_rate_limit_db_path", None)
+        if db_path is not None and not isinstance(db_path, Path):
+            try:
+                db_path = Path(str(db_path))
+            except Exception:
+                db_path = None
+            self.llm_rate_limit_db_path = db_path
+
+        if self.llm_rate_limit_enabled or self.llm_rpm_limit > 0 or self.llm_tpm_limit > 0:
+            if self.llm_rate_limit_db_path is None:
+                self.llm_rate_limit_db_path = self.project_root / ".autoforge" / "ratelimit.sqlite"
+
+    def fork(self, **overrides: Any) -> "ForgeConfig":
+        """Create a new config instance for isolated concurrent runs.
+
+        This is the supported way to derive per-case configs for harness/batch
+        execution without accidentally sharing mutable sub-config objects.
+        """
+        cfg = ForgeConfig(
+            project_root=self.project_root,
+            workspace_dir=self.workspace_dir,
+            constitution_dir=self.constitution_dir,
+            api_keys=dict(self.api_keys),
+            auth_config=copy.deepcopy(self.auth_config),
+            model_strong=self.model_strong,
+            model_fast=self.model_fast,
+            max_tokens_strong=self.max_tokens_strong,
+            max_tokens_fast=self.max_tokens_fast,
+            openai_reasoning_effort=self.openai_reasoning_effort,
+            budget_limit_usd=self.budget_limit_usd,
+            token_usage={},  # fresh budget accounting per run
+            max_agents=self.max_agents,
+            max_retries=self.max_retries,
+            max_build_resets=self.max_build_resets,
+            quality_threshold=self.quality_threshold,
+            verbose=self.verbose,
+            log_level=self.log_level,
+            mode=self.mode,
+            mobile_target=self.mobile_target,
+            mobile_framework=self.mobile_framework,
+            run_id="",  # re-generated in __post_init__
+            sandbox_image=self.sandbox_image,
+            docker_enabled=self.docker_enabled,
+            docker_required=self.docker_required,
+            docker_network_mode=self.docker_network_mode,
+            docker_memory_limit=self.docker_memory_limit,
+            docker_cpu_limit=self.docker_cpu_limit,
+            docker_pids_limit=self.docker_pids_limit,
+            execution_backend=self.execution_backend,
+            subprocess_security_mode=self.subprocess_security_mode,
+            subprocess_allowlist=list(self.subprocess_allowlist),
+            subprocess_allowlist_by_capability=copy.deepcopy(self.subprocess_allowlist_by_capability),
+            slurm_partition=self.slurm_partition,
+            slurm_account=self.slurm_account,
+            slurm_qos=self.slurm_qos,
+            slurm_cpus_per_task=int(self.slurm_cpus_per_task or 0) or 2,
+            slurm_mem=self.slurm_mem,
+            slurm_gres=self.slurm_gres,
+            slurm_queue_timeout_seconds=int(self.slurm_queue_timeout_seconds or 0),
+            slurm_poll_interval_seconds=float(self.slurm_poll_interval_seconds or 0.0),
+            slurm_use_local_in_allocation=bool(self.slurm_use_local_in_allocation),
+            deterministic=bool(self.deterministic),
+            deterministic_seed=int(self.deterministic_seed or 0),
+            deterministic_source_date_epoch=int(self.deterministic_source_date_epoch or 0),
+            pip_index_url=self.pip_index_url,
+            pip_cache_dir=self.pip_cache_dir,
+            npm_registry=self.npm_registry,
+            npm_cache_dir=self.npm_cache_dir,
+            llm_rate_limit_enabled=bool(self.llm_rate_limit_enabled),
+            llm_rpm_limit=int(self.llm_rpm_limit or 0),
+            llm_tpm_limit=int(self.llm_tpm_limit or 0),
+            llm_rate_limit_db_path=self.llm_rate_limit_db_path,
+            llm_rate_limit_namespace=self.llm_rate_limit_namespace,
+            daemon=copy.deepcopy(self.daemon),
+            tools=copy.deepcopy(self.tools),
+            pipeline=copy.deepcopy(self.pipeline),
+            advanced=copy.deepcopy(self.advanced),
+            goal=copy.deepcopy(self.goal),
+            obs=copy.deepcopy(self.obs),
+        )
+        for k, v in overrides.items():
+            if v is not None:
+                setattr(cfg, k, v)
+        return cfg
 
     @property
     def has_api_key(self) -> bool:
@@ -610,6 +890,30 @@ class ForgeConfig:
         elif max_agents > 50:
             max_agents = 50
 
+        subprocess_security_mode = os.getenv(
+            "FORGE_SUBPROCESS_SECURITY_MODE",
+            str(global_config.get("subprocess_security_mode", "blacklist")),
+        )
+        allowlist_raw = os.getenv("FORGE_SUBPROCESS_ALLOWLIST")
+        if allowlist_raw:
+            subprocess_allowlist = [s.strip() for s in allowlist_raw.split(",") if s.strip()]
+        else:
+            gc_allow = global_config.get("subprocess_allowlist", [])
+            if isinstance(gc_allow, list):
+                subprocess_allowlist = [str(s).strip() for s in gc_allow if str(s).strip()]
+            elif isinstance(gc_allow, str):
+                subprocess_allowlist = [s.strip() for s in gc_allow.split(",") if s.strip()]
+            else:
+                subprocess_allowlist = []
+
+        allowlist_map_raw = os.getenv("FORGE_SUBPROCESS_ALLOWLIST_MAP")
+        if allowlist_map_raw:
+            subprocess_allowlist_by_capability = _parse_allowlist_map(allowlist_map_raw)
+        else:
+            subprocess_allowlist_by_capability = _parse_allowlist_map(
+                global_config.get("subprocess_allowlist_by_capability", {})
+            )
+
         config = cls(
             api_keys=api_keys,
             auth_config=auth_config,
@@ -625,9 +929,124 @@ class ForgeConfig:
             budget_limit_usd=budget,
             max_agents=max_agents,
             log_level=log_level,
+            sandbox_image=os.getenv(
+                "FORGE_SANDBOX_IMAGE",
+                str(global_config.get("sandbox_image", "autoforge-sandbox:latest")),
+            ),
             docker_enabled=(
                 os.getenv("FORGE_DOCKER_ENABLED", "").lower() in ("true", "1", "yes")
                 or global_config.get("docker_enabled", False)
+            ),
+            docker_required=os.getenv("FORGE_DOCKER_REQUIRED", "").lower() in ("true", "1", "yes"),
+            docker_network_mode=os.getenv(
+                "FORGE_DOCKER_NETWORK",
+                str(global_config.get("docker_network_mode", "none")),
+            ),
+            docker_memory_limit=os.getenv(
+                "FORGE_DOCKER_MEMORY",
+                str(global_config.get("docker_memory_limit", "2g")),
+            ),
+            docker_cpu_limit=os.getenv(
+                "FORGE_DOCKER_CPUS",
+                str(global_config.get("docker_cpu_limit", "2")),
+            ),
+            docker_pids_limit=_safe_int(
+                "FORGE_DOCKER_PIDS_LIMIT",
+                _to_int(global_config.get("docker_pids_limit", 0), 0),
+            ),
+            execution_backend=os.getenv(
+                "FORGE_EXECUTION_BACKEND",
+                str(global_config.get("execution_backend", "auto")),
+            ),
+            subprocess_security_mode=subprocess_security_mode,
+            subprocess_allowlist=subprocess_allowlist,
+            subprocess_allowlist_by_capability=subprocess_allowlist_by_capability,
+            slurm_partition=os.getenv(
+                "FORGE_SLURM_PARTITION",
+                str(global_config.get("slurm_partition", "")),
+            ),
+            slurm_account=os.getenv(
+                "FORGE_SLURM_ACCOUNT",
+                str(global_config.get("slurm_account", "")),
+            ),
+            slurm_qos=os.getenv(
+                "FORGE_SLURM_QOS",
+                str(global_config.get("slurm_qos", "")),
+            ),
+            slurm_cpus_per_task=_safe_int(
+                "FORGE_SLURM_CPUS",
+                _to_int(global_config.get("slurm_cpus_per_task", 2), 2),
+            ),
+            slurm_mem=os.getenv(
+                "FORGE_SLURM_MEM",
+                str(global_config.get("slurm_mem", "")),
+            ),
+            slurm_gres=os.getenv(
+                "FORGE_SLURM_GRES",
+                str(global_config.get("slurm_gres", "")),
+            ),
+            slurm_queue_timeout_seconds=_safe_int(
+                "FORGE_SLURM_QUEUE_TIMEOUT",
+                _to_int(global_config.get("slurm_queue_timeout_seconds", 600), 600),
+            ),
+            slurm_poll_interval_seconds=_safe_float(
+                "FORGE_SLURM_POLL_INTERVAL",
+                float(global_config.get("slurm_poll_interval_seconds", 1.0)),
+            ),
+            slurm_use_local_in_allocation=os.getenv(
+                "FORGE_SLURM_LOCAL_IN_ALLOC",
+                str(global_config.get("slurm_use_local_in_allocation", "true")),
+            ).strip().lower() not in ("false", "0", "no"),
+            deterministic=os.getenv(
+                "FORGE_DETERMINISTIC",
+                str(global_config.get("deterministic", "false")),
+            ).strip().lower() in ("true", "1", "yes"),
+            deterministic_seed=_safe_int(
+                "FORGE_SEED",
+                _to_int(global_config.get("deterministic_seed", 0), 0),
+            ),
+            deterministic_source_date_epoch=_safe_int(
+                "FORGE_SOURCE_DATE_EPOCH",
+                _to_int(global_config.get("deterministic_source_date_epoch", 0), 0),
+            ),
+            pip_index_url=os.getenv(
+                "FORGE_PIP_INDEX_URL",
+                str(global_config.get("pip_index_url", "")),
+            ),
+            pip_cache_dir=os.getenv(
+                "FORGE_PIP_CACHE_DIR",
+                str(global_config.get("pip_cache_dir", "")),
+            ),
+            npm_registry=os.getenv(
+                "FORGE_NPM_REGISTRY",
+                str(global_config.get("npm_registry", "")),
+            ),
+            npm_cache_dir=os.getenv(
+                "FORGE_NPM_CACHE_DIR",
+                str(global_config.get("npm_cache_dir", "")),
+            ),
+            llm_rate_limit_enabled=os.getenv(
+                "FORGE_LLM_RATE_LIMIT",
+                str(global_config.get("llm_rate_limit_enabled", "false")),
+            ).strip().lower() in ("true", "1", "yes"),
+            llm_rpm_limit=_safe_int(
+                "FORGE_LLM_RPM",
+                _to_int(global_config.get("llm_rpm_limit", 0), 0),
+            ),
+            llm_tpm_limit=_safe_int(
+                "FORGE_LLM_TPM",
+                _to_int(global_config.get("llm_tpm_limit", 0), 0),
+            ),
+            llm_rate_limit_db_path=(
+                os.getenv(
+                    "FORGE_LLM_RATE_LIMIT_DB",
+                    str(global_config.get("llm_rate_limit_db_path", "")),
+                ).strip()
+                or None
+            ),
+            llm_rate_limit_namespace=os.getenv(
+                "FORGE_LLM_RATE_LIMIT_NAMESPACE",
+                str(global_config.get("llm_rate_limit_namespace", "global")),
             ),
             mode=global_config.get("mode", "developer"),
             mobile_target=global_config.get("mobile_target", "none"),
@@ -676,12 +1095,29 @@ class ForgeConfig:
                 dag_federation_api_key=os.getenv("FORGE_DAG_FEDERATION_API_KEY", str(global_config.get("dag_federation_api_key", ""))),
                 dag_federation_timeout_seconds=_safe_float("FORGE_DAG_FEDERATION_TIMEOUT_SECONDS", float(global_config.get("dag_federation_timeout_seconds", 10.0))),
             ),
+            obs=ObservabilityConfig(
+                trace_enabled=os.getenv("FORGE_TRACE", "").lower() in ("true", "1", "yes"),
+                trace_capture_llm_content=os.getenv("FORGE_TRACE_LLM", "").lower() in ("true", "1", "yes"),
+                trace_capture_command_output=os.getenv("FORGE_TRACE_CMD", "").lower() in ("true", "1", "yes"),
+                trace_capture_fs_snapshots=os.getenv("FORGE_TRACE_FS", "").lower() in ("true", "1", "yes"),
+                trace_max_inline_chars=_safe_int(
+                    "FORGE_TRACE_MAX_CHARS",
+                    _to_int(global_config.get("trace_max_inline_chars", 20000), 20000),
+                ),
+                trace_redact_secrets=os.getenv("FORGE_TRACE_REDACT", "true").lower() not in ("false", "0", "no"),
+            ),
         )
 
         # Layer 1: CLI overrides (highest priority)
         for key, value in overrides.items():
             if hasattr(config, key) and value is not None:
                 setattr(config, key, value)
+        # Normalize again after overrides so CLI can pass strings for Path fields,
+        # and so invalid values are clamped consistently.
+        try:
+            config.__post_init__()
+        except Exception:
+            pass
         return config
 
     def record_usage(self, model: str, input_tokens: int, output_tokens: int) -> None:

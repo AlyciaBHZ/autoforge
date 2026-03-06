@@ -32,7 +32,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from autoforge.engine.runtime.commands import run_args
+
 logger = logging.getLogger(__name__)
+
+
+def _python_executable(project_dir: Path) -> str:
+    """Prefer project-local venv python for dependency tooling (pip-audit), if compatible."""
+    if sys.platform == "win32":
+        candidates = [
+            project_dir / ".autoforge" / "venv" / "Scripts" / "python.exe",
+            project_dir / ".autoforge" / "venv" / "bin" / "python",
+        ]
+    else:
+        candidates = [
+            project_dir / ".autoforge" / "venv" / "bin" / "python",
+            project_dir / ".autoforge" / "venv" / "Scripts" / "python.exe",
+        ]
+    for c in candidates:
+        if c.is_file():
+            try:
+                return str(c.relative_to(project_dir))
+            except ValueError:
+                return str(c)
+    return sys.executable
 
 
 # ──────────────────────────────────────────────
@@ -376,16 +399,24 @@ async def _check_python_deps(project_dir: Path) -> list[SecurityFinding]:
         return findings
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "pip_audit",
-            "-r", str(req_files[0]),
-            "--format", "json",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        python_exe = _python_executable(project_dir)
+        res = await run_args(
+            [
+                python_exe, "-m", "pip_audit",
+                "-r", str(req_files[0]),
+                "--format", "json",
+            ],
+            cwd=project_dir,
+            timeout_s=60.0,
+            max_stdout_chars=200000,
+            max_stderr_chars=8000,
+            label="security.pip_audit",
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if res.exit_code == -1 or res.timed_out:
+            logger.debug(f"[Security] pip-audit not available or timed out: {res.stderr}")
+            return findings
 
-        data = json.loads(stdout.decode(errors="replace"))
+        data = json.loads(res.stdout or "{}")
         for vuln in data.get("dependencies", []):
             for v in vuln.get("vulns", []):
                 findings.append(SecurityFinding(
@@ -397,7 +428,7 @@ async def _check_python_deps(project_dir: Path) -> list[SecurityFinding]:
                     fix_suggestion=f"Update {vuln['name']} to {v.get('fix_versions', ['latest'])[0] if v.get('fix_versions') else 'latest'}",
                 ))
 
-    except (asyncio.TimeoutError, FileNotFoundError, json.JSONDecodeError, Exception) as e:
+    except (json.JSONDecodeError, Exception) as e:
         logger.debug(f"[Security] pip-audit not available or failed: {e}")
 
     return findings
@@ -411,15 +442,19 @@ async def _check_npm_deps(project_dir: Path) -> list[SecurityFinding]:
         return findings
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "npm", "audit", "--json",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        res = await run_args(
+            ["npm", "audit", "--json"],
             cwd=project_dir,
+            timeout_s=60.0,
+            max_stdout_chars=200000,
+            max_stderr_chars=8000,
+            label="security.npm_audit",
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if res.exit_code == -1 or res.timed_out:
+            logger.debug(f"[Security] npm audit not available or timed out: {res.stderr}")
+            return findings
 
-        data = json.loads(stdout.decode(errors="replace"))
+        data = json.loads(res.stdout or "{}")
         for name, advisory in data.get("advisories", {}).items():
             sev_map = {"critical": "critical", "high": "high", "moderate": "medium", "low": "low"}
             findings.append(SecurityFinding(
@@ -431,7 +466,7 @@ async def _check_npm_deps(project_dir: Path) -> list[SecurityFinding]:
                 fix_suggestion=advisory.get("recommendation", "Update to latest version"),
             ))
 
-    except (asyncio.TimeoutError, FileNotFoundError, json.JSONDecodeError, Exception) as e:
+    except (json.JSONDecodeError, Exception) as e:
         logger.debug(f"[Security] npm audit not available or failed: {e}")
 
     return findings

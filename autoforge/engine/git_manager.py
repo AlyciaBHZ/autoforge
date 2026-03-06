@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import shutil
-import subprocess
 from pathlib import Path
+
+from autoforge.engine.runtime.commands import run_args
 
 logger = logging.getLogger(__name__)
 
@@ -37,30 +37,18 @@ async def get_git_version() -> str | None:
     if not is_git_available():
         return None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode == 0:
-            return stdout.decode(errors="replace").strip()
-    except (OSError, FileNotFoundError, PermissionError):
-        # Some sandboxed Windows environments disallow asyncio subprocess pipes.
-        pass
-
-    try:
-        completed = await asyncio.to_thread(
-            subprocess.run,
+        res = await run_args(
             ["git", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+            cwd=Path.cwd(),
+            timeout_s=5.0,
+            max_stdout_chars=2000,
+            max_stderr_chars=2000,
+            label="git.version",
         )
-        if completed.returncode == 0:
-            return (completed.stdout or "").strip()
+        if res.exit_code == 0:
+            return (res.stdout or "").strip()
     except Exception:
-        pass
+        return None
     return None
 
 
@@ -77,22 +65,25 @@ class GitManager:
 
     def __init__(self, project_dir: Path) -> None:
         self.project_dir = project_dir
-        self.worktrees_dir = project_dir.parent / "worktrees"
+        # Worktrees are project-local to avoid cross-project collisions when multiple
+        # projects share the same workspace directory.
+        self.worktrees_dir = project_dir / ".autoforge" / "worktrees"
 
     async def _run_git(self, *args: str, cwd: Path | None = None) -> str:
         """Run a git command and return stdout."""
-        cmd = ["git"] + list(args)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
+        cmd = ["git", *list(args)]
+        res = await run_args(
+            cmd,
             cwd=cwd or self.project_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            timeout_s=120.0,
+            max_stdout_chars=12000,
+            max_stderr_chars=8000,
+            label="git",
         )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            error_msg = stderr.decode(errors="replace").strip()
-            raise GitError(f"git {' '.join(args)}: {error_msg}")
-        return stdout.decode(errors="replace").strip()
+        if res.exit_code != 0:
+            msg = (res.stderr or res.stdout or "").strip()
+            raise GitError(f"git {' '.join(args)}: {msg}")
+        return (res.stdout or "").strip()
 
     async def init_repo(self) -> None:
         """Initialize a git repo in the project directory."""
@@ -109,7 +100,15 @@ class GitManager:
 
         # Create initial commit so worktrees can branch from it
         gitignore = self.project_dir / ".gitignore"
-        gitignore.write_text("node_modules/\n.env\n__pycache__/\n.next/\n")
+        gitignore.write_text(
+            "node_modules/\n"
+            ".env\n"
+            "__pycache__/\n"
+            ".next/\n"
+            ".autoforge/\n"
+            ".forge_state.json\n"
+            ".forge_task_transition_log.jsonl\n"
+        )
         await self._run_git("add", ".")
         await self._run_git("commit", "-m", "Initial project scaffold")
         logger.info(f"Git repo initialized at {self.project_dir}")

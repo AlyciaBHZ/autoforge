@@ -473,7 +473,7 @@ def test_git_manager_instantiation():
         project_dir = d / "test-project"
         gm = GitManager(project_dir)
         assert gm.main_worktree == project_dir
-        assert gm.worktrees_dir == d / "worktrees"
+        assert gm.worktrees_dir == project_dir / ".autoforge" / "worktrees"
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

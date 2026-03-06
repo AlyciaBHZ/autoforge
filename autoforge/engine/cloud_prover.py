@@ -37,6 +37,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from autoforge.engine.runtime.commands import run_args
+
 logger = logging.getLogger(__name__)
 
 
@@ -166,7 +168,7 @@ class DockerLocalBackend:
 
     def __init__(self, config: CloudProverConfig) -> None:
         self.config = config
-        self._processes: dict[str, subprocess.Popen[bytes]] = {}
+        self._tasks: dict[str, asyncio.Task] = {}
 
     async def is_available(self) -> bool:
         """Check if Docker is installed and the image exists."""
@@ -206,39 +208,44 @@ class DockerLocalBackend:
                 "lean", lean_name,
             ]
 
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.config.job_timeout_seconds,
+                task = asyncio.create_task(
+                    run_args(
+                        cmd,
+                        cwd=Path(lean_dir),
+                        timeout_s=float(self.config.job_timeout_seconds),
+                        max_stdout_chars=20000,
+                        max_stderr_chars=20000,
+                        label="cloud_prover.docker_local",
+                    )
                 )
-
+                self._tasks[job.job_id] = task
+                res = await task
                 job.completed_at = time.time()
                 job.duration_seconds = job.completed_at - job.submitted_at
-
-                stdout_text = stdout.decode("utf-8", errors="replace")
-                stderr_text = stderr.decode("utf-8", errors="replace")
-
-                if process.returncode == 0:
+                if res.timed_out:
+                    job.status = JobStatus.TIMEOUT
+                    job.errors.append(f"Timeout after {self.config.job_timeout_seconds}s")
+                    job.result = (res.stderr or res.stdout or "")[:2000]
+                elif res.exit_code == 0:
                     job.status = JobStatus.COMPLETED
                     job.compiled_ok = True
                     job.has_sorry = "sorry" in job.lean_code.lower()
-                    job.result = stdout_text or "Compilation successful"
+                    job.result = res.stdout or "Compilation successful"
                 else:
                     job.status = JobStatus.FAILED
-                    job.errors.append(stderr_text[:2000])
-                    job.result = stderr_text
-
-            except asyncio.TimeoutError:
-                process.kill()
-                job.status = JobStatus.TIMEOUT
-                job.errors.append(f"Timeout after {self.config.job_timeout_seconds}s")
-
+                    err = (res.stderr or res.stdout or "").strip()
+                    if err:
+                        job.errors.append(err[:2000])
+                    job.result = err
+            except asyncio.CancelledError:
+                job.completed_at = time.time()
+                job.duration_seconds = job.completed_at - job.submitted_at
+                job.status = JobStatus.CANCELLED
+                job.errors.append("Cancelled")
+                job.result = "Cancelled"
+            finally:
+                self._tasks.pop(job.job_id, None)
             # Clean up
             try:
                 os.unlink(lean_file)
@@ -258,10 +265,10 @@ class DockerLocalBackend:
 
     async def cancel(self, job: ProofJob) -> None:
         """Cancel a running Docker job."""
-        proc = self._processes.get(job.job_id)
-        if proc:
-            proc.kill()
-            job.status = JobStatus.CANCELLED
+        task = self._tasks.get(job.job_id)
+        if task and not task.done():
+            task.cancel()
+        job.status = JobStatus.CANCELLED
 
 
 # ══════════════════════════════════════════════════════════════
@@ -321,12 +328,16 @@ class SSHServerBackend:
                 scp_cmd.extend(["-i", self.config.ssh_key_path])
             scp_cmd.extend([local_file, f"{host}:{remote_file}"])
 
-            scp_proc = await asyncio.create_subprocess_exec(
-                *scp_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            scp_res = await run_args(
+                scp_cmd,
+                cwd=Path("."),
+                timeout_s=120.0,
+                max_stdout_chars=4000,
+                max_stderr_chars=4000,
+                label="cloud_prover.scp",
             )
-            await scp_proc.communicate()
+            if scp_res.exit_code != 0:
+                raise RuntimeError(f"scp failed: {scp_res.stderr or scp_res.stdout}")
 
             # Run lean on remote
             ssh_cmd = ["ssh", "-o", "StrictHostKeyChecking=accept-new"]
@@ -338,33 +349,30 @@ class SSHServerBackend:
                 f"{shlex.quote(self.config.ssh_lean_path)} {shlex.quote(remote_file)} && rm {shlex.quote(remote_file)}",
             ])
 
-            lean_proc = await asyncio.create_subprocess_exec(
-                *ssh_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            res = await run_args(
+                ssh_cmd,
+                cwd=Path("."),
+                timeout_s=float(self.config.job_timeout_seconds),
+                max_stdout_chars=20000,
+                max_stderr_chars=20000,
+                label="cloud_prover.ssh_lean",
             )
+            job.completed_at = time.time()
+            job.duration_seconds = job.completed_at - job.submitted_at
 
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    lean_proc.communicate(),
-                    timeout=self.config.job_timeout_seconds,
-                )
-
-                job.completed_at = time.time()
-                job.duration_seconds = job.completed_at - job.submitted_at
-
-                if lean_proc.returncode == 0:
-                    job.status = JobStatus.COMPLETED
-                    job.compiled_ok = True
-                    job.has_sorry = "sorry" in job.lean_code.lower()
-                    job.result = stdout.decode("utf-8", errors="replace")
-                else:
-                    job.status = JobStatus.FAILED
-                    job.errors.append(stderr.decode("utf-8", errors="replace")[:2000])
-
-            except asyncio.TimeoutError:
-                lean_proc.kill()
+            if res.timed_out:
                 job.status = JobStatus.TIMEOUT
+                job.errors.append(f"Timeout after {self.config.job_timeout_seconds}s")
+                job.result = (res.stderr or res.stdout or "")[:2000]
+            elif res.exit_code == 0:
+                job.status = JobStatus.COMPLETED
+                job.compiled_ok = True
+                job.has_sorry = "sorry" in job.lean_code.lower()
+                job.result = res.stdout
+            else:
+                job.status = JobStatus.FAILED
+                job.errors.append((res.stderr or res.stdout or "")[:2000])
+                job.result = res.stderr or res.stdout or ""
 
         except Exception as e:
             job.status = JobStatus.FAILED

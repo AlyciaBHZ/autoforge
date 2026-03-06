@@ -174,7 +174,7 @@ class ArchitectAgent(AgentBase):
             return extract_json_from_text(output, schema=self._OUTPUT_SCHEMA_ARCHITECTURE, strict=True)
         except (ValueError, json.JSONDecodeError) as e:
             # Lenient fallback so minor schema drift doesn't break BUILD phase.
-            payload = extract_json_from_text(output)
+            payload = extract_json_from_text(output, schema=self._OUTPUT_SCHEMA_ARCHITECTURE, strict=False)
             if not isinstance(payload, dict):
                 raise ValueError(f"Could not extract architecture from Architect output: {e}") from e
 
