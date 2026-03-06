@@ -1599,6 +1599,152 @@ def test_pyproject_has_new_dependencies():
     assert "html2text" in content
 
 
+def test_cli_parse_harness_openai_export():
+    """CLI exposes the harness openai-export subcommand."""
+    from autoforge.cli.app import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["harness", "openai-export", "dataset.jsonl"])
+    assert args.command == "harness"
+    assert args.harness_action == "openai-export"
+    assert args.path == "dataset.jsonl"
+
+
+def test_harness_openai_export_dataset_bundle():
+    """Dataset export produces OpenAI-friendly JSONL + schema + manifest."""
+    from autoforge.engine.harness.openai_export import export_dataset_to_openai_bundle
+
+    root = _mkdtemp()
+    try:
+        golden_patch = root / "golden.patch"
+        golden_patch.write_text("diff --git a/app.py b/app.py\n", encoding="utf-8")
+
+        dataset = root / "dataset.jsonl"
+        dataset.write_text(
+            json.dumps(
+                {
+                    "id": "todo_case",
+                    "mode": "generate",
+                    "description": "Build a todo CLI",
+                    "owner": "benchmarking",
+                    "judge": {
+                        "visible_test_command": "pytest -q",
+                        "hidden_test_command": "pytest tests_holdout -q",
+                        "golden_patch_path": "golden.patch",
+                    },
+                    "trace": {"enabled": True, "llm_content": False},
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bundle = export_dataset_to_openai_bundle(
+            dataset,
+            out_dir=root / "bundle",
+            include_golden_patch=True,
+            golden_similarity_threshold=0.9,
+        )
+        manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+        rows = [
+            json.loads(line)
+            for line in bundle.items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+        assert bundle.case_count == 1
+        assert manifest["source_type"] == "dataset"
+        assert rows[0]["item"]["case_id"] == "todo_case"
+        assert rows[0]["item"]["judge"]["has_golden_patch"] is True
+        assert rows[0]["item"]["raw_case"]["owner"] == "benchmarking"
+        assert rows[0]["sample"]["expected_outcome"]["require_visible_tests"] is True
+        assert rows[0]["sample"]["expected_outcome"]["golden_similarity_threshold"] == 0.9
+        assert "golden_patch" in rows[0]["sample"]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_harness_openai_export_run_bundle():
+    """Completed harness runs export metrics and artifact pointers."""
+    from autoforge.engine.harness.openai_export import export_run_to_openai_bundle
+
+    root = _mkdtemp()
+    try:
+        run_dir = root / "run"
+        project_dir = run_dir / "cases" / "todo_case" / "workspace"
+        trace_dir = project_dir / ".autoforge" / "traces"
+        case_dir = run_dir / "cases" / "todo_case"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        case_dir.mkdir(parents=True, exist_ok=True)
+        (trace_dir / "trace.jsonl").write_text('{"event":"trace_started"}\n', encoding="utf-8")
+        (case_dir / "case_result.json").write_text("{}", encoding="utf-8")
+        (case_dir / "dir_diff.json").write_text("{}", encoding="utf-8")
+        (case_dir / "golden_patch_score.json").write_text("{}", encoding="utf-8")
+
+        (run_dir / "dataset.jsonl").write_text(
+            json.dumps(
+                {
+                    "id": "todo_case",
+                    "mode": "generate",
+                    "description": "Build a todo CLI",
+                    "owner": "benchmarking",
+                    "judge": {
+                        "visible_test_command": "pytest -q",
+                        "hidden_test_command": "pytest tests_holdout -q",
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (run_dir / "report.json").write_text(
+            json.dumps(
+                {
+                    "summary": {"run_id": "harness-demo", "total_cases": 1},
+                    "cases": [
+                        {
+                            "case_id": "todo_case",
+                            "mode": "generate",
+                            "ok": True,
+                            "duration_seconds": 1.25,
+                            "cost_usd": 0.12,
+                            "input_tokens": 10,
+                            "output_tokens": 20,
+                            "project_dir": str(project_dir),
+                            "error": "",
+                            "error_type": "",
+                            "visible_tests_ok": True,
+                            "hidden_tests_ok": True,
+                            "golden_patch_similarity": 0.91,
+                            "diff_counts": {"added": 3, "removed": 0, "changed": 1},
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        bundle = export_run_to_openai_bundle(run_dir, out_dir=root / "bundle")
+        manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+        rows = [
+            json.loads(line)
+            for line in bundle.items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+        assert manifest["source_type"] == "harness_run"
+        assert manifest["report_summary"]["run_id"] == "harness-demo"
+        assert rows[0]["item"]["raw_case"]["owner"] == "benchmarking"
+        assert rows[0]["item"]["metrics"]["ok"] is True
+        assert rows[0]["item"]["artifacts"]["trace_path"].endswith("trace.jsonl")
+        assert rows[0]["sample"]["expected_outcome"]["require_hidden_tests"] is True
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 # ────────────────────────────────────────────
 # ────────────────────────────────────────────
 # Auth Module
@@ -2269,6 +2415,11 @@ def main():
         ("CLI", [
             ("Subcommand parsing", test_cli_parse_subcommands),
             ("Legacy CLI compatibility", test_cli_legacy_compat),
+        ]),
+        ("Harness / OpenAI Export", [
+            ("CLI harness openai-export parser", test_cli_parse_harness_openai_export),
+            ("Dataset bundle export", test_harness_openai_export_dataset_bundle),
+            ("Run bundle export", test_harness_openai_export_run_bundle),
         ]),
         ("Unit: ForgeConfig", [
             ("Default construction + new fields", test_forge_config),

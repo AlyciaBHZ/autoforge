@@ -16,6 +16,7 @@ from autoforge.engine.harness.environment import (
     docker_build_image,
     docker_image_exists,
 )
+from autoforge.engine.harness.openai_export import export_run_to_openai_bundle
 from autoforge.engine.harness.judge import (
     diff_directories,
     hide_paths,
@@ -361,4 +362,11 @@ async def run_dataset(
     report.finalize()
 
     write_json(out_dir / "report.json", report.to_dict())
+    try:
+        export_run_to_openai_bundle(out_dir, out_dir=out_dir / "openai_eval_bundle")
+    except Exception as exc:
+        write_json(
+            out_dir / "openai_eval_bundle_error.json",
+            {"error": str(exc)},
+        )
     return report

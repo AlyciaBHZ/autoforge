@@ -400,6 +400,24 @@ def build_parser() -> argparse.ArgumentParser:
     harness_prewarm.add_argument("dataset", help="Path to dataset.jsonl")
     harness_prewarm.add_argument("--out", default=None, help="Output directory (default: .autoforge/harness/)")
 
+    harness_openai = harness_subparsers.add_parser(
+        "openai-export",
+        help="Export a dataset or completed harness run into an OpenAI-friendly eval bundle",
+    )
+    harness_openai.add_argument("path", help="Path to dataset.jsonl or harness run directory")
+    harness_openai.add_argument("--out", default=None, help="Output directory for exported bundle")
+    harness_openai.add_argument(
+        "--include-golden-patch",
+        action="store_true",
+        help="Embed golden patch content inside sample payloads when available",
+    )
+    harness_openai.add_argument(
+        "--golden-threshold",
+        type=float,
+        default=0.8,
+        help="Default expected golden patch similarity threshold (default: 0.8)",
+    )
+
     # paper
     from datetime import datetime
 
@@ -2051,6 +2069,7 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
         return await _run_deploy(config, args)
 
     elif args.command == "harness":
+        from autoforge.engine.harness.openai_export import export_to_openai_bundle
         from autoforge.engine.harness.runner import (
             HarnessRunConfig,
             prewarm_dataset_images,
@@ -2058,6 +2077,30 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
         )
 
         action = getattr(args, "harness_action", "")
+        if action == "openai-export":
+            source_path = Path(getattr(args, "path", "")).resolve()
+            if not source_path.exists():
+                console.print(f"[red]Error:[/red] Path not found: {source_path}")
+                return 1
+            out = getattr(args, "out", None)
+            out_dir = Path(out).resolve() if out else None
+            try:
+                bundle = export_to_openai_bundle(
+                    source_path,
+                    out_dir=out_dir,
+                    include_golden_patch=bool(getattr(args, "include_golden_patch", False)),
+                    golden_similarity_threshold=float(getattr(args, "golden_threshold", 0.8) or 0.8),
+                )
+                console.print(f"[green]OpenAI eval bundle exported[/green] {bundle.bundle_dir}")
+                console.print(f"[dim]items:[/dim] {bundle.items_path}")
+                console.print(f"[dim]schema:[/dim] {bundle.schema_path}")
+                console.print(f"[dim]manifest:[/dim] {bundle.manifest_path}")
+                return 0
+            except Exception as e:
+                console.print(f"[red]OpenAI eval export failed:[/red] {e}")
+                logging.getLogger(__name__).debug("Harness OpenAI export failed", exc_info=True)
+                return 1
+
         dataset_path = Path(getattr(args, "dataset", "")).resolve()
         if not dataset_path.is_file():
             console.print(f"[red]Error:[/red] Dataset not found: {dataset_path}")
@@ -2093,7 +2136,15 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
                 trace_enabled=not bool(getattr(args, "no_trace", False)),
             )
             try:
-                _ = await run_dataset(config, dataset_path, cfg=hcfg)
+                report = await run_dataset(config, dataset_path, cfg=hcfg)
+                run_dir = (
+                    out_dir.resolve()
+                    if out_dir is not None
+                    else (config.project_root / ".autoforge" / "harness" / "runs" / report.run_id).resolve()
+                )
+                bundle_dir = run_dir / "openai_eval_bundle"
+                if bundle_dir.is_dir():
+                    console.print(f"[dim]openai bundle:[/dim] {bundle_dir}")
                 return 0
             except Exception as e:
                 console.print(f"[red]Harness run failed:[/red] {e}")

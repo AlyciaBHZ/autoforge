@@ -511,3 +511,24 @@ export FORGE_DAG_FEDERATION_TIMEOUT_SECONDS=15
 ## 许可证
 
 MIT
+
+---
+
+## Harness / OpenAI Eval Bundle
+
+AutoForge can now export local harness datasets and completed harness runs into an OpenAI-friendly eval bundle.
+
+```bash
+# Export a dataset into OpenAI-style JSONL records
+autoforgeai harness openai-export ./benchmarks/todo.jsonl
+
+# Local harness run still executes deterministically on your side,
+# and AutoForge will also emit: <run_dir>/openai_eval_bundle/
+autoforgeai harness run ./benchmarks/todo.jsonl
+
+# Re-export an existing harness run directory
+autoforgeai harness openai-export ./.autoforge/harness/runs/harness-abc123
+```
+
+Each bundle contains `items.jsonl`, `item_schema.json`, and `bundle_manifest.json`.
+This keeps build/test execution local while making prompts, traces, judge results, and artifact paths easier to hand off to OpenAI Evals / agent-eval workflows.
