@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 class ProjectStatus(str, Enum):
     QUEUED = "queued"
     BUILDING = "building"
+    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -31,6 +32,7 @@ class ProjectStatus(str, Enum):
 class RunStage(str, Enum):
     PLANNED = "planned"
     RUNNING = "running"
+    PAUSED = "paused"
     ARTIFACT_GENERATED = "artifact_generated"
     COMPILED = "compiled"
     TESTED = "tested"
@@ -133,6 +135,30 @@ class Project:
         }
 
 
+@dataclass
+class ProjectMessage:
+    """A per-project user message/instruction (async interference)."""
+
+    id: int
+    project_id: str
+    ts: float
+    kind: str
+    source: str
+    text: str
+    handled_at: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": int(self.id),
+            "project_id": self.project_id,
+            "ts": float(self.ts),
+            "kind": self.kind,
+            "source": self.source,
+            "text": self.text,
+            "handled_at": float(self.handled_at) if self.handled_at is not None else None,
+        }
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -149,6 +175,16 @@ CREATE TABLE IF NOT EXISTS projects (
     completed_at TEXT,
     error TEXT,
     idempotency_key TEXT
+);
+
+CREATE TABLE IF NOT EXISTS project_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'note',
+    source TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL,
+    handled_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS run_records (
@@ -257,6 +293,17 @@ class ProjectRegistry:
             idempotency_key=row["idempotency_key"] if "idempotency_key" in row.keys() else None,
         )
 
+    def _row_to_message(self, row: aiosqlite.Row) -> ProjectMessage:
+        return ProjectMessage(
+            id=int(row["id"]),
+            project_id=str(row["project_id"]),
+            ts=float(row["ts"]),
+            kind=str(row["kind"]),
+            source=str(row["source"]),
+            text=str(row["text"]),
+            handled_at=float(row["handled_at"]) if row["handled_at"] is not None else None,
+        )
+
     async def _migrate_schema(self) -> None:
         """Apply additive migrations for older SQLite files."""
         db = self._ensure_db()
@@ -279,10 +326,17 @@ class ProjectRegistry:
             "ON projects(requested_by, idempotency_key)"
         )
         await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_project_messages_project_id "
+            "ON project_messages(project_id, id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_project_messages_unhandled "
+            "ON project_messages(project_id, handled_at, id)"
+        )
+        await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_run_created ON execution_events(run_id, created_at)"
         )
-
-
+        
     async def enqueue_run(
         self,
         *,
@@ -424,6 +478,65 @@ class ProjectRegistry:
         await db.commit()
         return await self.get(project_id)
 
+    async def add_message(
+        self,
+        project_id: str,
+        *,
+        text: str,
+        kind: str = "note",
+        source: str = "",
+    ) -> ProjectMessage:
+        """Append a message to a project inbox."""
+        project_id = str(project_id).strip()
+        if not project_id:
+            raise ValueError("project_id required")
+        msg_text = str(text or "").strip()
+        if not msg_text:
+            raise ValueError("Message text cannot be empty")
+        if len(msg_text) > 10000:
+            raise ValueError("Message too long (max 10,000 characters)")
+        db = self._ensure_db()
+        ts = datetime.now(timezone.utc).timestamp()
+        cursor = await db.execute(
+            "INSERT INTO project_messages(project_id, ts, kind, source, text, handled_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL) RETURNING *;",
+            (project_id, float(ts), str(kind or "note"), str(source or ""), msg_text),
+        )
+        row = await cursor.fetchone()
+        await db.commit()
+        if row is None:
+            raise RuntimeError("Failed to insert message")
+        return self._row_to_message(row)
+
+    async def list_unhandled_messages(
+        self,
+        project_id: str,
+        *,
+        after_id: int = 0,
+        limit: int = 100,
+    ) -> list[ProjectMessage]:
+        """List unhandled messages for a project (newest first is not guaranteed)."""
+        db = self._ensure_db()
+        safe_limit = max(1, min(int(limit), 500))
+        cursor = await db.execute(
+            "SELECT * FROM project_messages "
+            "WHERE project_id = ? AND handled_at IS NULL AND id > ? "
+            "ORDER BY id ASC LIMIT ?;",
+            (str(project_id), int(after_id), int(safe_limit)),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_message(r) for r in rows]
+
+    async def mark_message_handled(self, message_id: int) -> None:
+        """Mark a message as handled."""
+        db = self._ensure_db()
+        ts = datetime.now(timezone.utc).timestamp()
+        await db.execute(
+            "UPDATE project_messages SET handled_at = ? WHERE id = ?;",
+            (float(ts), int(message_id)),
+        )
+        await db.commit()
+
     async def get(self, project_id: str) -> Project:
         """Get a project by ID."""
         db = self._ensure_db()
@@ -561,6 +674,16 @@ class ProjectRegistry:
         )
         await db.commit()
 
+    async def mark_paused(self, project_id: str, *, error: str = "", cost_usd: float = 0.0) -> None:
+        """Mark a project as paused (HIL checkpoint declined)."""
+        db = self._ensure_db()
+        now = datetime.now(timezone.utc).isoformat()
+        await db.execute(
+            "UPDATE projects SET status = ?, error = ?, cost_usd = ?, completed_at = ? WHERE id = ?",
+            (ProjectStatus.PAUSED.value, error, cost_usd, now, project_id),
+        )
+        await db.commit()
+
     async def cancel(self, project_id: str) -> bool:
         """Cancel a queued project. Returns False if not queued."""
         db = self._ensure_db()
@@ -581,6 +704,37 @@ class ProjectRegistry:
                 project_id,
                 requested_by,
                 ProjectStatus.QUEUED.value,
+            ),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+    async def unpause_for_requester(self, project_id: str, requested_by: str) -> bool:
+        """Re-queue a paused project owned by requester. Returns False if unavailable."""
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "UPDATE projects SET status = ?, error = NULL, completed_at = NULL "
+            "WHERE id = ? AND requested_by = ? AND status = ?",
+            (
+                ProjectStatus.QUEUED.value,
+                project_id,
+                requested_by,
+                ProjectStatus.PAUSED.value,
+            ),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+    async def unpause(self, project_id: str) -> bool:
+        """Re-queue a paused project (admin/local use)."""
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "UPDATE projects SET status = ?, error = NULL, completed_at = NULL "
+            "WHERE id = ? AND status = ?",
+            (
+                ProjectStatus.QUEUED.value,
+                project_id,
+                ProjectStatus.PAUSED.value,
             ),
         )
         await db.commit()

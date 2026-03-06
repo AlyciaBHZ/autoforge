@@ -450,15 +450,24 @@ autoforgeai daemon start                       # 启动守护进程
 autoforgeai daemon status                      # 查看状态
 autoforgeai daemon stop                        # 停止
 
-autoforgeai queue "支持 Markdown 的博客系统"    # 排队构建
+autoforgeai queue "支持 Markdown 的博客系统" --wait --tail  # 排队并跟随进度 + 输出任务日志
+autoforgeai watch <project_id> --tail          # 跟随单个项目直到结束 + 输出任务日志
+autoforgeai msg <project_id> "请优先把登录做完"  # 异步干预：追加用户提示（安全点生效）
 autoforgeai projects                           # 查看所有项目
 autoforgeai deploy <project_id>                # 显示部署指南
 ```
 
 支持 systemd (Linux) 和 launchd (macOS) 系统服务安装，详见 `services/` 目录。
 
-消息处理采用统一异步桥接事件模型（normal response / timeout / late response），
-即使超时后晚到消息也会被投递到上层，由业务策略决定如何处理。
+消息处理采用统一异步桥接事件模型（normal response / timeout / late response），即使超时后晚到消息也会被投递到上层，由业务策略决定如何处理。
+
+Telegram 渠道会定期推送进度汇总（`[progress] ...`）。当系统需要确认时会发送 `[checkpoint] ...` 提示，你可以用 `/reply <request_id> yes|no` 异步回复；也可以用 `/msg <project_id> <text>` 异步追加用户提示（安全点生效）。
+
+可选环境变量：
+- `FORGE_PROGRESS_NOTIFY_INTERVAL_SECONDS`：进度推送间隔（秒，默认 120，设为 0 禁用）
+- `FORGE_BRIDGE_TIMEOUT_SECONDS`：交互等待超时（秒，默认 60）
+
+如果在 checkpoint 选择 `no`，项目会进入 `paused` 状态；可用 `autoforgeai unpause <project_id>` 或 Telegram `/resume <project_id>` 继续由守护进程恢复执行。
 
 ---
 
@@ -502,3 +511,38 @@ export FORGE_DAG_FEDERATION_TIMEOUT_SECONDS=15
 ## 许可证
 
 MIT
+
+---
+
+## Harness / OpenAI Eval Bundle
+
+AutoForge can now export local harness datasets and completed harness runs into an OpenAI-friendly eval bundle.
+
+```bash
+# Export a dataset into OpenAI-style JSONL records
+autoforgeai harness openai-export ./benchmarks/todo.jsonl
+
+# Local harness run still executes deterministically on your side,
+# and AutoForge will also emit: <run_dir>/openai_eval_bundle/
+autoforgeai harness run ./benchmarks/todo.jsonl
+
+# Re-export an existing harness run directory
+autoforgeai harness openai-export ./.autoforge/harness/runs/harness-abc123
+```
+
+Each bundle contains `items.jsonl`, `item_schema.json`, and `bundle_manifest.json`.
+This keeps build/test execution local while making prompts, traces, judge results, and artifact paths easier to hand off to OpenAI Evals / agent-eval workflows.
+
+---
+
+## Claude Code Plugin
+
+AutoForge now ships a Claude Code plugin package plus a repository-hosted marketplace manifest.
+
+```text
+/plugin marketplace add AlyciaBHZ/autoforge
+/plugin install autoforge@autoforge
+```
+
+Plugin assets live under `plugins/autoforge`, with marketplace metadata in `.claude-plugin/marketplace.json`.
+This lets the same repository act as both the plugin source and a GitHub-hosted marketplace while you wait for official marketplace approval.

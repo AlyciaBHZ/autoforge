@@ -163,10 +163,46 @@ def test_cli_parse_subcommands():
     assert args.daemon_action == "start"
 
     # Test queue
-    args = parser.parse_args(["queue", "Build a blog", "--budget", "5", "--idempotency-key", "abc"])
+    args = parser.parse_args([
+        "queue",
+        "Build a blog",
+        "--budget",
+        "5",
+        "--idempotency-key",
+        "abc",
+        "--wait",
+        "--poll",
+        "2",
+        "--timeout",
+        "60",
+        "--tail",
+    ])
     assert args.command == "queue"
     assert args.description == "Build a blog"
     assert args.idempotency_key == "abc"
+    assert args.wait is True
+    assert args.poll == 2.0
+    assert args.timeout == 60.0
+    assert args.tail is True
+
+    # Test watch
+    args = parser.parse_args(["watch", "abc123", "--poll", "2", "--timeout", "60", "--tail"])
+    assert args.command == "watch"
+    assert args.project_id == "abc123"
+    assert args.poll == 2.0
+    assert args.timeout == 60.0
+    assert args.tail is True
+
+    # Test msg
+    args = parser.parse_args(["msg", "abc123", "please", "prioritize", "login"])
+    assert args.command == "msg"
+    assert args.project_id == "abc123"
+    assert args.text == ["please", "prioritize", "login"]
+
+    # Test unpause
+    args = parser.parse_args(["unpause", "abc123"])
+    assert args.command == "unpause"
+    assert args.project_id == "abc123"
 
     # Test projects
     args = parser.parse_args(["projects", "--limit", "10"])
@@ -996,6 +1032,15 @@ def test_project_registry_crud():
                 updated = await reg.get(p.id)
                 assert updated.phase == "build"
 
+                # Messages
+                msg = await reg.add_message(p.id, text="hello", kind="user_note", source="cli:test")
+                assert msg.project_id == p.id
+                unhandled = await reg.list_unhandled_messages(p.id)
+                assert len(unhandled) == 1
+                assert unhandled[0].text == "hello"
+                await reg.mark_message_handled(unhandled[0].id)
+                assert await reg.list_unhandled_messages(p.id) == []
+
                 # Mark completed
                 await reg.mark_completed(p.id, 2.50)
                 completed = await reg.get(p.id)
@@ -1010,6 +1055,16 @@ def test_project_registry_crud():
                 assert await reg.cancel(p3.id) is True
                 cancelled = await reg.get(p3.id)
                 assert cancelled.status == ProjectStatus.CANCELLED
+
+                # Pause state
+                p_pause = await reg.enqueue("Pause me", "cli")
+                await reg.mark_paused(p_pause.id, error="paused_after_build", cost_usd=1.23)
+                paused = await reg.get(p_pause.id)
+                assert paused.status == ProjectStatus.PAUSED
+                assert paused.cost_usd == 1.23
+                assert await reg.unpause_for_requester(p_pause.id, "cli") is True
+                unpaused = await reg.get(p_pause.id)
+                assert unpaused.status == ProjectStatus.QUEUED
 
                 # Cannot cancel non-queued
                 assert await reg.cancel(p.id) is False
@@ -1202,6 +1257,44 @@ def test_service_files_exist():
     """Test service config files exist."""
     assert (PROJECT_ROOT / "services" / "autoforge.service").exists()
     assert (PROJECT_ROOT / "services" / "com.autoforge.daemon.plist").exists()
+
+
+def test_claude_plugin_assets_exist():
+    """Claude plugin package, marketplace manifest, and repo settings should exist."""
+    plugin_manifest = PROJECT_ROOT / "plugins" / "autoforge" / ".claude-plugin" / "plugin.json"
+    marketplace_manifest = PROJECT_ROOT / ".claude-plugin" / "marketplace.json"
+    settings_path = PROJECT_ROOT / ".claude" / "settings.json"
+
+    assert plugin_manifest.exists()
+    assert marketplace_manifest.exists()
+    assert settings_path.exists()
+
+    plugin = json.loads(plugin_manifest.read_text(encoding="utf-8"))
+    marketplace = json.loads(marketplace_manifest.read_text(encoding="utf-8"))
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    assert plugin["name"] == "autoforge"
+    assert plugin["version"] == "2.7.25"
+    assert marketplace["name"] == "autoforge"
+    assert marketplace["plugins"][0]["source"] == "./plugins/autoforge"
+    assert "autoforge" in settings["extraKnownMarketplaces"]
+    assert settings["enabledPlugins"]["autoforge@autoforge"] is True
+
+
+def test_claude_plugin_skills_exist():
+    """Claude plugin should ship the key AutoForge skills."""
+    skills_root = PROJECT_ROOT / "plugins" / "autoforge" / "skills"
+    for skill_name in [
+        "autoforge-runtime-overview",
+        "academic-repro",
+        "software-forge",
+        "long-run-runtime",
+        "harness-evals-export",
+    ]:
+        skill_path = skills_root / skill_name / "SKILL.md"
+        assert skill_path.exists(), f"Missing skill: {skill_path}"
+        content = skill_path.read_text(encoding="utf-8")
+        assert "description:" in content
 
 
 # ────────────────────────────────────────────
@@ -1542,6 +1635,152 @@ def test_pyproject_has_new_dependencies():
     assert "httpx" in content
     assert "duckduckgo-search" in content
     assert "html2text" in content
+
+
+def test_cli_parse_harness_openai_export():
+    """CLI exposes the harness openai-export subcommand."""
+    from autoforge.cli.app import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["harness", "openai-export", "dataset.jsonl"])
+    assert args.command == "harness"
+    assert args.harness_action == "openai-export"
+    assert args.path == "dataset.jsonl"
+
+
+def test_harness_openai_export_dataset_bundle():
+    """Dataset export produces OpenAI-friendly JSONL + schema + manifest."""
+    from autoforge.engine.harness.openai_export import export_dataset_to_openai_bundle
+
+    root = _mkdtemp()
+    try:
+        golden_patch = root / "golden.patch"
+        golden_patch.write_text("diff --git a/app.py b/app.py\n", encoding="utf-8")
+
+        dataset = root / "dataset.jsonl"
+        dataset.write_text(
+            json.dumps(
+                {
+                    "id": "todo_case",
+                    "mode": "generate",
+                    "description": "Build a todo CLI",
+                    "owner": "benchmarking",
+                    "judge": {
+                        "visible_test_command": "pytest -q",
+                        "hidden_test_command": "pytest tests_holdout -q",
+                        "golden_patch_path": "golden.patch",
+                    },
+                    "trace": {"enabled": True, "llm_content": False},
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        bundle = export_dataset_to_openai_bundle(
+            dataset,
+            out_dir=root / "bundle",
+            include_golden_patch=True,
+            golden_similarity_threshold=0.9,
+        )
+        manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+        rows = [
+            json.loads(line)
+            for line in bundle.items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+        assert bundle.case_count == 1
+        assert manifest["source_type"] == "dataset"
+        assert rows[0]["item"]["case_id"] == "todo_case"
+        assert rows[0]["item"]["judge"]["has_golden_patch"] is True
+        assert rows[0]["item"]["raw_case"]["owner"] == "benchmarking"
+        assert rows[0]["sample"]["expected_outcome"]["require_visible_tests"] is True
+        assert rows[0]["sample"]["expected_outcome"]["golden_similarity_threshold"] == 0.9
+        assert "golden_patch" in rows[0]["sample"]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_harness_openai_export_run_bundle():
+    """Completed harness runs export metrics and artifact pointers."""
+    from autoforge.engine.harness.openai_export import export_run_to_openai_bundle
+
+    root = _mkdtemp()
+    try:
+        run_dir = root / "run"
+        project_dir = run_dir / "cases" / "todo_case" / "workspace"
+        trace_dir = project_dir / ".autoforge" / "traces"
+        case_dir = run_dir / "cases" / "todo_case"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        case_dir.mkdir(parents=True, exist_ok=True)
+        (trace_dir / "trace.jsonl").write_text('{"event":"trace_started"}\n', encoding="utf-8")
+        (case_dir / "case_result.json").write_text("{}", encoding="utf-8")
+        (case_dir / "dir_diff.json").write_text("{}", encoding="utf-8")
+        (case_dir / "golden_patch_score.json").write_text("{}", encoding="utf-8")
+
+        (run_dir / "dataset.jsonl").write_text(
+            json.dumps(
+                {
+                    "id": "todo_case",
+                    "mode": "generate",
+                    "description": "Build a todo CLI",
+                    "owner": "benchmarking",
+                    "judge": {
+                        "visible_test_command": "pytest -q",
+                        "hidden_test_command": "pytest tests_holdout -q",
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (run_dir / "report.json").write_text(
+            json.dumps(
+                {
+                    "summary": {"run_id": "harness-demo", "total_cases": 1},
+                    "cases": [
+                        {
+                            "case_id": "todo_case",
+                            "mode": "generate",
+                            "ok": True,
+                            "duration_seconds": 1.25,
+                            "cost_usd": 0.12,
+                            "input_tokens": 10,
+                            "output_tokens": 20,
+                            "project_dir": str(project_dir),
+                            "error": "",
+                            "error_type": "",
+                            "visible_tests_ok": True,
+                            "hidden_tests_ok": True,
+                            "golden_patch_similarity": 0.91,
+                            "diff_counts": {"added": 3, "removed": 0, "changed": 1},
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        bundle = export_run_to_openai_bundle(run_dir, out_dir=root / "bundle")
+        manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+        rows = [
+            json.loads(line)
+            for line in bundle.items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+        assert manifest["source_type"] == "harness_run"
+        assert manifest["report_summary"]["run_id"] == "harness-demo"
+        assert rows[0]["item"]["raw_case"]["owner"] == "benchmarking"
+        assert rows[0]["item"]["metrics"]["ok"] is True
+        assert rows[0]["item"]["artifacts"]["trace_path"].endswith("trace.jsonl")
+        assert rows[0]["sample"]["expected_outcome"]["require_hidden_tests"] is True
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 # ────────────────────────────────────────────
@@ -2215,6 +2454,11 @@ def main():
             ("Subcommand parsing", test_cli_parse_subcommands),
             ("Legacy CLI compatibility", test_cli_legacy_compat),
         ]),
+        ("Harness / OpenAI Export", [
+            ("CLI harness openai-export parser", test_cli_parse_harness_openai_export),
+            ("Dataset bundle export", test_harness_openai_export_dataset_bundle),
+            ("Run bundle export", test_harness_openai_export_run_bundle),
+        ]),
         ("Unit: ForgeConfig", [
             ("Default construction + new fields", test_forge_config),
             ("from_env with overrides", test_forge_config_from_env),
@@ -2298,6 +2542,10 @@ def main():
         ]),
         ("Service Files", [
             ("systemd + launchd configs exist", test_service_files_exist),
+        ]),
+        ("Claude Plugin", [
+            ("Plugin assets exist", test_claude_plugin_assets_exist),
+            ("Plugin skills exist", test_claude_plugin_skills_exist),
         ]),
         ("Constitution", [
             ("All constitution files exist + non-empty", test_constitution_files_exist),

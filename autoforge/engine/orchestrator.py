@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -43,6 +44,7 @@ from autoforge.engine.runtime.dependencies import (
 )
 from autoforge.engine.runtime.journal import RunJournal
 from autoforge.engine.runtime.runtime import ForgeRuntime
+from autoforge.engine.hil import CheckpointRequest, CheckpointResponder
 
 # Agents — loaded via registry (no direct class imports needed at module level)
 from autoforge.engine.agents import AGENT_REGISTRY
@@ -111,7 +113,12 @@ class Orchestrator:
         ("_pantograph_repl", "pantograph_repl_enabled", "autoforge.engine.provers.pantograph_repl", "PantographREPL"),
     ]
 
-    def __init__(self, config: ForgeConfig) -> None:
+    def __init__(
+        self,
+        config: ForgeConfig,
+        *,
+        checkpoint_responder: CheckpointResponder | None = None,
+    ) -> None:
         self.config = config
         self.llm = LLMRouter(config)
         self.runtime: ForgeRuntime | None = None
@@ -142,6 +149,7 @@ class Orchestrator:
         self._state_lock = threading.RLock()
         self._task_transition_log: list[dict[str, Any]] = []
         self._resumed_task_progress: list[dict[str, Any]] | None = None
+        self._checkpoint_responder = checkpoint_responder
 
         # ── Lazy-initialized advanced engines ──
         # Pre-initialize ALL engine attributes to None so they always exist,
@@ -606,12 +614,31 @@ class Orchestrator:
         if self.project_dir:
             console.print(f"  Output: {self.project_dir}")
 
-        # Bridge sync Rich prompt into async context
-        from rich.prompt import Confirm
+        proceed = True
+        if self._checkpoint_responder is not None:
+            try:
+                proceed = await self._checkpoint_responder.confirm_checkpoint(
+                    CheckpointRequest(
+                        run_id=str(getattr(self.config, "run_id", "")),
+                        phase=str(phase),
+                        summary=str(summary),
+                        project_dir=self.project_dir,
+                    )
+                )
+            except Exception as exc:
+                logger.warning("Checkpoint responder failed: %s", exc)
+                proceed = True
+        else:
+            # Non-interactive environments (daemon, CI) must not block.
+            if not (getattr(sys, "stdin", None) and sys.stdin.isatty()):
+                proceed = True
+            else:
+                # Bridge sync Rich prompt into async context
+                from rich.prompt import Confirm
 
-        proceed = await asyncio.to_thread(
-            Confirm.ask, "  Continue to next phase?", default=True
-        )
+                proceed = await asyncio.to_thread(
+                    Confirm.ask, "  Continue to next phase?", default=True
+                )
         if not proceed:
             self._save_state(f"paused_after_{phase}")
             raise UserPausedError(

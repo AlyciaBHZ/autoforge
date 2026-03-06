@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "autoforge": {
+      "source": {
+        "source": "github",
+        "repo": "AlyciaBHZ/autoforge"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "autoforge@autoforge": true
+  }
+}

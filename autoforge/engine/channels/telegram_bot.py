@@ -17,12 +17,14 @@ NotifierRegistrar = Callable[
     [str, Callable[[str, str], Coroutine[Any, Any, None]]],
     None,
 ]
+BridgeReceiver = Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]]
 
 
 async def start_telegram_bot(
     config: ForgeConfig,
     registry: ProjectRegistry,
     register_notifier: NotifierRegistrar | None = None,
+    bridge_receive: BridgeReceiver | None = None,
 ) -> None:
     """Start Telegram bot in long-polling mode."""
     try:
@@ -103,7 +105,10 @@ async def start_telegram_bot(
             "/queue - Show your queued/building requests\n"
             "/budget - Show your total spending\n"
             "/cancel <id> - Cancel one queued project\n"
+            "/resume <id> - Resume a paused project\n"
             "/deploy <id> - Get deploy guide\n"
+            "/msg <id> <text> - Send an async note to a running project\n"
+            "/reply <request_id> <yes|no|text> - Reply to a system prompt\n"
             "/help - Show this message",
         )
 
@@ -184,6 +189,7 @@ async def start_telegram_bot(
             status_emoji = {
                 ProjectStatus.QUEUED: "⏳",
                 ProjectStatus.BUILDING: "🔨",
+                ProjectStatus.PAUSED: "⏸️",
                 ProjectStatus.COMPLETED: "✅",
                 ProjectStatus.FAILED: "❌",
                 ProjectStatus.CANCELLED: "🚫",
@@ -263,6 +269,28 @@ async def start_telegram_bot(
                 f"Cannot cancel {project_id}. It may not be queued or not owned by you.",
             )
 
+    async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_authorized(update):
+            await _send_reply(update, "Unauthorized.")
+            return
+
+        _remember_chat(update)
+        message_text = update.message.text if update.message else ""
+        project_id = message_text.replace("/resume", "", 1).strip()
+        if not project_id:
+            await _send_reply(update, "Usage: /resume <project_id>")
+            return
+
+        requester = _requester_from_update(update)
+        ok = await registry.unpause_for_requester(project_id, requester)
+        if ok:
+            await _send_reply(update, f"Project {project_id} re-queued for resume.")
+        else:
+            await _send_reply(
+                update,
+                f"Cannot resume {project_id}. It may not be paused or not owned by you.",
+            )
+
     async def cmd_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _is_authorized(update):
             await _send_reply(update, "Unauthorized.")
@@ -311,6 +339,81 @@ async def start_telegram_bot(
             return
         await _send_long(update.effective_chat.id, guide)
 
+    async def cmd_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_authorized(update):
+            await _send_reply(update, "Unauthorized.")
+            return
+
+        _remember_chat(update)
+        args = list(getattr(context, "args", []) or [])
+        if len(args) < 2:
+            await _send_reply(update, "Usage: /msg <project_id> <text>")
+            return
+        project_id = args[0].strip()
+        text = " ".join(args[1:]).strip()
+        if not project_id or not text:
+            await _send_reply(update, "Usage: /msg <project_id> <text>")
+            return
+
+        requester = _requester_from_update(update)
+        try:
+            project = await registry.get_for_requester(project_id, requester)
+        except KeyError:
+            await _send_reply(update, "Project not found.")
+            return
+
+        if project.status not in {ProjectStatus.QUEUED, ProjectStatus.BUILDING, ProjectStatus.PAUSED}:
+            await _send_reply(
+                update,
+                f"Project is {project.status.value}; cannot accept messages for this state.",
+            )
+            return
+
+        try:
+            await registry.add_message(
+                project_id,
+                text=text,
+                kind="user_note",
+                source=requester,
+            )
+        except Exception as exc:
+            await _send_reply(update, f"Failed to enqueue message: {exc}")
+            return
+        await _send_reply(update, "Message queued. It will be applied at the next safe point.")
+
+    async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_authorized(update):
+            await _send_reply(update, "Unauthorized.")
+            return
+        if bridge_receive is None:
+            await _send_reply(update, "Bridge is not enabled on this daemon.")
+            return
+
+        _remember_chat(update)
+        args = list(getattr(context, "args", []) or [])
+        if len(args) < 2:
+            await _send_reply(update, "Usage: /reply <request_id> <yes|no|text>")
+            return
+        request_id = args[0].strip()
+        raw = " ".join(args[1:]).strip()
+        lowered = raw.lower()
+
+        proceed = True
+        if lowered in {"no", "n", "0", "false", "stop", "pause", "cancel"}:
+            proceed = False
+        elif lowered in {"yes", "y", "1", "true", "ok", "continue"}:
+            proceed = True
+
+        user = update.effective_user
+        payload = {
+            "proceed": proceed,
+            "raw": raw,
+            "user_id": str(user.id) if user is not None else "unknown",
+            "username": str(user.username or "") if user is not None else "",
+        }
+        await bridge_receive(request_id, payload)
+        await _send_reply(update, f"Reply delivered for {request_id}.")
+
     app = Application.builder().token(config.telegram_token).build()
 
     if register_notifier is not None:
@@ -323,7 +426,10 @@ async def start_telegram_bot(
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("budget", cmd_budget))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("deploy", cmd_deploy))
+    app.add_handler(CommandHandler("msg", cmd_msg))
+    app.add_handler(CommandHandler("reply", cmd_reply))
 
     logger.info("Telegram bot starting...")
     await app.initialize()

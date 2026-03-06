@@ -27,6 +27,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +92,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level",
+    )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Enable trace export (FORGE_TRACE). Writes JSONL under .autoforge/traces/",
+    )
+    parser.add_argument(
+        "--trace-llm",
+        dest="trace_llm",
+        action="store_true",
+        help="Include LLM content in trace (FORGE_TRACE_LLM). May capture sensitive data.",
+    )
+    parser.add_argument(
+        "--trace-cmd",
+        dest="trace_cmd",
+        action="store_true",
+        help="Include command output in trace (FORGE_TRACE_CMD).",
+    )
+    parser.add_argument(
+        "--trace-fs",
+        dest="trace_fs",
+        action="store_true",
+        help="Include filesystem snapshots in trace (FORGE_TRACE_FS).",
     )
     parser.add_argument(
         "--confirm",
@@ -241,6 +265,97 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional idempotency key to de-duplicate retries",
     )
+    queue_parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait and stream status updates until the project completes/fails",
+    )
+    queue_parser.add_argument(
+        "--poll",
+        type=float,
+        default=3.0,
+        help="Polling interval in seconds when using --wait (default: 3.0)",
+    )
+    queue_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=0.0,
+        help="Timeout in seconds for --wait (0=never, default: 0)",
+    )
+    queue_parser.add_argument(
+        "--tail",
+        action="store_true",
+        help="When using --wait, also tail task transition log once workspace is available",
+    )
+
+    # watch
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="Watch a queued/building project until completion",
+    )
+    watch_parser.add_argument("project_id", help="Project id")
+    watch_parser.add_argument(
+        "--poll",
+        type=float,
+        default=3.0,
+        help="Polling interval in seconds (default: 3.0)",
+    )
+    watch_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=0.0,
+        help="Timeout in seconds (0=never, default: 0)",
+    )
+    watch_parser.add_argument(
+        "--requester",
+        default=None,
+        help="Requester id for authorization checks (default: current user)",
+    )
+    watch_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Bypass requester filter and read any project id",
+    )
+    watch_parser.add_argument(
+        "--tail",
+        action="store_true",
+        help="Also tail task transition log once workspace is available",
+    )
+
+    # msg
+    msg_parser = subparsers.add_parser(
+        "msg",
+        help="Send an async message/note to a queued/building project",
+    )
+    msg_parser.add_argument("project_id", help="Project id")
+    msg_parser.add_argument("text", nargs="+", help="Message text")
+    msg_parser.add_argument(
+        "--requester",
+        default=None,
+        help="Requester id for authorization checks (default: current user)",
+    )
+    msg_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Bypass requester filter and read any project id",
+    )
+
+    # unpause
+    unpause_parser = subparsers.add_parser(
+        "unpause",
+        help="Re-queue a paused project so the daemon can resume it",
+    )
+    unpause_parser.add_argument("project_id", help="Project id")
+    unpause_parser.add_argument(
+        "--requester",
+        default=None,
+        help="Requester id for authorization checks (default: current user)",
+    )
+    unpause_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Bypass requester filter and unpause any project id",
+    )
 
     # projects
     projects_parser = subparsers.add_parser("projects", help="List projects from registry")
@@ -284,6 +399,24 @@ def build_parser() -> argparse.ArgumentParser:
     harness_prewarm = harness_subparsers.add_parser("prewarm", help="Build/prewarm docker images referenced by dataset")
     harness_prewarm.add_argument("dataset", help="Path to dataset.jsonl")
     harness_prewarm.add_argument("--out", default=None, help="Output directory (default: .autoforge/harness/)")
+
+    harness_openai = harness_subparsers.add_parser(
+        "openai-export",
+        help="Export a dataset or completed harness run into an OpenAI-friendly eval bundle",
+    )
+    harness_openai.add_argument("path", help="Path to dataset.jsonl or harness run directory")
+    harness_openai.add_argument("--out", default=None, help="Output directory for exported bundle")
+    harness_openai.add_argument(
+        "--include-golden-patch",
+        action="store_true",
+        help="Embed golden patch content inside sample payloads when available",
+    )
+    harness_openai.add_argument(
+        "--golden-threshold",
+        type=float,
+        default=0.8,
+        help="Default expected golden patch similarity threshold (default: 0.8)",
+    )
 
     # paper
     from datetime import datetime
@@ -421,6 +554,9 @@ _KNOWN_COMMANDS = {
     "resume",
     "daemon",
     "queue",
+    "watch",
+    "msg",
+    "unpause",
     "projects",
     "deploy",
     "paper",
@@ -444,6 +580,17 @@ def _build_config_overrides(args: argparse.Namespace) -> dict:
         overrides["verbose"] = True
     if args.log_level:
         overrides["log_level"] = args.log_level
+    if getattr(args, "trace", False):
+        overrides["trace_enabled"] = True
+    if getattr(args, "trace_llm", False):
+        overrides["trace_enabled"] = True
+        overrides["trace_capture_llm_content"] = True
+    if getattr(args, "trace_cmd", False):
+        overrides["trace_enabled"] = True
+        overrides["trace_capture_command_output"] = True
+    if getattr(args, "trace_fs", False):
+        overrides["trace_enabled"] = True
+        overrides["trace_capture_fs_snapshots"] = True
     if getattr(args, "confirm", None) is not None:
         overrides["confirm_phases"] = [p.strip() for p in args.confirm.split(",")]
     if getattr(args, "tdd", None) is not None:
@@ -529,6 +676,11 @@ async def _run_generate(config, description: str) -> int:
         model_strong=config.model_strong,
         model_fast=config.model_fast,
         mobile_target=config.mobile_target,
+        run_id=str(getattr(config, "run_id", "")),
+        trace_enabled=bool(getattr(config, "trace_enabled", False)),
+        trace_llm=bool(getattr(config, "trace_capture_llm_content", False)),
+        trace_cmd=bool(getattr(config, "trace_capture_command_output", False)),
+        trace_fs=bool(getattr(config, "trace_capture_fs_snapshots", False)),
     )
 
     orchestrator = Orchestrator(config)
@@ -565,6 +717,11 @@ async def _run_review(config, project_path: str) -> int:
         agents=config.max_agents,
         model_strong=config.model_strong,
         model_fast=config.model_fast,
+        run_id=str(getattr(config, "run_id", "")),
+        trace_enabled=bool(getattr(config, "trace_enabled", False)),
+        trace_llm=bool(getattr(config, "trace_capture_llm_content", False)),
+        trace_cmd=bool(getattr(config, "trace_capture_command_output", False)),
+        trace_fs=bool(getattr(config, "trace_capture_fs_snapshots", False)),
     )
 
     orchestrator = Orchestrator(config)
@@ -602,6 +759,11 @@ async def _run_import(config, project_path: str, enhance: str = "") -> int:
         model_strong=config.model_strong,
         model_fast=config.model_fast,
         mobile_target=config.mobile_target,
+        run_id=str(getattr(config, "run_id", "")),
+        trace_enabled=bool(getattr(config, "trace_enabled", False)),
+        trace_llm=bool(getattr(config, "trace_capture_llm_content", False)),
+        trace_cmd=bool(getattr(config, "trace_capture_command_output", False)),
+        trace_fs=bool(getattr(config, "trace_capture_fs_snapshots", False)),
     )
 
     orchestrator = Orchestrator(config)
@@ -861,6 +1023,265 @@ async def _run_daemon_install(config) -> int:
     return 0
 
 
+def _clamp_float(value: float, *, minimum: float, maximum: float) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return minimum
+    return max(minimum, min(v, maximum))
+
+
+async def _tail_task_transitions(
+    *,
+    project_dir: Path,
+    stop_event: asyncio.Event,
+    poll_seconds: float = 0.5,
+    replay_last: int = 50,
+) -> None:
+    """Tail ``.forge_task_transition_log.jsonl`` and print task transitions.
+
+    Designed for codex-like visibility when using daemon mode.
+    """
+    from rich.text import Text
+
+    from autoforge.engine.task_dag import TaskDAG
+
+    poll = _clamp_float(poll_seconds, minimum=0.1, maximum=5.0)
+    replay_last = max(0, min(int(replay_last), 500))
+
+    log_path = project_dir / ".forge_task_transition_log.jsonl"
+    plan_path = project_dir / "dev_plan.json"
+    plan_mtime: float | None = None
+    task_map: dict[str, tuple[str, list[str]]] = {}
+
+    def _maybe_reload_plan() -> None:
+        nonlocal plan_mtime, task_map
+        try:
+            if not plan_path.exists():
+                return
+            mtime = float(plan_path.stat().st_mtime)
+            if plan_mtime is not None and mtime == plan_mtime:
+                return
+            dag = TaskDAG.load(plan_path)
+            task_map = {
+                t.id: (str(t.description or ""), list(t.files or []))
+                for t in dag.get_all_tasks()
+            }
+            plan_mtime = mtime
+        except Exception:
+            return
+
+    while not stop_event.is_set() and not log_path.exists():
+        await asyncio.sleep(poll)
+    if stop_event.is_set():
+        return
+
+    console.print(Text(f"[tail] {log_path}", style="dim"))
+
+    try:
+        _maybe_reload_plan()
+    except Exception:
+        pass
+
+    def _print_entry(entry: dict[str, Any]) -> None:
+        try:
+            ts = float(entry.get("ts", 0.0) or 0.0)
+        except Exception:
+            ts = 0.0
+        stamp = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else time.strftime("%H:%M:%S")
+        task_id = str(entry.get("task_id", "") or "")
+        to_status = str(entry.get("to_status", "") or "")
+        reason = str(entry.get("reason", "") or "")
+        agent_id = str(entry.get("agent_id", "") or "")
+
+        status_style = {
+            "in_progress": "yellow",
+            "done": "green",
+            "failed": "red",
+            "blocked": "red",
+            "todo": "dim",
+        }.get(to_status, "cyan")
+
+        desc, files = task_map.get(task_id, ("", []))
+        desc = (desc or "").strip()
+        if len(desc) > 90:
+            desc = desc[:90] + "..."
+
+        files_part = ""
+        if files:
+            preview = ", ".join(str(f) for f in files[:3] if str(f))
+            suffix = "…" if len(files) > 3 else ""
+            files_part = f"[{preview}{suffix}]"
+
+        reason_part = ""
+        if reason:
+            reason_short = reason.replace("\n", " ").strip()
+            if len(reason_short) > 120:
+                reason_short = reason_short[:120] + "..."
+            reason_part = f" ({reason_short})"
+
+        line = Text()
+        line.append(stamp, style="dim")
+        line.append(" ")
+        line.append(to_status or "transition", style=status_style)
+        if task_id:
+            line.append(" ")
+            line.append(task_id, style="bold")
+        if agent_id:
+            line.append(f" @{agent_id}", style="dim")
+        if desc:
+            line.append(" - ")
+            line.append(desc)
+        if files_part:
+            line.append(" ")
+            line.append(files_part, style="dim")
+        if reason_part:
+            line.append(reason_part, style="dim")
+        console.print(line)
+
+    try:
+        if replay_last > 0:
+            try:
+                existing = log_path.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                existing = []
+            for raw in existing[-replay_last:]:
+                s = (raw or "").strip()
+                if not s:
+                    continue
+                try:
+                    payload = json.loads(s)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    _maybe_reload_plan()
+                    _print_entry(payload)
+    except Exception:
+        pass
+
+    with log_path.open("r", encoding="utf-8") as f:
+        f.seek(0, os.SEEK_END)
+        while not stop_event.is_set():
+            line = f.readline()
+            if not line:
+                await asyncio.sleep(poll)
+                continue
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                payload = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            _maybe_reload_plan()
+            _print_entry(payload)
+
+
+async def _watch_project(
+    *,
+    config,
+    project_id: str,
+    requested_by: str,
+    poll_seconds: float = 3.0,
+    timeout_seconds: float = 0.0,
+    allow_all: bool = False,
+    tail: bool = False,
+) -> int:
+    """Poll the daemon registry and print project status changes."""
+    from autoforge.engine.project_registry import ProjectRegistry, ProjectStatus
+    from rich.text import Text
+
+    poll_seconds = _clamp_float(poll_seconds, minimum=0.5, maximum=60.0)
+    timeout_seconds = _clamp_float(timeout_seconds, minimum=0.0, maximum=7 * 24 * 3600.0)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
+
+    console.print(f"[dim]Watching project[/dim] [bold]{project_id}[/bold] [dim](Ctrl+C to stop)[/dim]")
+    console.print("[dim]Tip:[/dim] if it stays queued, run: [bold]autoforgeai daemon start[/bold]")
+
+    last: tuple[str, str, float, str, str] | None = None
+    stop_event = asyncio.Event()
+    tail_task: asyncio.Task[None] | None = None
+    async with ProjectRegistry(config.db_path) as registry:
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                console.print("[yellow]Watch timed out.[/yellow]")
+                stop_event.set()
+                if tail_task is not None:
+                    tail_task.cancel()
+                    await asyncio.gather(tail_task, return_exceptions=True)
+                return 2
+
+            try:
+                project = await (registry.get(project_id) if allow_all else registry.get_for_requester(project_id, requested_by))
+            except KeyError:
+                console.print("[red]Project not found.[/red]")
+                stop_event.set()
+                if tail_task is not None:
+                    tail_task.cancel()
+                    await asyncio.gather(tail_task, return_exceptions=True)
+                return 1
+
+            status = project.status.value
+            phase = project.phase or ""
+            cost = float(project.cost_usd or 0.0)
+            workspace = project.workspace_path or ""
+            error = project.error or ""
+
+            cur = (status, phase, cost, workspace, error)
+            if cur != last:
+                stamp = time.strftime("%H:%M:%S")
+                phase_part = f" ({phase})" if phase else ""
+                status_style = {
+                    ProjectStatus.QUEUED: "yellow",
+                    ProjectStatus.BUILDING: "cyan",
+                    ProjectStatus.COMPLETED: "green",
+                    ProjectStatus.FAILED: "red",
+                    ProjectStatus.CANCELLED: "red",
+                    ProjectStatus.PAUSED: "yellow",
+                }.get(project.status, "")
+
+                line = Text()
+                line.append(stamp, style="dim")
+                line.append(" ")
+                line.append(status, style=status_style)
+                if phase_part:
+                    line.append(phase_part, style="dim")
+                line.append(f" cost=${cost:.4f}", style="magenta")
+                console.print(line)
+
+                if error and project.status in {ProjectStatus.FAILED, ProjectStatus.CANCELLED, ProjectStatus.PAUSED}:
+                    err_style = "red" if project.status != ProjectStatus.PAUSED else "yellow"
+                    console.print(Text("  ") + Text(error[:200], style=err_style))
+                if workspace:
+                    console.print(Text("  workspace: ", style="dim") + Text(workspace))
+                last = cur
+
+            if tail and workspace and tail_task is None:
+                try:
+                    project_dir = Path(workspace)
+                except Exception:
+                    project_dir = None
+                if project_dir is not None and project_dir.exists():
+                    tail_task = asyncio.create_task(
+                        _tail_task_transitions(project_dir=project_dir, stop_event=stop_event),
+                    )
+
+            if project.status in {ProjectStatus.COMPLETED, ProjectStatus.FAILED, ProjectStatus.CANCELLED, ProjectStatus.PAUSED}:
+                stop_event.set()
+                if tail_task is not None:
+                    tail_task.cancel()
+                    await asyncio.gather(tail_task, return_exceptions=True)
+                if project.status == ProjectStatus.COMPLETED:
+                    return 0
+                if project.status == ProjectStatus.PAUSED:
+                    return 2
+                return 1
+
+            await asyncio.sleep(poll_seconds)
+
+
 async def _run_queue(config, args: argparse.Namespace) -> int:
     """Queue a project request in the daemon registry."""
     from autoforge.engine.project_registry import ProjectRegistry
@@ -892,7 +1313,110 @@ async def _run_queue(config, args: argparse.Namespace) -> int:
         f"Queued project [bold]{result.project.id}[/bold] "
         f"(budget=${result.project.budget_usd:.2f}, queue_position={result.queue_size})"
     )
+    if bool(getattr(args, "wait", False)):
+        try:
+            return await _watch_project(
+                config=config,
+                project_id=result.project.id,
+                requested_by=requested_by,
+                poll_seconds=float(getattr(args, "poll", 3.0)),
+                timeout_seconds=float(getattr(args, "timeout", 0.0)),
+                allow_all=False,
+                tail=bool(getattr(args, "tail", False)),
+            )
+        except KeyboardInterrupt:
+            console.print("\n[dim]Stopped watching.[/dim]")
+            return 0
     return 0
+
+
+async def _run_watch(config, args: argparse.Namespace) -> int:
+    requested_by = _normalize_cli_requester(getattr(args, "requester", None))
+    allow_all = bool(getattr(args, "all", False))
+    try:
+        return await _watch_project(
+            config=config,
+            project_id=str(getattr(args, "project_id", "")).strip(),
+            requested_by=requested_by,
+            poll_seconds=float(getattr(args, "poll", 3.0)),
+            timeout_seconds=float(getattr(args, "timeout", 0.0)),
+            allow_all=allow_all,
+            tail=bool(getattr(args, "tail", False)),
+        )
+    except KeyboardInterrupt:
+        console.print("\n[dim]Stopped watching.[/dim]")
+        return 0
+
+
+async def _run_msg(config, args: argparse.Namespace) -> int:
+    """Send an async message to a queued/building project."""
+    from autoforge.engine.project_registry import ProjectRegistry, ProjectStatus
+
+    project_id = str(getattr(args, "project_id", "")).strip()
+    raw_text = getattr(args, "text", [])
+    text = " ".join(str(t) for t in (raw_text or [])).strip()
+    if not project_id:
+        console.print("[red]Project id is required.[/red]")
+        return 1
+    if not text:
+        console.print("[red]Message text is required.[/red]")
+        console.print("Usage: autoforgeai msg <project_id> <text>")
+        return 1
+
+    requested_by = _normalize_cli_requester(getattr(args, "requester", None))
+    allow_all = bool(getattr(args, "all", False))
+    async with ProjectRegistry(config.db_path) as registry:
+        try:
+            project = await (registry.get(project_id) if allow_all else registry.get_for_requester(project_id, requested_by))
+        except KeyError:
+            console.print("[red]Project not found.[/red]")
+            return 1
+
+        if project.status not in {ProjectStatus.QUEUED, ProjectStatus.BUILDING, ProjectStatus.PAUSED}:
+            console.print(
+                f"[red]Project is {project.status.value}; cannot accept messages for this state.[/red]",
+                markup=False,
+            )
+            return 1
+
+        try:
+            await registry.add_message(
+                project_id,
+                text=text,
+                kind="user_note",
+                source=requested_by,
+            )
+        except Exception as exc:
+            console.print(f"[red]Failed to enqueue message:[/red] {exc}")
+            return 1
+
+    console.print("[green]Message queued.[/green] It will be applied at the next safe point.")
+    return 0
+
+
+async def _run_unpause(config, args: argparse.Namespace) -> int:
+    """Re-queue a paused project for daemon resume."""
+    from autoforge.engine.project_registry import ProjectRegistry
+
+    project_id = str(getattr(args, "project_id", "")).strip()
+    if not project_id:
+        console.print("[red]Project id is required.[/red]")
+        return 1
+
+    requested_by = _normalize_cli_requester(getattr(args, "requester", None))
+    allow_all = bool(getattr(args, "all", False))
+    async with ProjectRegistry(config.db_path) as registry:
+        try:
+            ok = await (registry.unpause(project_id) if allow_all else registry.unpause_for_requester(project_id, requested_by))
+        except Exception as exc:
+            console.print(f"[red]Failed to unpause:[/red] {exc}")
+            return 1
+
+    if ok:
+        console.print(f"[green]Project {project_id} re-queued.[/green]")
+        return 0
+    console.print("[yellow]Nothing to unpause.[/yellow] (not paused or not owned by you)")
+    return 1
 
 
 async def _run_projects(config, args: argparse.Namespace) -> int:
@@ -1531,6 +2055,13 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
     elif args.command == "queue":
         return await _run_queue(config, args)
 
+    elif args.command == "watch":
+        return await _run_watch(config, args)
+    elif args.command == "msg":
+        return await _run_msg(config, args)
+    elif args.command == "unpause":
+        return await _run_unpause(config, args)
+
     elif args.command == "projects":
         return await _run_projects(config, args)
 
@@ -1538,6 +2069,7 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
         return await _run_deploy(config, args)
 
     elif args.command == "harness":
+        from autoforge.engine.harness.openai_export import export_to_openai_bundle
         from autoforge.engine.harness.runner import (
             HarnessRunConfig,
             prewarm_dataset_images,
@@ -1545,6 +2077,30 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
         )
 
         action = getattr(args, "harness_action", "")
+        if action == "openai-export":
+            source_path = Path(getattr(args, "path", "")).resolve()
+            if not source_path.exists():
+                console.print(f"[red]Error:[/red] Path not found: {source_path}")
+                return 1
+            out = getattr(args, "out", None)
+            out_dir = Path(out).resolve() if out else None
+            try:
+                bundle = export_to_openai_bundle(
+                    source_path,
+                    out_dir=out_dir,
+                    include_golden_patch=bool(getattr(args, "include_golden_patch", False)),
+                    golden_similarity_threshold=float(getattr(args, "golden_threshold", 0.8) or 0.8),
+                )
+                console.print(f"[green]OpenAI eval bundle exported[/green] {bundle.bundle_dir}")
+                console.print(f"[dim]items:[/dim] {bundle.items_path}")
+                console.print(f"[dim]schema:[/dim] {bundle.schema_path}")
+                console.print(f"[dim]manifest:[/dim] {bundle.manifest_path}")
+                return 0
+            except Exception as e:
+                console.print(f"[red]OpenAI eval export failed:[/red] {e}")
+                logging.getLogger(__name__).debug("Harness OpenAI export failed", exc_info=True)
+                return 1
+
         dataset_path = Path(getattr(args, "dataset", "")).resolve()
         if not dataset_path.is_file():
             console.print(f"[red]Error:[/red] Dataset not found: {dataset_path}")
@@ -1580,7 +2136,15 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
                 trace_enabled=not bool(getattr(args, "no_trace", False)),
             )
             try:
-                _ = await run_dataset(config, dataset_path, cfg=hcfg)
+                report = await run_dataset(config, dataset_path, cfg=hcfg)
+                run_dir = (
+                    out_dir.resolve()
+                    if out_dir is not None
+                    else (config.project_root / ".autoforge" / "harness" / "runs" / report.run_id).resolve()
+                )
+                bundle_dir = run_dir / "openai_eval_bundle"
+                if bundle_dir.is_dir():
+                    console.print(f"[dim]openai bundle:[/dim] {bundle_dir}")
                 return 0
             except Exception as e:
                 console.print(f"[red]Harness run failed:[/red] {e}")
