@@ -1284,7 +1284,7 @@ def test_claude_plugin_assets_exist():
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
 
     assert plugin["name"] == "autoforge"
-    assert plugin["version"] == "2.7.25"
+    assert plugin["version"] == "2.7.26"
     assert marketplace["name"] == "autoforge"
     assert marketplace["plugins"][0]["source"] == "./plugins/autoforge"
     assert "autoforge" in settings["extraKnownMarketplaces"]

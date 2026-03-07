@@ -1,7 +1,7 @@
 {
   "name": "autoforge",
   "description": "AutoForge workflows for long-running software, research, verification, and eval tasks in Claude Code.",
-  "version": "2.7.25",
+  "version": "2.7.26",
   "author": {
     "name": "AlyciaBHZ",
     "url": "https://github.com/AlyciaBHZ"
