@@ -33,6 +33,7 @@ Reference:
 
 from __future__ import annotations
 
+import os
 import json
 import logging
 import math
@@ -362,9 +363,22 @@ class EvolutionEngine:
 
     def __init__(self, base_dir: Path | None = None) -> None:
         if base_dir is None:
-            base_dir = Path.home() / self._EVOLUTION_DIR_NAME
+            # Prefer an explicit override for restricted environments.
+            env_home = os.environ.get("AUTOFORGE_HOME", "").strip()
+            if env_home:
+                base_dir = Path(env_home).expanduser()
+            else:
+                base_dir = Path.home() / self._EVOLUTION_DIR_NAME
+            try:
+                base_dir.mkdir(parents=True, exist_ok=True)
+            except (OSError, PermissionError):
+                # Some sandboxes disallow writes to the real home directory.
+                base_dir = Path.cwd() / self._EVOLUTION_DIR_NAME
+                base_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            base_dir.mkdir(parents=True, exist_ok=True)
+
         self.base_dir = base_dir
-        self.base_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory = self._load_memory()
         self._current_genome: WorkflowGenome | None = None

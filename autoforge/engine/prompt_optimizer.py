@@ -28,6 +28,7 @@ Persistence: ~/.autoforge/prompt_optimization/
 
 from __future__ import annotations
 
+import os
 import json
 import logging
 import math
@@ -221,7 +222,16 @@ class PromptOptimizer:
 
     def __init__(self, base_dir: Path | None = None) -> None:
         if base_dir is None:
-            base_dir = Path.home() / ".autoforge"
+            env_home = os.environ.get("AUTOFORGE_HOME", "").strip()
+            if env_home:
+                base_dir = Path(env_home).expanduser()
+            else:
+                base_dir = Path.home() / ".autoforge"
+            try:
+                (base_dir / self._OPT_DIR).mkdir(parents=True, exist_ok=True)
+            except (OSError, PermissionError):
+                # Restricted sandboxes may not allow writes to the real home directory.
+                base_dir = Path.cwd() / ".autoforge"
         self.opt_dir = base_dir / self._OPT_DIR
         self.opt_dir.mkdir(parents=True, exist_ok=True)
 

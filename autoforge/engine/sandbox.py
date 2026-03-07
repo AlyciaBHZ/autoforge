@@ -455,6 +455,28 @@ class SubprocessSandbox(SandboxBase):
         if sys.platform == "win32" and not command.startswith("cmd") and self._security_mode != "allowlist":
             sh = shutil.which("bash") or shutil.which("sh")
             if sh:
+                sh_norm = sh.replace("/", "\\").lower()
+                # Avoid WSL's bash.exe shim (often present on PATH but not usable in restricted environments).
+                if "\\windowsapps\\bash.exe" in sh_norm or sh_norm.endswith("\\system32\\bash.exe"):
+                    sh = None
+
+                    # Prefer a non-WSL bash/sh if one exists on PATH (for example Git Bash).
+                    for entry in os.environ.get("PATH", "").split(os.pathsep):
+                        entry = entry.strip().strip('"')
+                        if not entry:
+                            continue
+                        low = entry.replace("/", "\\").lower().rstrip("\\")
+                        if "windowsapps" in low or low.endswith("\\system32"):
+                            continue
+                        for name in ("bash.exe", "sh.exe"):
+                            candidate = Path(entry) / name
+                            if candidate.is_file():
+                                sh = str(candidate)
+                                break
+                        if sh:
+                            break
+
+            if sh:
                 shell_command = f'{_shell_quote(sh)} -c {_shell_quote(command)}'
 
         res = await run_shell(
