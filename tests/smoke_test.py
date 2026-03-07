@@ -144,6 +144,16 @@ def test_cli_parse_subcommands():
     assert args.path == "/tmp/project"
     assert args.enhance == "add dark mode"
 
+    args = parser.parse_args([
+        "--ui-harness",
+        "--design-ref",
+        "figma://demo",
+        "generate",
+        "Build a dashboard",
+    ])
+    assert args.ui_harness is True
+    assert args.design_refs == ["figma://demo"]
+
     # Test status
     args = parser.parse_args(["status"])
     assert args.command == "status"
@@ -1362,6 +1372,8 @@ def test_config_new_fields():
     assert config.confirm_phases == []
     # TDD
     assert config.build_test_loops == 0
+    assert config.ui_harness_enabled is False
+    assert config.design_context_refs == []
 
 
 def test_config_with_overrides():
@@ -1373,12 +1385,16 @@ def test_config_with_overrides():
         search_api_key="test-key:cx123",
         confirm_phases=["spec", "build"],
         build_test_loops=2,
+        ui_harness_enabled=True,
+        design_context_refs=["figma://demo", "brand.pdf"],
     )
     assert config.web_tools_enabled is False
     assert config.search_backend == "google"
     assert config.search_api_key == "test-key:cx123"
     assert config.confirm_phases == ["spec", "build"]
     assert config.build_test_loops == 2
+    assert config.ui_harness_enabled is True
+    assert config.design_context_refs == ["figma://demo", "brand.pdf"]
 
 
 def test_cli_confirm_flag():

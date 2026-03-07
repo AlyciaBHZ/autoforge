@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from autoforge.engine.development_harness import (
+    append_development_jsonl,
+    write_development_json,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,9 +75,100 @@ class TaskDAG:
 
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
+        self._harness_root: Path | None = None
+
+    def set_harness_root(self, root: Path | None) -> None:
+        self._harness_root = root
+        if self._harness_root is not None:
+            self._harness_root.mkdir(parents=True, exist_ok=True)
+            self._write_harness_artifacts()
+
+    def _task_attempts_path(self) -> Path | None:
+        if self._harness_root is None:
+            return None
+        return self._harness_root / "task_attempts.jsonl"
+
+    def _write_harness_artifacts(self) -> None:
+        if self._harness_root is None:
+            return
+        tasks = [t.to_dict() for t in self.get_all_tasks()]
+        write_development_json(
+            self._harness_root / "task_graph.json",
+            {"tasks": tasks},
+            artifact_type="task_graph",
+        )
+        write_development_json(
+            self._harness_root / "task_contracts.json",
+            {
+                "tasks": [
+                    {
+                        "id": t.id,
+                        "owner": t.owner,
+                        "phase": t.phase.value,
+                        "depends_on": list(t.depends_on),
+                        "files": list(t.files),
+                        "acceptance_criteria": t.acceptance_criteria,
+                        "exports": t.exports,
+                    }
+                    for t in self.get_all_tasks()
+                ]
+            },
+            artifact_type="task_contracts",
+        )
+        write_development_json(
+            self._harness_root / "task_verdicts.json",
+            {
+                "total_tasks": self.total_tasks(),
+                "status_counts": {
+                    status.value: sum(1 for task in self._tasks.values() if task.status == status)
+                    for status in TaskStatus
+                },
+                "all_done": self.is_all_done(),
+                "has_failures": self.has_failures(),
+                "tasks": [
+                    {
+                        "id": t.id,
+                        "status": t.status.value,
+                        "retry_count": t.retry_count,
+                        "claimed_by": t.claimed_by,
+                        "result": t.result,
+                    }
+                    for t in self.get_all_tasks()
+                ],
+            },
+            artifact_type="task_verdicts",
+        )
+
+    def _append_task_attempt(
+        self,
+        task: Task,
+        *,
+        event_type: str,
+        previous_status: str = "",
+        detail: str = "",
+    ) -> None:
+        attempts_path = self._task_attempts_path()
+        if attempts_path is None:
+            return
+        append_development_jsonl(
+            attempts_path,
+            {
+                "task_id": task.id,
+                "owner": task.owner,
+                "phase": task.phase.value,
+                "event": event_type,
+                "previous_status": previous_status,
+                "status": task.status.value,
+                "retry_count": task.retry_count,
+                "claimed_by": task.claimed_by,
+                "detail": detail,
+            },
+            event_type=event_type,
+        )
 
     def add_task(self, task: Task) -> None:
         self._tasks[task.id] = task
+        self._write_harness_artifacts()
 
     def get_task(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)
@@ -131,21 +227,28 @@ class TaskDAG:
         if task_id not in self._tasks:
             raise ValueError(f"Unknown task: {task_id}")
         task = self._tasks[task_id]
+        previous = task.status.value
         task.status = TaskStatus.IN_PROGRESS
         task.claimed_by = agent_id
+        self._append_task_attempt(task, event_type="task_claimed", previous_status=previous, detail=agent_id)
+        self._write_harness_artifacts()
 
     def mark_done(self, task_id: str, result: str = "") -> None:
         if task_id not in self._tasks:
             raise ValueError(f"Unknown task: {task_id}")
         task = self._tasks[task_id]
+        previous = task.status.value
         task.status = TaskStatus.DONE
         task.result = result
         task.claimed_by = None
+        self._append_task_attempt(task, event_type="task_completed", previous_status=previous, detail=result)
+        self._write_harness_artifacts()
 
     def mark_failed(self, task_id: str, error: str = "") -> None:
         if task_id not in self._tasks:
             raise ValueError(f"Unknown task: {task_id}")
         task = self._tasks[task_id]
+        previous = task.status.value
         task.retry_count += 1
         if task.retry_count >= 3:
             task.status = TaskStatus.BLOCKED
@@ -153,6 +256,8 @@ class TaskDAG:
         else:
             task.status = TaskStatus.FAILED
             task.result = error
+        self._append_task_attempt(task, event_type="task_failed", previous_status=previous, detail=error)
+        self._write_harness_artifacts()
 
     def reset_failed(self, task_id: str) -> None:
         """Reset a failed task to TODO for retry."""
@@ -160,9 +265,12 @@ class TaskDAG:
             raise ValueError(f"Unknown task: {task_id}")
         task = self._tasks[task_id]
         if task.status == TaskStatus.FAILED:
+            previous = task.status.value
             task.status = TaskStatus.TODO
             task.retry_count = 0
             task.claimed_by = None
+            self._append_task_attempt(task, event_type="task_reset", previous_status=previous)
+            self._write_harness_artifacts()
 
     def validate_acyclic(self) -> None:
         """Check for cycles in the DAG. Raises ValueError if a cycle exists.
@@ -267,12 +375,12 @@ class TaskDAG:
 
     def save(self, path: Path) -> None:
         """Persist DAG state to JSON for resume capability."""
-        data = [t.to_dict() for t in self._tasks.values()]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(data, indent=2, ensure_ascii=False)
-        tmp = path.parent / f".{path.name}.tmp"
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(path)
+        write_development_json(
+            path,
+            {"tasks": [t.to_dict() for t in self._tasks.values()]},
+            artifact_type="task_graph_snapshot",
+        )
+        self._write_harness_artifacts()
         logger.debug(f"DAG saved to {path}")
 
     @classmethod
@@ -282,9 +390,15 @@ class TaskDAG:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in task DAG file {path}: {e}") from e
-        if not isinstance(data, list):
-            raise ValueError(f"Task DAG file must contain a JSON array, got {type(data).__name__}")
-        return cls.from_dict(data)
+        if isinstance(data, dict):
+            tasks_data = data.get("tasks", [])
+        elif isinstance(data, list):
+            tasks_data = data
+        else:
+            raise ValueError(f"Task DAG file must contain a JSON object or array, got {type(data).__name__}")
+        if not isinstance(tasks_data, list):
+            raise ValueError("Task DAG payload must contain a 'tasks' array")
+        return cls.from_dict(tasks_data)
 
     def to_markdown(self) -> str:
         """Render the DAG as a markdown task list (DEV_PLAN format)."""

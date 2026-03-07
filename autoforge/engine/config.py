@@ -326,14 +326,14 @@ class AdvancedConfig:
     literature_search_enabled: bool = True
     experiment_loop_enabled: bool = True
     paper_writer_enabled: bool = True
-    dense_retrieval_enabled: bool = True
+    dense_retrieval_enabled: bool = False
     benchmark_eval_enabled: bool = False
     rl_proof_search_enabled: bool = True
     article_reasoning_enabled: bool = True
     vlm_figure_enabled: bool = True
     symbolic_compute_enabled: bool = True
     peer_review_enabled: bool = True
-    proof_embedding_enabled: bool = True
+    proof_embedding_enabled: bool = False
     pantograph_repl_enabled: bool = True
 
     def __post_init__(self) -> None:
@@ -434,11 +434,18 @@ class ForgeConfig:
 
     # Operating mode
     mode: str = "developer"
+    profile: str = ""
+    client_surface: str = "cli"
     mobile_target: str = "none"
     mobile_framework: str = "react-native"
+    ui_harness_enabled: bool = False
+    design_context_refs: list[str] = field(default_factory=list)
 
     # Run identity
     run_id: str = ""
+    project_id: str = ""
+    lineage_id: str = ""
+    parent_run_id: str = ""
 
     # Thread-safe usage tracking lock (not a dataclass field)
     _usage_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
@@ -562,6 +569,8 @@ class ForgeConfig:
             self.daemon.db_path = self.project_root / "autoforge.db"
         if not self.run_id:
             self.run_id = uuid.uuid4().hex[:12]
+        if not self.lineage_id:
+            self.lineage_id = self.run_id
 
         # Normalize legacy OpenAI aliases from older config files.
         #
@@ -599,6 +608,48 @@ class ForgeConfig:
             self.openai_reasoning_effort = "medium"
         else:
             self.openai_reasoning_effort = level
+
+        aliases = {
+            "developer": "development",
+            "dev": "development",
+            "verify": "verification",
+            "academic": "research",
+        }
+        profile = str(getattr(self, "profile", "") or "").strip().lower()
+        if profile:
+            profile = aliases.get(profile, profile)
+            if profile not in {"development", "verification", "research"}:
+                logging.getLogger(__name__).warning(
+                    "profile=%r invalid; clearing explicit profile",
+                    profile,
+                )
+                profile = ""
+        self.profile = profile
+
+        client_surface = str(getattr(self, "client_surface", "cli") or "cli").strip().lower()
+        self.client_surface = client_surface or "cli"
+
+        self.ui_harness_enabled = bool(getattr(self, "ui_harness_enabled", False))
+        raw_design_refs = getattr(self, "design_context_refs", [])
+        if isinstance(raw_design_refs, str):
+            design_context_refs = [
+                token.strip()
+                for token in raw_design_refs.replace("\r", "\n").replace(";", ",").split(",")
+                if token.strip()
+            ]
+        elif isinstance(raw_design_refs, (list, tuple, set)):
+            design_context_refs = [str(token).strip() for token in raw_design_refs if str(token).strip()]
+        else:
+            design_context_refs = []
+        deduped_refs: list[str] = []
+        seen_refs: set[str] = set()
+        for token in design_context_refs:
+            lowered = token.lower()
+            if lowered in seen_refs:
+                continue
+            seen_refs.add(lowered)
+            deduped_refs.append(token)
+        self.design_context_refs = deduped_refs
 
         backend = str(getattr(self, "execution_backend", "auto") or "auto").strip().lower()
         allowed_backends = {"auto", "docker", "subprocess", "slurm"}
@@ -704,9 +755,16 @@ class ForgeConfig:
             verbose=self.verbose,
             log_level=self.log_level,
             mode=self.mode,
+            profile=self.profile,
+            client_surface=self.client_surface,
             mobile_target=self.mobile_target,
             mobile_framework=self.mobile_framework,
+            ui_harness_enabled=bool(self.ui_harness_enabled),
+            design_context_refs=list(self.design_context_refs),
             run_id="",  # re-generated in __post_init__
+            project_id=self.project_id,
+            lineage_id=self.lineage_id,
+            parent_run_id=self.parent_run_id,
             sandbox_image=self.sandbox_image,
             docker_enabled=self.docker_enabled,
             docker_required=self.docker_required,
@@ -936,6 +994,24 @@ class ForgeConfig:
                 global_config.get("subprocess_allowlist_by_capability", {})
             )
 
+        design_refs_env = os.getenv("FORGE_DESIGN_REFS")
+        if design_refs_env:
+            design_context_refs = [
+                token.strip()
+                for token in design_refs_env.replace("\r", "\n").replace(";", ",").split(",")
+                if token.strip()
+            ]
+        else:
+            design_refs_global = global_config.get("design_context_refs", [])
+            if isinstance(design_refs_global, list):
+                design_context_refs = [str(token).strip() for token in design_refs_global if str(token).strip()]
+            else:
+                design_context_refs = [
+                    token.strip()
+                    for token in str(design_refs_global or "").replace("\r", "\n").replace(";", ",").split(",")
+                    if token.strip()
+                ]
+
         config = cls(
             api_keys=api_keys,
             auth_config=auth_config,
@@ -1071,7 +1147,14 @@ class ForgeConfig:
                 str(global_config.get("llm_rate_limit_namespace", "global")),
             ),
             mode=global_config.get("mode", "developer"),
+            profile=os.getenv("FORGE_PROFILE", str(global_config.get("profile", ""))),
+            client_surface=os.getenv("FORGE_CLIENT_SURFACE", str(global_config.get("client_surface", "cli"))),
             mobile_target=global_config.get("mobile_target", "none"),
+            ui_harness_enabled=os.getenv(
+                "FORGE_UI_HARNESS",
+                str(global_config.get("ui_harness_enabled", "false")),
+            ).strip().lower() in ("true", "1", "yes"),
+            design_context_refs=design_context_refs,
             # Sub-configs
             daemon=DaemonConfig(
                 daemon_poll_interval=_safe_int("FORGE_DAEMON_POLL_INTERVAL", 10),

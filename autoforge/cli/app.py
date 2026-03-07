@@ -81,10 +81,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Operating mode: developer (read-write) or research (read-only)",
     )
     parser.add_argument(
+        "--profile",
+        choices=["development", "verification", "research"],
+        default=None,
+        help="Kernel profile contract to run against",
+    )
+    parser.add_argument(
         "--mobile",
         choices=["none", "ios", "android", "both"],
         default=None,
         help="Mobile app target platform",
+    )
+    parser.add_argument(
+        "--ui-harness",
+        dest="ui_harness",
+        action="store_true",
+        default=None,
+        help="Enable UI harness overlay for frontend-style development runs",
+    )
+    parser.add_argument(
+        "--no-ui-harness",
+        dest="ui_harness",
+        action="store_false",
+        default=None,
+        help="Disable UI harness overlay even if globally configured",
+    )
+    parser.add_argument(
+        "--design-ref",
+        dest="design_refs",
+        action="append",
+        default=None,
+        help="Design context reference: Figma link, screenshot pack path, brand guide, etc. Repeatable.",
     )
     parser.add_argument("--verbose", action="store_true", help="Show detailed logs")
     parser.add_argument(
@@ -418,6 +445,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default expected golden patch similarity threshold (default: 0.8)",
     )
 
+    # kernel
+    kernel_parser = subparsers.add_parser("kernel", help="Inspect kernel runs and export evidence packs")
+    kernel_subparsers = kernel_parser.add_subparsers(dest="kernel_action", required=True)
+
+    kernel_inspect = kernel_subparsers.add_parser("inspect", help="Inspect a kernel run directory or workspace")
+    kernel_inspect.add_argument("path", help="Project dir, kernel run dir, or kernel manifest path")
+    kernel_inspect.add_argument("--run-id", default=None, help="Specific run id when path contains multiple runs")
+    kernel_inspect.add_argument("--tail", type=int, default=20, help="How many final events to inspect (default: 20)")
+    kernel_inspect.add_argument("--json", action="store_true", help="Emit raw JSON instead of text summary")
+
+    kernel_events = kernel_subparsers.add_parser("events", help="Render or follow kernel events.jsonl")
+    kernel_events.add_argument("path", help="Project dir, kernel run dir, or kernel manifest path")
+    kernel_events.add_argument("--run-id", default=None, help="Specific run id when path contains multiple runs")
+    kernel_events.add_argument("--tail", type=int, default=20, help="How many final events to render (default: 20)")
+    kernel_events.add_argument("--json", action="store_true", help="Emit parsed JSON instead of text rendering")
+    kernel_events.add_argument("--follow", action="store_true", help="Follow new kernel events until interrupted")
+    kernel_events.add_argument("--poll", type=float, default=0.5, help="Polling interval seconds for --follow")
+
+    kernel_pack = kernel_subparsers.add_parser("evidence-pack", help="Export a kernel evidence pack")
+    kernel_pack.add_argument("path", help="Project dir or kernel run dir")
+    kernel_pack.add_argument("--run-id", default=None, help="Specific run id when path contains multiple runs")
+    kernel_pack.add_argument("--out", default=None, help="Output directory for the evidence pack")
+    kernel_pack.add_argument(
+        "--kernel-only",
+        action="store_true",
+        help="Only copy kernel run files; skip workspace artifacts",
+    )
+
+    kernel_replay = kernel_subparsers.add_parser(
+        "replay-bundle",
+        help="Export a replay/judge bundle for a kernel run",
+    )
+    kernel_replay.add_argument("path", help="Project dir or kernel run dir")
+    kernel_replay.add_argument("--run-id", default=None, help="Specific run id when path contains multiple runs")
+    kernel_replay.add_argument("--out", default=None, help="Output directory for the replay bundle")
+    kernel_replay.add_argument(
+        "--kernel-only",
+        action="store_true",
+        help="Only copy kernel run files; skip workspace artifacts",
+    )
+
     # paper
     from datetime import datetime
 
@@ -574,8 +642,15 @@ def _build_config_overrides(args: argparse.Namespace) -> dict:
         overrides["model_fast"] = args.model
     if args.mode is not None:
         overrides["mode"] = args.mode
+    if getattr(args, "profile", None) is not None:
+        overrides["profile"] = args.profile
+    overrides["client_surface"] = "cli"
     if args.mobile is not None:
         overrides["mobile_target"] = args.mobile
+    if getattr(args, "ui_harness", None) is not None:
+        overrides["ui_harness_enabled"] = bool(args.ui_harness)
+    if getattr(args, "design_refs", None):
+        overrides["design_context_refs"] = list(args.design_refs)
     if args.verbose:
         overrides["verbose"] = True
     if args.log_level:
@@ -829,6 +904,8 @@ def _is_pid_running(pid: int) -> bool:
 
 async def _run_doctor(config) -> int:
     """Run static doctor checks and print a compact health matrix."""
+    import importlib.util
+
     from autoforge.engine.project_registry import ProjectRegistry
 
     checks: list[tuple[str, bool, str]] = []
@@ -853,6 +930,47 @@ async def _run_doctor(config) -> int:
         db_ok = False
     checks.append(("registry_access", db_ok, str(config.db_path)))
 
+    workspace_ok = True
+    try:
+        config.workspace_dir.mkdir(parents=True, exist_ok=True)
+        probe = config.workspace_dir / ".doctor_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception:
+        workspace_ok = False
+    checks.append(("workspace_writable", workspace_ok, str(config.workspace_dir)))
+
+    state_backend = str(getattr(config, "state_backend", "sqlite") or "sqlite").strip().lower()
+    checks.append((
+        "kernel_state_backend",
+        state_backend in {"json", "sqlite", "both"},
+        "Expected one of: json, sqlite, both",
+    ))
+
+    numpy_needed = bool(
+        getattr(config, "dense_retrieval_enabled", False)
+        or getattr(config, "proof_embedding_enabled", False)
+    )
+    numpy_ok = (not numpy_needed) or importlib.util.find_spec("numpy") is not None
+    checks.append((
+        "optional_numpy_dependency",
+        numpy_ok,
+        "Install numpy or disable dense_retrieval/proof_embedding engines",
+    ))
+
+    trace_dir_ok = True
+    if bool(getattr(config, "trace_enabled", False)):
+        try:
+            trace_root = config.project_root / ".autoforge" / "traces"
+            trace_root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            trace_dir_ok = False
+    checks.append((
+        "trace_dir_access",
+        trace_dir_ok,
+        str(config.project_root / ".autoforge" / "traces"),
+    ))
+
     max_name = max(len(c[0]) for c in checks)
     console.print("[bold]AutoForge Doctor[/bold]")
     for name, ok, hint in checks:
@@ -867,6 +985,7 @@ async def _run_doctor(config) -> int:
 
 async def _run_healthcheck(config) -> int:
     """Runtime healthcheck including daemon status and queue visibility."""
+    from autoforge.engine.kernel import load_latest_kernel_checkpoint
     from autoforge.engine.project_registry import ProjectRegistry, ProjectStatus
 
     pid = _read_daemon_pid_file(config.daemon_pid_file)
@@ -878,9 +997,23 @@ async def _run_healthcheck(config) -> int:
         completed = len(await registry.list_by_status(ProjectStatus.COMPLETED))
         failed = len(await registry.list_by_status(ProjectStatus.FAILED))
 
+    kernel_resume_ready = 0
+    kernel_runs = 0
+    if config.workspace_dir.exists():
+        for child in config.workspace_dir.iterdir():
+            if not child.is_dir():
+                continue
+            checkpoint = load_latest_kernel_checkpoint(child)
+            if checkpoint is not None:
+                kernel_resume_ready += 1
+            run_root = child / ".autoforge" / "kernel" / "runs"
+            if run_root.is_dir():
+                kernel_runs += len([item for item in run_root.iterdir() if item.is_dir()])
+
     console.print("[bold]AutoForge Healthcheck[/bold]")
     console.print(f"daemon_running={str(running).lower()}")
     console.print(f"queue={{queued:{queued},building:{building},completed:{completed},failed:{failed}}}")
+    console.print(f"kernel={{runs:{kernel_runs},resume_ready:{kernel_resume_ready}}}")
     return 0
 
 
@@ -1179,6 +1312,71 @@ async def _tail_task_transitions(
             _print_entry(payload)
 
 
+async def _tail_kernel_events(
+    *,
+    project_dir: Path,
+    stop_event: asyncio.Event,
+    poll_seconds: float = 0.5,
+    replay_last: int = 50,
+) -> None:
+    """Tail the active kernel events log for a project workspace."""
+    from rich.text import Text
+
+    from autoforge.engine.kernel.events import render_kernel_event
+    from autoforge.engine.kernel.inspector import resolve_kernel_run_dir
+
+    poll = _clamp_float(poll_seconds, minimum=0.1, maximum=5.0)
+    replay_last = max(0, min(int(replay_last), 500))
+    events_path: Path | None = None
+
+    while not stop_event.is_set():
+        try:
+            run_dir = resolve_kernel_run_dir(project_dir)
+        except Exception:
+            await asyncio.sleep(poll)
+            continue
+        candidate = run_dir / "events.jsonl"
+        if candidate.exists():
+            events_path = candidate
+            break
+        await asyncio.sleep(poll)
+
+    if stop_event.is_set() or events_path is None:
+        return
+
+    console.print(Text(f"[kernel] {events_path}", style="dim"))
+
+    def _print_entry(raw: str) -> None:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+        line = Text()
+        line.append("[kernel] ", style="dim")
+        line.append(render_kernel_event(payload))
+        console.print(line)
+
+    try:
+        existing = events_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        existing = []
+    for raw in existing[-replay_last:]:
+        if raw.strip():
+            _print_entry(raw)
+
+    with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+        handle.seek(0, os.SEEK_END)
+        while not stop_event.is_set():
+            line = handle.readline()
+            if not line:
+                await asyncio.sleep(poll)
+                continue
+            if line.strip():
+                _print_entry(line)
+
+
 async def _watch_project(
     *,
     config,
@@ -1202,15 +1400,17 @@ async def _watch_project(
 
     last: tuple[str, str, float, str, str] | None = None
     stop_event = asyncio.Event()
-    tail_task: asyncio.Task[None] | None = None
+    tail_started = False
+    tail_tasks: list[asyncio.Task[None]] = []
     async with ProjectRegistry(config.db_path) as registry:
         while True:
             if deadline is not None and time.monotonic() >= deadline:
                 console.print("[yellow]Watch timed out.[/yellow]")
                 stop_event.set()
-                if tail_task is not None:
-                    tail_task.cancel()
-                    await asyncio.gather(tail_task, return_exceptions=True)
+                for task in tail_tasks:
+                    task.cancel()
+                if tail_tasks:
+                    await asyncio.gather(*tail_tasks, return_exceptions=True)
                 return 2
 
             try:
@@ -1218,9 +1418,10 @@ async def _watch_project(
             except KeyError:
                 console.print("[red]Project not found.[/red]")
                 stop_event.set()
-                if tail_task is not None:
-                    tail_task.cancel()
-                    await asyncio.gather(tail_task, return_exceptions=True)
+                for task in tail_tasks:
+                    task.cancel()
+                if tail_tasks:
+                    await asyncio.gather(*tail_tasks, return_exceptions=True)
                 return 1
 
             status = project.status.value
@@ -1258,21 +1459,28 @@ async def _watch_project(
                     console.print(Text("  workspace: ", style="dim") + Text(workspace))
                 last = cur
 
-            if tail and workspace and tail_task is None:
+            if tail and workspace and not tail_started:
                 try:
                     project_dir = Path(workspace)
                 except Exception:
                     project_dir = None
                 if project_dir is not None and project_dir.exists():
-                    tail_task = asyncio.create_task(
-                        _tail_task_transitions(project_dir=project_dir, stop_event=stop_event),
-                    )
+                    tail_started = True
+                    tail_tasks = [
+                        asyncio.create_task(
+                            _tail_task_transitions(project_dir=project_dir, stop_event=stop_event),
+                        ),
+                        asyncio.create_task(
+                            _tail_kernel_events(project_dir=project_dir, stop_event=stop_event),
+                        ),
+                    ]
 
             if project.status in {ProjectStatus.COMPLETED, ProjectStatus.FAILED, ProjectStatus.CANCELLED, ProjectStatus.PAUSED}:
                 stop_event.set()
-                if tail_task is not None:
-                    tail_task.cancel()
-                    await asyncio.gather(tail_task, return_exceptions=True)
+                for task in tail_tasks:
+                    task.cancel()
+                if tail_tasks:
+                    await asyncio.gather(*tail_tasks, return_exceptions=True)
                 if project.status == ProjectStatus.COMPLETED:
                     return 0
                 if project.status == ProjectStatus.PAUSED:
@@ -1484,6 +1692,172 @@ async def _run_deploy(config, args: argparse.Namespace) -> int:
     except (OSError, UnicodeDecodeError) as exc:
         console.print(f"[red]Failed to read deploy guide:[/red] {exc}")
         return 1
+    return 0
+
+
+async def _run_kernel_inspect(config, args: argparse.Namespace) -> int:  # noqa: ARG001
+    from autoforge.engine.kernel.inspector import inspect_kernel_run, render_kernel_inspection
+
+    target = Path(str(getattr(args, "path", "") or "")).resolve()
+    if not target.exists():
+        console.print(f"[red]Error:[/red] Path not found: {target}")
+        return 1
+
+    try:
+        inspection = inspect_kernel_run(
+            target,
+            run_id=getattr(args, "run_id", None),
+            tail=max(1, int(getattr(args, "tail", 20) or 20)),
+        )
+    except Exception as exc:
+        console.print(f"[red]Kernel inspect failed:[/red] {exc}")
+        logging.getLogger(__name__).debug("Kernel inspect failed", exc_info=True)
+        return 1
+
+    if bool(getattr(args, "json", False)):
+        console.print(json.dumps(inspection.to_dict(), indent=2, ensure_ascii=False), markup=False)
+    else:
+        console.print(render_kernel_inspection(inspection), markup=False)
+    return 0
+
+
+async def _run_kernel_events(config, args: argparse.Namespace) -> int:  # noqa: ARG001
+    from autoforge.engine.kernel.events import (
+        load_kernel_event_stream,
+        render_kernel_event,
+        render_kernel_event_stream,
+    )
+    from autoforge.engine.kernel.inspector import resolve_kernel_run_dir
+
+    target = Path(str(getattr(args, "path", "") or "")).resolve()
+    if not target.exists():
+        console.print(f"[red]Error:[/red] Path not found: {target}")
+        return 1
+
+    run_id = getattr(args, "run_id", None)
+    tail = max(1, int(getattr(args, "tail", 20) or 20))
+    if not bool(getattr(args, "follow", False)):
+        try:
+            stream = load_kernel_event_stream(target, run_id=run_id, tail=tail)
+        except Exception as exc:
+            console.print(f"[red]Kernel events failed:[/red] {exc}")
+            logging.getLogger(__name__).debug("Kernel events load failed", exc_info=True)
+            return 1
+
+        if bool(getattr(args, "json", False)):
+            console.print(json.dumps(stream.to_dict(), indent=2, ensure_ascii=False), markup=False)
+        else:
+            console.print(render_kernel_event_stream(stream), markup=False)
+        return 0
+
+    try:
+        run_dir = resolve_kernel_run_dir(target, run_id=run_id)
+    except Exception as exc:
+        console.print(f"[red]Kernel events failed:[/red] {exc}")
+        logging.getLogger(__name__).debug("Kernel events resolve failed", exc_info=True)
+        return 1
+
+    events_path = run_dir / "events.jsonl"
+    if not events_path.exists():
+        console.print(f"[red]Kernel events not found:[/red] {events_path}")
+        return 1
+
+    poll = _clamp_float(float(getattr(args, "poll", 0.5) or 0.5), minimum=0.1, maximum=5.0)
+    emit_json = bool(getattr(args, "json", False))
+
+    def _print_line(raw: str) -> None:
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(event, dict):
+            return
+        if emit_json:
+            console.print(json.dumps(event, ensure_ascii=False), markup=False)
+        else:
+            console.print(render_kernel_event(event), markup=False)
+
+    console.print(f"[dim]Following kernel events[/dim] {events_path}")
+
+    try:
+        existing = events_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        existing = []
+    for raw in existing[-tail:]:
+        if raw.strip():
+            _print_line(raw)
+
+    try:
+        with events_path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(0, os.SEEK_END)
+            while True:
+                line = handle.readline()
+                if not line:
+                    await asyncio.sleep(poll)
+                    continue
+                if line.strip():
+                    _print_line(line)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Stopped following kernel events.[/dim]")
+        return 0
+
+
+async def _run_kernel_evidence_pack(config, args: argparse.Namespace) -> int:  # noqa: ARG001
+    from autoforge.engine.kernel.evidence import export_evidence_pack
+
+    target = Path(str(getattr(args, "path", "") or "")).resolve()
+    if not target.exists():
+        console.print(f"[red]Error:[/red] Path not found: {target}")
+        return 1
+
+    out_raw = getattr(args, "out", None)
+    out_dir = Path(out_raw).resolve() if out_raw else None
+    try:
+        pack = export_evidence_pack(
+            target,
+            run_id=getattr(args, "run_id", None),
+            out_dir=out_dir,
+            include_workspace_artifacts=not bool(getattr(args, "kernel_only", False)),
+        )
+    except Exception as exc:
+        console.print(f"[red]Evidence pack export failed:[/red] {exc}")
+        logging.getLogger(__name__).debug("Kernel evidence export failed", exc_info=True)
+        return 1
+
+    console.print(f"[green]Evidence pack exported[/green] {pack.output_dir}")
+    console.print(f"[dim]manifest:[/dim] {pack.manifest_path}")
+    console.print(f"[dim]summary:[/dim] {pack.summary_path}")
+    console.print(f"[dim]files:[/dim] {len(pack.copied_files)}")
+    return 0
+
+
+async def _run_kernel_replay_bundle(config, args: argparse.Namespace) -> int:  # noqa: ARG001
+    from autoforge.engine.kernel.replay import export_replay_bundle
+
+    target = Path(str(getattr(args, "path", "") or "")).resolve()
+    if not target.exists():
+        console.print(f"[red]Error:[/red] Path not found: {target}")
+        return 1
+
+    out_raw = getattr(args, "out", None)
+    out_dir = Path(out_raw).resolve() if out_raw else None
+    try:
+        bundle = export_replay_bundle(
+            target,
+            run_id=getattr(args, "run_id", None),
+            out_dir=out_dir,
+            include_workspace_artifacts=not bool(getattr(args, "kernel_only", False)),
+        )
+    except Exception as exc:
+        console.print(f"[red]Replay bundle export failed:[/red] {exc}")
+        logging.getLogger(__name__).debug("Kernel replay export failed", exc_info=True)
+        return 1
+
+    console.print(f"[green]Replay bundle exported[/green] {bundle.output_dir}")
+    console.print(f"[dim]manifest:[/dim] {bundle.manifest_path}")
+    console.print(f"[dim]summary:[/dim] {bundle.summary_path}")
+    console.print(f"[dim]rubric:[/dim] {bundle.rubric_path}")
+    console.print(f"[dim]files:[/dim] {len(bundle.copied_files)}")
     return 0
 
 
@@ -2067,6 +2441,19 @@ async def _async_dispatch(args: argparse.Namespace, overrides: dict) -> int:
 
     elif args.command == "deploy":
         return await _run_deploy(config, args)
+
+    elif args.command == "kernel":
+        action = getattr(args, "kernel_action", "")
+        if action == "inspect":
+            return await _run_kernel_inspect(config, args)
+        if action == "events":
+            return await _run_kernel_events(config, args)
+        if action == "evidence-pack":
+            return await _run_kernel_evidence_pack(config, args)
+        if action == "replay-bundle":
+            return await _run_kernel_replay_bundle(config, args)
+        console.print(f"[red]Unknown kernel action:[/red] {action}")
+        return 1
 
     elif args.command == "harness":
         from autoforge.engine.harness.openai_export import export_to_openai_bundle

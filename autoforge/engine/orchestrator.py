@@ -44,6 +44,14 @@ from autoforge.engine.runtime.dependencies import (
 )
 from autoforge.engine.runtime.journal import RunJournal
 from autoforge.engine.runtime.runtime import ForgeRuntime
+from autoforge.engine.kernel import (
+    KernelSession,
+    create_runtime_from_config,
+    default_profile_for_command,
+    resolve_profile,
+)
+from autoforge.engine.kernel.checkpoint import load_latest_kernel_checkpoint
+from autoforge.engine.kernel.schema import write_kernel_json
 from autoforge.engine.hil import CheckpointRequest, CheckpointResponder
 
 # Agents — loaded via registry (no direct class imports needed at module level)
@@ -56,6 +64,7 @@ from autoforge.engine.dynamic_constitution import DynamicConstitution
 from autoforge.engine.evolution import EvolutionEngine, FitnessScore, WorkflowGenome
 from autoforge.engine.process_reward import ProcessRewardModel, StepType
 from autoforge.engine.prompt_optimizer import PromptOptimizer
+from autoforge.engine.run_controller import RunController
 from autoforge.engine.dag_federation import (
     DAGFederationClient,
     DAGFederationConfig,
@@ -122,6 +131,7 @@ class Orchestrator:
         self.config = config
         self.llm = LLMRouter(config)
         self.runtime: ForgeRuntime | None = None
+        self.kernel_session: KernelSession | None = None
         self.project_dir: Path | None = None
         self.dag: TaskDAG | None = None
         self.spec: dict[str, Any] = {}
@@ -149,6 +159,7 @@ class Orchestrator:
         self._state_lock = threading.RLock()
         self._task_transition_log: list[dict[str, Any]] = []
         self._resumed_task_progress: list[dict[str, Any]] | None = None
+        self._phase_context: dict[str, Any] = {}
         self._checkpoint_responder = checkpoint_responder
 
         # ── Lazy-initialized advanced engines ──
@@ -178,11 +189,865 @@ class Orchestrator:
             telemetry = self.runtime.telemetry
         return create_sandbox(self.config, working_dir, telemetry=telemetry)
 
+    def _kernel_surface(self) -> str:
+        return str(getattr(self.config, "client_surface", "cli") or "cli").strip().lower() or "cli"
+
+    def _profile_name_for_operation(self, operation: str) -> str:
+        return default_profile_for_command(
+            operation,
+            mode=str(getattr(self.config, "mode", "") or ""),
+            explicit_profile=str(getattr(self.config, "profile", "") or ""),
+        )
+
+    def _open_runtime(
+        self,
+        *,
+        operation: str,
+        profile_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self.project_dir is None:
+            raise RuntimeError("project_dir must be set before opening runtime")
+        self.runtime = create_runtime_from_config(self.config, self.project_dir)
+        if self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False)):
+            self.llm.set_telemetry_sink(self.runtime.telemetry)
+        self.llm.set_harness_project_dir(self.project_dir)
+        self.kernel_session = KernelSession.open(
+            config=self.config,
+            project_dir=self.project_dir,
+            runtime=self.runtime,
+            profile_name=str(profile_name or self._profile_name_for_operation(operation)),
+            operation=operation,
+            surface=self._kernel_surface(),
+            metadata=metadata,
+        )
+
+    def _close_runtime(self, *, status: str, metadata: dict[str, Any] | None = None) -> None:
+        try:
+            if self.kernel_session is not None:
+                self.kernel_session.close(status=status, metadata=metadata)
+        except Exception:
+            pass
+        finally:
+            self.kernel_session = None
+        try:
+            if self.runtime is not None:
+                self.runtime.close()
+        except Exception:
+            pass
+        finally:
+            self.runtime = None
+        try:
+            self.llm.set_harness_project_dir(None)
+        except Exception:
+            pass
+
+    def _kernel_phase(
+        self,
+        phase: str,
+        state: str,
+        *,
+        summary: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self.kernel_session is None:
+            return
+        try:
+            self.kernel_session.record_phase(
+                phase,
+                state=state,
+                summary=summary,
+                metadata=metadata,
+            )
+        except Exception:
+            pass
+
+    def _declare_kernel_outcomes(self, *outcomes: str) -> None:
+        if self.kernel_session is None:
+            return
+        try:
+            self.kernel_session.declare_outcomes(*outcomes)
+        except Exception:
+            pass
+
+    def _resume_prior_success_outcomes(self, prior_run_id: str | None) -> tuple[str, ...]:
+        if self.project_dir is None or not prior_run_id:
+            return ()
+        verdict_path = self.project_dir / ".autoforge" / "kernel" / "runs" / str(prior_run_id) / "contract_verdict.json"
+        if not verdict_path.is_file():
+            return ()
+        try:
+            payload = json.loads(verdict_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ()
+        if not isinstance(payload, dict):
+            return ()
+        success = {
+            str(item).strip()
+            for item in payload.get("success_outcomes", [])
+            if str(item).strip()
+        }
+        observed: list[str] = []
+        for source in ("declared_outcomes", "inferred_outcomes"):
+            for item in payload.get(source, []):
+                token = str(item).strip()
+                if token and token in success and token not in observed:
+                    observed.append(token)
+        return tuple(observed)
+
+    def _kernel_phase_from_state_marker(self, marker: str, profile_name: str | None = None) -> str:
+        value = str(marker or "").strip().lower()
+        resolved_profile = str(profile_name or self._phase_context.get("profile", "") or self._profile_name_for_operation("resume"))
+        profile = resolve_profile(resolved_profile)
+        mapped = profile.phase_graph.phase_for_resume_marker(value)
+        if mapped:
+            return mapped
+        if profile.name == "verification":
+            return "counterexample_report"
+        if profile.name == "research":
+            return "report"
+        if "spec" in value or "scan" in value:
+            return "spec"
+        if "build" in value or "review" in value or "enhance" in value:
+            return "build"
+        if "verify" in value or "dependencies" in value or "test" in value:
+            return "test"
+        if "refactor" in value:
+            return "refactor"
+        return "deliver"
+
     def _durable_enabled(self) -> bool:
         if not getattr(self.config, "durable_execution_enabled", True):
             return False
         backend = str(getattr(self.config, "state_backend", "sqlite")).strip().lower()
         return backend in ("sqlite", "both")
+
+    def _has_resume_checkpoint(self, workspace_path: Path) -> bool:
+        if (workspace_path / ".forge_state.json").is_file():
+            return True
+        checkpoint = load_latest_kernel_checkpoint(workspace_path)
+        return checkpoint is not None
+
+    def _resolve_resume_workspace(self, workspace_path: Path | None = None) -> Path:
+        if workspace_path is not None:
+            return workspace_path
+        workspace = self.config.workspace_dir
+        if not workspace.exists():
+            raise RuntimeError(
+                f"Workspace directory does not exist: {workspace}. "
+                f"Check FORGE_WORKSPACE env var or --workspace flag."
+            )
+        projects = [d for d in workspace.iterdir() if d.is_dir() and self._has_resume_checkpoint(d)]
+        if not projects:
+            raise RuntimeError("No previous runs found to resume")
+        return max(projects, key=lambda d: d.stat().st_mtime)
+
+    def _load_resume_state_snapshot(self, workspace_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+        state: dict[str, Any] = {}
+        loaded_from_journal = False
+        loaded_from_kernel = False
+        file_state: dict[str, Any] | None = None
+        file_run_id: str | None = None
+
+        self._state_file = workspace_path / ".forge_state.json"
+        if self._state_file.exists():
+            try:
+                candidate = json.loads(self._state_file.read_text(encoding="utf-8"))
+                if isinstance(candidate, dict) and candidate:
+                    file_state = candidate
+                    rid = candidate.get("run_id")
+                    if isinstance(rid, str) and rid:
+                        file_run_id = rid
+            except Exception:
+                file_state = None
+                file_run_id = None
+
+        checkpoint = load_latest_kernel_checkpoint(workspace_path, preferred_run_id=file_run_id)
+        if checkpoint is not None:
+            state = dict(checkpoint.state)
+            loaded_from_kernel = True
+            if not file_run_id:
+                file_run_id = checkpoint.run_id
+
+        backend = str(getattr(self.config, "state_backend", "sqlite")).strip().lower()
+        if not loaded_from_kernel and getattr(self.config, "durable_execution_enabled", True) and backend in ("sqlite", "both"):
+            journal = RunJournal(workspace_path)
+            try:
+                snap = journal.load_latest_snapshot(run_id=file_run_id) if file_run_id else None
+                if snap is None:
+                    snap = journal.load_latest_snapshot()
+                if snap is not None and isinstance(snap.payload, dict) and snap.payload:
+                    state = snap.payload
+                    loaded_from_journal = True
+            finally:
+                journal.close()
+
+        if not loaded_from_kernel and not loaded_from_journal:
+            if file_state is not None:
+                state = file_state
+            else:
+                raise RuntimeError(
+                    f"Failed to load state from {self._state_file}. "
+                    "The state file may be corrupted or deleted; delete it and re-run."
+                )
+
+        run_id = ""
+        if loaded_from_kernel and checkpoint is not None:
+            run_id = checkpoint.run_id
+        else:
+            value = state.get("run_id")
+            if isinstance(value, str):
+                run_id = value
+
+        return state, {
+            "loaded_from_journal": loaded_from_journal,
+            "loaded_from_kernel": loaded_from_kernel,
+            "state_file": str(self._state_file),
+            "checkpoint_path": str(checkpoint.path) if loaded_from_kernel and checkpoint is not None else "",
+            "resumed_from_run_id": run_id,
+        }
+
+    def _apply_resume_identity(self, state: dict[str, Any]) -> tuple[str | None, tuple[str, ...]]:
+        state_run_id = state.get("run_id")
+        prior_success_outcomes = self._resume_prior_success_outcomes(
+            state_run_id if isinstance(state_run_id, str) else None
+        )
+        if isinstance(state_run_id, str) and state_run_id:
+            self.config.parent_run_id = state_run_id
+        state_lineage_id = state.get("lineage_id")
+        if isinstance(state_lineage_id, str) and state_lineage_id:
+            self.config.lineage_id = state_lineage_id
+        elif not str(getattr(self.config, "lineage_id", "") or "").strip():
+            self.config.lineage_id = state_run_id if isinstance(state_run_id, str) and state_run_id else self.config.run_id
+        state_project_id = state.get("project_id")
+        if isinstance(state_project_id, str) and state_project_id:
+            self.config.project_id = state_project_id
+        return state_run_id if isinstance(state_run_id, str) else None, prior_success_outcomes
+
+    def _executor_reset_context(self, *, operation: str, profile: str) -> None:
+        self._start_time = time.monotonic()
+        self._wall_start = time.time()
+        self._force_rebuild_plan = False
+        self._state_epoch = int(self._wall_start)
+        self._task_transition_log = []
+        self._transition_seq = 0
+        self._phase_context = {
+            "operation": str(operation),
+            "profile": str(profile),
+        }
+
+    async def _executor_prepare_generate(self, requirement: str) -> None:
+        self._executor_reset_context(operation="generate", profile="development")
+        self._phase_context["requirement"] = requirement
+        logger.info("AutoForge run %s starting", self.config.run_id)
+
+        global_dag_dir = self.config.project_root / ".autoforge" / "capability_dag"
+        self._phase_context["global_dag_dir"] = global_dag_dir
+        if self._capability_dag is not None:
+            self._capability_dag.load(global_dag_dir)
+            if self._capability_dag.size > 0:
+                console.print(f"  [cyan]CapabilityDAG:[/cyan] loaded {self._capability_dag.size} capabilities")
+
+        if self._dag_federation is not None and self._dag_federation.enabled:
+            pulled = await pull_into_local_knowledge(
+                federation=self._dag_federation,
+                capability_dag=self._capability_dag,
+                theoretical_reasoning=self._theoretical_reasoning,
+                global_theory_dir=self.config.project_root / ".autoforge" / "theories",
+            )
+            if pulled["dag_nodes"] > 0 or pulled["theories"] > 0:
+                console.print(
+                    f"  [cyan]DAG Federation:[/cyan] pulled +{pulled['dag_nodes']} DAG nodes, "
+                    f"{pulled['theories']} theory graphs"
+                )
+
+        if self.config.theoretical_reasoning_enabled and self._theoretical_reasoning is not None:
+            theory_dir = self.config.project_root / ".autoforge" / "theories"
+            self._theoretical_reasoning.load_all(theory_dir)
+            n_theories = len(self._theoretical_reasoning._theories)
+            if n_theories > 0:
+                console.print(f"  [cyan]Theoretical reasoning:[/cyan] loaded {n_theories} theory graphs")
+
+    async def _executor_generate_spec(self) -> dict[str, Any]:
+        requirement = str(self._phase_context.get("requirement", "") or "")
+        console.print("\n[bold blue]Phase 1: SPEC[/bold blue] — Analyzing requirements...")
+        self.spec = await self._phase_spec(requirement)
+        project_name = self.spec.get("project_name", "project")
+        self.project_dir = self.config.workspace_dir / project_name
+        self.project_dir.mkdir(parents=True, exist_ok=True)
+        self._state_file = self.project_dir / ".forge_state.json"
+        self._open_runtime(
+            operation="generate",
+            profile_name="development",
+            metadata={
+                "project_name": project_name,
+                "requirement_chars": len(requirement),
+            },
+        )
+        if (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))) and self.runtime is not None:
+            self.runtime.telemetry.record(
+                "run_started",
+                {
+                    "project_name": project_name,
+                    "workspace_dir": str(self.config.workspace_dir),
+                    "requirement_chars": len(requirement),
+                    "docker_enabled": bool(getattr(self.config, "docker_enabled", False)),
+                    "sandbox_image": str(getattr(self.config, "sandbox_image", "")),
+                },
+            )
+
+        (self.project_dir / "spec.json").write_text(
+            json.dumps(self.spec, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        if getattr(self.config, "artifacts_enabled", True) and self.runtime is not None:
+            try:
+                self.runtime.artifacts.write_json("spec.json", self.spec)
+            except Exception:
+                pass
+        self._save_state("spec_complete")
+        n_modules = len(self.spec.get("modules", []))
+        console.print(f"  [green]Spec generated:[/green] {project_name} — {n_modules} modules")
+        if self.kernel_session is not None:
+            self.kernel_session.update_execution_plan(
+                objective=f"Build project {project_name}",
+                summary=f"Generate {project_name} with {n_modules} planned modules",
+                inputs={"requirement": requirement, "project_name": project_name, "module_count": n_modules},
+                metadata={"spec": {"project_name": project_name, "module_count": n_modules}},
+            )
+
+        self._genome = self._evolution.prepare_genome(
+            project_type=EvolutionEngine.infer_project_type(self.spec),
+            tech_fingerprint=EvolutionEngine.extract_tech_fingerprint(self.spec),
+            config=self.config,
+        )
+        self._evolution.apply_genome_to_config(self._genome, self.config)
+        if self._genome.generation > 0:
+            console.print(
+                f"  [cyan]Evolution:[/cyan] gen {self._genome.generation} "
+                f"(from {self._genome.parent_id})"
+            )
+            if self._genome.mutations:
+                console.print(f"    Mutations: {', '.join(self._genome.mutations)}")
+
+        await self._init_dynamic_constitution()
+        await self._init_prompt_optimizer()
+
+        if self.config.evomac_enabled:
+            self._evomac.start_iteration()
+
+        if self.config.speculative_enabled:
+            await self._speculative.speculate_build_scaffold(self.spec, self.project_dir)
+
+        if self.config.adaptive_compute_enabled:
+            self._difficulty = self._adaptive_compute.estimate_difficulty(requirement, self.spec)
+            console.print(
+                f"  [cyan]Compute router:[/cyan] difficulty={self._difficulty.level.value} "
+                f"(score={self._difficulty.score:.2f})"
+            )
+
+        return {
+            "summary": f"{project_name} with {n_modules} modules",
+            "metadata": {"project_name": project_name, "module_count": n_modules},
+            "checkpoint_summary": (
+                f"Generated spec with {n_modules} modules. "
+                f"Review: {self.project_dir / 'spec.json'}"
+            ),
+        }
+
+    async def _executor_generate_build(self) -> dict[str, Any]:
+        console.print("\n[bold blue]Phase 2: BUILD[/bold blue] — Building project...")
+        if self.config.speculative_enabled:
+            await self._speculative.validate_and_commit("spec-build-scaffold")
+        await self._phase_build()
+        self._save_state("build_complete")
+        done = 0
+        total = 0
+        if self.dag:
+            done = len([t for t in self.dag.get_all_tasks() if t.phase == TaskPhase.BUILD and t.status == TaskStatus.DONE])
+            total = len([t for t in self.dag.get_all_tasks() if t.phase == TaskPhase.BUILD])
+        return {
+            "summary": "Build phase completed",
+            "metadata": {"build_done": done, "build_total": total},
+            "checkpoint_summary": (
+                f"Built {done}/{total} tasks. Review generated code in: {self.project_dir}"
+                if total
+                else ""
+            ),
+        }
+
+    async def _executor_generate_test(self) -> dict[str, Any]:
+        console.print("\n[bold blue]Phase 3: VERIFY[/bold blue] — Verifying project...")
+        if self.config.speculative_enabled:
+            await self._speculative.speculate_test_scaffold(self.spec, self.project_dir)
+        await self._integration_check()
+        await self._prepare_runtime_dependencies(self.project_dir)
+        verify_passed = await self._phase_verify()
+
+        if self.config.formal_verify_enabled:
+            await self._run_formal_verification()
+        if self.config.security_scan_enabled:
+            await self._run_security_scan()
+        if self.config.lean_prover_enabled:
+            await self._run_lean_proving()
+        if self.config.theoretical_reasoning_enabled:
+            await self._run_theoretical_reasoning()
+        if self.config.autonomous_discovery_enabled and self._autonomous_discovery:
+            await self._run_autonomous_discovery()
+        if self.config.paper_formalizer_enabled and self._paper_formalizer:
+            await self._run_paper_formalization()
+        if self.config.theoretical_reasoning_enabled and self._reasoning_extension is not None:
+            await self._run_reasoning_extension()
+
+        self._save_state("verify_complete")
+        self._phase_context["last_verify_passed"] = bool(verify_passed)
+
+        if self.config.evomac_enabled:
+            await self._evomac_backward_pass()
+        if not verify_passed and self.config.security_scan_enabled:
+            console.print("  [yellow]VERIFY→REFACTOR gate: feeding scan findings back for fixing[/yellow]")
+            await self._fix_from_security_scan()
+
+        return {
+            "summary": "Verification phase completed",
+            "metadata": {"verify_passed": bool(verify_passed)},
+            "outcomes": ("tests_pass",) if verify_passed else (),
+            "checkpoint_summary": "Verification complete. Review test_results.json.",
+        }
+
+    async def _executor_generate_refactor(self) -> dict[str, Any]:
+        verify_passed = bool(self._phase_context.get("last_verify_passed", False))
+        if verify_passed:
+            console.print("\n[bold blue]Phase 4: REFACTOR[/bold blue] — Improving quality...")
+        else:
+            console.print(
+                "\n[bold yellow]Phase 4: REFACTOR[/bold yellow] — "
+                "Improving quality (some tests still failing, proceeding with best-effort)..."
+            )
+        await self._phase_refactor()
+        self._save_state("refactor_complete")
+        return {"summary": "Refactor phase completed"}
+
+    async def _executor_generate_deliver(self) -> dict[str, Any]:
+        console.print("\n[bold blue]Phase 5: DELIVER[/bold blue] — Packaging...")
+        await self._phase_deliver()
+        self._save_state("complete")
+
+        project_name = self.spec.get("project_name", self.project_dir.name if self.project_dir is not None else "")
+        await self._evolution_record_and_reflect(project_name)
+        await self._prompt_optimizer_record_and_optimize(project_name)
+
+        if self.config.rag_enabled:
+            self._rag.index_project(self.project_dir, project_name)
+            console.print("  [cyan]RAG:[/cyan] indexed for future projects")
+        if self.config.sica_enabled:
+            await self._sica_propose_improvements(project_name)
+        if self.config.evomac_enabled and self.project_dir:
+            self._evomac.save_state(self.project_dir / ".autoforge")
+        if self.config.reflexion_enabled and self.project_dir:
+            self._reflexion.save_state(self.project_dir / ".autoforge")
+        if self.config.lean_prover_enabled and self._lean_prover and self.project_dir:
+            self._lean_prover.save_state(self.project_dir / ".autoforge" / "lean")
+            console.print("  [cyan]Lean:[/cyan] proof state saved")
+        if self._multi_prover and self.project_dir:
+            self._multi_prover.save_state(self.project_dir / ".autoforge" / "multi_prover.json")
+        if self._reasoning_extension is not None:
+            ext_dir = self._forge_dir / "reasoning_extension"
+            self._reasoning_extension.save(ext_dir)
+        if self.config.theoretical_reasoning_enabled and self.project_dir:
+            self._theoretical_reasoning.save_all(self.project_dir / ".autoforge" / "theories")
+            global_theory_dir = self.config.project_root / ".autoforge" / "theories"
+            self._theoretical_reasoning.save_all(global_theory_dir)
+            n_theories = len(self._theoretical_reasoning._theories)
+            if n_theories > 0:
+                console.print(
+                    f"  [cyan]Theoretical reasoning:[/cyan] {n_theories} theory graphs saved"
+                )
+        if self.config.adaptive_compute_enabled and self.project_dir:
+            self._adaptive_compute.save_state(self.project_dir / ".autoforge")
+        if self._capability_dag is not None:
+            global_dag_dir = self._phase_context.get("global_dag_dir")
+            await self._ingest_run_to_dag(project_name)
+            if isinstance(global_dag_dir, Path):
+                self._capability_dag.save(global_dag_dir)
+            console.print(
+                f"  [cyan]CapabilityDAG:[/cyan] {self._capability_dag.size} total capabilities"
+            )
+        if self._dag_federation is not None and self._dag_federation.enabled:
+            payload = build_snapshot_payload(
+                capability_dag=self._capability_dag,
+                theoretical_reasoning=(
+                    self._theoretical_reasoning if self.config.theoretical_reasoning_enabled else None
+                ),
+            )
+            pushed = await self._dag_federation.push_snapshot(payload)
+            if pushed:
+                console.print("  [cyan]DAG Federation:[/cyan] remote snapshot updated")
+
+        return {
+            "summary": "Deliverables packaged",
+            "outcomes": ("repo_runnable",),
+        }
+
+    async def _executor_prepare_review(self, project_path: str) -> None:
+        self._executor_reset_context(operation="review", profile="verification")
+        self.project_dir = Path(project_path).resolve()
+        logger.info("AutoForge review %s starting: %s", self.config.run_id, self.project_dir)
+        self._open_runtime(
+            operation="review",
+            profile_name="verification",
+            metadata={"project_dir": str(self.project_dir)},
+        )
+        if (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))) and self.runtime is not None:
+            try:
+                self.runtime.telemetry.record("review_started", {"project_dir": str(self.project_dir)})
+            except Exception:
+                pass
+
+    async def _executor_review_intake(self) -> dict[str, Any]:
+        console.print("\n[bold blue]Phase 1: SCAN[/bold blue] — Analyzing project...")
+        scan_result = await self._phase_scan(self.project_dir)
+        self.spec = scan_result.spec
+        self._phase_context["scan_result"] = scan_result
+        console.print(
+            f"  [green]Scan complete:[/green] {self.spec.get('project_name', 'project')} "
+            f"— {scan_result.completeness}% complete, {len(scan_result.gaps)} gaps found"
+        )
+        if self.kernel_session is not None:
+            self.kernel_session.update_execution_plan(
+                objective=f"Verify project {self.project_dir.name}",
+                summary="Review existing project for obligations, issues, and proofs",
+                inputs={"project_dir": str(self.project_dir), "gap_count": len(scan_result.gaps)},
+                metadata={"scan_completeness": scan_result.completeness},
+            )
+        return {
+            "summary": "Project scan completed",
+            "metadata": {
+                "completeness": scan_result.completeness,
+                "gap_count": len(scan_result.gaps),
+            },
+        }
+
+    async def _executor_review_obligation_extraction(self) -> dict[str, Any]:
+        console.print("\n[bold blue]Phase 2: REVIEW[/bold blue] — Reviewing code...")
+        review = await self._phase_full_review()
+        self._phase_context["review"] = review
+        console.print(f"  Quality score: {review.score}/10")
+        console.print(f"  Issues found: {len(review.issues)}")
+        return {
+            "summary": "Obligations extracted from review pass",
+            "metadata": {"issue_count": len(review.issues), "score": review.score},
+        }
+
+    def _executor_judge_review(self) -> dict[str, Any]:
+        scan_result = self._phase_context.get("scan_result")
+        review = self._phase_context.get("review")
+        issue_count = len(getattr(review, "issues", []) or [])
+        gap_count = len(getattr(scan_result, "gaps", []) or [])
+        score = int(getattr(review, "score", 0) or 0)
+        if issue_count or gap_count:
+            outcome = "falsified"
+            summary = f"Found {issue_count} issues and {gap_count} gaps"
+        elif self.config.formal_verify_enabled and score >= 9:
+            outcome = "proven"
+            summary = "No issues found and formal verification enabled"
+        else:
+            outcome = "bounded_confidence"
+            summary = "No blocking issues found, but proof remains bounded"
+
+        verification_dir = self._forge_dir / "verification"
+        verification_dir.mkdir(parents=True, exist_ok=True)
+        judge_path = verification_dir / "judge_result.json"
+        payload = {
+            "schema_version": 1,
+            "artifact_type": "verification_judge",
+            "run_id": str(getattr(self.config, "run_id", "") or ""),
+            "project_dir": str(self.project_dir),
+            "outcome": outcome,
+            "summary": summary,
+            "score": score,
+            "issue_count": issue_count,
+            "gap_count": gap_count,
+            "generated_at": time.time(),
+        }
+        write_kernel_json(judge_path, payload, artifact_type="verification_judge")
+        if self.kernel_session is not None:
+            self.kernel_session.register_artifact(
+                "verification_judge",
+                judge_path,
+                required=False,
+                metadata={"outcome": outcome, "score": score},
+            )
+        self._phase_context["judge_result"] = payload
+        return {
+            "summary": summary,
+            "metadata": {"issue_count": issue_count, "gap_count": gap_count, "score": score},
+            "outcomes": (outcome,),
+        }
+
+    async def _executor_review_counterexample_report(self) -> dict[str, Any]:
+        review = self._phase_context.get("review")
+        scan_result = self._phase_context.get("scan_result")
+        judge = self._phase_context.get("judge_result", {})
+        if (
+            self.config.mode == "developer"
+            and getattr(review, "score", 10) < round(self.config.quality_threshold * 10)
+            and getattr(review, "issues", None)
+        ):
+            console.print("\n[bold blue]Phase 3: REFACTOR[/bold blue] — Applying fixes...")
+            await self._phase_refactor()
+        console.print("\n[bold blue]Phase 4: REPORT[/bold blue] — Generating report...")
+        report = self._generate_review_report(scan_result, review)
+        if judge.get("outcome") == "falsified":
+            verification_dir = self._forge_dir / "verification"
+            verification_dir.mkdir(parents=True, exist_ok=True)
+            counterexamples_dir = verification_dir / "counterexamples"
+            counterexamples_dir.mkdir(parents=True, exist_ok=True)
+            findings_path = counterexamples_dir / "findings.json"
+            findings_path.write_text(
+                json.dumps(
+                    {
+                        "issues": list(getattr(review, "issues", []) or []),
+                        "gaps": list(getattr(scan_result, "gaps", []) or []),
+                        "generated_at": time.time(),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            if self.kernel_session is not None:
+                self.kernel_session.register_artifact("counterexamples", counterexamples_dir, required=False)
+        self._phase_context["review_report"] = report
+        return {"summary": "Verification report generated"}
+
+    async def _executor_prepare_import(self, project_path: str, enhancement: str = "") -> None:
+        self._executor_reset_context(operation="import", profile="development")
+        self._phase_context["enhancement"] = enhancement
+        source_dir = Path(project_path).resolve()
+        self._phase_context["source_dir"] = source_dir
+        logger.info("AutoForge import %s: %s", self.config.run_id, source_dir)
+        if not source_dir.is_dir():
+            raise ValueError(f"Not a directory: {project_path}")
+
+        import shutil
+
+        project_name = source_dir.name
+        self.project_dir = self.config.workspace_dir / f"{project_name}-forge"
+        if self.project_dir.exists():
+            shutil.rmtree(self.project_dir)
+        ignore_names = {".git", "node_modules", "__pycache__", ".venv", "venv", ".env"}
+        try:
+            workspace_rel = self.config.workspace_dir.resolve().relative_to(source_dir)
+            if workspace_rel.parts:
+                ignore_names.add(workspace_rel.parts[0])
+        except ValueError:
+            pass
+        shutil.copytree(
+            source_dir,
+            self.project_dir,
+            ignore=shutil.ignore_patterns(*sorted(ignore_names)),
+        )
+        self._state_file = self.project_dir / ".forge_state.json"
+        self._open_runtime(
+            operation="import",
+            profile_name="development",
+            metadata={"source_dir": str(source_dir), "project_dir": str(self.project_dir)},
+        )
+        if (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))) and self.runtime is not None:
+            try:
+                self.runtime.telemetry.record(
+                    "import_started",
+                    {"source_dir": str(source_dir), "project_dir": str(self.project_dir)},
+                )
+            except Exception:
+                pass
+
+    async def _executor_import_spec(self) -> dict[str, Any]:
+        source_dir = self._phase_context.get("source_dir")
+        enhancement = str(self._phase_context.get("enhancement", "") or "")
+        project_name = getattr(source_dir, "name", self.project_dir.name if self.project_dir is not None else "project")
+        console.print("\n[bold blue]Phase 1: SCAN[/bold blue] — Analyzing project...")
+        scan_result = await self._phase_scan(self.project_dir)
+        self._phase_context["scan_result"] = scan_result
+        self.spec = scan_result.spec
+        console.print(
+            f"  [green]Scan complete:[/green] {self.spec.get('project_name', project_name)} "
+            f"— {scan_result.completeness}% complete"
+        )
+        self._save_state("scan_complete")
+        if self.kernel_session is not None:
+            self.kernel_session.update_execution_plan(
+                objective=f"Import and improve {self.project_dir.name}",
+                summary="Scan, review, enhance, verify, and deliver imported project",
+                inputs={"source_dir": str(source_dir), "project_dir": str(self.project_dir)},
+                metadata={"scan_completeness": scan_result.completeness, "enhancement": enhancement},
+            )
+        return {
+            "summary": "Imported project scan complete",
+            "metadata": {"completeness": scan_result.completeness},
+        }
+
+    async def _executor_import_build(self) -> dict[str, Any]:
+        enhancement = str(self._phase_context.get("enhancement", "") or "")
+        console.print("\n[bold blue]Phase 2: REVIEW[/bold blue] — Reviewing code...")
+        review = await self._phase_full_review()
+        self._phase_context["review"] = review
+        console.print(f"  Quality score: {review.score}/10, {len(review.issues)} issues")
+        self._save_state("review_complete")
+        if enhancement:
+            console.print("\n[bold blue]Phase 3: ENHANCE[/bold blue] — Adding features...")
+            await self._phase_enhance(enhancement)
+            self._save_state("enhance_complete")
+        return {
+            "summary": "Import build/enhancement stage complete",
+            "metadata": {"issue_count": len(review.issues), "enhanced": bool(enhancement)},
+        }
+
+    async def _executor_import_test(self) -> dict[str, Any]:
+        console.print("\n[bold blue]Phase 4: VERIFY[/bold blue] — Verifying project...")
+        verify_passed = await self._phase_verify()
+        self._save_state("verify_complete")
+        self._phase_context["last_verify_passed"] = bool(verify_passed)
+        return {
+            "summary": "Imported project verification complete",
+            "metadata": {"verify_passed": bool(verify_passed)},
+            "outcomes": ("tests_pass",) if verify_passed else (),
+        }
+
+    async def _executor_import_refactor(self) -> dict[str, Any]:
+        if self.config.mode == "developer":
+            console.print("\n[bold blue]Phase 5: REFACTOR[/bold blue] — Improving quality...")
+            await self._phase_refactor()
+            self._save_state("refactor_complete")
+            return {"summary": "Imported project refactor complete"}
+        return {"summary": "Imported project refactor skipped", "metadata": {"skipped": True}}
+
+    async def _executor_import_deliver(self) -> dict[str, Any]:
+        console.print("\n[bold blue]Phase 6: DELIVER[/bold blue] — Packaging...")
+        await self._phase_deliver()
+        self._save_state("complete")
+        return {
+            "summary": "Imported project packaged",
+            "outcomes": ("repo_runnable",),
+        }
+
+    def _resume_operation_from_state(self, state: dict[str, Any]) -> str:
+        profile = str(state.get("profile", "") or "").strip().lower()
+        if profile == "verification":
+            return "review"
+        if profile == "research":
+            return "research"
+        operation = str(state.get("operation", "") or "").strip().lower()
+        if operation in {"generate", "review", "import", "research"}:
+            return operation
+        return "generate"
+
+    def _resume_start_phase(self, *, profile_name: str, marker: str) -> str | None:
+        token = str(marker or "").strip().lower()
+        if not token:
+            return resolve_profile(profile_name).phase_graph.start
+        paused = token.startswith("paused_after_")
+        base_token = token[len("paused_after_"):] if paused else token
+        phase = self._kernel_phase_from_state_marker(base_token, profile_name=profile_name)
+        graph = resolve_profile(profile_name).phase_graph
+        is_completed_marker = base_token == "complete" or base_token.endswith("_complete")
+        if paused or is_completed_marker:
+            successors = graph.successors(phase)
+            if successors:
+                return successors[0]
+            return None
+        return phase
+
+    def _restore_resumed_state(self, state: dict[str, Any], *, resume_metadata: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+        state_run_id, prior_success_outcomes = self._apply_resume_identity(state)
+        profile_name = str(state.get("profile", "") or self._profile_name_for_operation("resume"))
+        self._phase_context["profile"] = profile_name
+        self._phase_context["resume_source"] = dict(resume_metadata)
+        self._phase_context["resumed_operation"] = self._resume_operation_from_state(state)
+
+        self._open_runtime(
+            operation="resume",
+            profile_name=profile_name,
+            metadata={
+                "project_dir": str(self.project_dir),
+                **dict(resume_metadata),
+            },
+        )
+        if (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))) and self.runtime is not None:
+            try:
+                self.runtime.telemetry.record(
+                    "resume_loaded",
+                    {
+                        "loaded_from_journal": bool(resume_metadata.get("loaded_from_journal", False)),
+                        "loaded_from_kernel": bool(resume_metadata.get("loaded_from_kernel", False)),
+                        "project_dir": str(self.project_dir),
+                        "state_file": str(resume_metadata.get("state_file", "")),
+                        "checkpoint_path": str(resume_metadata.get("checkpoint_path", "")),
+                    },
+                )
+            except Exception:
+                pass
+
+        self.spec = state.get("spec", {})
+        self.architecture = state.get("architecture", {})
+        task_progress = state.get("task_progress")
+        if isinstance(task_progress, list):
+            self._resumed_task_progress = [item for item in task_progress if isinstance(item, dict)]
+        state_version = state.get("state_version", self._state_version)
+        if isinstance(state_version, (int, str)) and str(state_version).isdigit():
+            self._state_version = int(state_version)
+        state_epoch = state.get("state_epoch", self._state_epoch)
+        if isinstance(state_epoch, (int, str)) and str(state_epoch).isdigit():
+            self._state_epoch = int(state_epoch)
+        task_transition_seq = state.get("task_transition_seq", self._transition_seq)
+        if isinstance(task_transition_seq, (int, str)) and str(task_transition_seq).isdigit():
+            self._transition_seq = int(task_transition_seq)
+        prepared_dirs = state.get("prepared_dependency_dirs", [])
+        if isinstance(prepared_dirs, list):
+            self._dependency_prepared_dirs = {str(item) for item in prepared_dirs if isinstance(item, str)}
+        transition_log = state.get("task_transition_log", [])
+        if isinstance(transition_log, list):
+            self._task_transition_log = [entry for entry in transition_log if isinstance(entry, dict)]
+
+        for entry in self._load_task_transitions():
+            if isinstance(entry, dict) and entry not in self._task_transition_log:
+                self._task_transition_log.append(entry)
+        if len(self._task_transition_log) > 2000:
+            self._task_transition_log = self._task_transition_log[-2000:]
+
+        expected_signature = state.get("build_plan_signature")
+        if isinstance(expected_signature, str) and expected_signature:
+            current_signature = self._build_plan_signature()
+            if current_signature and current_signature != expected_signature:
+                logger.warning(
+                    "Build plan signature mismatch while resuming. "
+                    "Clearing resumed task progress and rebuilding plan."
+                )
+                self._resumed_task_progress = None
+                self._force_rebuild_plan = True
+
+        if "token_usage" in state and isinstance(state["token_usage"], dict):
+            for model, usage in state["token_usage"].items():
+                if isinstance(usage, dict) and "input" in usage and "output" in usage:
+                    self.config.token_usage[model] = usage
+
+        elapsed = state.get("elapsed_seconds", 0)
+        if not isinstance(elapsed, (int, float)):
+            elapsed = 0
+        self._wall_start = time.time() - elapsed
+        self._start_time = time.monotonic()
+
+        phase = str(state.get("phase", "") or "")
+        if self.kernel_session is not None:
+            self.kernel_session.update_execution_plan(
+                summary=f"Resume from state marker {phase}",
+                inputs={"resume_phase": phase, "project_dir": str(self.project_dir)},
+                metadata=resume_metadata,
+                status="resuming",
+            )
+        self._phase_context["resume_phase"] = phase
+        return phase, prior_success_outcomes
 
     def _agent(self, role: str, *args: Any, **kwargs: Any) -> Any:
         """Instantiate an agent by role name via AGENT_REGISTRY.
@@ -259,7 +1124,23 @@ class Orchestrator:
                 logger.warning("CapabilityDAG failed to initialize: %s", e)
 
     async def run(self, requirement: str) -> Path:
+        return await RunController(self).run_generate(requirement)
+
+    async def review_project(self, project_path: str) -> dict[str, Any]:
+        return await RunController(self).run_review(project_path)
+
+    async def import_project(self, project_path: str, enhancement: str = "") -> Path:
+        return await RunController(self).run_import(project_path, enhancement)
+
+    async def resume(self, workspace_path: Path | None = None) -> Path:
+        return await RunController(self).run_resume(workspace_path)
+
+    async def _run_generate_pipeline(self, requirement: str) -> Path:
         """Execute the full pipeline. Returns path to the generated project."""
+        from autoforge.engine.phase_executor import PhaseExecutor
+
+        return await PhaseExecutor(self).run_generate_pipeline(requirement)
+
         self._start_time = time.monotonic()
         self._wall_start = time.time()
         self._force_rebuild_plan = False
@@ -303,29 +1184,14 @@ class Orchestrator:
             self.project_dir = self.config.workspace_dir / project_name
             self.project_dir.mkdir(parents=True, exist_ok=True)
             self._state_file = self.project_dir / ".forge_state.json"
-            self.runtime = ForgeRuntime.create(
-                self.project_dir,
-                self.config.run_id,
-                artifacts_enabled=bool(getattr(self.config, "artifacts_enabled", True)),
-                trace_enabled=bool(getattr(self.config, "trace_enabled", False)),
-                trace_capture_llm_content=bool(getattr(self.config, "trace_capture_llm_content", False)),
-                trace_capture_command_output=bool(getattr(self.config, "trace_capture_command_output", False)),
-                trace_capture_fs_snapshots=bool(getattr(self.config, "trace_capture_fs_snapshots", False)),
-                trace_max_inline_chars=int(getattr(self.config, "trace_max_inline_chars", 20000) or 20000),
-                trace_redact_secrets=bool(getattr(self.config, "trace_redact_secrets", True)),
-                trace_secrets=[s for s in (
-                    list(getattr(self.config, "api_keys", {}).values())
-                    + [
-                        getattr(self.config, "search_api_key", ""),
-                        getattr(self.config, "github_token", ""),
-                        getattr(self.config, "webhook_secret", ""),
-                        getattr(self.config, "webhook_admin_secret", ""),
-                        getattr(self.config, "dag_federation_api_key", ""),
-                    ]
-                ) if isinstance(s, str) and s],
+            self._open_runtime(
+                operation="generate",
+                metadata={
+                    "project_name": project_name,
+                    "requirement_chars": len(requirement or ""),
+                },
             )
             if self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False)):
-                self.llm.set_telemetry_sink(self.runtime.telemetry)
                 self.runtime.telemetry.record(
                     "run_started",
                     {
@@ -349,6 +1215,19 @@ class Orchestrator:
             self._save_state("spec_complete")
             n_modules = len(self.spec.get("modules", []))
             console.print(f"  [green]Spec generated:[/green] {project_name} — {n_modules} modules")
+            if self.kernel_session is not None:
+                self.kernel_session.update_execution_plan(
+                    objective=f"Build project {project_name}",
+                    summary=f"Generate {project_name} with {n_modules} planned modules",
+                    inputs={"requirement": requirement, "project_name": project_name, "module_count": n_modules},
+                    metadata={"spec": {"project_name": project_name, "module_count": n_modules}},
+                )
+            self._kernel_phase(
+                "spec",
+                "completed",
+                summary=f"{project_name} with {n_modules} modules",
+                metadata={"project_name": project_name, "module_count": n_modules},
+            )
 
             # Evolution: prepare genome based on project type + past experience
             self._genome = self._evolution.prepare_genome(
@@ -402,8 +1281,10 @@ class Orchestrator:
 
             # Phase 2: BUILD
             console.print("\n[bold blue]Phase 2: BUILD[/bold blue] — Building project...")
+            self._kernel_phase("build", "started", summary="Building project workspace")
             await self._phase_build()
             self._save_state("build_complete")
+            self._kernel_phase("build", "completed", summary="Build phase completed")
 
             # Checkpoint: review build output before verification
             if self.dag:
@@ -428,6 +1309,7 @@ class Orchestrator:
 
             # Phase 3: VERIFY
             console.print("\n[bold blue]Phase 3: VERIFY[/bold blue] — Verifying project...")
+            self._kernel_phase("test", "started", summary="Running verification and test loops")
             verify_passed = await self._phase_verify()
 
             # Formal verification: static analysis + LLM formal checks
@@ -459,6 +1341,14 @@ class Orchestrator:
                 await self._run_reasoning_extension()
 
             self._save_state("verify_complete")
+            self._kernel_phase(
+                "test",
+                "completed",
+                summary="Verification phase completed",
+                metadata={"verify_passed": bool(verify_passed)},
+            )
+            if verify_passed:
+                self._declare_kernel_outcomes("tests_pass")
 
             # Checkpoint: review test results
             await self._checkpoint("verify", "Verification complete. Review test_results.json.")
@@ -480,13 +1370,18 @@ class Orchestrator:
                     "\n[bold yellow]Phase 4: REFACTOR[/bold yellow] — "
                     "Improving quality (some tests still failing, proceeding with best-effort)..."
                 )
+            self._kernel_phase("refactor", "started", summary="Applying hardening and cleanup")
             await self._phase_refactor()
             self._save_state("refactor_complete")
+            self._kernel_phase("refactor", "completed", summary="Refactor phase completed")
 
             # Phase 5: DELIVER
             console.print("\n[bold blue]Phase 5: DELIVER[/bold blue] — Packaging...")
+            self._kernel_phase("deliver", "started", summary="Packaging final handoff artifacts")
             await self._phase_deliver()
             self._save_state("complete")
+            self._kernel_phase("deliver", "completed", summary="Deliverables packaged")
+            self._declare_kernel_outcomes("repo_runnable")
 
             # Evolution: record fitness and reflect on the run
             await self._evolution_record_and_reflect(project_name)
@@ -569,27 +1464,39 @@ class Orchestrator:
         except UserPausedError as e:
             console.print(f"\n[bold yellow]Paused:[/bold yellow] {e}")
             console.print("Use [bold]autoforgeai resume[/bold] to continue.")
+            self._kernel_phase("checkpoint", "paused", summary=str(e))
             if self.project_dir:
                 return self.project_dir
             raise
         except BudgetExceededError as e:
             console.print(f"\n[bold red]Budget exceeded:[/bold red] {e}")
             console.print("Delivering what's available so far.")
+            self._kernel_phase("deliver", "budget_exceeded", summary=str(e))
+            self._declare_kernel_outcomes("partial_delivery")
             if self.project_dir:
                 self._save_state("budget_exceeded")
             raise
         except Exception as e:
             logger.error(f"AutoForge failed: {e}", exc_info=True)
+            self._kernel_phase("deliver", "failed", summary=str(e))
             if self.project_dir:
                 self._save_state(f"failed: {e}")
             raise
         finally:
-            try:
-                if self.runtime is not None:
-                    self.runtime.close()
-            except Exception:
-                pass
-            self.runtime = None
+            close_status = "failed"
+            if self.project_dir is not None and self._state_file and self._state_file.exists():
+                try:
+                    state = json.loads(self._state_file.read_text(encoding="utf-8"))
+                    phase = str(state.get("phase", ""))
+                    if phase == "complete":
+                        close_status = "completed"
+                    elif phase.startswith("paused_after_"):
+                        close_status = "paused"
+                    elif phase == "budget_exceeded":
+                        close_status = "budget_exceeded"
+                except Exception:
+                    pass
+            self._close_runtime(status=close_status)
 
     # ──────────────────────────────────────────────
     # Human-in-the-Loop Checkpoints
@@ -639,6 +1546,13 @@ class Orchestrator:
                 proceed = await asyncio.to_thread(
                     Confirm.ask, "  Continue to next phase?", default=True
                 )
+        if self.kernel_session is not None:
+            self.kernel_session.record_checkpoint(
+                phase=phase,
+                summary=summary,
+                proceed=proceed,
+                source="hil",
+            )
         if not proceed:
             self._save_state(f"paused_after_{phase}")
             raise UserPausedError(
@@ -797,6 +1711,7 @@ class Orchestrator:
                 )
                 self._resumed_task_progress = None
                 self.dag = loaded
+                self.dag.set_harness_root(self._forge_dir / "task_harness")
                 console.print("  [cyan]Build:[/cyan] loaded existing dev_plan.json")
             except Exception as e:
                 logger.warning("Failed to load existing dev_plan.json: %s", e)
@@ -844,6 +1759,7 @@ class Orchestrator:
                 tasks_data = tasks_data[:max_tasks]
 
             self.dag = TaskDAG.from_dict(tasks_data)
+            self.dag.set_harness_root(self._forge_dir / "task_harness")
             console.print(f"  [green]Task DAG:[/green] {self.dag.total_tasks()} tasks created")
 
             (self.project_dir / "architecture.md").write_text(
@@ -879,7 +1795,10 @@ class Orchestrator:
 
         # Step 4: Build tasks
         sandbox = self._create_sandbox(self.project_dir)
-        lock_manager = LockManager(self.config.workspace_dir / ".locks")
+        lock_manager = LockManager(
+            self.config.workspace_dir / ".locks",
+            harness_root=self._forge_dir / "execution_harness",
+        )
         lock_manager.clear_all()
 
         async with sandbox:
@@ -1093,6 +2012,7 @@ class Orchestrator:
             plan_file = self.project_dir / "dev_plan.json"
             md_file = self.project_dir / "DEV_PLAN.md"
             try:
+                self.dag.set_harness_root(self._forge_dir / "task_harness")
                 self.dag.save(plan_file)
                 md_file.write_text(self.dag.to_markdown(), encoding="utf-8")
             except OSError as exc:
@@ -2616,43 +3536,69 @@ class Orchestrator:
             if p.exists():
                 p.rename(self._forge_dir / internal_file)
 
+        try:
+            from autoforge.engine.deploy_guide import (
+                generate_deploy_guide,
+                write_delivery_harness_artifacts,
+            )
+
+            project_name = str(self.spec.get("project_name", self.project_dir.name) or self.project_dir.name)
+            guide_path = self.project_dir / "DEPLOY_GUIDE.md"
+            guide_path.write_text(
+                generate_deploy_guide(self.project_dir, project_name),
+                encoding="utf-8",
+            )
+            delivery_artifacts = write_delivery_harness_artifacts(self.project_dir, project_name)
+            if self.kernel_session is not None:
+                self.kernel_session.register_artifact(
+                    "deploy_guide",
+                    guide_path,
+                    required=True,
+                    metadata={"project_name": project_name},
+                )
+                self.kernel_session.register_artifact(
+                    "deploy_manifest",
+                    delivery_artifacts["deploy_manifest"],
+                    required=False,
+                    metadata={"project_name": project_name},
+                )
+                self.kernel_session.register_artifact(
+                    "environment_requirements",
+                    delivery_artifacts["environment_requirements"],
+                    required=False,
+                )
+                self.kernel_session.register_artifact(
+                    "publish_verdict",
+                    delivery_artifacts["publish_verdict"],
+                    required=False,
+                )
+        except Exception:
+            logger.debug("Could not generate deploy guide during deliver", exc_info=True)
+
         console.print("  [green]Project packaged[/green]")
 
     # ──────────────────────────────────────────────
     # Review Pipeline: SCAN → REVIEW → [REFACTOR] → REPORT
     # ──────────────────────────────────────────────
 
-    async def review_project(self, project_path: str) -> dict[str, Any]:
+    async def _run_review_pipeline(self, project_path: str) -> dict[str, Any]:
         """Standalone review of an existing project.
 
         Pipeline: SCAN → REVIEW → [REFACTOR in developer mode] → REPORT
         """
+        from autoforge.engine.phase_executor import PhaseExecutor
+
+        return await PhaseExecutor(self).run_review_pipeline(project_path)
+
         self._start_time = time.monotonic()
         self._wall_start = time.time()
         self.project_dir = Path(project_path).resolve()
         logger.info(f"AutoForge review {self.config.run_id} starting: {self.project_dir}")
-        self.runtime = ForgeRuntime.create(
-            self.project_dir,
-            self.config.run_id,
-            artifacts_enabled=bool(getattr(self.config, "artifacts_enabled", True)),
-            trace_enabled=bool(getattr(self.config, "trace_enabled", False)),
-            trace_capture_llm_content=bool(getattr(self.config, "trace_capture_llm_content", False)),
-            trace_capture_command_output=bool(getattr(self.config, "trace_capture_command_output", False)),
-            trace_capture_fs_snapshots=bool(getattr(self.config, "trace_capture_fs_snapshots", False)),
-            trace_max_inline_chars=int(getattr(self.config, "trace_max_inline_chars", 20000) or 20000),
-            trace_redact_secrets=bool(getattr(self.config, "trace_redact_secrets", True)),
-            trace_secrets=[s for s in (
-                list(getattr(self.config, "api_keys", {}).values())
-                + [
-                    getattr(self.config, "search_api_key", ""),
-                    getattr(self.config, "github_token", ""),
-                    getattr(self.config, "webhook_secret", ""),
-                    getattr(self.config, "webhook_admin_secret", ""),
-                ]
-            ) if isinstance(s, str) and s],
+        self._open_runtime(
+            operation="review",
+            metadata={"project_dir": str(self.project_dir)},
         )
         if (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))) and self.runtime is not None:
-            self.llm.set_telemetry_sink(self.runtime.telemetry)
             try:
                 self.runtime.telemetry.record(
                     "review_started",
@@ -2661,21 +3607,56 @@ class Orchestrator:
             except Exception:
                 pass
 
+        close_status = "failed"
         try:
             # Phase 1: SCAN — Understand the project
             console.print("\n[bold blue]Phase 1: SCAN[/bold blue] — Analyzing project...")
+            self._kernel_phase("intake", "started", summary="Scanning project inputs")
             scan_result = await self._phase_scan(self.project_dir)
             self.spec = scan_result.spec
             console.print(
                 f"  [green]Scan complete:[/green] {self.spec.get('project_name', 'project')} "
                 f"— {scan_result.completeness}% complete, {len(scan_result.gaps)} gaps found"
             )
+            self._kernel_phase(
+                "intake",
+                "completed",
+                summary="Project scan completed",
+                metadata={
+                    "completeness": scan_result.completeness,
+                    "gap_count": len(scan_result.gaps),
+                },
+            )
+            if self.kernel_session is not None:
+                self.kernel_session.update_execution_plan(
+                    objective=f"Verify project {self.project_dir.name}",
+                    summary="Review existing project for obligations, issues, and proofs",
+                    inputs={"project_dir": str(self.project_dir), "gap_count": len(scan_result.gaps)},
+                    metadata={"scan_completeness": scan_result.completeness},
+                )
 
             # Phase 2: REVIEW — Deep code review
             console.print("\n[bold blue]Phase 2: REVIEW[/bold blue] — Reviewing code...")
+            self._kernel_phase(
+                "obligation_extraction",
+                "started",
+                summary="Extracting verification obligations from the codebase",
+            )
             review = await self._phase_full_review()
             console.print(f"  Quality score: {review.score}/10")
             console.print(f"  Issues found: {len(review.issues)}")
+            self._kernel_phase(
+                "obligation_extraction",
+                "completed",
+                summary="Obligations extracted from review pass",
+                metadata={"issue_count": len(review.issues), "score": review.score},
+            )
+            self._kernel_phase(
+                "check_prove",
+                "completed",
+                summary="Verification review completed",
+                metadata={"issue_count": len(review.issues), "score": review.score},
+            )
 
             # Phase 3: REFACTOR (developer mode only)
             if (
@@ -2688,24 +3669,25 @@ class Orchestrator:
 
             # Phase 4: REPORT
             console.print("\n[bold blue]Phase 4: REPORT[/bold blue] — Generating report...")
+            self._kernel_phase("counterexample_report", "started", summary="Generating verification report")
             report = self._generate_review_report(scan_result, review)
+            self._kernel_phase("counterexample_report", "completed", summary="Verification report generated")
+            self._declare_kernel_outcomes("bounded_confidence")
 
             self._print_review_summary(review, scan_result)
+            close_status = "completed"
             return report
 
         except BudgetExceededError as e:
             console.print(f"\n[bold red]Budget exceeded:[/bold red] {e}")
+            self._kernel_phase("counterexample_report", "budget_exceeded", summary=str(e))
             raise
         except Exception as e:
             logger.error(f"Review failed: {e}", exc_info=True)
+            self._kernel_phase("counterexample_report", "failed", summary=str(e))
             raise
         finally:
-            try:
-                if self.runtime is not None:
-                    self.runtime.close()
-            except Exception:
-                pass
-            self.runtime = None
+            self._close_runtime(status=close_status)
 
     async def _phase_scan(self, project_dir: Path):
         """Run Scanner Agent on existing project."""
@@ -2749,6 +3731,32 @@ class Orchestrator:
         (self._forge_dir / "review_report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        verification_dir = self._forge_dir / "verification"
+        verification_dir.mkdir(parents=True, exist_ok=True)
+        obligations = {
+            "project_name": report["project_name"],
+            "completeness": scan_result.completeness,
+            "gaps": list(scan_result.gaps),
+            "issues": list(review.issues),
+            "generated_at": time.time(),
+        }
+        obligations_path = verification_dir / "obligations.json"
+        obligations_path.write_text(
+            json.dumps(obligations, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        if self.kernel_session is not None:
+            self.kernel_session.register_artifact(
+                "verification_report",
+                self._forge_dir / "review_report.json",
+                required=True,
+            )
+            self.kernel_session.register_artifact(
+                "obligation_ledger",
+                obligations_path,
+                required=True,
+                metadata={"issue_count": len(review.issues), "gap_count": len(scan_result.gaps)},
+            )
 
         return report
 
@@ -2780,11 +3788,15 @@ class Orchestrator:
     # Import Pipeline: SCAN → REVIEW → [ENHANCE] → VERIFY → [REFACTOR] → DELIVER
     # ──────────────────────────────────────────────
 
-    async def import_project(self, project_path: str, enhancement: str = "") -> Path:
+    async def _run_import_pipeline(self, project_path: str, enhancement: str = "") -> Path:
         """Import and optionally enhance an existing project.
 
         Pipeline: SCAN → REVIEW → [ENHANCE] → VERIFY → [REFACTOR] → DELIVER
         """
+        from autoforge.engine.phase_executor import PhaseExecutor
+
+        return await PhaseExecutor(self).run_import_pipeline(project_path, enhancement)
+
         self._start_time = time.monotonic()
         self._wall_start = time.time()
         source_dir = Path(project_path).resolve()
@@ -2815,28 +3827,11 @@ class Orchestrator:
                 ignore=shutil.ignore_patterns(*sorted(ignore_names)),
             )
             self._state_file = self.project_dir / ".forge_state.json"
-            self.runtime = ForgeRuntime.create(
-                self.project_dir,
-                self.config.run_id,
-                artifacts_enabled=bool(getattr(self.config, "artifacts_enabled", True)),
-                trace_enabled=bool(getattr(self.config, "trace_enabled", False)),
-                trace_capture_llm_content=bool(getattr(self.config, "trace_capture_llm_content", False)),
-                trace_capture_command_output=bool(getattr(self.config, "trace_capture_command_output", False)),
-                trace_capture_fs_snapshots=bool(getattr(self.config, "trace_capture_fs_snapshots", False)),
-                trace_max_inline_chars=int(getattr(self.config, "trace_max_inline_chars", 20000) or 20000),
-                trace_redact_secrets=bool(getattr(self.config, "trace_redact_secrets", True)),
-                trace_secrets=[s for s in (
-                    list(getattr(self.config, "api_keys", {}).values())
-                    + [
-                        getattr(self.config, "search_api_key", ""),
-                        getattr(self.config, "github_token", ""),
-                        getattr(self.config, "webhook_secret", ""),
-                        getattr(self.config, "webhook_admin_secret", ""),
-                    ]
-                ) if isinstance(s, str) and s],
+            self._open_runtime(
+                operation="import",
+                metadata={"source_dir": str(source_dir), "project_dir": str(self.project_dir)},
             )
             if (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))) and self.runtime is not None:
-                self.llm.set_telemetry_sink(self.runtime.telemetry)
                 try:
                     self.runtime.telemetry.record(
                         "import_started",
@@ -2847,6 +3842,7 @@ class Orchestrator:
 
             # Phase 1: SCAN
             console.print("\n[bold blue]Phase 1: SCAN[/bold blue] — Analyzing project...")
+            self._kernel_phase("spec", "started", summary="Scanning imported project")
             scan_result = await self._phase_scan(self.project_dir)
             self.spec = scan_result.spec
             console.print(
@@ -2854,9 +3850,23 @@ class Orchestrator:
                 f"— {scan_result.completeness}% complete"
             )
             self._save_state("scan_complete")
+            self._kernel_phase(
+                "spec",
+                "completed",
+                summary="Imported project scan complete",
+                metadata={"completeness": scan_result.completeness},
+            )
+            if self.kernel_session is not None:
+                self.kernel_session.update_execution_plan(
+                    objective=f"Import and improve {self.project_dir.name}",
+                    summary="Scan, review, enhance, verify, and deliver imported project",
+                    inputs={"source_dir": str(source_dir), "project_dir": str(self.project_dir)},
+                    metadata={"scan_completeness": scan_result.completeness, "enhancement": enhancement},
+                )
 
             # Phase 2: REVIEW
             console.print("\n[bold blue]Phase 2: REVIEW[/bold blue] — Reviewing code...")
+            self._kernel_phase("build", "started", summary="Reviewing imported project for enhancement plan")
             review = await self._phase_full_review()
             console.print(f"  Quality score: {review.score}/10, {len(review.issues)} issues")
             self._save_state("review_complete")
@@ -2866,43 +3876,66 @@ class Orchestrator:
                 console.print("\n[bold blue]Phase 3: ENHANCE[/bold blue] — Adding features...")
                 await self._phase_enhance(enhancement)
                 self._save_state("enhance_complete")
+            self._kernel_phase(
+                "build",
+                "completed",
+                summary="Import build/enhancement stage complete",
+                metadata={"issue_count": len(review.issues), "enhanced": bool(enhancement)},
+            )
 
             # Phase 4: VERIFY
             console.print("\n[bold blue]Phase 4: VERIFY[/bold blue] — Verifying project...")
+            self._kernel_phase("test", "started", summary="Verifying imported project")
             await self._phase_verify()
             self._save_state("verify_complete")
+            self._kernel_phase("test", "completed", summary="Imported project verification complete")
+            self._declare_kernel_outcomes("tests_pass")
 
             # Phase 5: REFACTOR (developer mode only)
             if self.config.mode == "developer":
                 console.print("\n[bold blue]Phase 5: REFACTOR[/bold blue] — Improving quality...")
+                self._kernel_phase("refactor", "started", summary="Refactoring imported project")
                 await self._phase_refactor()
                 self._save_state("refactor_complete")
+                self._kernel_phase("refactor", "completed", summary="Imported project refactor complete")
 
             # Phase 6: DELIVER
             console.print("\n[bold blue]Phase 6: DELIVER[/bold blue] — Packaging...")
+            self._kernel_phase("deliver", "started", summary="Packaging imported project")
             await self._phase_deliver()
             self._save_state("complete")
+            self._kernel_phase("deliver", "completed", summary="Imported project packaged")
+            self._declare_kernel_outcomes("repo_runnable")
 
             self._print_summary()
             return self.project_dir
 
         except BudgetExceededError as e:
             console.print(f"\n[bold red]Budget exceeded:[/bold red] {e}")
+            self._kernel_phase("deliver", "budget_exceeded", summary=str(e))
+            self._declare_kernel_outcomes("partial_delivery")
             if self.project_dir:
                 self._save_state("budget_exceeded")
             raise
         except Exception as e:
             logger.error(f"Import failed: {e}", exc_info=True)
+            self._kernel_phase("deliver", "failed", summary=str(e))
             if self.project_dir:
                 self._save_state(f"failed: {e}")
             raise
         finally:
-            try:
-                if self.runtime is not None:
-                    self.runtime.close()
-            except Exception:
-                pass
-            self.runtime = None
+            close_status = "failed"
+            if self.project_dir is not None and self._state_file and self._state_file.exists():
+                try:
+                    state = json.loads(self._state_file.read_text(encoding="utf-8"))
+                    phase = str(state.get("phase", ""))
+                    if phase == "complete":
+                        close_status = "completed"
+                    elif phase == "budget_exceeded":
+                        close_status = "budget_exceeded"
+                except Exception:
+                    pass
+            self._close_runtime(status=close_status)
 
     async def _phase_enhance(self, enhancement: str) -> None:
         """Add new features to an imported project.
@@ -4095,8 +5128,16 @@ class Orchestrator:
         task_progress = self._task_progress_snapshot()
         next_state_version = self._state_version + 1
 
+        kernel_profile = ""
+        if self.kernel_session is not None:
+            kernel_profile = getattr(self.kernel_session.profile, "name", "")
         state = {
             "run_id": self.config.run_id,
+            "lineage_id": str(getattr(self.config, "lineage_id", "") or self.config.run_id),
+            "parent_run_id": str(getattr(self.config, "parent_run_id", "") or ""),
+            "project_id": str(getattr(self.config, "project_id", "") or ""),
+            "operation": str(self._phase_context.get("operation", "") or self._profile_name_for_operation("generate") or "generate"),
+            "profile": str(self._phase_context.get("profile", "") or kernel_profile),
             "phase": phase,
             "spec": self.spec,
             "architecture": self.architecture,
@@ -4171,6 +5212,22 @@ class Orchestrator:
                 self.runtime.trace.record_fs_snapshot(self.project_dir, label=f"state:{phase}")
             except Exception:
                 pass
+        if did_save and self.kernel_session is not None and self._state_file is not None:
+            try:
+                self.kernel_session.heartbeat()
+                self.kernel_session.write_checkpoint(
+                    state_marker=phase,
+                    state_version=next_state_version,
+                    state=state,
+                )
+                self.kernel_session.register_artifact(
+                    "state_snapshot",
+                    self._state_file,
+                    required=False,
+                    metadata={"phase": phase, "state_version": next_state_version},
+                )
+            except Exception:
+                pass
 
     def _list_project_files(self) -> list[str]:
         """List all source files in the project directory."""
@@ -4189,8 +5246,12 @@ class Orchestrator:
     # Resume + Status
     # ──────────────────────────────────────────────
 
-    async def resume(self, workspace_path: Path | None = None) -> Path:
+    async def _resume_pipeline(self, workspace_path: Path | None = None) -> Path:
         """Resume an interrupted run."""
+        from autoforge.engine.phase_executor import PhaseExecutor
+
+        return await PhaseExecutor(self).run_resume_pipeline(workspace_path)
+
         if workspace_path is None:
             # Find the most recent project in workspace
             workspace = self.config.workspace_dir
@@ -4249,32 +5310,32 @@ class Orchestrator:
                 )
 
         state_run_id = state.get("run_id")
-        if isinstance(state_run_id, str) and state_run_id:
-            self.config.run_id = state_run_id
-
-        self.runtime = ForgeRuntime.create(
-            self.project_dir,
-            self.config.run_id,
-            artifacts_enabled=bool(getattr(self.config, "artifacts_enabled", True)),
-            trace_enabled=bool(getattr(self.config, "trace_enabled", False)),
-            trace_capture_llm_content=bool(getattr(self.config, "trace_capture_llm_content", False)),
-            trace_capture_command_output=bool(getattr(self.config, "trace_capture_command_output", False)),
-            trace_capture_fs_snapshots=bool(getattr(self.config, "trace_capture_fs_snapshots", False)),
-            trace_max_inline_chars=int(getattr(self.config, "trace_max_inline_chars", 20000) or 20000),
-            trace_redact_secrets=bool(getattr(self.config, "trace_redact_secrets", True)),
-            trace_secrets=[s for s in (
-                list(getattr(self.config, "api_keys", {}).values())
-                + [
-                    getattr(self.config, "search_api_key", ""),
-                    getattr(self.config, "github_token", ""),
-                    getattr(self.config, "webhook_secret", ""),
-                    getattr(self.config, "webhook_admin_secret", ""),
-                ]
-            ) if isinstance(s, str) and s],
+        prior_success_outcomes = self._resume_prior_success_outcomes(
+            state_run_id if isinstance(state_run_id, str) else None
         )
+        if isinstance(state_run_id, str) and state_run_id:
+            self.config.parent_run_id = state_run_id
+        state_lineage_id = state.get("lineage_id")
+        if isinstance(state_lineage_id, str) and state_lineage_id:
+            self.config.lineage_id = state_lineage_id
+        elif not str(getattr(self.config, "lineage_id", "") or "").strip():
+            self.config.lineage_id = state_run_id if isinstance(state_run_id, str) and state_run_id else self.config.run_id
+        state_project_id = state.get("project_id")
+        if isinstance(state_project_id, str) and state_project_id:
+            self.config.project_id = state_project_id
+
+        self._open_runtime(
+            operation="resume",
+            metadata={
+                "project_dir": str(self.project_dir),
+                "loaded_from_journal": loaded_from_journal,
+                "state_file": str(self._state_file),
+                "resumed_from_run_id": state_run_id if isinstance(state_run_id, str) else "",
+            },
+        )
+        close_status = "failed"
         try:
             if (self._durable_enabled() or bool(getattr(self.config, "trace_enabled", False))) and self.runtime is not None:
-                self.llm.set_telemetry_sink(self.runtime.telemetry)
                 try:
                     self.runtime.telemetry.record(
                         "resume_loaded",
@@ -4348,6 +5409,19 @@ class Orchestrator:
             self._start_time = time.monotonic()
 
             console.print(f"Resuming from phase: {phase}")
+            if self.kernel_session is not None:
+                self.kernel_session.update_execution_plan(
+                    summary=f"Resume from state marker {phase}",
+                    inputs={"resume_phase": phase, "project_dir": str(self.project_dir)},
+                    metadata={"loaded_from_journal": loaded_from_journal},
+                    status="resuming",
+                )
+            self._kernel_phase(
+                self._kernel_phase_from_state_marker(phase),
+                "resumed",
+                summary=f"Loaded resume state {phase}",
+                metadata={"loaded_from_journal": loaded_from_journal},
+            )
 
             # Resume from the appropriate phase
             if phase == "spec_complete":
@@ -4382,6 +5456,7 @@ class Orchestrator:
                 await self._phase_deliver()
             elif phase == "complete":
                 console.print("Project already complete!")
+                close_status = "completed"
             else:
                 console.print(f"Unknown phase '{phase}', starting from build")
                 await self._phase_build()
@@ -4390,14 +5465,13 @@ class Orchestrator:
                 await self._phase_deliver()
 
             self._print_summary()
+            if close_status != "completed":
+                close_status = "completed"
+            if phase == "complete" and prior_success_outcomes:
+                self._declare_kernel_outcomes(*prior_success_outcomes)
             return self.project_dir
         finally:
-            try:
-                if self.runtime is not None:
-                    self.runtime.close()
-            except Exception:
-                pass
-            self.runtime = None
+            self._close_runtime(status=close_status)
 
     def show_status(self) -> None:
         """Display current project status."""
@@ -4414,6 +5488,8 @@ class Orchestrator:
         table.add_column("Cost", style="yellow")
 
         for project_dir in sorted(projects):
+            if project_dir.name == ".locks":
+                continue
             state_file = project_dir / ".forge_state.json"
             if state_file.exists():
                 try:
@@ -4425,7 +5501,16 @@ class Orchestrator:
                     )
                 except (json.JSONDecodeError, OSError):
                     table.add_row(project_dir.name, "[red]corrupted[/red]", "—")
-            elif project_dir.name != ".locks":
+            else:
+                checkpoint = load_latest_kernel_checkpoint(project_dir)
+                if checkpoint is not None:
+                    state = checkpoint.state
+                    table.add_row(
+                        project_dir.name,
+                        str(state.get("phase", checkpoint.state_marker) or "unknown"),
+                        f"${float(state.get('cost_usd', 0.0) or 0.0):.4f}",
+                    )
+                    continue
                 table.add_row(project_dir.name, "unknown", "—")
 
         console.print(table)

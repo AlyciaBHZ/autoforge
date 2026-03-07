@@ -25,6 +25,7 @@ from autoforge.engine.harness.judge import (
     write_json,
 )
 from autoforge.engine.harness.report import CaseMetrics, HarnessReport, classify_error
+from autoforge.engine.kernel import apply_harness_judge_overlay
 from autoforge.engine.runtime.runtime import ForgeRuntime
 
 
@@ -125,6 +126,12 @@ async def run_dataset(
 
     report = HarnessReport(run_id=run_id)
     cases = load_dataset(dataset_path)
+    lineage_manifest = {
+        "schema_version": 1,
+        "harness_run_id": run_id,
+        "lineage_id": run_id,
+        "case_runs": [],
+    }
 
     # Persist a copy of the dataset for provenance.
     try:
@@ -147,7 +154,13 @@ async def run_dataset(
         # Derive per-case config (isolated, no shared sub-config objects).
         workspace_dir = (case_root / "workspace").resolve()
         workspace_dir.mkdir(parents=True, exist_ok=True)
-        cconf = base_config.fork(workspace_dir=workspace_dir)
+        cconf = base_config.fork(
+            workspace_dir=workspace_dir,
+            client_surface="harness",
+            lineage_id=run_id,
+            parent_run_id=run_id,
+            project_id=f"{run_id}:{case.id}",
+        )
         cconf.run_id = f"{run_id}-{case.id}-{uuid.uuid4().hex[:6]}"
 
         if case.budget_usd is not None:
@@ -342,6 +355,7 @@ async def run_dataset(
             cost_usd=float(getattr(cconf, "estimated_cost_usd", 0.0)),
             input_tokens=int(getattr(cconf, "total_input_tokens", 0)),
             output_tokens=int(getattr(cconf, "total_output_tokens", 0)),
+            kernel_run_id=cconf.run_id,
             project_dir=str(project_dir) if project_dir else "",
             error=error,
             error_type=classify_error(error),
@@ -351,6 +365,34 @@ async def run_dataset(
             diff_counts=diff_counts,
         )
         write_json(case_root / "case_result.json", metrics.to_dict())
+        lineage_manifest["case_runs"].append(
+            {
+                "case_id": case.id,
+                "mode": case.mode,
+                "run_id": cconf.run_id,
+                "project_id": cconf.project_id,
+                "workspace": str(project_dir) if project_dir else "",
+            }
+        )
+        if project_dir is not None and project_dir.is_dir():
+            try:
+                apply_harness_judge_overlay(
+                    project_dir,
+                    run_id=cconf.run_id,
+                    payload={
+                        "harness_run_id": run_id,
+                        "case_id": case.id,
+                        "mode": case.mode,
+                        "visible_tests_ok": visible_ok,
+                        "hidden_tests_ok": hidden_ok,
+                        "golden_patch_similarity": golden_sim,
+                        "diff_counts": diff_counts,
+                        "ok": ok,
+                        "error": error,
+                    },
+                )
+            except Exception:
+                pass
         return metrics
 
     async def _worker(case: HarnessCase) -> None:
@@ -362,6 +404,7 @@ async def run_dataset(
     report.finalize()
 
     write_json(out_dir / "report.json", report.to_dict())
+    write_json(out_dir / "kernel_lineage.json", lineage_manifest)
     try:
         export_run_to_openai_bundle(out_dir, out_dir=out_dir / "openai_eval_bundle")
     except Exception as exc:

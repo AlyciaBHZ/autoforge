@@ -16,9 +16,16 @@ import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from autoforge.engine.config import DEFAULT_PRICING, MODEL_PRICING, ForgeConfig
+from autoforge.engine.development_harness import (
+    append_development_jsonl,
+    resolve_development_harness_root,
+    serialize_jsonable,
+    write_development_json,
+)
 from autoforge.engine.runtime.rate_limit import RateLimitSpec, SqliteRateLimiter
 from autoforge.engine.runtime.telemetry import TelemetrySink
 
@@ -232,6 +239,8 @@ class LLMRouter:
         self._reserved_budget_usd: float = 0.0
         self._telemetry: TelemetrySink | None = None
         self._rng = random.Random()
+        self._harness_project_dir: Path | None = None
+        self._last_openai_candidate: str = ""
         if bool(getattr(config, "deterministic", False)):
             try:
                 self._rng.seed(int(getattr(config, "deterministic_seed", 0) or 0))
@@ -242,6 +251,136 @@ class LLMRouter:
     def set_telemetry_sink(self, sink: TelemetrySink | None) -> None:
         """Attach a best-effort telemetry sink (durable journal, trace exporter, etc)."""
         self._telemetry = sink
+
+    def set_harness_project_dir(self, project_dir: Path | None) -> None:
+        self._harness_project_dir = project_dir
+
+    def _llm_harness_root(self) -> Path:
+        root = resolve_development_harness_root(
+            config=self.config,
+            project_dir=self._harness_project_dir,
+        )
+        return root / "llm_harness"
+
+    def _record_call_bundle(
+        self,
+        *,
+        call_id: int,
+        provider: str,
+        requested_model: str,
+        actual_model: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        response: LLMResponse | None,
+        error_text: str,
+        duration_seconds: float,
+        max_tokens: int,
+        response_json_schema: dict[str, Any] | None,
+    ) -> None:
+        calls_dir = self._llm_harness_root() / "calls"
+        bundle_path = calls_dir / f"call_{call_id:05d}.json"
+        payload: dict[str, Any] = {
+            "run_id": str(getattr(self.config, "run_id", "") or ""),
+            "lineage_id": str(getattr(self.config, "lineage_id", "") or ""),
+            "project_id": str(getattr(self.config, "project_id", "") or ""),
+            "call_id": int(call_id),
+            "provider": str(provider or ""),
+            "requested_model": str(requested_model or ""),
+            "actual_model": str(actual_model or requested_model or ""),
+            "system": system,
+            "messages": serialize_jsonable(messages),
+            "tools": serialize_jsonable(tools or []),
+            "max_tokens": int(max_tokens),
+            "schema_enforced": response_json_schema is not None,
+            "response_json_schema": serialize_jsonable(response_json_schema or {}),
+            "ok": response is not None,
+            "error": str(error_text or ""),
+            "duration_seconds": float(duration_seconds),
+        }
+        if response is not None:
+            payload.update(
+                {
+                    "stop_reason": response.stop_reason,
+                    "usage": {
+                        "input_tokens": int(response.usage.input_tokens),
+                        "output_tokens": int(response.usage.output_tokens),
+                    },
+                    "response_content": serialize_jsonable(response.content),
+                }
+            )
+        write_development_json(bundle_path, payload, artifact_type="llm_call_bundle")
+
+    def _actual_call_cost_usd(self, *, model: str, input_tokens: int, output_tokens: int) -> float:
+        pricing = MODEL_PRICING.get(model, DEFAULT_PRICING)
+        return (
+            int(input_tokens) * float(pricing["input"]) / 1_000_000
+            + int(output_tokens) * float(pricing["output"]) / 1_000_000
+        )
+
+    def _record_budget_ledger(
+        self,
+        *,
+        call_id: int,
+        provider: str,
+        actual_model: str,
+        response: LLMResponse | None,
+        budget_before: float,
+    ) -> None:
+        if response is None:
+            return
+        actual_cost = self._actual_call_cost_usd(
+            model=actual_model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
+        ledger_path = self._llm_harness_root() / "budget_ledger.jsonl"
+        entry = {
+            "run_id": str(getattr(self.config, "run_id", "") or ""),
+            "call_id": int(call_id),
+            "provider": str(provider or ""),
+            "model": str(actual_model or ""),
+            "input_tokens": int(response.usage.input_tokens),
+            "output_tokens": int(response.usage.output_tokens),
+            "actual_cost_usd": float(actual_cost),
+            "budget_before_usd": float(budget_before),
+            "budget_after_usd": float(getattr(self.config, "estimated_cost_usd", 0.0)),
+            "budget_limit_usd": float(getattr(self.config, "budget_limit_usd", 0.0)),
+        }
+        append_development_jsonl(ledger_path, entry, event_type="budget_entry")
+        write_development_json(
+            self._llm_harness_root() / "budget_summary.json",
+            {
+                "run_id": str(getattr(self.config, "run_id", "") or ""),
+                "call_count": int(self._call_count),
+                "budget_limit_usd": float(getattr(self.config, "budget_limit_usd", 0.0)),
+                "budget_used_usd": float(getattr(self.config, "estimated_cost_usd", 0.0)),
+                "last_call_cost_usd": float(actual_cost),
+                "last_call_id": int(call_id),
+            },
+            artifact_type="llm_budget_summary",
+        )
+
+    def _record_fallback_receipt(
+        self,
+        *,
+        requested_model: str,
+        failed_candidate: str,
+        fallback_candidate: str,
+        error: str,
+    ) -> None:
+        append_development_jsonl(
+            self._llm_harness_root() / "fallback_receipts.jsonl",
+            {
+                "run_id": str(getattr(self.config, "run_id", "") or ""),
+                "lineage_id": str(getattr(self.config, "lineage_id", "") or ""),
+                "requested_model": str(requested_model or ""),
+                "failed_candidate": str(failed_candidate or ""),
+                "fallback_candidate": str(fallback_candidate or ""),
+                "error": str(error or ""),
+            },
+            event_type="model_fallback",
+        )
 
     async def close(self) -> None:
         """Close all cached async HTTP clients to release connection pools."""
@@ -634,8 +773,11 @@ class LLMRouter:
         provider = detect_provider(model)
         if provider == "openai":
             model = self._canonicalize_openai_model(model)
+            self._last_openai_candidate = ""
         budget_enforced = self._is_budget_enforced(provider)
         reservation = 0.0
+        actual_model = model
+        budget_before = float(getattr(self.config, "estimated_cost_usd", 0.0))
         if response_json_schema is not None and provider == "anthropic":
             schema_hint = json.dumps(response_json_schema, ensure_ascii=False)
             if system:
@@ -732,6 +874,7 @@ class LLMRouter:
                     response_json_schema=response_json_schema,
                     temperature=temperature,
                 )
+                actual_model = model
             elif provider == "openai":
                 response = await self._call_openai(
                     model,
@@ -742,6 +885,7 @@ class LLMRouter:
                     response_json_schema=response_json_schema,
                     temperature=temperature,
                 )
+                actual_model = str(self._last_openai_candidate or model)
             elif provider == "google":
                 response = await self._call_google(
                     model,
@@ -752,6 +896,7 @@ class LLMRouter:
                     response_json_schema=response_json_schema,
                     temperature=temperature,
                 )
+                actual_model = model
             else:
                 raise ValueError(f"Unknown provider: {provider}")
             return response
@@ -765,7 +910,7 @@ class LLMRouter:
 
             if response is not None:
                 self.config.record_usage(
-                    model,
+                    actual_model,
                     response.usage.input_tokens,
                     response.usage.output_tokens,
                 )
@@ -830,6 +975,30 @@ class LLMRouter:
                     self._telemetry.record_llm_call(payload)
                 except Exception:
                     pass
+            try:
+                self._record_call_bundle(
+                    call_id=call_id,
+                    provider=provider,
+                    requested_model=model,
+                    actual_model=actual_model,
+                    system=system,
+                    messages=messages,
+                    tools=tools,
+                    response=response,
+                    error_text=error_text,
+                    duration_seconds=time.monotonic() - call_started,
+                    max_tokens=effective_max_tokens,
+                    response_json_schema=response_json_schema,
+                )
+                self._record_budget_ledger(
+                    call_id=call_id,
+                    provider=provider,
+                    actual_model=actual_model,
+                    response=response,
+                    budget_before=budget_before,
+                )
+            except Exception:
+                pass
 
     # ── Anthropic ──────────────────────────────────────────────────
 
@@ -1007,6 +1176,7 @@ class LLMRouter:
                     response_json_schema=response_json_schema,
                     temperature=temperature,
                 )
+                self._last_openai_candidate = candidate
                 if candidate.lower() != requested_key and self._openai_model_overrides.get(requested_key) != candidate:
                     self._openai_model_overrides[requested_key] = candidate
                 return resp
@@ -1014,6 +1184,12 @@ class LLMRouter:
                 last_exc = exc
                 if idx == len(candidates) - 1 or not self._is_openai_model_access_error(exc):
                     raise
+                self._record_fallback_receipt(
+                    requested_model=model,
+                    failed_candidate=candidate,
+                    fallback_candidate=candidates[idx + 1],
+                    error=str(exc),
+                )
                 logger.warning(
                     "OpenAI model '%s' is unavailable (%s). Falling back to '%s'.",
                     candidate,

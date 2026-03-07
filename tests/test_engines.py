@@ -8,11 +8,14 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import shutil
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -55,11 +58,19 @@ from autoforge.engine.speculative_pipeline import (
     SpeculativeTask,
 )
 from autoforge.engine.config import ForgeConfig
+from autoforge.engine.daemon import ForgeDaemon
+from autoforge.engine.kernel import KernelSession, create_runtime_from_config
 from autoforge.engine.project_registry import ProjectRegistry, ProjectStatus, RunStage
 from autoforge.engine.provers.proof_search import AdaptiveBeamSearch
 from autoforge.engine.provers.lean_core import ProofState
 from autoforge.engine.request_intake import RequestIntakeService
 from autoforge.engine.sandbox import SubprocessSandbox
+
+
+def _make_local_tmp_dir() -> Path:
+    path = Path.cwd() / ".tmp_engine_tests" / uuid4().hex
+    path.mkdir(parents=True, exist_ok=False)
+    return path
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1322,8 +1333,9 @@ class TestDurableExecutionLedger:
 
     def test_worker_crash_recovery_requeues_stale_build(self):
         async def _run():
-            with tempfile.TemporaryDirectory() as td:
-                db = Path(td) / "registry.db"
+            td = _make_local_tmp_dir()
+            try:
+                db = td / "registry.db"
                 reg = ProjectRegistry(db)
                 await reg.open()
                 p = await reg.enqueue_run(description="recover", requested_by="cli")
@@ -1339,13 +1351,16 @@ class TestDurableExecutionLedger:
                 restored = await reg.get(p.id)
                 assert restored.status == ProjectStatus.QUEUED
                 await reg.close()
+            finally:
+                shutil.rmtree(td, ignore_errors=True)
 
         asyncio.run(_run())
 
     def test_http_entry_is_enqueue_only_creates_planned_run(self):
         async def _run():
-            with tempfile.TemporaryDirectory() as td:
-                db = Path(td) / "registry.db"
+            td = _make_local_tmp_dir()
+            try:
+                db = td / "registry.db"
                 reg = ProjectRegistry(db)
                 await reg.open()
                 p = await reg.enqueue_run(description="queue only", requested_by="webhook:test")
@@ -1355,5 +1370,298 @@ class TestDurableExecutionLedger:
                 assert row is not None
                 assert row[0] == RunStage.PLANNED.value
                 await reg.close()
+            finally:
+                shutil.rmtree(td, ignore_errors=True)
+
+        asyncio.run(_run())
+
+    def test_claim_run_identity_promotes_placeholder_run_and_events(self):
+        async def _run():
+            td = _make_local_tmp_dir()
+            try:
+                db = td / "registry.db"
+                reg = ProjectRegistry(db)
+                await reg.open()
+                p = await reg.enqueue_run(description="queue only", requested_by="daemon")
+
+                await reg.claim_run_identity(
+                    project_id=p.id,
+                    run_id="kernel-run-123",
+                    stage=RunStage.RUNNING,
+                    lineage_id="lineage-123",
+                    parent_run_id="",
+                    surface="daemon",
+                    profile="development",
+                )
+                await reg.claim_run_identity(
+                    project_id=p.id,
+                    run_id="kernel-run-123",
+                    stage=RunStage.RUNNING,
+                    lineage_id="lineage-123",
+                    parent_run_id="",
+                    surface="daemon",
+                    profile="development",
+                )
+
+                dbconn = reg._ensure_db()
+                cur = await dbconn.execute(
+                    """
+                    SELECT run_id, project_id, stage, lineage_id, parent_run_id, surface, profile
+                    FROM run_records
+                    WHERE project_id = ?
+                    """,
+                    (p.id,),
+                )
+                rows = [tuple(row) for row in await cur.fetchall()]
+                assert rows == [
+                    (
+                        "kernel-run-123",
+                        p.id,
+                        RunStage.RUNNING.value,
+                        "lineage-123",
+                        "",
+                        "daemon",
+                        "development",
+                    )
+                ]
+
+                cur = await dbconn.execute(
+                    "SELECT run_id, event_type FROM execution_events ORDER BY created_at"
+                )
+                events = [tuple(row) for row in await cur.fetchall()]
+                assert events == [("kernel-run-123", "RunEnqueued")]
+                await reg.close()
+            finally:
+                shutil.rmtree(td, ignore_errors=True)
+
+        asyncio.run(_run())
+
+    def test_daemon_recovery_resumes_from_kernel_checkpoint_end_to_end(self):
+        async def _run():
+            td = _make_local_tmp_dir()
+            try:
+                db = td / "registry.db"
+                workspace = td / "workspace" / "resume-demo"
+                workspace.mkdir(parents=True, exist_ok=True)
+
+                reg = ProjectRegistry(db)
+                await reg.open()
+                project = await reg.enqueue_run(description="recover with resume", requested_by="cli")
+                _ = await reg.dequeue()
+                await reg.update_name(project.id, "resume-demo", str(workspace))
+
+                checkpoint_config = ForgeConfig(
+                    project_root=td,
+                    workspace_dir=workspace.parent,
+                    run_id="resume-kernel-run",
+                    project_id=project.id,
+                    lineage_id=project.id,
+                    client_surface="daemon",
+                )
+                runtime = create_runtime_from_config(checkpoint_config, workspace)
+                try:
+                    session = KernelSession.open(
+                        config=checkpoint_config,
+                        project_dir=workspace,
+                        runtime=runtime,
+                        profile_name="development",
+                        operation="generate",
+                        surface="daemon",
+                        metadata={"purpose": "daemon-recovery-test"},
+                    )
+                    session.write_checkpoint(
+                        state_marker="build_complete",
+                        state_version=1,
+                        state={
+                            "run_id": checkpoint_config.run_id,
+                            "project_id": project.id,
+                            "lineage_id": project.id,
+                            "operation": "generate",
+                            "profile": "development",
+                            "phase": "build_complete",
+                        },
+                    )
+                    session.close(status="paused")
+                finally:
+                    runtime.close()
+
+                stale = (datetime.now(timezone.utc) - timedelta(seconds=7200)).isoformat()
+                dbconn = reg._ensure_db()
+                await reg.sync_run_record(
+                    run_id="prior-run",
+                    project_id=project.id,
+                    stage=RunStage.PAUSED,
+                    lineage_id=project.id,
+                    parent_run_id="",
+                    surface="daemon",
+                    profile="development",
+                )
+                await dbconn.execute(
+                    "UPDATE projects SET started_at = ?, workspace_path = ? WHERE id = ?",
+                    (stale, str(workspace), project.id),
+                )
+                await dbconn.commit()
+
+                recovered = await reg.requeue_stale_builds(max_age_seconds=600)
+                assert recovered == 1
+
+                daemon_config = ForgeConfig(
+                    project_root=td,
+                    workspace_dir=workspace.parent,
+                    db_path=db,
+                    client_surface="daemon",
+                )
+                daemon = ForgeDaemon(daemon_config)
+                daemon.registry = reg
+
+                dequeued = await reg.dequeue()
+                assert dequeued is not None
+                assert dequeued.workspace_path == str(workspace)
+
+                class _FakeOrchestrator:
+                    instances: list["_FakeOrchestrator"] = []
+
+                    def __init__(self, config: ForgeConfig, checkpoint_responder=None) -> None:
+                        self.config = config
+                        self.checkpoint_responder = checkpoint_responder
+                        self.project_dir: Path | None = None
+                        self.spec: dict[str, Any] = {}
+                        self.dag = None
+                        self.kernel_session = None
+                        self.runtime = None
+                        self.llm = None
+                        self.resume_calls: list[Path] = []
+                        self.run_calls: list[str] = []
+                        self._save_state = lambda phase: None
+                        type(self).instances.append(self)
+
+                    def _has_resume_checkpoint(self, workspace_path: Path) -> bool:
+                        return (
+                            workspace_path
+                            / ".autoforge"
+                            / "kernel"
+                            / "runs"
+                            / checkpoint_config.run_id
+                            / "checkpoint.json"
+                        ).is_file()
+
+                    async def resume(self, workspace_path: Path) -> Path:
+                        self.resume_calls.append(workspace_path)
+                        self.project_dir = workspace_path
+                        self._save_state("complete")
+                        return workspace_path
+
+                    async def run(self, description: str) -> Path:
+                        self.run_calls.append(description)
+                        raise AssertionError("fresh run should not execute when a kernel checkpoint is present")
+
+                with (
+                    patch("autoforge.engine.daemon.ForgeConfig.from_env", return_value=checkpoint_config),
+                    patch("autoforge.engine.daemon.Orchestrator", _FakeOrchestrator),
+                    patch("autoforge.engine.daemon.generate_deploy_guide", return_value="# deploy\n"),
+                ):
+                    await daemon._process_project(dequeued)
+
+                restored = await reg.get(project.id)
+                assert restored is not None
+                assert restored.status == ProjectStatus.COMPLETED
+                assert restored.workspace_path == str(workspace)
+
+                assert _FakeOrchestrator.instances
+                fake = _FakeOrchestrator.instances[-1]
+                assert fake.resume_calls == [workspace.resolve()]
+                assert fake.run_calls == []
+
+                cur = await dbconn.execute(
+                    "SELECT stage, lineage_id, profile FROM run_records WHERE run_id = ?",
+                    (checkpoint_config.run_id,),
+                )
+                run_row = await cur.fetchone()
+                assert run_row is not None
+                assert tuple(run_row) == (
+                    RunStage.RUNTIME_VERIFIED.value,
+                    project.id,
+                    "development",
+                )
+
+                cur = await dbconn.execute(
+                    "SELECT event_type FROM execution_events WHERE run_id = ? ORDER BY created_at",
+                    (checkpoint_config.run_id,),
+                )
+                events = [row[0] for row in await cur.fetchall()]
+                assert "RunStarted" in events
+                assert "RunCompleted" in events
+
+                assert (workspace / "DEPLOY_GUIDE.md").is_file()
+                lineage_compare = json.loads(
+                    (
+                        workspace
+                        / ".autoforge"
+                        / "development_harness"
+                        / "daemon_harness"
+                        / "lineage_compare.json"
+                    ).read_text(encoding="utf-8")
+                )
+                recovery_view = json.loads(
+                    (
+                        workspace
+                        / ".autoforge"
+                        / "development_harness"
+                        / "daemon_harness"
+                        / "recovery_view.json"
+                    ).read_text(encoding="utf-8")
+                )
+                compare_run_ids = [item["run_id"] for item in lineage_compare["runs"]]
+                assert "prior-run" in compare_run_ids
+                assert checkpoint_config.run_id in compare_run_ids
+                assert recovery_view["resumed_from_checkpoint"] is True
+                assert recovery_view["status"] == "completed"
+                await reg.close()
+            finally:
+                shutil.rmtree(td, ignore_errors=True)
+
+        asyncio.run(_run())
+
+    def test_daemon_harness_writes_contention_view_when_lease_is_held(self):
+        async def _run():
+            td = _make_local_tmp_dir()
+            try:
+                db = td / "registry.db"
+                workspace = td / "workspace" / "contention-demo"
+                workspace.mkdir(parents=True, exist_ok=True)
+
+                reg = ProjectRegistry(db)
+                await reg.open()
+                project = await reg.enqueue_run(description="contention case", requested_by="cli")
+                await reg.update_name(project.id, "contention-demo", str(workspace))
+                queued = await reg.get(project.id)
+                await reg.acquire_task_lease(project.id, "daemon:other-worker", ttl_seconds=120)
+
+                daemon_config = ForgeConfig(
+                    project_root=td,
+                    workspace_dir=workspace.parent,
+                    db_path=db,
+                    client_surface="daemon",
+                )
+                daemon = ForgeDaemon(daemon_config)
+                daemon.registry = reg
+
+                await daemon._process_project(queued)
+
+                recovery_view = json.loads(
+                    (
+                        workspace
+                        / ".autoforge"
+                        / "development_harness"
+                        / "daemon_harness"
+                        / "recovery_view.json"
+                    ).read_text(encoding="utf-8")
+                )
+                assert recovery_view["contention_detected"] is True
+                assert recovery_view["contention_holder"] == "daemon:other-worker"
+                assert recovery_view["status"] == "lease_contention"
+                await reg.close()
+            finally:
+                shutil.rmtree(td, ignore_errors=True)
 
         asyncio.run(_run())

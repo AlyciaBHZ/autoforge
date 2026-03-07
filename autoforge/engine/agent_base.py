@@ -11,12 +11,19 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
 from autoforge.engine.config import ForgeConfig
+from autoforge.engine.development_harness import (
+    append_development_jsonl,
+    resolve_development_harness_root,
+    serialize_jsonable,
+    write_development_json,
+)
 from autoforge.engine.llm_router import BudgetExceededError, LLMRouter, TaskComplexity
 
 logger = logging.getLogger(__name__)
@@ -199,8 +206,102 @@ class AgentBase(ABC):
         self._output_parts: list[str] = []
         self._artifacts: dict[str, Any] = {}
         self._checkpoint_mgr: Any = None  # Lazy-initialized CheckpointManager
+        self._agent_run_id: str = ""
+        self._agent_run_dir: Path | None = None
+        self._tool_trace_path: Path | None = None
         self._load_system_prompt()
         self._register_tools()
+
+    def _agent_harness_root(self) -> Path:
+        working_dir = getattr(self, "working_dir", None)
+        if isinstance(working_dir, Path):
+            root = resolve_development_harness_root(
+                config=self.config,
+                working_dir=working_dir,
+            )
+        else:
+            root = resolve_development_harness_root(config=self.config)
+        return root / "agent_harness"
+
+    def _start_agent_harness(self, context: dict[str, Any]) -> None:
+        self._agent_run_id = f"{self.ROLE}-{uuid.uuid4().hex[:10]}"
+        self._agent_run_dir = self._agent_harness_root() / self.ROLE / self._agent_run_id
+        self._agent_run_dir.mkdir(parents=True, exist_ok=True)
+        self._tool_trace_path = self._agent_run_dir / "tool_call_trace.jsonl"
+        working_dir = getattr(self, "working_dir", None)
+        write_development_json(
+            self._agent_run_dir / "agent_run.json",
+            {
+                "agent_run_id": self._agent_run_id,
+                "run_id": str(getattr(self.config, "run_id", "") or ""),
+                "lineage_id": str(getattr(self.config, "lineage_id", "") or ""),
+                "parent_run_id": str(getattr(self.config, "parent_run_id", "") or ""),
+                "project_id": str(getattr(self.config, "project_id", "") or ""),
+                "agent_name": self.ROLE,
+                "mode": str(self.mode or ""),
+                "working_dir": str(working_dir) if isinstance(working_dir, Path) else "",
+                "context_keys": sorted(str(key) for key in context.keys()),
+                "started_at": time.time(),
+            },
+            artifact_type="agent_run",
+        )
+
+    def _record_tool_trace(
+        self,
+        *,
+        turn: int,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        result: str,
+        duration_seconds: float,
+    ) -> None:
+        if self._tool_trace_path is None:
+            return
+        preview = str(result or "")
+        if len(preview) > 1200:
+            preview = preview[:1200] + "..."
+        append_development_jsonl(
+            self._tool_trace_path,
+            {
+                "agent_run_id": self._agent_run_id,
+                "run_id": str(getattr(self.config, "run_id", "") or ""),
+                "turn": int(turn),
+                "tool_name": str(tool_name or ""),
+                "tool_input": serialize_jsonable(tool_input),
+                "result_preview": preview,
+                "duration_seconds": float(duration_seconds),
+            },
+            event_type="tool_call",
+        )
+
+    def _write_agent_verdict(
+        self,
+        *,
+        context: dict[str, Any],
+        result: AgentResult,
+    ) -> None:
+        if self._agent_run_dir is None:
+            return
+        write_development_json(
+            self._agent_run_dir / "agent_verdict.json",
+            {
+                "agent_run_id": self._agent_run_id,
+                "run_id": str(getattr(self.config, "run_id", "") or ""),
+                "lineage_id": str(getattr(self.config, "lineage_id", "") or ""),
+                "agent_name": result.agent_name,
+                "success": bool(result.success),
+                "error": str(result.error or ""),
+                "total_turns": int(result.total_turns),
+                "duration_seconds": float(result.duration_seconds),
+                "files_written": int(result.files_written),
+                "tool_calls": dict(result.tool_calls),
+                "artifact_count": len(result.artifacts),
+                "artifact_paths": serialize_jsonable(result.artifacts),
+                "context_keys": sorted(str(key) for key in context.keys()),
+                "completed_at": time.time(),
+            },
+            artifact_type="agent_verdict",
+        )
 
     def set_dynamic_constitution(self, supplement: str) -> None:
         """Set dynamic constitution supplement (project-specific instructions)."""
@@ -307,6 +408,7 @@ class AgentBase(ABC):
         self._output_parts = []
         self._artifacts = {}
         start_time = time.monotonic()
+        self._start_agent_harness(context)
 
         # Build effective system prompt (static + dynamic)
         effective_system = self._system_prompt
@@ -354,7 +456,7 @@ class AgentBase(ABC):
 
         def _build_result(success: bool, error: str = "") -> AgentResult:
             elapsed = time.monotonic() - start_time
-            return AgentResult(
+            result = AgentResult(
                 agent_name=self.ROLE,
                 success=success,
                 output="\n".join(self._output_parts),
@@ -365,6 +467,8 @@ class AgentBase(ABC):
                 files_written=files_written,
                 tool_calls=dict(tool_counts),
             )
+            self._write_agent_verdict(context=context, result=result)
+            return result
 
         try:
             while turns < self.MAX_TURNS:
@@ -426,7 +530,15 @@ class AgentBase(ABC):
                     for block in response.content:
                         if block.type == "tool_use":
                             self._log_action("tool_call", f"{block.name}")
+                            tool_started = time.monotonic()
                             result = await self._execute_tool(block.name, block.input)
+                            self._record_tool_trace(
+                                turn=turns,
+                                tool_name=block.name,
+                                tool_input=block.input,
+                                result=result,
+                                duration_seconds=time.monotonic() - tool_started,
+                            )
 
                             # Track metrics (Section D)
                             tool_counts[block.name] = tool_counts.get(block.name, 0) + 1
