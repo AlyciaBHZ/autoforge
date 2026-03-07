@@ -895,6 +895,9 @@ def test_provider_detection():
     assert detect_provider("claude-sonnet-4-6") == "anthropic"
     assert detect_provider("claude-haiku-4-5-20251001") == "anthropic"
     assert detect_provider("gpt-4o") == "openai"
+    assert detect_provider("gpt-5.4") == "openai"
+    assert detect_provider("gpt-5.3-codex") == "openai"
+    assert detect_provider("gpt-5.3-codex-spark") == "openai"
     assert detect_provider("gpt-5-mini") == "openai"
     assert detect_provider("gpt-4o-mini") == "openai"
     assert detect_provider("o3") == "openai"
@@ -905,6 +908,37 @@ def test_provider_detection():
     assert detect_provider("gemini-2.5-flash-lite") == "google"
     # Unknown model defaults to anthropic
     assert detect_provider("some-unknown-model") == "anthropic"
+
+
+def test_openai_subscription_model_normalization():
+    """Codex OAuth / Device Code cannot use GPT-4o/o-series models."""
+    from autoforge.engine.config import ForgeConfig
+
+    config = ForgeConfig(
+        auth_config={"openai": {"auth_method": "codex_oauth"}},
+        model_strong="gpt-4o",
+        model_fast="o4-mini",
+    )
+    assert config.model_strong == "gpt-5.1-codex-max"
+    assert config.model_fast == "gpt-5.1-codex-mini"
+
+
+def test_openai_codex_unsupported_model_error_is_treated_as_access_error():
+    """OpenAI Codex backend rejects unsupported models with 400s; we should fallback."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+
+    class _FakeOpenAIError(Exception):
+        status_code = 400
+        body = {
+            "detail": "The 'gpt-4o' model is not supported when using Codex with a ChatGPT account."
+        }
+
+        def __str__(self) -> str:  # pragma: no cover
+            return "Error code: 400 - {'detail': 'The gpt-4o model is not supported when using Codex with a ChatGPT account.'}"
+
+    router = LLMRouter(ForgeConfig(auth_config={"openai": {"auth_method": "codex_oauth"}}))
+    assert router._is_openai_model_access_error(_FakeOpenAIError()) is True
 
 
 def test_normalized_response_types():

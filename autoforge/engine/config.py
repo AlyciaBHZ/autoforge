@@ -39,7 +39,13 @@ MODEL_PRICING = {
     "codex-5.3": {"input": 1.75, "output": 14.0},
     "gpt-5.3-codex": {"input": 1.75, "output": 14.0},
     "gpt-5.2-codex": {"input": 1.75, "output": 14.0},
+    "gpt-5.1-codex-max": {"input": 1.25, "output": 10.0},
+    "gpt-5.1-codex": {"input": 1.25, "output": 10.0},
+    "gpt-5-codex": {"input": 1.25, "output": 10.0},
     "gpt-5.2": {"input": 1.75, "output": 14.0},
+    "gpt-5.1": {"input": 1.25, "output": 10.0},
+    "gpt-5": {"input": 1.25, "output": 10.0},
+    "gpt-5.4": {"input": 2.5, "output": 15.0},
     "gpt-5-mini": {"input": 0.25, "output": 2.0},
     "gpt-5.1-codex-mini": {"input": 0.25, "output": 2.0},
     "gpt-5-nano": {"input": 0.05, "output": 0.4},
@@ -575,13 +581,37 @@ class ForgeConfig:
         # Normalize legacy OpenAI aliases from older config files.
         #
         # NOTE: `codex-5.3` was an early placeholder in the setup wizard.
-        # Map it to a broadly available OpenAI model to avoid repeated 404s.
-        legacy_aliases = {"codex-5.3": "gpt-4o"}
+        # Map it to the modern canonical Codex model name.
+        legacy_aliases = {"codex-5.3": "gpt-5.3-codex"}
         for attr in ("model_strong", "model_fast"):
             model_name = str(getattr(self, attr, "")).strip()
             canonical = legacy_aliases.get(model_name.lower())
             if canonical:
                 setattr(self, attr, canonical)
+
+        # If the user authenticated with Codex OAuth / Device Code (ChatGPT subscription),
+        # we must avoid models that the Codex backend does not support (e.g. GPT-4o).
+        openai_auth = self.auth_config.get("openai", {}) if isinstance(self.auth_config, dict) else {}
+        method = str(openai_auth.get("auth_method", "") or "").strip().lower()
+        if method in {"codex_oauth", "device_code"}:
+            for attr, fallback in (
+                ("model_strong", "gpt-5.1-codex-max"),
+                ("model_fast", "gpt-5.1-codex-mini"),
+            ):
+                model_name = str(getattr(self, attr, "")).strip()
+                model_lower = model_name.lower()
+                if not model_name:
+                    continue
+                # Accept GPT-5 family and Codex models; rewrite anything else.
+                if not (model_lower.startswith("gpt-5") or model_lower.startswith("codex-") or "codex" in model_lower):
+                    logging.getLogger(__name__).warning(
+                        "%s=%r is not supported with ChatGPT-subscription Codex auth; "
+                        "using %r instead. (Tip: switch OpenAI auth_method to api_key to use GPT-4o/o-series.)",
+                        attr,
+                        model_name,
+                        fallback,
+                    )
+                    setattr(self, attr, fallback)
 
         # Warn (but don't block) if model names don't match known patterns
         logger = logging.getLogger(__name__)

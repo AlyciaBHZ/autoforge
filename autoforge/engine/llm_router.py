@@ -128,7 +128,11 @@ _RETRY_BASE_DELAY = 1.0  # seconds - base delay for exponential backoff
 
 # Known OpenAI model prefixes/names
 _OPENAI_MODELS = {
+    "gpt-5.4",
+    "gpt-5.3",
     "gpt-5.2",
+    "gpt-5.1",
+    "gpt-5",
     "gpt-4o",
     "gpt-4o-mini",
     "gpt-5-mini",
@@ -137,10 +141,12 @@ _OPENAI_MODELS = {
     "gpt-4",
     "gpt-3.5-turbo",
     "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
     "gpt-5.2-codex",
     "gpt-5.1-codex",
     "gpt-5.1-codex-mini",
     "gpt-5.1-codex-max",
+    "gpt-5-codex",
     "codex-5.3",
     "o3",
     "o3-mini",
@@ -153,13 +159,16 @@ _OPENAI_MODELS = {
 
 _OPENAI_MODEL_ALIASES = {
     # Historical alias from older AutoForge releases.
-    "codex-5.3": "gpt-4o",
+    "codex-5.3": "gpt-5.3-codex",
 }
 
 _OPENAI_MODEL_FALLBACKS = [
+    "gpt-5.1-codex-max",
+    "gpt-5.3-codex",
     "gpt-5.2-codex",
     "gpt-5.1-codex-mini",
     "gpt-5-mini",
+    "gpt-5-nano",
     "gpt-4o",
     "gpt-4o-mini",
     "o4-mini",
@@ -424,6 +433,37 @@ class LLMRouter:
             return True
         return False
 
+    def _is_codex_subscription_model(self, model: str) -> bool:
+        """Return True if model looks compatible with the ChatGPT-subscription Codex backend.
+
+        Codex OAuth / Device Code auth routes requests via chatgpt.com and does not
+        support legacy GPT-4o/o-series models.
+        """
+        model_lower = (model or "").strip().lower()
+        if not model_lower:
+            return False
+        if model_lower.startswith("gpt-5"):
+            return True
+        if model_lower.startswith("codex-"):
+            return True
+        if "codex" in model_lower:
+            return True
+        return False
+
+    def _map_openai_model_to_codex_subscription(self, model: str) -> str:
+        """Map an unsupported OpenAI model to a safe Codex-subscription default."""
+        model_lower = (model or "").strip().lower()
+        if not model_lower:
+            return "gpt-5.1-codex-max"
+        # Prefer the smaller Codex model for "mini"/small variants.
+        if (
+            "mini" in model_lower
+            or model_lower.endswith("-nano")
+            or model_lower in {"o4-mini", "o3-mini", "o1-mini"}
+        ):
+            return "gpt-5.1-codex-mini"
+        return "gpt-5.1-codex-max"
+
     def _canonicalize_openai_model(self, model: str) -> str:
         """Normalize legacy OpenAI aliases into canonical API model names."""
         return _OPENAI_MODEL_ALIASES.get(model.lower(), model)
@@ -433,9 +473,14 @@ class LLMRouter:
         candidates: list[str] = []
         canonical = self._canonicalize_openai_model(model)
         if canonical:
-            candidates.append(canonical)
+            if self._is_openai_subscription_auth() and not self._is_codex_subscription_model(canonical):
+                candidates.append(self._map_openai_model_to_codex_subscription(canonical))
+            else:
+                candidates.append(canonical)
 
         for fallback in _OPENAI_MODEL_FALLBACKS:
+            if self._is_openai_subscription_auth() and not self._is_codex_subscription_model(fallback):
+                continue
             if fallback not in candidates:
                 candidates.append(fallback)
         return candidates
@@ -445,17 +490,26 @@ class LLMRouter:
         status_code = getattr(exc, "status_code", None)
         body = getattr(exc, "body", None)
         code = ""
+        detail = ""
         if isinstance(body, dict):
             err = body.get("error")
             if isinstance(err, dict):
                 code = str(err.get("code", "")).lower()
+            if "detail" in body:
+                detail = str(body.get("detail", "")).lower()
 
         text = str(exc).lower()
+        combined = " ".join(x for x in (text, detail, code) if x)
         if code == "model_not_found":
             return True
         if status_code == 404 and ("model" in text and ("not found" in text or "does not exist" in text)):
             return True
         if "do not have access" in text or "does not exist or you do not have access" in text:
+            return True
+        if status_code in (400, 403) and "codex" in combined and "not supported" in combined:
+            # ChatGPT-subscription Codex backend rejects unsupported models with 400s.
+            return True
+        if "not supported when using codex" in combined and "chatgpt" in combined:
             return True
         return False
 

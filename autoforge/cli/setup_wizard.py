@@ -50,7 +50,8 @@ PROVIDERS = {
         "validate": lambda x: x.startswith("sk-") and len(x) > 20,
         "invalid_msg": "Must start with 'sk-' and be at least 20 characters",
         "models_strong": [
-            {"name": "GPT-4o (recommended, broadly available)", "value": "gpt-4o"},
+            {"name": "GPT-5.4 (latest, access may vary)", "value": "gpt-5.4"},
+            {"name": "GPT-4o (broadly available)", "value": "gpt-4o"},
             {"name": "o3 (strongest reasoning, access may vary)", "value": "o3"},
             {"name": "GPT-5.2-Codex (code, access may vary)", "value": "gpt-5.2-codex"},
             {"name": "GPT-5.3-Codex (code, latest, access may vary)", "value": "gpt-5.3-codex"},
@@ -61,6 +62,21 @@ PROVIDERS = {
             {"name": "o4-mini (reasoning, access may vary)", "value": "o4-mini"},
             {"name": "GPT-5 mini (access may vary)", "value": "gpt-5-mini"},
             {"name": "GPT-5.1-Codex-mini (code, access may vary)", "value": "gpt-5.1-codex-mini"},
+        ],
+        # Codex OAuth / Device Code routes via the ChatGPT-subscription Codex backend,
+        # which does not support GPT-4o/o-series models. Default to Codex models.
+        "models_strong_subscription": [
+            {"name": "GPT-5.1-Codex-Max (recommended for subscription)", "value": "gpt-5.1-codex-max"},
+            {"name": "GPT-5.3-Codex (code, latest, access may vary)", "value": "gpt-5.3-codex"},
+            {"name": "GPT-5.2-Codex (code, access may vary)", "value": "gpt-5.2-codex"},
+            {"name": "GPT-5.4 (general, access may vary)", "value": "gpt-5.4"},
+            {"name": "GPT-5.1-Codex (code, stable)", "value": "gpt-5.1-codex"},
+        ],
+        "models_fast_subscription": [
+            {"name": "GPT-5.1-Codex-mini (recommended for subscription)", "value": "gpt-5.1-codex-mini"},
+            {"name": "GPT-5.3-Codex-Spark (fast code, access may vary)", "value": "gpt-5.3-codex-spark"},
+            {"name": "GPT-5 mini (access may vary)", "value": "gpt-5-mini"},
+            {"name": "GPT-5 nano (cheapest, access may vary)", "value": "gpt-5-nano"},
         ],
         "auth_methods": [
             {"name": "API Key", "value": "api_key"},
@@ -210,8 +226,14 @@ def run_setup_wizard() -> None:
                 for pid in selected_providers:
                     if pid in api_keys or pid in auth_configs:
                         info = PROVIDERS[pid]
-                        strong_choices.extend(info["models_strong"])
-                        fast_choices.extend(info["models_fast"])
+                        if pid == "openai" and _is_openai_subscription_auth_method(
+                            auth_configs.get("openai", {}).get("auth_method")
+                        ):
+                            strong_choices.extend(info.get("models_strong_subscription", info["models_strong"]))
+                            fast_choices.extend(info.get("models_fast_subscription", info["models_fast"]))
+                        else:
+                            strong_choices.extend(info["models_strong"])
+                            fast_choices.extend(info["models_fast"])
 
                 if strong_choices:
                     model_strong = inquirer.select(
