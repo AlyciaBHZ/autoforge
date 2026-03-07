@@ -590,28 +590,28 @@ class ForgeConfig:
                 setattr(self, attr, canonical)
 
         # If the user authenticated with Codex OAuth / Device Code (ChatGPT subscription),
-        # we must avoid models that the Codex backend does not support (e.g. GPT-4o).
+        # the Codex backend may reject some models (for example GPT-4o/o-series).
+        #
+        # IMPORTANT: Do not silently rewrite user-selected models here. Users may
+        # intentionally set models and prefer a clear error over implicit changes.
+        # The OpenAI router handles error messaging at call-time.
         openai_auth = self.auth_config.get("openai", {}) if isinstance(self.auth_config, dict) else {}
         method = str(openai_auth.get("auth_method", "") or "").strip().lower()
         if method in {"codex_oauth", "device_code"}:
-            for attr, fallback in (
-                ("model_strong", "gpt-5.1-codex-max"),
-                ("model_fast", "gpt-5.1-codex-mini"),
-            ):
+            for attr in ("model_strong", "model_fast"):
                 model_name = str(getattr(self, attr, "")).strip()
-                model_lower = model_name.lower()
                 if not model_name:
                     continue
-                # Accept GPT-5 family and Codex models; rewrite anything else.
-                if not (model_lower.startswith("gpt-5") or model_lower.startswith("codex-") or "codex" in model_lower):
-                    logging.getLogger(__name__).warning(
-                        "%s=%r is not supported with ChatGPT-subscription Codex auth; "
-                        "using %r instead. (Tip: switch OpenAI auth_method to api_key to use GPT-4o/o-series.)",
-                        attr,
-                        model_name,
-                        fallback,
-                    )
-                    setattr(self, attr, fallback)
+                model_lower = model_name.lower()
+                if model_lower.startswith(("gpt-5", "codex-")) or "codex" in model_lower:
+                    continue
+                logging.getLogger(__name__).warning(
+                    "%s=%r may be unsupported with Codex OAuth / Device Code. "
+                    "If you see a \"model is not supported when using Codex with a ChatGPT account\" error, "
+                    "choose a GPT-5/Codex model (e.g. gpt-5.4, gpt-5.3-codex) or switch OpenAI auth_method to api_key.",
+                    attr,
+                    model_name,
+                )
 
         # Warn (but don't block) if model names don't match known patterns
         logger = logging.getLogger(__name__)

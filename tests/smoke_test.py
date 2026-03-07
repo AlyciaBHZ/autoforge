@@ -910,8 +910,8 @@ def test_provider_detection():
     assert detect_provider("some-unknown-model") == "anthropic"
 
 
-def test_openai_subscription_model_normalization():
-    """Codex OAuth / Device Code cannot use GPT-4o/o-series models."""
+def test_openai_subscription_models_are_not_auto_rewritten():
+    """Codex OAuth / Device Code should not silently rewrite user-selected models."""
     from autoforge.engine.config import ForgeConfig
 
     config = ForgeConfig(
@@ -919,12 +919,23 @@ def test_openai_subscription_model_normalization():
         model_strong="gpt-4o",
         model_fast="o4-mini",
     )
-    assert config.model_strong == "gpt-5.1-codex-max"
-    assert config.model_fast == "gpt-5.1-codex-mini"
+    assert config.model_strong == "gpt-4o"
+    assert config.model_fast == "o4-mini"
 
 
-def test_openai_codex_unsupported_model_error_is_treated_as_access_error():
-    """OpenAI Codex backend rejects unsupported models with 400s; we should fallback."""
+def test_openai_subscription_does_not_auto_fallback_models():
+    """Subscription auth should not auto-fallback to other OpenAI models."""
+    from autoforge.engine.config import ForgeConfig
+    from autoforge.engine.llm_router import LLMRouter
+
+    router = LLMRouter(ForgeConfig(auth_config={"openai": {"auth_method": "codex_oauth"}}))
+    assert router._openai_model_candidates("gpt-4o") == ["gpt-4o"]
+    # Legacy alias should still canonicalize
+    assert router._openai_model_candidates("codex-5.3") == ["gpt-5.3-codex"]
+
+
+def test_openai_codex_unsupported_model_error_is_detected():
+    """OpenAI Codex backend rejects unsupported models with 400s; detect for clearer errors."""
     from autoforge.engine.config import ForgeConfig
     from autoforge.engine.llm_router import LLMRouter
 
@@ -938,7 +949,7 @@ def test_openai_codex_unsupported_model_error_is_treated_as_access_error():
             return "Error code: 400 - {'detail': 'The gpt-4o model is not supported when using Codex with a ChatGPT account.'}"
 
     router = LLMRouter(ForgeConfig(auth_config={"openai": {"auth_method": "codex_oauth"}}))
-    assert router._is_openai_model_access_error(_FakeOpenAIError()) is True
+    assert router._is_openai_codex_unsupported_model_error(_FakeOpenAIError()) is True
 
 
 def test_normalized_response_types():
@@ -1318,7 +1329,7 @@ def test_claude_plugin_assets_exist():
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
 
     assert plugin["name"] == "autoforge"
-    assert plugin["version"] == "2.7.27"
+    assert plugin["version"] == "2.7.28"
     assert marketplace["name"] == "autoforge"
     assert marketplace["plugins"][0]["source"] == "./plugins/autoforge"
     assert "autoforge" in settings["extraKnownMarketplaces"]

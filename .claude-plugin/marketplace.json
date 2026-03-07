@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "AutoForge plugin catalog for durable software, research, verification, and eval workflows.",
-    "version": "2.7.27"
+    "version": "2.7.28"
   },
   "plugins": [
     {
       "name": "autoforge",
       "source": "./plugins/autoforge",
       "description": "Durable multi-agent runtime for software projects, academic research workflows, verification, and eval harnesses.",
-      "version": "2.7.27",
+      "version": "2.7.28",
       "author": {
         "name": "AlyciaBHZ"
       }

@@ -433,36 +433,31 @@ class LLMRouter:
             return True
         return False
 
-    def _is_codex_subscription_model(self, model: str) -> bool:
-        """Return True if model looks compatible with the ChatGPT-subscription Codex backend.
+    def _is_openai_codex_unsupported_model_error(self, exc: Exception) -> bool:
+        """Detect the Codex backend error for an unsupported model.
 
-        Codex OAuth / Device Code auth routes requests via chatgpt.com and does not
-        support legacy GPT-4o/o-series models.
+        When using ChatGPT-subscription Codex auth, OpenAI may return HTTP 400/403
+        with a message like "model is not supported when using Codex with a ChatGPT account".
         """
-        model_lower = (model or "").strip().lower()
-        if not model_lower:
+        status_code = getattr(exc, "status_code", None)
+        body = getattr(exc, "body", None)
+        detail = ""
+        if isinstance(body, dict) and "detail" in body:
+            detail = str(body.get("detail", "")).lower()
+        text = str(exc).lower()
+        combined = " ".join(x for x in (text, detail) if x)
+        if "not supported" not in combined:
             return False
-        if model_lower.startswith("gpt-5"):
+        if "codex" not in combined:
+            return False
+        if "chatgpt" not in combined:
+            return False
+        if status_code in (400, 403):
             return True
-        if model_lower.startswith("codex-"):
-            return True
-        if "codex" in model_lower:
+        # Some client wrappers don't expose status_code/body reliably.
+        if "not supported when using codex" in combined:
             return True
         return False
-
-    def _map_openai_model_to_codex_subscription(self, model: str) -> str:
-        """Map an unsupported OpenAI model to a safe Codex-subscription default."""
-        model_lower = (model or "").strip().lower()
-        if not model_lower:
-            return "gpt-5.1-codex-max"
-        # Prefer the smaller Codex model for "mini"/small variants.
-        if (
-            "mini" in model_lower
-            or model_lower.endswith("-nano")
-            or model_lower in {"o4-mini", "o3-mini", "o1-mini"}
-        ):
-            return "gpt-5.1-codex-mini"
-        return "gpt-5.1-codex-max"
 
     def _canonicalize_openai_model(self, model: str) -> str:
         """Normalize legacy OpenAI aliases into canonical API model names."""
@@ -470,17 +465,17 @@ class LLMRouter:
 
     def _openai_model_candidates(self, model: str) -> list[str]:
         """Build fallback model candidates for OpenAI model access failures."""
-        candidates: list[str] = []
         canonical = self._canonicalize_openai_model(model)
-        if canonical:
-            if self._is_openai_subscription_auth() and not self._is_codex_subscription_model(canonical):
-                candidates.append(self._map_openai_model_to_codex_subscription(canonical))
-            else:
-                candidates.append(canonical)
+        if not canonical:
+            return []
+        candidates: list[str] = [canonical]
+
+        # Respect user-selected models in subscription auth mode: no silent model rewrite,
+        # and no automatic fallback to other models.
+        if self._is_openai_subscription_auth():
+            return candidates
 
         for fallback in _OPENAI_MODEL_FALLBACKS:
-            if self._is_openai_subscription_auth() and not self._is_codex_subscription_model(fallback):
-                continue
             if fallback not in candidates:
                 candidates.append(fallback)
         return candidates
@@ -1236,6 +1231,12 @@ class LLMRouter:
                 return resp
             except Exception as exc:
                 last_exc = exc
+                if self._is_openai_subscription_auth() and self._is_openai_codex_unsupported_model_error(exc):
+                    raise RuntimeError(
+                        f"OpenAI model {candidate!r} is not supported with Codex OAuth / Device Code "
+                        "(ChatGPT subscription). Choose a GPT-5/Codex model (e.g. gpt-5.4, gpt-5.3-codex) "
+                        "or switch OpenAI auth_method to api_key."
+                    ) from exc
                 if idx == len(candidates) - 1 or not self._is_openai_model_access_error(exc):
                     raise
                 self._record_fallback_receipt(
