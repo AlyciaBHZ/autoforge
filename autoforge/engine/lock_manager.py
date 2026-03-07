@@ -14,6 +14,11 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+from autoforge.engine.development_harness import (
+    append_development_jsonl,
+    write_development_json,
+)
+
 logger = logging.getLogger(__name__)
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -40,12 +45,62 @@ class LockManager:
         "-_."
     )
 
-    def __init__(self, lock_dir: Path) -> None:
+    def __init__(self, lock_dir: Path, *, harness_root: Path | None = None) -> None:
         self.lock_dir = lock_dir
         self.lock_dir.mkdir(parents=True, exist_ok=True)
         # In-memory cache: task_id -> agent_id for active locks.
         # Falls back to filesystem scanning when potentially stale.
         self._lock_cache: dict[str, str] = {}
+        self._harness_root = harness_root
+        if self._harness_root is not None:
+            self._harness_root.mkdir(parents=True, exist_ok=True)
+            self._write_lease_artifact()
+
+    def _lease_events_path(self) -> Path | None:
+        if self._harness_root is None:
+            return None
+        return self._harness_root / "lease_events.jsonl"
+
+    def _append_lease_event(
+        self,
+        *,
+        event_type: str,
+        task_id: str,
+        agent_id: str = "",
+        detail: str = "",
+    ) -> None:
+        path = self._lease_events_path()
+        if path is None:
+            return
+        append_development_jsonl(
+            path,
+            {
+                "task_id": str(task_id or ""),
+                "agent_id": str(agent_id or ""),
+                "detail": str(detail or ""),
+                "lock_dir": str(self.lock_dir),
+            },
+            event_type=event_type,
+        )
+
+    def _write_lease_artifact(self) -> None:
+        if self._harness_root is None:
+            return
+        locks: list[dict[str, str]] = []
+        for lock_file in sorted(self.lock_dir.glob("*.lock")):
+            owner = self._read_owner(lock_file)
+            if owner is None:
+                continue
+            locks.append({"task_id": lock_file.stem, "owner": owner})
+        write_development_json(
+            self._harness_root / "lease_artifact.json",
+            {
+                "lock_dir": str(self.lock_dir),
+                "lock_count": len(locks),
+                "locks": locks,
+            },
+            artifact_type="lease_artifact",
+        )
 
     @classmethod
     def _sanitize_id(cls, task_id: str) -> str:
@@ -78,10 +133,18 @@ class LockManager:
             else:
                 os.symlink(agent_id, lock_path)
             self._lock_cache[task_id] = agent_id
+            self._append_lease_event(event_type="lease_claimed", task_id=task_id, agent_id=agent_id)
+            self._write_lease_artifact()
             logger.info(f"Task {task_id} claimed by {agent_id}")
             return True
         except FileExistsError:
             existing = self.get_owner(task_id)
+            self._append_lease_event(
+                event_type="lease_contention",
+                task_id=task_id,
+                agent_id=agent_id,
+                detail=str(existing or ""),
+            )
             logger.debug(f"Task {task_id} already claimed by {existing}")
             return False
 
@@ -119,6 +182,8 @@ class LockManager:
             if owner == agent_id:
                 tmp_path.unlink(missing_ok=True)
                 self._lock_cache.pop(task_id, None)
+                self._append_lease_event(event_type="lease_released", task_id=task_id, agent_id=agent_id)
+                self._write_lease_artifact()
                 logger.info("Task %s released by %s", task_id, agent_id)
                 return True
             else:
@@ -230,6 +295,8 @@ class LockManager:
                     )
                     lock_file.unlink(missing_ok=True)
                     self._lock_cache.pop(task_id, None)
+                    self._append_lease_event(event_type="lease_stale_cleared", task_id=task_id, agent_id=agent_id)
+                    self._write_lease_artifact()
                     continue
                 count += 1
             except OSError:
@@ -244,6 +311,8 @@ class LockManager:
             except OSError:
                 continue
         self._lock_cache.clear()
+        self._append_lease_event(event_type="lease_clear_all", task_id="*")
+        self._write_lease_artifact()
         logger.info("All locks cleared")
 
     def clear_stale(self, max_age_seconds: int = 3600) -> None:
@@ -257,5 +326,7 @@ class LockManager:
                 if self._is_stale(lock_file, max_age_seconds):
                     lock_file.unlink(missing_ok=True)
                     self._lock_cache.pop(lock_file.stem, None)
+                    self._append_lease_event(event_type="lease_stale_cleared", task_id=lock_file.stem)
             except OSError:
                 continue
+        self._write_lease_artifact()

@@ -296,13 +296,23 @@ def _load_run_payload(run_dir: Path) -> tuple[list[HarnessCase], dict[str, Any],
 def _artifact_paths(run_dir: Path, case_id: str, metrics: dict[str, Any]) -> dict[str, Any]:
     case_root = run_dir / "cases" / case_id
     project_dir = str(metrics.get("project_dir", "") or "")
+    kernel_run_id = str(metrics.get("kernel_run_id", "") or "")
     trace_path = _locate_trace_path(project_dir)
+    kernel_run_dir = None
+    if project_dir and kernel_run_id:
+        candidate = Path(project_dir).resolve() / ".autoforge" / "kernel" / "runs" / kernel_run_id
+        if candidate.is_dir():
+            kernel_run_dir = candidate
     artifacts = {
         "project_dir": project_dir,
+        "kernel_run_id": kernel_run_id,
         "case_result_path": _relative_to(run_dir, case_root / "case_result.json"),
         "dir_diff_path": _relative_to(run_dir, case_root / "dir_diff.json"),
         "golden_patch_score_path": _relative_to(run_dir, case_root / "golden_patch_score.json"),
         "trace_path": _relative_to(run_dir, trace_path),
+        "kernel_manifest_path": _relative_to(run_dir, kernel_run_dir / "manifest.json" if kernel_run_dir else None),
+        "kernel_verdict_path": _relative_to(run_dir, kernel_run_dir / "contract_verdict.json" if kernel_run_dir else None),
+        "kernel_harness_judge_path": _relative_to(run_dir, kernel_run_dir / "harness_judge.json" if kernel_run_dir else None),
     }
     return artifacts
 

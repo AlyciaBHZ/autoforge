@@ -7,6 +7,10 @@ import re
 import shutil
 from pathlib import Path
 
+from autoforge.engine.development_harness import (
+    append_development_jsonl,
+    write_development_json,
+)
 from autoforge.engine.runtime.commands import run_args
 
 logger = logging.getLogger(__name__)
@@ -68,6 +72,55 @@ class GitManager:
         # Worktrees are project-local to avoid cross-project collisions when multiple
         # projects share the same workspace directory.
         self.worktrees_dir = project_dir / ".autoforge" / "worktrees"
+        self._harness_root = project_dir / ".autoforge" / "development_harness" / "execution_harness"
+
+    def _worktree_manifest_path(self) -> Path:
+        return self._harness_root / "worktree_manifest.json"
+
+    def _merge_verdict_path(self) -> Path:
+        return self._harness_root / "merge_verdict.json"
+
+    def _write_worktree_manifest(self) -> None:
+        branches: list[dict[str, str]] = []
+        if self.worktrees_dir.exists():
+            for path in sorted(self.worktrees_dir.iterdir()):
+                if path.is_dir():
+                    branches.append({"branch": path.name, "path": str(path)})
+        write_development_json(
+            self._worktree_manifest_path(),
+            {
+                "project_dir": str(self.project_dir),
+                "main_worktree": str(self.project_dir),
+                "worktrees_dir": str(self.worktrees_dir),
+                "worktree_count": len(branches),
+                "worktrees": branches,
+            },
+            artifact_type="worktree_manifest",
+        )
+
+    def _append_commit_receipt(self, *, branch_name: str, message: str, commit_hash: str) -> None:
+        append_development_jsonl(
+            self._harness_root / "commit_receipts.jsonl",
+            {
+                "project_dir": str(self.project_dir),
+                "branch_name": str(branch_name or ""),
+                "message": str(message or ""),
+                "commit_hash": str(commit_hash or ""),
+            },
+            event_type="git_commit",
+        )
+
+    def _write_merge_verdict(self, *, branch_name: str, success: bool, error: str = "") -> None:
+        write_development_json(
+            self._merge_verdict_path(),
+            {
+                "project_dir": str(self.project_dir),
+                "branch_name": str(branch_name or ""),
+                "success": bool(success),
+                "error": str(error or ""),
+            },
+            artifact_type="merge_verdict",
+        )
 
     async def _run_git(self, *args: str, cwd: Path | None = None) -> str:
         """Run a git command and return stdout."""
@@ -111,6 +164,7 @@ class GitManager:
         )
         await self._run_git("add", ".")
         await self._run_git("commit", "-m", "Initial project scaffold")
+        self._write_worktree_manifest()
         logger.info(f"Git repo initialized at {self.project_dir}")
 
     @staticmethod
@@ -134,6 +188,7 @@ class GitManager:
         await self._run_git(
             "worktree", "add", "-b", branch_name, str(worktree_path), "main"
         )
+        self._write_worktree_manifest()
         logger.info(f"Created worktree: {worktree_path} (branch: {branch_name})")
         return worktree_path
 
@@ -161,6 +216,8 @@ class GitManager:
         commit_hash = await self._run_git(
             "rev-parse", "--short", "HEAD", cwd=worktree_path
         )
+        self._append_commit_receipt(branch_name=branch_name, message=commit_msg, commit_hash=commit_hash)
+        self._write_worktree_manifest()
         logger.info(f"Committed in {branch_name}: {commit_hash}")
         return commit_hash
 
@@ -171,11 +228,14 @@ class GitManager:
             await self._run_git(
                 "merge", "--no-ff", branch_name, "-m", f"Merge {branch_name}"
             )
+            self._write_merge_verdict(branch_name=branch_name, success=True)
+            self._write_worktree_manifest()
             logger.info(f"Merged {branch_name} into main")
         except GitError as e:
             logger.error(f"Merge conflict in {branch_name}: {e}")
             # Abort the merge on conflict
             await self._run_git("merge", "--abort")
+            self._write_merge_verdict(branch_name=branch_name, success=False, error=str(e))
             raise
 
     async def cleanup_worktree(self, branch_name: str) -> None:
@@ -189,6 +249,7 @@ class GitManager:
             await self._run_git("branch", "-d", branch_name)
         except GitError:
             logger.warning(f"Could not delete branch {branch_name}")
+        self._write_worktree_manifest()
 
     @property
     def main_worktree(self) -> Path:

@@ -10,6 +10,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from autoforge.engine.development_harness import write_development_json
+
 
 def detect_framework(project_dir: Path) -> dict[str, Any]:
     """Detect the project's framework and deployment characteristics."""
@@ -68,6 +70,91 @@ def detect_framework(project_dir: Path) -> dict[str, Any]:
                     info["env_vars"].append(key)
 
     return info
+
+
+def build_deploy_manifest(project_dir: Path, project_name: str = "") -> dict[str, Any]:
+    info = detect_framework(project_dir)
+    return {
+        "project_dir": str(project_dir),
+        "project_name": str(project_name or project_dir.name),
+        "framework": info["framework"],
+        "build_command": info["build_command"],
+        "install_command": info["install_command"],
+        "dev_command": info["dev_command"],
+        "output_directory": info["output_directory"],
+        "env_vars": list(info["env_vars"]),
+        "node_version": info["node_version"],
+    }
+
+
+def build_environment_requirements(project_dir: Path, project_name: str = "") -> dict[str, Any]:
+    manifest = build_deploy_manifest(project_dir, project_name)
+    return {
+        "project_name": manifest["project_name"],
+        "runtime": {
+            "node_version": manifest["node_version"],
+            "install_command": manifest["install_command"],
+            "build_command": manifest["build_command"],
+        },
+        "environment_variables": [
+            {
+                "name": var,
+                "required_for_publish": True,
+                "hint": _get_env_var_hint(var),
+            }
+            for var in manifest["env_vars"]
+        ],
+    }
+
+
+def build_publish_verdict(project_dir: Path, project_name: str = "") -> dict[str, Any]:
+    manifest = build_deploy_manifest(project_dir, project_name)
+    blocking_items: list[str] = []
+    if manifest["framework"] == "unknown":
+        blocking_items.append("framework_unknown")
+    if not (project_dir / "README.md").exists():
+        blocking_items.append("missing_readme")
+    publish_ready = manifest["framework"] != "unknown"
+    return {
+        "project_name": manifest["project_name"],
+        "framework": manifest["framework"],
+        "publish_ready": publish_ready,
+        "blocking_items": blocking_items,
+        "required_env_var_count": len(manifest["env_vars"]),
+        "summary": (
+            "Ready for publish configuration"
+            if publish_ready
+            else "Needs manual deployment review"
+        ),
+    }
+
+
+def write_delivery_harness_artifacts(project_dir: Path, project_name: str = "") -> dict[str, Path]:
+    harness_dir = project_dir / ".autoforge" / "development_harness" / "delivery_harness"
+    deploy_manifest_path = harness_dir / "deploy_manifest.json"
+    env_requirements_path = harness_dir / "environment_requirements.json"
+    publish_verdict_path = harness_dir / "publish_verdict.json"
+
+    write_development_json(
+        deploy_manifest_path,
+        build_deploy_manifest(project_dir, project_name),
+        artifact_type="deploy_manifest",
+    )
+    write_development_json(
+        env_requirements_path,
+        build_environment_requirements(project_dir, project_name),
+        artifact_type="environment_requirements",
+    )
+    write_development_json(
+        publish_verdict_path,
+        build_publish_verdict(project_dir, project_name),
+        artifact_type="publish_verdict",
+    )
+    return {
+        "deploy_manifest": deploy_manifest_path,
+        "environment_requirements": env_requirements_path,
+        "publish_verdict": publish_verdict_path,
+    }
 
 
 def generate_deploy_guide(project_dir: Path, project_name: str = "") -> str:

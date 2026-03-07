@@ -50,6 +50,11 @@ class RunRecord:
     project_id: str
     stage: RunStage
     created_at: str
+    lineage_id: str = ""
+    parent_run_id: str = ""
+    surface: str = ""
+    profile: str = ""
+    updated_at: str = ""
 
 
 @dataclass
@@ -191,7 +196,12 @@ CREATE TABLE IF NOT EXISTS run_records (
     run_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
     stage TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    lineage_id TEXT NOT NULL DEFAULT '',
+    parent_run_id TEXT NOT NULL DEFAULT '',
+    surface TEXT NOT NULL DEFAULT '',
+    profile TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS execution_events (
@@ -304,6 +314,26 @@ class ProjectRegistry:
             handled_at=float(row["handled_at"]) if row["handled_at"] is not None else None,
         )
 
+    def _row_to_run_record(self, row: aiosqlite.Row) -> RunRecord:
+        return RunRecord(
+            run_id=str(row["run_id"]),
+            project_id=str(row["project_id"]),
+            stage=RunStage(str(row["stage"])),
+            created_at=str(row["created_at"]),
+            lineage_id=str(row["lineage_id"] or ""),
+            parent_run_id=str(row["parent_run_id"] or ""),
+            surface=str(row["surface"] or ""),
+            profile=str(row["profile"] or ""),
+            updated_at=str(row["updated_at"] or ""),
+        )
+
+    def _row_to_task_lease(self, row: aiosqlite.Row) -> TaskLease:
+        return TaskLease(
+            task_id=str(row["task_id"]),
+            holder=str(row["holder"]),
+            lease_until=str(row["lease_until"]),
+        )
+
     async def _migrate_schema(self) -> None:
         """Apply additive migrations for older SQLite files."""
         db = self._ensure_db()
@@ -312,6 +342,20 @@ class ProjectRegistry:
         columns = {row["name"] for row in rows}
         if "idempotency_key" not in columns:
             await db.execute("ALTER TABLE projects ADD COLUMN idempotency_key TEXT")
+
+        cursor = await db.execute("PRAGMA table_info(run_records)")
+        rows = await cursor.fetchall()
+        columns = {row["name"] for row in rows}
+        if "lineage_id" not in columns:
+            await db.execute("ALTER TABLE run_records ADD COLUMN lineage_id TEXT NOT NULL DEFAULT ''")
+        if "parent_run_id" not in columns:
+            await db.execute("ALTER TABLE run_records ADD COLUMN parent_run_id TEXT NOT NULL DEFAULT ''")
+        if "surface" not in columns:
+            await db.execute("ALTER TABLE run_records ADD COLUMN surface TEXT NOT NULL DEFAULT ''")
+        if "profile" not in columns:
+            await db.execute("ALTER TABLE run_records ADD COLUMN profile TEXT NOT NULL DEFAULT ''")
+        if "updated_at" not in columns:
+            await db.execute("ALTER TABLE run_records ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
 
     async def _ensure_indexes(self) -> None:
         db = self._ensure_db()
@@ -335,6 +379,12 @@ class ProjectRegistry:
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_run_created ON execution_events(run_id, created_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_run_records_project_created ON run_records(project_id, created_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_run_records_lineage_created ON run_records(lineage_id, created_at)"
         )
         
     async def enqueue_run(
@@ -362,9 +412,121 @@ class ProjectRegistry:
         await self.append_event(run_id, "RunEnqueued", {"project_id": project.id, "requested_by": requested_by})
         return project
 
+    async def sync_run_record(
+        self,
+        *,
+        run_id: str,
+        project_id: str,
+        stage: RunStage,
+        lineage_id: str = "",
+        parent_run_id: str = "",
+        surface: str = "",
+        profile: str = "",
+    ) -> None:
+        db = self._ensure_db()
+        now = datetime.now(timezone.utc).isoformat()
+        await db.execute(
+            """
+            INSERT INTO run_records (
+                run_id, project_id, stage, created_at, lineage_id, parent_run_id, surface, profile, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                project_id=excluded.project_id,
+                stage=excluded.stage,
+                lineage_id=excluded.lineage_id,
+                parent_run_id=excluded.parent_run_id,
+                surface=excluded.surface,
+                profile=excluded.profile,
+                updated_at=excluded.updated_at
+            """,
+            (
+                run_id,
+                project_id,
+                stage.value,
+                now,
+                lineage_id,
+                parent_run_id,
+                surface,
+                profile,
+                now,
+            ),
+        )
+        await db.commit()
+
+    async def claim_run_identity(
+        self,
+        *,
+        project_id: str,
+        run_id: str,
+        stage: RunStage,
+        lineage_id: str = "",
+        parent_run_id: str = "",
+        surface: str = "",
+        profile: str = "",
+    ) -> None:
+        db = self._ensure_db()
+        placeholder_run_id = f"run_{project_id}"
+        if run_id == placeholder_run_id:
+            await self.sync_run_record(
+                run_id=run_id,
+                project_id=project_id,
+                stage=stage,
+                lineage_id=lineage_id,
+                parent_run_id=parent_run_id,
+                surface=surface,
+                profile=profile,
+            )
+            return
+
+        placeholder_cursor = await db.execute(
+            "SELECT run_id FROM run_records WHERE run_id = ? AND project_id = ?",
+            (placeholder_run_id, project_id),
+        )
+        placeholder_row = await placeholder_cursor.fetchone()
+        actual_cursor = await db.execute(
+            "SELECT run_id FROM run_records WHERE run_id = ?",
+            (run_id,),
+        )
+        actual_row = await actual_cursor.fetchone()
+
+        if placeholder_row is not None and actual_row is None:
+            await db.execute(
+                """
+                UPDATE run_records
+                SET run_id = ?
+                WHERE run_id = ? AND project_id = ?
+                """,
+                (run_id, placeholder_run_id, project_id),
+            )
+        elif placeholder_row is not None and actual_row is not None:
+            await db.execute(
+                "DELETE FROM run_records WHERE run_id = ? AND project_id = ?",
+                (placeholder_run_id, project_id),
+            )
+
+        await db.execute(
+            "UPDATE execution_events SET run_id = ? WHERE run_id = ?",
+            (run_id, placeholder_run_id),
+        )
+        await db.commit()
+
+        await self.sync_run_record(
+            run_id=run_id,
+            project_id=project_id,
+            stage=stage,
+            lineage_id=lineage_id,
+            parent_run_id=parent_run_id,
+            surface=surface,
+            profile=profile,
+        )
+
     async def set_run_stage(self, run_id: str, stage: RunStage) -> None:
         db = self._ensure_db()
-        await db.execute("UPDATE run_records SET stage = ? WHERE run_id = ?", (stage.value, run_id))
+        now = datetime.now(timezone.utc).isoformat()
+        await db.execute(
+            "UPDATE run_records SET stage = ?, updated_at = ? WHERE run_id = ?",
+            (stage.value, now, run_id),
+        )
         await db.commit()
 
     async def append_event(self, run_id: str, event_type: str, payload: dict[str, Any]) -> None:
@@ -410,6 +572,23 @@ class ProjectRegistry:
         db = self._ensure_db()
         await db.execute("DELETE FROM task_leases WHERE task_id = ? AND holder = ?", (task_id, holder))
         await db.commit()
+
+    async def get_task_lease(self, task_id: str) -> TaskLease | None:
+        db = self._ensure_db()
+        cursor = await db.execute("SELECT * FROM task_leases WHERE task_id = ?", (task_id,))
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return self._row_to_task_lease(row)
+
+    async def list_runs_for_lineage(self, lineage_id: str) -> list[RunRecord]:
+        db = self._ensure_db()
+        cursor = await db.execute(
+            "SELECT * FROM run_records WHERE lineage_id = ? ORDER BY created_at ASC",
+            (str(lineage_id or ""),),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_run_record(row) for row in rows]
 
     async def requeue_stale_builds(self, max_age_seconds: int = 600) -> int:
         """Move stale BUILDING projects back to QUEUED for crash recovery."""

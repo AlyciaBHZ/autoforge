@@ -15,10 +15,12 @@ from rich.console import Console
 
 from autoforge.engine.channels.bridge_agent import AsyncBridgeAgent, BridgeRequest, BridgeResponse, BridgeTimeoutEvent
 from autoforge.engine.config import ForgeConfig
-from autoforge.engine.deploy_guide import generate_deploy_guide
+from autoforge.engine.development_harness import write_development_json
+from autoforge.engine.deploy_guide import generate_deploy_guide, write_delivery_harness_artifacts
 from autoforge.engine.hil import CheckpointRequest, CheckpointResponder
+from autoforge.engine.kernel import default_profile_for_command
 from autoforge.engine.orchestrator import Orchestrator
-from autoforge.engine.project_registry import Project, ProjectMessage, ProjectRegistry, RunStage
+from autoforge.engine.project_registry import Project, ProjectMessage, ProjectRegistry, RunRecord, RunStage
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -131,6 +133,74 @@ class ForgeDaemon:
                 logger.warning("%s failed: %s", label, exc, exc_info=True)
 
         task.add_done_callback(_done)
+
+    def _daemon_harness_root(self, workspace: Path | None) -> Path | None:
+        if workspace is None:
+            return None
+        return workspace / ".autoforge" / "development_harness" / "daemon_harness"
+
+    async def _write_daemon_harness_views(
+        self,
+        *,
+        workspace: Path | None,
+        project_id: str,
+        run_id: str,
+        lineage_id: str,
+        status: str,
+        resumed_from_checkpoint: bool = False,
+        contention_detected: bool = False,
+        contention_holder: str = "",
+        note: str = "",
+    ) -> None:
+        root = self._daemon_harness_root(workspace)
+        if root is None:
+            return
+        root.mkdir(parents=True, exist_ok=True)
+        runs: list[RunRecord] = []
+        if lineage_id:
+            try:
+                runs = await self.registry.list_runs_for_lineage(lineage_id)
+            except Exception:
+                runs = []
+        write_development_json(
+            root / "lineage_compare.json",
+            {
+                "project_id": str(project_id or ""),
+                "run_id": str(run_id or ""),
+                "lineage_id": str(lineage_id or ""),
+                "status": str(status or ""),
+                "workspace": str(workspace),
+                "runs": [
+                    {
+                        "run_id": item.run_id,
+                        "project_id": item.project_id,
+                        "stage": item.stage.value,
+                        "created_at": item.created_at,
+                        "updated_at": item.updated_at,
+                        "surface": item.surface,
+                        "profile": item.profile,
+                        "parent_run_id": item.parent_run_id,
+                    }
+                    for item in runs
+                ],
+            },
+            artifact_type="daemon_lineage_compare",
+        )
+        write_development_json(
+            root / "recovery_view.json",
+            {
+                "project_id": str(project_id or ""),
+                "run_id": str(run_id or ""),
+                "lineage_id": str(lineage_id or ""),
+                "workspace": str(workspace),
+                "status": str(status or ""),
+                "resumed_from_checkpoint": bool(resumed_from_checkpoint),
+                "contention_detected": bool(contention_detected),
+                "contention_holder": str(contention_holder or ""),
+                "note": str(note or ""),
+            },
+            artifact_type="daemon_recovery_view",
+        )
 
     async def start(self) -> None:
         """Start the daemon event loop."""
@@ -366,6 +436,12 @@ class ForgeDaemon:
         while True:
             await asyncio.sleep(interval)
 
+            try:
+                if orchestrator.kernel_session is not None:
+                    orchestrator.kernel_session.heartbeat()
+            except Exception:
+                pass
+
             phase = str(phase_ref.get("phase", "") or "")
             done = 0
             total = 0
@@ -457,6 +533,16 @@ class ForgeDaemon:
                             )
                     except Exception:
                         pass
+                    try:
+                        if orchestrator.kernel_session is not None:
+                            orchestrator.kernel_session.record_inbox_message(
+                                source=msg.source,
+                                kind=msg.kind,
+                                text=text[:2000],
+                                metadata={"project_id": project.id},
+                            )
+                    except Exception:
+                        pass
                     applied.append(text[:200])
 
                 if applied:
@@ -472,13 +558,34 @@ class ForgeDaemon:
         """Run one project through the orchestrator pipeline."""
         console.print(f"[bold blue]Building:[/bold blue] {project.id} - {project.description[:80]}")
         project_config = None
+        registry_run_id = f"run_{project.id}"
+        registry_profile = ""
         progress_task: asyncio.Task[None] | None = None
         message_task: asyncio.Task[None] | None = None
+        resumed_from_checkpoint = False
+        workspace_for_views: Path | None = None
+        workspace_raw = str(getattr(project, "workspace_path", "") or "").strip()
+        if workspace_raw:
+            try:
+                workspace_for_views = Path(workspace_raw).resolve()
+            except Exception:
+                workspace_for_views = None
 
         lease_holder = f"daemon:{os.getpid()}"
         lease_ok = await self.registry.acquire_task_lease(project.id, lease_holder, ttl_seconds=120)
         if not lease_ok:
             logger.info("Skipping %s; lease already held", project.id)
+            current_lease = await self.registry.get_task_lease(project.id)
+            await self._write_daemon_harness_views(
+                workspace=workspace_for_views,
+                project_id=project.id,
+                run_id=registry_run_id,
+                lineage_id=project.id,
+                status="lease_contention",
+                contention_detected=True,
+                contention_holder=current_lease.holder if current_lease is not None else "",
+                note="worker skipped because another daemon lease holder is active",
+            )
             return
 
         heartbeat_task: asyncio.Task[None] | None = None
@@ -489,11 +596,26 @@ class ForgeDaemon:
                     await self.registry.heartbeat_task_lease(project.id, lease_holder, ttl_seconds=120)
 
             heartbeat_task = asyncio.create_task(_heartbeat())
-            await self.registry.set_run_stage(f"run_{project.id}", RunStage.RUNNING)
-            await self.registry.append_event(f"run_{project.id}", "RunStarted", {"project_id": project.id})
-
             project_config = ForgeConfig.from_env(
                 budget_limit_usd=project.budget_usd,
+                client_surface="daemon",
+                project_id=project.id,
+                lineage_id=project.id,
+            )
+            registry_run_id = str(project_config.run_id)
+            registry_profile = default_profile_for_command(
+                "generate",
+                mode=str(project_config.mode or ""),
+                explicit_profile=str(project_config.profile or ""),
+            )
+            await self.registry.claim_run_identity(
+                project_id=project.id,
+                run_id=registry_run_id,
+                stage=RunStage.RUNNING,
+                lineage_id=str(project_config.lineage_id or project.id),
+                parent_run_id=str(project_config.parent_run_id or ""),
+                surface=str(project_config.client_surface or "daemon"),
+                profile=registry_profile,
             )
             checkpoint_responder = self._checkpoint_responder_for(
                 requested_by=project.requested_by,
@@ -547,6 +669,16 @@ class ForgeDaemon:
                         pass
 
             orchestrator._save_state = _track_phase  # type: ignore[assignment]
+            await self.registry.append_event(
+                registry_run_id,
+                "RunStarted",
+                {
+                    "project_id": project.id,
+                    "run_id": registry_run_id,
+                    "lineage_id": str(project_config.lineage_id or project.id),
+                    "profile": registry_profile,
+                },
+            )
 
             progress_task = asyncio.create_task(
                 self._progress_loop(
@@ -565,11 +697,10 @@ class ForgeDaemon:
                 )
             )
 
-            workspace_raw = str(getattr(project, "workspace_path", "") or "").strip()
             if workspace_raw:
                 workspace = Path(workspace_raw).resolve()
-                state_file = workspace / ".forge_state.json"
-                if workspace.is_dir() and state_file.exists():
+                if workspace.is_dir() and orchestrator._has_resume_checkpoint(workspace):
+                    resumed_from_checkpoint = True
                     self._fire_and_forget(
                         self._notify(project.requested_by, f"[resume] {project.id} resuming from {workspace}"),
                         "notify_resume",
@@ -579,6 +710,15 @@ class ForgeDaemon:
                     project_dir = await orchestrator.run(project.description)
             else:
                 project_dir = await orchestrator.run(project.description)
+            await self.registry.sync_run_record(
+                run_id=project_config.run_id,
+                project_id=project.id,
+                stage=RunStage.RUNNING,
+                lineage_id=str(project_config.lineage_id or project.id),
+                parent_run_id=str(project_config.parent_run_id or ""),
+                surface=str(project_config.client_surface or "daemon"),
+                profile=registry_profile,
+            )
             cost = project_config.estimated_cost_usd
             project_name = project_dir.name
 
@@ -590,11 +730,33 @@ class ForgeDaemon:
                     error=final_phase,
                     cost_usd=cost,
                 )
-                await self.registry.set_run_stage(f"run_{project.id}", RunStage.PAUSED)
+                await self.registry.sync_run_record(
+                    run_id=project_config.run_id,
+                    project_id=project.id,
+                    stage=RunStage.PAUSED,
+                    lineage_id=str(project_config.lineage_id or project.id),
+                    parent_run_id=str(project_config.parent_run_id or ""),
+                    surface=str(project_config.client_surface or "daemon"),
+                    profile=registry_profile,
+                )
                 await self.registry.append_event(
-                    f"run_{project.id}",
+                    project_config.run_id,
                     "RunPaused",
-                    {"project_id": project.id, "phase": final_phase, "workspace": str(project_dir)},
+                    {
+                        "project_id": project.id,
+                        "phase": final_phase,
+                        "workspace": str(project_dir),
+                        "run_id": project_config.run_id,
+                    },
+                )
+                await self._write_daemon_harness_views(
+                    workspace=project_dir,
+                    project_id=project.id,
+                    run_id=project_config.run_id,
+                    lineage_id=str(project_config.lineage_id or project.id),
+                    status="paused",
+                    resumed_from_checkpoint=resumed_from_checkpoint,
+                    note=final_phase,
                 )
                 console.print(f"[bold yellow]Paused:[/bold yellow] {project_name} (${cost:.4f})")
                 await self._notify(
@@ -607,16 +769,40 @@ class ForgeDaemon:
 
             await self.registry.update_name(project.id, project_name, str(project_dir))
             await self.registry.mark_completed(project.id, cost)
-            await self.registry.set_run_stage(f"run_{project.id}", RunStage.RUNTIME_VERIFIED)
+            await self.registry.sync_run_record(
+                run_id=project_config.run_id,
+                project_id=project.id,
+                stage=RunStage.RUNTIME_VERIFIED,
+                lineage_id=str(project_config.lineage_id or project.id),
+                parent_run_id=str(project_config.parent_run_id or ""),
+                surface=str(project_config.client_surface or "daemon"),
+                profile=registry_profile,
+            )
             await self.registry.append_event(
-                f"run_{project.id}",
+                project_config.run_id,
                 "RunCompleted",
-                {"project_id": project.id, "cost_usd": cost, "workspace": str(project_dir)},
+                {
+                    "project_id": project.id,
+                    "cost_usd": cost,
+                    "workspace": str(project_dir),
+                    "run_id": project_config.run_id,
+                    "lineage_id": str(project_config.lineage_id or project.id),
+                },
             )
 
             guide = generate_deploy_guide(project_dir, project_name)
             guide_path = project_dir / "DEPLOY_GUIDE.md"
             guide_path.write_text(guide, encoding="utf-8")
+            write_delivery_harness_artifacts(project_dir, project_name)
+            await self._write_daemon_harness_views(
+                workspace=project_dir,
+                project_id=project.id,
+                run_id=project_config.run_id,
+                lineage_id=str(project_config.lineage_id or project.id),
+                status="completed",
+                resumed_from_checkpoint=resumed_from_checkpoint,
+                note="run completed",
+            )
 
             console.print(f"[bold green]Completed:[/bold green] {project_name} (${cost:.4f})")
             console.print(f"  Location: {project_dir}")
@@ -634,11 +820,34 @@ class ForgeDaemon:
             cost = project_config.estimated_cost_usd if project_config is not None else 0.0
             logger.error("Build failed for %s: %s", project.id, error_msg, exc_info=True)
             await self.registry.mark_failed(project.id, error_msg, cost_usd=cost)
-            await self.registry.set_run_stage(f"run_{project.id}", RunStage.FAILED)
+            if project_config is not None:
+                await self.registry.sync_run_record(
+                    run_id=project_config.run_id,
+                    project_id=project.id,
+                    stage=RunStage.FAILED,
+                    lineage_id=str(project_config.lineage_id or project.id),
+                    parent_run_id=str(project_config.parent_run_id or ""),
+                    surface=str(project_config.client_surface or "daemon"),
+                    profile=registry_profile,
+                )
             await self.registry.append_event(
-                f"run_{project.id}",
+                registry_run_id,
                 "RunFailed",
-                {"project_id": project.id, "error": error_msg},
+                {
+                    "project_id": project.id,
+                    "error": error_msg,
+                    "run_id": registry_run_id if project_config is not None else "",
+                    "profile": registry_profile,
+                },
+            )
+            await self._write_daemon_harness_views(
+                workspace=workspace_for_views,
+                project_id=project.id,
+                run_id=registry_run_id,
+                lineage_id=str(getattr(project_config, "lineage_id", project.id) or project.id),
+                status="failed",
+                resumed_from_checkpoint=resumed_from_checkpoint,
+                note=error_msg,
             )
             console.print(f"[bold red]Failed:[/bold red] {project.id} - {error_msg[:80]}")
             await self._notify(project.requested_by, f"Build failed: {error_msg[:200]}")

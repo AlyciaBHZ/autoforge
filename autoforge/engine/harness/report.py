@@ -33,6 +33,7 @@ class CaseMetrics:
     cost_usd: float
     input_tokens: int
     output_tokens: int
+    kernel_run_id: str = ""
     project_dir: str = ""
     error: str = ""
     error_type: str = ""
@@ -50,6 +51,7 @@ class CaseMetrics:
             "cost_usd": self.cost_usd,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "kernel_run_id": self.kernel_run_id,
             "project_dir": self.project_dir,
             "error": self.error,
             "error_type": self.error_type,
@@ -103,4 +105,3 @@ class HarnessReport:
             "summary": self.summary(),
             "cases": [c.to_dict() for c in self.cases],
         }
-

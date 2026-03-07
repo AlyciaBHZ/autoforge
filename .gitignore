@@ -41,6 +41,8 @@ docker/sandbox-data/
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm
 
 # Local runtime metadata
 .claude/
@@ -55,6 +57,12 @@ CODE_REVIEW.md
 
 # Smoke test temp
 .tmp_smoke*/
+
+# Unit test temp
+.tmp_engine_tests*/
+.tmp_kernel_tests*/
+.tmp_development_harness_tests*/
+.tmp_ui_harness_tests*/
 
 # Local audit markdown (do not commit)
 docs/CLAIMS_AUDIT.md

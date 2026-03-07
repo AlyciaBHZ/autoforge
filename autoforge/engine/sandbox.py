@@ -23,6 +23,11 @@ from pathlib import Path
 from typing import Any
 
 from autoforge.engine.config import ForgeConfig
+from autoforge.engine.development_harness import (
+    append_development_jsonl,
+    resolve_development_harness_root,
+    write_development_json,
+)
 from autoforge.engine.runtime.env import build_env_overrides, shell_export_block
 from autoforge.engine.runtime.commands import run_args, run_shell
 from autoforge.engine.runtime.telemetry import TelemetrySink
@@ -54,11 +59,82 @@ class SandboxBase(ABC):
     """Abstract sandbox for command execution."""
 
     telemetry: TelemetrySink | None = None
+    _development_harness_root: Path | None = None
+    _sandbox_backend: str = ""
 
     @property
     def execution_platform(self) -> str:
         """Execution platform inside this sandbox ("windows" | "posix")."""
         return "windows" if sys.platform == "win32" else "posix"
+
+    def configure_execution_harness(
+        self,
+        *,
+        root: Path,
+        backend: str,
+        config: ForgeConfig,
+        working_dir: Path,
+        env_overrides: dict[str, str] | None = None,
+    ) -> None:
+        self._development_harness_root = root
+        self._sandbox_backend = str(backend or "")
+        root.mkdir(parents=True, exist_ok=True)
+        write_development_json(
+            root / "execution_environment.json",
+            {
+                "run_id": str(getattr(config, "run_id", "") or ""),
+                "lineage_id": str(getattr(config, "lineage_id", "") or ""),
+                "project_id": str(getattr(config, "project_id", "") or ""),
+                "backend": str(backend or ""),
+                "working_dir": str(working_dir),
+                "execution_platform": self.execution_platform,
+                "env_keys": sorted(str(key) for key in (env_overrides or {}).keys()),
+            },
+            artifact_type="execution_environment",
+        )
+        write_development_json(
+            root / "sandbox_policy.json",
+            {
+                "backend": str(backend or ""),
+                "security_mode": str(getattr(self, "_security_mode", "") or ""),
+                "docker_enabled": bool(getattr(config, "docker_enabled", False)),
+                "execution_backend": str(getattr(config, "execution_backend", "") or ""),
+            },
+            artifact_type="sandbox_policy",
+        )
+
+    def _record_command_receipt(
+        self,
+        *,
+        command: str = "",
+        args: list[str] | None = None,
+        capability: str | None = None,
+        result: SandboxResult,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if self._development_harness_root is None:
+            return
+        payload = {
+            "cwd": str(getattr(self, "working_dir", "")),
+            "backend": str(self._sandbox_backend or ""),
+            "execution_platform": self.execution_platform,
+            "command": str(command or ""),
+            "args": [str(item) for item in (args or [])],
+            "capability": str(capability or ""),
+            "exit_code": int(result.exit_code),
+            "timed_out": bool(result.timed_out),
+            "duration_seconds": float(result.duration_seconds),
+            "used_fallback": bool(result.used_fallback),
+            "stderr_preview": str(result.stderr or "")[:600],
+            "stdout_preview": str(result.stdout or "")[:600],
+        }
+        if extra:
+            payload.update(extra)
+        append_development_jsonl(
+            self._development_harness_root / "command_receipts.jsonl",
+            payload,
+            event_type="command_receipt",
+        )
 
     @abstractmethod
     async def start(self) -> None:
@@ -356,7 +432,9 @@ class SubprocessSandbox(SandboxBase):
             reason = self._allowlist_reject_reason(command=command, args=None, capability=capability)
             if reason:
                 logger.warning("[sandbox] Command blocked (allowlist): %s", reason)
-                return SandboxResult(exit_code=-1, stdout="", stderr=f"Command blocked by allowlist policy: {reason}")
+                blocked = SandboxResult(exit_code=-1, stdout="", stderr=f"Command blocked by allowlist policy: {reason}")
+                self._record_command_receipt(command=command, capability=capability, result=blocked, extra={"blocked_reason": reason})
+                return blocked
 
         # Validate command against blocked patterns
         if self._security_mode != "disabled":
@@ -364,11 +442,13 @@ class SubprocessSandbox(SandboxBase):
                 self._sanitize_command(command)
             except ValueError as e:
                 logger.warning("[sandbox] Command blocked: %s", e)
-                return SandboxResult(
+                blocked = SandboxResult(
                     exit_code=-1,
                     stdout="",
                     stderr=f"Command blocked by security filter: {e}",
                 )
+                self._record_command_receipt(command=command, capability=capability, result=blocked, extra={"blocked_reason": str(e)})
+                return blocked
 
         # On Windows, wrap Unix-style commands to run via bash/sh if available
         shell_command = command
@@ -410,6 +490,7 @@ class SubprocessSandbox(SandboxBase):
                 self.telemetry.record_command(payload)
             except Exception:
                 pass
+        self._record_command_receipt(command=command, capability=capability, result=result)
         return result
 
     async def exec_args(
@@ -430,7 +511,9 @@ class SubprocessSandbox(SandboxBase):
             reason = self._allowlist_reject_reason(command="", args=args, capability=capability)
             if reason:
                 logger.warning("[sandbox] Command blocked (allowlist): %s", reason)
-                return SandboxResult(exit_code=-1, stdout="", stderr=f"Command blocked by allowlist policy: {reason}")
+                blocked = SandboxResult(exit_code=-1, stdout="", stderr=f"Command blocked by allowlist policy: {reason}")
+                self._record_command_receipt(args=args, capability=capability, result=blocked, extra={"blocked_reason": reason})
+                return blocked
 
         # Sanitize the joined command too; patterns like "pip install" span args.
         if self._security_mode != "disabled":
@@ -438,11 +521,13 @@ class SubprocessSandbox(SandboxBase):
                 self._sanitize_command(joined)
             except ValueError as e:
                 logger.warning("[sandbox] Command blocked: %s", e)
-                return SandboxResult(
+                blocked = SandboxResult(
                     exit_code=-1,
                     stdout="",
                     stderr=f"Command blocked by security filter: {e}",
                 )
+                self._record_command_receipt(args=args, capability=capability, result=blocked, extra={"blocked_reason": str(e)})
+                return blocked
 
         # Sanitize args individually — don't join into a shell string
         if self._security_mode != "disabled":
@@ -451,11 +536,13 @@ class SubprocessSandbox(SandboxBase):
                     self._sanitize_command(arg)
                 except ValueError as e:
                     logger.warning("[sandbox] Argument blocked: %s", e)
-                    return SandboxResult(
+                    blocked = SandboxResult(
                         exit_code=-1,
                         stdout="",
                         stderr=f"Command blocked by security filter: {e}",
                     )
+                    self._record_command_receipt(args=args, capability=capability, result=blocked, extra={"blocked_reason": str(e)})
+                    return blocked
 
         res = await run_args(
             args,
@@ -490,6 +577,7 @@ class SubprocessSandbox(SandboxBase):
                 self.telemetry.record_command(payload)
             except Exception:
                 pass
+        self._record_command_receipt(args=args, capability=capability, result=result)
         return result
 
     async def stop(self) -> None:
@@ -605,11 +693,13 @@ class DockerSandbox(SandboxBase):
             SubprocessSandbox._sanitize_command(command)
         except ValueError as e:
             logger.warning("[docker-sandbox] Command blocked: %s", e)
-            return SandboxResult(
+            blocked = SandboxResult(
                 exit_code=-1,
                 stdout="",
                 stderr=f"Command blocked by security filter: {e}",
             )
+            self._record_command_receipt(command=command, capability=capability, result=blocked, extra={"blocked_reason": str(e), "docker": True})
+            return blocked
 
         cmd = ["docker", "exec", "-w", "/workspace", self._container_id, "bash", "-c", command]
         res = await run_args(cmd, cwd=self.working_dir, timeout_s=float(timeout), label="docker.exec")
@@ -641,6 +731,7 @@ class DockerSandbox(SandboxBase):
                 self.telemetry.record_command(payload)
             except Exception:
                 pass
+        self._record_command_receipt(command=command, capability=capability, result=result, extra={"docker": True})
         return result
 
     async def exec_args(
@@ -663,11 +754,13 @@ class DockerSandbox(SandboxBase):
             SubprocessSandbox._sanitize_command(joined)
         except ValueError as e:
             logger.warning("[docker-sandbox] Command blocked: %s", e)
-            return SandboxResult(
+            blocked = SandboxResult(
                 exit_code=-1,
                 stdout="",
                 stderr=f"Command blocked by security filter: {e}",
             )
+            self._record_command_receipt(args=args, capability=capability, result=blocked, extra={"blocked_reason": str(e), "docker": True})
+            return blocked
 
         cmd = ["docker", "exec", "-w", "/workspace", self._container_id, *[str(a) for a in args]]
         res = await run_args(cmd, cwd=self.working_dir, timeout_s=float(timeout), label="docker.exec_args")
@@ -700,6 +793,7 @@ class DockerSandbox(SandboxBase):
                 self.telemetry.record_command(payload)
             except Exception:
                 pass
+        self._record_command_receipt(args=args, capability=capability, result=result, extra={"docker": True})
         return result
 
     async def stop(self) -> None:
@@ -901,11 +995,13 @@ class SlurmSandbox(SandboxBase):
             SubprocessSandbox._sanitize_command(command)
         except ValueError as e:
             logger.warning("[slurm-sandbox] Command blocked: %s", e)
-            return SandboxResult(
+            blocked = SandboxResult(
                 exit_code=-1,
                 stdout="",
                 stderr=f"Command blocked by security filter: {e}",
             )
+            self._record_command_receipt(command=command, capability=capability, result=blocked, extra={"blocked_reason": str(e), "slurm": True})
+            return blocked
 
         use_local_in_alloc = bool(getattr(self.config, "slurm_use_local_in_allocation", True))
         if use_local_in_alloc and os.getenv("SLURM_JOB_ID"):
@@ -942,14 +1038,17 @@ class SlurmSandbox(SandboxBase):
                     self.telemetry.record_command(payload)
                 except Exception:
                     pass
+            self._record_command_receipt(command=command, capability=capability, result=result, extra={"slurm": True, "slurm_local_in_allocation": True})
             return result
 
         if not _slurm_available():
-            return SandboxResult(
+            blocked = SandboxResult(
                 exit_code=-1,
                 stdout="",
                 stderr="Slurm requested but sbatch was not found on PATH",
             )
+            self._record_command_receipt(command=command, capability=capability, result=blocked, extra={"slurm": True, "blocked_reason": "sbatch_not_found"})
+            return blocked
 
         token = uuid.uuid4().hex[:12]
         script_path = self._jobs_dir / f"job_{token}.sh"
@@ -974,7 +1073,7 @@ class SlurmSandbox(SandboxBase):
             label="slurm.sbatch",
         )
         if submit.exit_code != 0:
-            return SandboxResult(
+            failed = SandboxResult(
                 exit_code=submit.exit_code,
                 stdout=submit.stdout,
                 stderr=submit.stderr,
@@ -982,18 +1081,22 @@ class SlurmSandbox(SandboxBase):
                 duration_seconds=submit.duration_s,
                 used_fallback=submit.used_fallback,
             )
+            self._record_command_receipt(command=command, capability=capability, result=failed, extra={"slurm": True, "stage": "submit"})
+            return failed
 
         raw_out = (submit.stdout or "").strip()
         lines = raw_out.splitlines()
         job_id_raw = (lines[0].strip() if lines else raw_out).strip()
         job_id = job_id_raw.split(";", 1)[0].strip()
         if not job_id:
-            return SandboxResult(
+            failed = SandboxResult(
                 exit_code=-1,
                 stdout=submit.stdout,
                 stderr=f"sbatch did not return a job id (stdout={submit.stdout!r} stderr={submit.stderr!r})",
                 duration_seconds=submit.duration_s,
             )
+            self._record_command_receipt(command=command, capability=capability, result=failed, extra={"slurm": True, "stage": "submit"})
+            return failed
 
         self._active_job_ids.add(job_id)
         start = time.monotonic()
@@ -1076,6 +1179,7 @@ class SlurmSandbox(SandboxBase):
                 self.telemetry.record_command(payload2)
             except Exception:
                 pass
+        self._record_command_receipt(command=command, capability=capability, result=result, extra={"slurm": True, "slurm_job_id": job_id})
         return result
 
     async def exec_args(
@@ -1164,4 +1268,15 @@ def create_sandbox(
         logger.info("Using subprocess sandbox")
         sb = SubprocessSandbox(working_dir=working_dir, env=env_overrides, config=config)
     sb.telemetry = telemetry
+    harness_root = (
+        resolve_development_harness_root(config=config, project_dir=working_dir)
+        / "execution_harness"
+    )
+    sb.configure_execution_harness(
+        root=harness_root,
+        backend=selected,
+        config=config,
+        working_dir=working_dir,
+        env_overrides=env_overrides,
+    )
     return sb
